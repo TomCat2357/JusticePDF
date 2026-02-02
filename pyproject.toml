@@ -1,0 +1,17 @@
+[project]
+name = "justinpdf"
+version = "0.1.0"
+description = "JustinPDF - Visual PDF merge/split application."
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.6.0",
+    "PyMuPDF>=1.23.0",
+    "watchdog>=3.0.0",
+    "send2trash>=1.8.0",
+    "pytest>=7.0.0",
+    "pytest-qt>=4.4.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
