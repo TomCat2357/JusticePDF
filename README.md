@@ -23,7 +23,7 @@
 
 アプリは起動時に作業フォルダを作成/利用します。
 
-- 既定: `~/Documents/PDFas`（OS のホーム配下）
+- 既定: `~/Documents/PDFs`（OS のホーム配下）
 - フォルダ内の PDF を監視しており、追加/削除/更新がメイン画面に自動反映されます。
 
 > このパスは `src/views/main_window.py` の `self._work_dir` で定義されています。

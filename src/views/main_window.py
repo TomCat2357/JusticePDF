@@ -34,7 +34,7 @@ class MainWindow(QMainWindow):
         self._sort_ascending = True
 
         # Setup working directory
-        self._work_dir = Path.home() / "Documents" / "PDFas"
+        self._work_dir = Path.home() / "Documents" / "PDFs"
         self._work_dir.mkdir(parents=True, exist_ok=True)
 
         # Undo manager
