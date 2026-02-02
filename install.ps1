@@ -4,7 +4,7 @@
 # - Python (prefer Scoop Python; reject Microsoft Store alias python.exe)
 # - Create venv
 # - Install dependencies + editable install WITHOUT activation
-# - Create Desktop shortcut
+# - Create Desktop + Project folder shortcut
 #
 # NOTE:
 # - Do NOT run `scoop update *` (updates all apps like nodejs-lts, and may break due to unrelated packages).
@@ -45,15 +45,12 @@ function Ensure-Scoop {
   }
 
   Write-Step "[1/5] Installing Scoop..."
-  # Scoop install requires execution policy bypass (current process only)
   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   Invoke-Expression (Invoke-RestMethod -UseBasicParsing "https://get.scoop.sh")
 }
 
 function Update-ScoopMinimal {
-  # Only update Scoop core + buckets.
-  # Do NOT update all installed apps.
   Write-Host "Updating Scoop..."
   try {
     scoop update
@@ -66,7 +63,6 @@ function Update-ScoopMinimal {
 }
 
 function Ensure-Git {
-  # Git is often needed. Install if missing.
   $git = Get-Command git -ErrorAction SilentlyContinue
   if (-not $git) {
     Write-Host "Installing git (Scoop)..."
@@ -78,7 +74,6 @@ function Ensure-Git {
     return
   }
 
-  # If present, optionally update only git (won't touch nodejs-lts)
   try {
     $ver = (& git --version) -replace '^git version\s+',''
     Write-Host "WARN  'git' ($ver) is already installed."
@@ -90,32 +85,26 @@ function Ensure-Git {
 }
 
 function Ensure-Python {
-  # Reject Store alias first (if present)
   Assert-NotWindowsAppsPython
 
   $python = Get-Command python -ErrorAction SilentlyContinue
   if ($python) {
-    # Try to confirm it is a real python
     try {
       $ver = & python --version 2>&1
       if ($ver -match "^Python\s+\d+\.\d+\.\d+") {
         Write-Step "[2/5] Python already installed. Skipping."
         return
       }
-    } catch {
-      # fall through to install
-    }
+    } catch {}
   }
 
   Write-Step "[2/5] Installing Python (Scoop)..."
   scoop install python | Out-Host
 
-  # Refresh PATH in current session (best effort)
   if (Get-Command refreshenv -ErrorAction SilentlyContinue) {
     refreshenv | Out-Null
   }
 
-  # Re-check alias problem and python availability
   Assert-NotWindowsAppsPython
 
   $ver2 = & python --version 2>&1
@@ -127,9 +116,6 @@ function Ensure-Python {
 function New-Venv([string]$ProjectDir) {
   $venvPath = Join-Path $ProjectDir ".venv"
   Write-Step "[3/5] Creating virtual environment at $venvPath ..."
-
-  # If venv exists, keep it by default. Uncomment next lines to recreate always.
-  # if (Test-Path $venvPath) { Remove-Item -Recurse -Force $venvPath }
 
   & python -m venv $venvPath
 
@@ -146,22 +132,18 @@ function New-Venv([string]$ProjectDir) {
 
 function Install-Project([string]$ProjectDir, [string]$VenvPython) {
   Write-Step "[4/5] (Skip) Activating virtual environment..."
-  $activate = Join-Path (Join-Path $ProjectDir ".venv") "Scripts\Activate.ps1"
-  if (-not (Test-Path $activate)) {
-    Write-Warning "Activate.ps1 not found (this is OK). Proceeding without activation (using venv python directly)."
-  }
 
   Write-Step "[5/5] Installing JusticePDF..."
   & $VenvPython -m ensurepip --upgrade | Out-Host
   & $VenvPython -m pip install --upgrade pip | Out-Host
-
-  # Editable install (pyproject.toml / setup.cfg whichever)
   & $VenvPython -m pip install -e $ProjectDir | Out-Host
 }
 
-function Create-DesktopShortcut([string]$ProjectDir) {
-  $Desktop = [Environment]::GetFolderPath("Desktop")
-  $ShortcutPath = Join-Path $Desktop "JusticePDF.lnk"
+# -------------------------
+# Shortcut helpers
+# -------------------------
+
+function Create-Shortcut([string]$ShortcutPath, [string]$ProjectDir) {
   $Pythonw = Join-Path $ProjectDir ".venv\Scripts\pythonw.exe"
 
   if (-not (Test-Path $Pythonw)) {
@@ -179,13 +161,26 @@ function Create-DesktopShortcut([string]$ProjectDir) {
     $Shortcut.Save()
     Write-Host "Created shortcut: $ShortcutPath"
   } catch {
-    Write-Warning "Failed to create shortcut. Details: $($_.Exception.Message)"
+    Write-Warning "Failed to create shortcut: $ShortcutPath"
+    Write-Warning "Details: $($_.Exception.Message)"
   }
+}
+
+function Create-Shortcuts([string]$ProjectDir) {
+  # Desktop
+  $Desktop = [Environment]::GetFolderPath("Desktop")
+  $DesktopShortcut = Join-Path $Desktop "JusticePDF.lnk"
+  Create-Shortcut -ShortcutPath $DesktopShortcut -ProjectDir $ProjectDir
+
+  # Project folder (same as install.ps1)
+  $ProjectShortcut = Join-Path $ProjectDir "JusticePDF.lnk"
+  Create-Shortcut -ShortcutPath $ProjectShortcut -ProjectDir $ProjectDir
 }
 
 # -------------------------
 # Main
 # -------------------------
+
 $OriginalDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 Write-Step "=== Install Scoop, Python, venv, and JusticePDF ==="
@@ -199,7 +194,6 @@ Update-ScoopMinimal
 Ensure-Git
 Ensure-Python
 
-# Work in project directory for venv + install
 Set-Location $OriginalDir
 
 $venvInfo = New-Venv -ProjectDir $OriginalDir
@@ -211,6 +205,6 @@ Write-Host "Run (without activation):"
 Write-Host "  $($venvInfo.VenvPython) -m src.main"
 Write-Host ""
 Write-Host "Or activate manually if available:"
-Write-Host "  .\ .venv\Scripts\Activate.ps1"
+Write-Host "  .\.venv\Scripts\Activate.ps1"
 
-Create-DesktopShortcut -ProjectDir $OriginalDir
+Create-Shortcuts -ProjectDir $OriginalDir
