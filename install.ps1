@@ -48,6 +48,7 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 # Under the directory where install.ps1 was executed
 # ----------------
 $VenvPath = Join-Path $OriginalDir ".venv"
+$PythonwPath = Join-Path $VenvPath "Scripts\pythonw.exe"
 
 Write-Host "[3/5] Creating virtual environment at $VenvPath ..."
 python -m venv $VenvPath
@@ -89,21 +90,23 @@ Write-Host "Current directory: $(Get-Location)"
 Write-Host "[SHORTCUT 1/2] Creating run_justicepdf.ps1 wrapper script..."
 $WrapperPath = Join-Path $OriginalDir "run_justicepdf.ps1"
 $WrapperContent = @"
-. `"$OriginalDir\.venv\Scripts\Activate.ps1`"
-python -m src.main
+Set-Location -Path `"$OriginalDir`"
+& `"$PythonwPath`" -m src.main
 "@
 Set-Content -Path $WrapperPath -Value $WrapperContent -Encoding UTF8
 Write-Host "Wrapper script created: $WrapperPath"
 
 # ----------------
 # Create Desktop shortcut with Ctrl+Shift+J
+# .lnk -> .ps1 -> .py の流れ
 # ----------------
 Write-Host "[SHORTCUT 2/2] Creating desktop shortcut with Ctrl+Shift+J..."
 $WshShell = New-Object -ComObject WScript.Shell
+$PowerShellPath = "powershell.exe"
 $ShortcutPath = [System.IO.Path]::Combine([Environment]::GetFolderPath("Desktop"), "Run_JusticePDF.lnk")
 $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-$Shortcut.TargetPath = "powershell.exe"
-$Shortcut.Arguments = "-ExecutionPolicy Bypass -File `"$WrapperPath`""
+$Shortcut.TargetPath = $PowerShellPath
+$Shortcut.Arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WrapperPath`""
 $Shortcut.WorkingDirectory = "$OriginalDir"
 $Shortcut.Hotkey = "Ctrl+Shift+J"
 $Shortcut.Save()
@@ -113,8 +116,8 @@ Write-Host "Hotkey: Ctrl+Shift+J"
 # Create same shortcut in install folder
 $LocalShortcutPath = Join-Path $OriginalDir "Run_JusticePDF.lnk"
 $LocalShortcut = $WshShell.CreateShortcut($LocalShortcutPath)
-$LocalShortcut.TargetPath = "powershell.exe"
-$LocalShortcut.Arguments = "-ExecutionPolicy Bypass -File `"$WrapperPath`""
+$LocalShortcut.TargetPath = $PowerShellPath
+$LocalShortcut.Arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WrapperPath`""
 $LocalShortcut.WorkingDirectory = "$OriginalDir"
 $LocalShortcut.Hotkey = "Ctrl+Shift+J"
 $LocalShortcut.Save()
