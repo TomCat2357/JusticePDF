@@ -1,4 +1,4 @@
-"""Undo/Redo manager for PDFas operations."""
+"""Undo/Redo manager for JusticePDF operations."""
 from dataclasses import dataclass
 from typing import Callable
 from collections import deque

@@ -204,7 +204,7 @@ class PageEditWindow(QMainWindow):
         self._load_pages()
 
     def _setup_ui(self) -> None:
-        self.setWindowTitle(f"Edit: {os.path.basename(self._pdf_path)}")
+        self.setWindowTitle(f"JusticePDF - Edit: {os.path.basename(self._pdf_path)}")
         self.resize(800, 600)
         self.setAcceptDrops(True)
 
@@ -541,7 +541,7 @@ class PageEditWindow(QMainWindow):
             new_path = os.path.join(os.path.dirname(self._pdf_path), new_name)
             os.rename(self._pdf_path, new_path)
             self._pdf_path = new_path
-            self.setWindowTitle(f"Edit: {new_name}")
+            self.setWindowTitle(f"JusticePDF - Edit: {new_name}")
 
     def _on_rotate(self) -> None:
         if not self._selected_thumbnails:

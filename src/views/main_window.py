@@ -1,5 +1,5 @@
 # src/views/main_window.py
-"""Main window for PDFas application."""
+"""Main window for JusticePDF application."""
 import os
 import logging
 from pathlib import Path
@@ -65,7 +65,7 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self) -> None:
         """Set up the main UI."""
-        self.setWindowTitle("PDFas")
+        self.setWindowTitle("JusticePDF")
         self.resize(1000, 700)
         self.setAcceptDrops(True)
 
@@ -675,20 +675,29 @@ class MainWindow(QMainWindow):
             drop_pos = self._container.mapFrom(self, event.position().toPoint())
             target_card = self._get_card_at_pos(drop_pos)
 
-            # Reset highlights and indicator (page drop is merge-only)
-            for card in self._cards:
-                if not card.is_selected:
-                    card._update_style()
-            self._hide_drop_indicator()
+            data = event.mimeData().data(PAGETHUMBNAIL_MIME_TYPE).data().decode('utf-8')
+            source_path = data.split('|')[0]
 
-            if target_card and not target_card.is_locked:
-                data = event.mimeData().data(PAGETHUMBNAIL_MIME_TYPE).data().decode('utf-8')
-                source_path = data.split('|')[0]
-                if target_card.pdf_path != source_path:
-                    target_card.setStyleSheet("PDFCard { background-color: #90EE90; border: 2px solid #228B22; }")
-                    self._drop_indicator_index = -2
+            # Check for merge mode on card center
+            if target_card:
+                # Locked cards cannot be merge targets
+                if target_card.is_locked:
+                    self._show_drop_indicator(drop_pos)
                     return
-            self._drop_indicator_index = -1
+
+                card_rect = target_card.geometry()
+                edge_margin = card_rect.width() * 0.15  # 70% center = 15% edges
+
+                if target_card.pdf_path != source_path:
+                    if drop_pos.x() > card_rect.left() + edge_margin and drop_pos.x() < card_rect.right() - edge_margin:
+                        # On card center - merge mode
+                        self._hide_drop_indicator()
+                        target_card.setStyleSheet("PDFCard { background-color: #90EE90; border: 2px solid #228B22; }")
+                        self._drop_indicator_index = -2
+                        return
+
+            # Show insert indicator
+            self._show_drop_indicator(drop_pos)
         elif event.mimeData().hasUrls():
             event.acceptProposedAction()
             self._hide_drop_indicator()
@@ -885,6 +894,22 @@ class MainWindow(QMainWindow):
             if not new_path.exists():
                 return str(new_path)
             copy_num += 1
+
+    def _generate_unique_page_extract_filename(self, src_path: str) -> str:
+        """Generate a unique filename for extracted pages."""
+        from pathlib import Path
+
+        src = Path(src_path)
+        base_name = src.stem
+        parent = self._work_dir
+
+        extract_num = 1
+        while True:
+            new_name = f"{base_name}_pages_{extract_num}.pdf"
+            new_path = parent / new_name
+            if not new_path.exists():
+                return str(new_path)
+            extract_num += 1
 
     def _handle_card_copy(self, source_paths_str: str, drop_pos) -> None:
         """Handle Ctrl+drag copy operation (insert at position).
@@ -1122,23 +1147,26 @@ class MainWindow(QMainWindow):
             logger.debug("No page_nums, returning early")
             return
 
-        if not drop_pos:
+        if drop_pos is None:
             logger.debug("No drop_pos, ignoring")
             return
 
         target_card = self._get_card_at_pos(drop_pos)
         logger.debug(f"target_card at drop_pos: {target_card}")
-        if not target_card:
-            logger.debug("No target card, ignoring")
-            return
-        if target_card.is_locked:
-            logger.debug("Target card locked, ignoring")
-            return
-        if target_card.pdf_path == pdf_path:
-            logger.debug("Same file, ignoring")
-            return
-
-        target_path = target_card.pdf_path
+        is_new_target = target_card is None
+        if not is_new_target:
+            if target_card.is_locked:
+                logger.debug("Target card locked, ignoring")
+                return
+            if target_card.pdf_path == pdf_path:
+                logger.debug("Same file, ignoring")
+                return
+            target_path = target_card.pdf_path
+            insert_index = None
+        else:
+            target_path = self._generate_unique_page_extract_filename(pdf_path)
+            insert_index = self._get_drop_index(drop_pos)
+            logger.debug(f"No target card, creating new PDF at {target_path} (insert_index={insert_index})")
 
         modifiers = QApplication.keyboardModifiers()
         is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
@@ -1154,7 +1182,7 @@ class MainWindow(QMainWindow):
         if not is_copy:
             source_backup = Path(backup_dir) / Path(pdf_path).name
             shutil.copy2(pdf_path, source_backup)
-        if target_path:
+        if not is_new_target and target_path:
             target_backup = Path(backup_dir) / Path(target_path).name
             shutil.copy2(target_path, target_backup)
 
@@ -1190,11 +1218,19 @@ class MainWindow(QMainWindow):
                     logger.debug("extract_pages failed, returning")
                     return False
 
-                logger.debug(f"Appending pages to target_card: {target_path}")
-                insert_pages(target_path, tmp_path, [0] * len(page_nums))
-                _refresh_card(target_path)
-                _reload_page_windows([target_path])
-                _select_single_card(target_path)
+                if is_new_target:
+                    shutil.move(tmp_path, target_path)
+                    tmp_path = None
+                    self._add_card(target_path, insert_index=insert_index)
+                    self._sort_order = "manual"
+                    self._refresh_grid()
+                    _select_single_card(target_path)
+                else:
+                    logger.debug(f"Appending pages to target_card: {target_path}")
+                    insert_pages(target_path, tmp_path, [0] * len(page_nums))
+                    _refresh_card(target_path)
+                    _reload_page_windows([target_path])
+                    _select_single_card(target_path)
 
                 if not is_copy:
                     logger.debug("Removing pages from source")
@@ -1217,6 +1253,8 @@ class MainWindow(QMainWindow):
                     os.unlink(tmp_path)
 
         def undo_extraction() -> None:
+            if is_new_target and target_path and os.path.exists(target_path):
+                send2trash(target_path)
             if target_backup and target_path and os.path.exists(target_backup):
                 shutil.copy2(target_backup, target_path)
                 _refresh_card(target_path)

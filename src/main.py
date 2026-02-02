@@ -1,4 +1,4 @@
-"""PDFas application entry point."""
+"""JusticePDF application entry point."""
 import sys
 import argparse
 import logging
@@ -9,7 +9,7 @@ from src.views.main_window import MainWindow
 def main():
     """Application entry point."""
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="PDFas - PDF management application")
+    parser = argparse.ArgumentParser(description="JusticePDF - PDF management application")
     parser.add_argument(
         '--log-level',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -27,7 +27,8 @@ def main():
     )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("PDFas")
+    app.setApplicationName("JusticePDF")
+    app.setApplicationDisplayName("JusticePDF")
 
     window = MainWindow()
     window.show()

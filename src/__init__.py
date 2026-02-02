@@ -1,1 +1,1 @@
-"""PDFas - Visual PDF merge/split application."""
+"""JusticePDF - Visual PDF merge/split application."""
