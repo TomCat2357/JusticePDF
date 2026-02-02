@@ -2,15 +2,15 @@
 import os
 import logging
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
-    QInputDialog, QLabel, QFrame, QApplication, QRubberBand
+    QInputDialog, QLabel, QFrame, QApplication, QRubberBand, QSlider
 )
 from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QPoint
 from PyQt6.QtGui import QAction, QKeySequence, QDrag
 
 from src.utils.pdf_utils import (
-    get_page_thumbnail, get_page_count, rotate_pages,
+    get_page_thumbnail, get_page_pixmap, get_page_count, rotate_pages,
     remove_pages, reorder_pages, extract_pages, insert_pages
 )
 from src.models.undo_manager import UndoManager, UndoAction
@@ -94,6 +94,13 @@ class PageThumbnail(QFrame):
             self.clicked.emit(self)
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            parent_window = self.window()
+            if hasattr(parent_window, "_open_zoom_view"):
+                parent_window._open_zoom_view(self._page_num)
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event) -> None:
         if not (event.buttons() & Qt.MouseButton.LeftButton):
             return
@@ -149,8 +156,24 @@ class PageThumbnail(QFrame):
         logger.debug(f"Drag completed with result: {result}")
 
 
+class ZoomLabel(QLabel):
+    wheel_zoom = pyqtSignal(int)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        step = 5 if delta > 0 else -5
+        self.wheel_zoom.emit(step)
+        event.accept()
+
+
 class PageEditWindow(QMainWindow):
     """Window for editing pages within a PDF."""
+
+    ZOOM_MIN = 25
+    ZOOM_MAX = 400
+    ZOOM_STEP = 5
 
     def __init__(self, pdf_path: str, undo_manager: UndoManager, parent=None):
         super().__init__(parent)
@@ -158,6 +181,14 @@ class PageEditWindow(QMainWindow):
         self._undo_manager = undo_manager
         self._thumbnails: list[PageThumbnail] = []
         self._selected_thumbnails: list[PageThumbnail] = []
+        self._grid_scroll = None
+        self._zoom_view = None
+        self._zoom_scroll = None
+        self._zoom_label = None
+        self._zoom_slider = None
+        self._zoom_percent_label = None
+        self._zoom_page_num = None
+        self._zoom_factor = 1.0
 
         # Drop indicator
         self._drop_indicator = None
@@ -183,13 +214,13 @@ class PageEditWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        layout.addWidget(scroll)
+        self._grid_scroll = QScrollArea()
+        self._grid_scroll.setWidgetResizable(True)
+        layout.addWidget(self._grid_scroll)
 
         self._container = QWidget()
         self._container.setAcceptDrops(True)
-        scroll.setWidget(self._container)
+        self._grid_scroll.setWidget(self._container)
 
         self._grid_layout = QGridLayout(self._container)
         self._grid_layout.setSpacing(10)
@@ -205,6 +236,53 @@ class PageEditWindow(QMainWindow):
 
         # Rubber band for selection
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self._container)
+
+        self._zoom_view = QWidget()
+        zoom_layout = QVBoxLayout(self._zoom_view)
+        zoom_layout.setContentsMargins(0, 0, 0, 0)
+
+        zoom_controls = QWidget()
+        controls_layout = QHBoxLayout(zoom_controls)
+        controls_layout.setContentsMargins(10, 10, 10, 10)
+
+        self._zoom_back_btn = QPushButton("Back")
+        self._zoom_back_btn.clicked.connect(self._exit_zoom_view)
+        controls_layout.addWidget(self._zoom_back_btn)
+
+        self._zoom_out_btn = QPushButton("-")
+        self._zoom_out_btn.clicked.connect(self._on_zoom_out)
+        controls_layout.addWidget(self._zoom_out_btn)
+
+        self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_slider.setRange(self.ZOOM_MIN, self.ZOOM_MAX)
+        self._zoom_slider.setValue(100)
+        self._zoom_slider.setSingleStep(self.ZOOM_STEP)
+        self._zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
+        controls_layout.addWidget(self._zoom_slider)
+
+        self._zoom_in_btn = QPushButton("+")
+        self._zoom_in_btn.clicked.connect(self._on_zoom_in)
+        controls_layout.addWidget(self._zoom_in_btn)
+
+        self._zoom_reset_btn = QPushButton("100%")
+        self._zoom_reset_btn.clicked.connect(self._on_zoom_reset)
+        controls_layout.addWidget(self._zoom_reset_btn)
+
+        self._zoom_percent_label = QLabel("100%")
+        controls_layout.addWidget(self._zoom_percent_label)
+
+        zoom_layout.addWidget(zoom_controls)
+
+        self._zoom_scroll = QScrollArea()
+        self._zoom_scroll.setWidgetResizable(True)
+        self._zoom_label = ZoomLabel()
+        self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._zoom_label.wheel_zoom.connect(self._on_zoom_wheel)
+        self._zoom_scroll.setWidget(self._zoom_label)
+        zoom_layout.addWidget(self._zoom_scroll)
+
+        layout.addWidget(self._zoom_view)
+        self._zoom_view.hide()
 
     def _setup_toolbar(self) -> None:
         toolbar = QToolBar()
@@ -287,6 +365,8 @@ class PageEditWindow(QMainWindow):
             self._thumbnails.append(thumb)
 
         self._refresh_grid()
+        if self._zoom_view and self._zoom_view.isVisible():
+            self._render_zoom_page()
 
     def _refresh_grid(self) -> None:
         while self._grid_layout.count():
@@ -352,6 +432,61 @@ class PageEditWindow(QMainWindow):
                 self._selected_thumbnails.append(thumb)
 
         self._update_button_states()
+
+    def _open_zoom_view(self, page_num: int) -> None:
+        self._zoom_page_num = page_num
+        self._set_zoom_percent(100)
+        if self._grid_scroll:
+            self._grid_scroll.hide()
+        if self._zoom_view:
+            self._zoom_view.show()
+
+    def _exit_zoom_view(self) -> None:
+        if self._zoom_view:
+            self._zoom_view.hide()
+        if self._grid_scroll:
+            self._grid_scroll.show()
+
+    def _set_zoom_percent(self, value: int) -> None:
+        value = max(self.ZOOM_MIN, min(self.ZOOM_MAX, value))
+        if self._zoom_slider:
+            self._zoom_slider.blockSignals(True)
+            self._zoom_slider.setValue(value)
+            self._zoom_slider.blockSignals(False)
+        self._zoom_factor = value / 100.0
+        if self._zoom_percent_label:
+            self._zoom_percent_label.setText(f"{value}%")
+        self._render_zoom_page()
+
+    def _on_zoom_slider_changed(self, value: int) -> None:
+        self._set_zoom_percent(value)
+
+    def _on_zoom_wheel(self, step: int) -> None:
+        current = self._zoom_slider.value() if self._zoom_slider else 100
+        self._set_zoom_percent(current + step)
+
+    def _on_zoom_in(self) -> None:
+        current = self._zoom_slider.value() if self._zoom_slider else 100
+        self._set_zoom_percent(current + self.ZOOM_STEP)
+
+    def _on_zoom_out(self) -> None:
+        current = self._zoom_slider.value() if self._zoom_slider else 100
+        self._set_zoom_percent(current - self.ZOOM_STEP)
+
+    def _on_zoom_reset(self) -> None:
+        self._set_zoom_percent(100)
+
+    def _render_zoom_page(self) -> None:
+        if self._zoom_page_num is None or not self._zoom_label:
+            return
+        page_count = get_page_count(self._pdf_path)
+        if self._zoom_page_num >= page_count:
+            self._exit_zoom_view()
+            return
+        pixmap = get_page_pixmap(self._pdf_path, self._zoom_page_num, self._zoom_factor)
+        if not pixmap.isNull():
+            self._zoom_label.setPixmap(pixmap)
+            self._zoom_label.adjustSize()
 
     def _on_undo(self) -> None:
         self._undo_manager.undo()

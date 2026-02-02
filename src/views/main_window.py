@@ -140,12 +140,6 @@ class MainWindow(QMainWindow):
         self._select_all_btn.clicked.connect(self._on_select_all)
         toolbar.addWidget(self._select_all_btn)
 
-        self._split_btn = QPushButton("Split")
-        self._split_btn.clicked.connect(self._on_split)
-        toolbar.addWidget(self._split_btn)
-
-        toolbar.addSeparator()
-
         self._sort_name_btn = QPushButton("Sort Name")
         self._sort_name_btn.clicked.connect(self._on_sort_by_name)
         toolbar.addWidget(self._sort_name_btn)
@@ -189,7 +183,6 @@ class MainWindow(QMainWindow):
         self._delete_btn.setEnabled(has_selection)
         self._rename_btn.setEnabled(len(self._selected_cards) == 1)
         self._rotate_btn.setEnabled(has_selection)
-        self._split_btn.setEnabled(has_selection)
         self._undo_btn.setEnabled(self._undo_manager.can_undo())
         self._redo_btn.setEnabled(self._undo_manager.can_redo())
 
@@ -430,24 +423,8 @@ class MainWindow(QMainWindow):
         for card in self._cards:
             if card.pdf_path == path:
                 return
-        insert_index = None
-        if hasattr(self, '_pending_insert_positions') and path in self._pending_insert_positions:
-            insert_index = self._pending_insert_positions.pop(path)
-            if not self._pending_insert_positions:
-                del self._pending_insert_positions
-            self._sort_order = "manual"
-
-        new_card = self._add_card(path, insert_index=insert_index)
+        new_card = self._add_card(path, insert_index=None)
         self._refresh_grid()
-        
-        # Check if this file should be selected (e.g., from split operation)
-        if hasattr(self, '_pending_select_paths') and path in self._pending_select_paths:
-            new_card.set_selected(True)
-            self._selected_cards.append(new_card)
-            self._pending_select_paths.remove(path)
-            if not self._pending_select_paths:
-                del self._pending_select_paths
-            self._update_button_states()
 
     def _on_file_removed(self, path: str) -> None:
         """Handle file removed from folder."""
@@ -592,75 +569,6 @@ class MainWindow(QMainWindow):
             self._selected_cards.append(card)
         self._update_button_states()
 
-    def _on_split(self) -> None:
-        """Handle split action - split PDFs into individual pages."""
-        from src.utils.pdf_utils import extract_pages
-        import tempfile
-        import shutil
-
-        if not self._selected_cards:
-            return
-
-        split_info = []
-        all_new_paths = []
-
-        for card in self._selected_cards:
-            page_count = get_page_count(card.pdf_path)
-            if page_count <= 1:
-                continue
-
-            backup_fd, backup_path = tempfile.mkstemp(suffix=".pdf")
-            os.close(backup_fd)
-            shutil.copy2(card.pdf_path, backup_path)
-
-            original_path = card.pdf_path
-            base_name = os.path.splitext(card.filename)[0]
-            new_paths = []
-
-            for i in range(page_count):
-                j = 1
-                while True:
-                    new_name = f"{base_name}_{j}.pdf"
-                    new_path = self._work_dir / new_name
-                    if not new_path.exists():
-                        break
-                    j += 1
-
-                extract_pages(card.pdf_path, str(new_path), [i])
-                new_paths.append(str(new_path))
-                all_new_paths.append(str(new_path))
-
-            split_info.append((original_path, backup_path, new_paths))
-            send2trash(original_path)
-
-        if not split_info:
-            return
-
-        def undo_split():
-            for original_path, backup_path, new_paths in split_info:
-                shutil.copy2(backup_path, original_path)
-                for new_path in new_paths:
-                    if os.path.exists(new_path):
-                        send2trash(new_path)
-
-        def redo_split():
-            for original_path, backup_path, new_paths in split_info:
-                base_name = os.path.splitext(os.path.basename(original_path))[0]
-                page_count = get_page_count(original_path)
-                for i in range(page_count):
-                    if i < len(new_paths):
-                        extract_pages(original_path, new_paths[i], [i])
-                send2trash(original_path)
-
-        self._undo_manager.add_action(UndoAction(
-            description=f"Split {len(split_info)} PDF(s)",
-            undo_func=undo_split,
-            redo_func=redo_split
-        ))
-
-        # Select split files after they are added by file watcher
-        self._pending_select_paths = all_new_paths
-
     def _on_sort_by_name(self) -> None:
         """Handle sort by name."""
         self._sort_by("name", default_ascending=True)
@@ -722,15 +630,14 @@ class MainWindow(QMainWindow):
     def dragMoveEvent(self, event) -> None:
         """Handle drag move event - show drop indicator."""
         from src.views.page_edit_window import PAGETHUMBNAIL_MIME_TYPE
-
-        if event.mimeData().hasFormat(PDFCARD_MIME_TYPE) or event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
+        if event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
             # Set drop action based on Ctrl key
             modifiers = QApplication.keyboardModifiers()
             if modifiers & Qt.KeyboardModifier.ControlModifier:
                 event.setDropAction(Qt.DropAction.CopyAction)
             else:
                 event.setDropAction(Qt.DropAction.MoveAction)
-            
+
             event.acceptProposedAction()
             drop_pos = self._container.mapFrom(self, event.position().toPoint())
             target_card = self._get_card_at_pos(drop_pos)
@@ -741,30 +648,47 @@ class MainWindow(QMainWindow):
                 if target_card.is_locked:
                     self._show_drop_indicator(drop_pos)
                     return
-                    
+
                 card_rect = target_card.geometry()
                 edge_margin = card_rect.width() * 0.15  # 70% center = 15% edges
-                
-                if event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
-                    # Check self-drop exclusion
-                    source_paths = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8').split('|')
-                    if target_card.pdf_path not in source_paths:
-                        if drop_pos.x() > card_rect.left() + edge_margin and drop_pos.x() < card_rect.right() - edge_margin:
-                            # On card center - merge mode
-                            self._hide_drop_indicator()
-                            target_card.setStyleSheet("PDFCard { background-color: #90EE90; border: 2px solid #228B22; }")
-                            self._drop_indicator_index = -2  # Special value for merge
-                            return
-                elif event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
+
+                # Check self-drop exclusion
+                source_paths = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8').split('|')
+                if target_card.pdf_path not in source_paths:
                     if drop_pos.x() > card_rect.left() + edge_margin and drop_pos.x() < card_rect.right() - edge_margin:
                         # On card center - merge mode
                         self._hide_drop_indicator()
                         target_card.setStyleSheet("PDFCard { background-color: #90EE90; border: 2px solid #228B22; }")
                         self._drop_indicator_index = -2  # Special value for merge
                         return
-            
+
             # Show insert indicator
             self._show_drop_indicator(drop_pos)
+        elif event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
+            modifiers = QApplication.keyboardModifiers()
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
+                event.setDropAction(Qt.DropAction.CopyAction)
+            else:
+                event.setDropAction(Qt.DropAction.MoveAction)
+
+            event.acceptProposedAction()
+            drop_pos = self._container.mapFrom(self, event.position().toPoint())
+            target_card = self._get_card_at_pos(drop_pos)
+
+            # Reset highlights and indicator (page drop is merge-only)
+            for card in self._cards:
+                if not card.is_selected:
+                    card._update_style()
+            self._hide_drop_indicator()
+
+            if target_card and not target_card.is_locked:
+                data = event.mimeData().data(PAGETHUMBNAIL_MIME_TYPE).data().decode('utf-8')
+                source_path = data.split('|')[0]
+                if target_card.pdf_path != source_path:
+                    target_card.setStyleSheet("PDFCard { background-color: #90EE90; border: 2px solid #228B22; }")
+                    self._drop_indicator_index = -2
+                    return
+            self._drop_indicator_index = -1
         elif event.mimeData().hasUrls():
             event.acceptProposedAction()
             self._hide_drop_indicator()
@@ -1198,61 +1122,31 @@ class MainWindow(QMainWindow):
             logger.debug("No page_nums, returning early")
             return
 
+        if not drop_pos:
+            logger.debug("No drop_pos, ignoring")
+            return
+
+        target_card = self._get_card_at_pos(drop_pos)
+        logger.debug(f"target_card at drop_pos: {target_card}")
+        if not target_card:
+            logger.debug("No target card, ignoring")
+            return
+        if target_card.is_locked:
+            logger.debug("Target card locked, ignoring")
+            return
+        if target_card.pdf_path == pdf_path:
+            logger.debug("Same file, ignoring")
+            return
+
+        target_path = target_card.pdf_path
+
         modifiers = QApplication.keyboardModifiers()
         is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
         logger.debug(f"is_copy={is_copy}")
 
-        source_page_count = get_page_count(pdf_path)
-        source_will_be_deleted = (not is_copy and source_page_count == len(page_nums))
-        
-        # Check if dropping on a card (merge) or between cards (insert as new file)
-        target_card = None
-        insert_index = -1
-        
-        if drop_pos:
-            target_card = self._get_card_at_pos(drop_pos)
-            logger.debug(f"target_card at drop_pos: {target_card}")
-            if target_card:
-                # Check if on edge (insert) or center (merge)
-                card_rect = target_card.geometry()
-                edge_margin = card_rect.width() // 4
-                if drop_pos.x() <= card_rect.left() + edge_margin or drop_pos.x() >= card_rect.right() - edge_margin:
-                    # On edge - insert mode
-                    insert_index = self._get_drop_index(drop_pos)
-                    target_card = None
-                    logger.debug(f"Edge drop detected, insert_index={insert_index}")
-            else:
-                insert_index = self._get_drop_index(drop_pos)
-                logger.debug(f"No target card, insert_index={insert_index}")
-
-        target_path = None
-        if target_card and target_card.pdf_path != pdf_path:
-            target_path = target_card.pdf_path
-
         old_sort_order = self._sort_order
         old_sort_ascending = self._sort_ascending
         old_paths = [card.pdf_path for card in self._cards]
-        old_source_index = old_paths.index(pdf_path) if pdf_path in old_paths else None
-
-        new_pdf_path = None
-        insert_index_clamped = None
-        if target_path is None:
-            base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-            suffix = f"_page{page_nums[0] + 1}" if len(page_nums) == 1 else "_pages"
-            i = 1
-            while True:
-                candidate = self._work_dir / f"{base_name}{suffix}_{i}.pdf"
-                if not candidate.exists():
-                    new_pdf_path = candidate
-                    break
-                i += 1
-
-            if insert_index == -1:
-                insert_index = len(self._cards)
-            if source_will_be_deleted and old_source_index is not None and old_source_index < insert_index:
-                insert_index -= 1
-            adjusted_len = len(self._cards) - (1 if source_will_be_deleted and old_source_index is not None else 0)
-            insert_index_clamped = max(0, min(insert_index, adjusted_len))
 
         backup_dir = tempfile.mkdtemp(prefix="pdfas_page_extract_")
         source_backup = None
@@ -1285,22 +1179,6 @@ class MainWindow(QMainWindow):
                     logger.debug(f"Reloading pages in PageEditWindow for {window._pdf_path}")
                     window._load_pages()
 
-        def _set_pending_insert(path: str, index: int) -> None:
-            self._pending_insert_positions = getattr(self, '_pending_insert_positions', {})
-            self._pending_insert_positions[path] = index
-
-        def _clear_pending_insert(path: str) -> None:
-            if hasattr(self, '_pending_insert_positions') and path in self._pending_insert_positions:
-                self._pending_insert_positions.pop(path)
-                if not self._pending_insert_positions:
-                    del self._pending_insert_positions
-
-        def _clear_pending_select(path: str) -> None:
-            if hasattr(self, '_pending_select_paths') and path in self._pending_select_paths:
-                self._pending_select_paths.remove(path)
-                if not self._pending_select_paths:
-                    del self._pending_select_paths
-
         def do_extraction() -> bool:
             nonlocal source_was_deleted
             tmp_path = None
@@ -1312,54 +1190,24 @@ class MainWindow(QMainWindow):
                     logger.debug("extract_pages failed, returning")
                     return False
 
-                if target_path:
-                    logger.debug(f"Appending pages to target_card: {target_path}")
-                    insert_pages(target_path, tmp_path, [0] * len(page_nums))
-                    _refresh_card(target_path)
-                    _reload_page_windows([target_path])
-                    _select_single_card(target_path)
-                else:
-                    if new_pdf_path is None:
-                        logger.debug("new_pdf_path is None, returning")
-                        return False
-
-                    if insert_index_clamped is not None:
-                        _set_pending_insert(str(new_pdf_path), insert_index_clamped)
-                        self._sort_order = "manual"
-
-                    self._pending_select_paths = getattr(self, '_pending_select_paths', [])
-                    self._pending_select_paths.append(str(new_pdf_path))
-
-                    if os.path.exists(new_pdf_path):
-                        send2trash(str(new_pdf_path))
-
-                    logger.debug(f"Creating new PDF file: {new_pdf_path}")
-                    shutil.move(tmp_path, new_pdf_path)
-                    tmp_path = None  # Prevent cleanup
+                logger.debug(f"Appending pages to target_card: {target_path}")
+                insert_pages(target_path, tmp_path, [0] * len(page_nums))
+                _refresh_card(target_path)
+                _reload_page_windows([target_path])
+                _select_single_card(target_path)
 
                 if not is_copy:
-                    page_count = source_page_count
-                    logger.debug(f"Removing pages from source: page_count={page_count}, len(page_nums)={len(page_nums)}")
-                    
-                    if page_count == len(page_nums):
-                        source_was_deleted = True
-                        # All pages removed - delete file and close window
-                        logger.debug("All pages moved, closing PageEditWindow and deleting file")
+                    logger.debug("Removing pages from source")
+                    source_was_deleted = remove_pages(pdf_path, page_nums)
+                    if source_was_deleted:
+                        logger.debug("Source file deleted, closing PageEditWindow and removing card")
                         for window in QApplication.topLevelWidgets():
                             if isinstance(window, PageEditWindow) and window._pdf_path == pdf_path:
-                                logger.debug(f"Closing PageEditWindow for {pdf_path}")
                                 window.close()
-                        
-                        logger.debug(f"Sending {pdf_path} to trash")
-                        send2trash(pdf_path)
-                        
-                        # Remove card from main window
-                        logger.debug(f"Removing card for {pdf_path} from main window")
+                                break
                         self._remove_card(pdf_path)
                         self._refresh_grid()
                     else:
-                        logger.debug("Partial page removal, calling remove_pages")
-                        remove_pages(pdf_path, page_nums)
                         _reload_page_windows([pdf_path])
                 
                 return True
@@ -1375,23 +1223,11 @@ class MainWindow(QMainWindow):
                 _reload_page_windows([target_path])
 
             if source_backup and os.path.exists(source_backup):
-                if source_was_deleted and old_source_index is not None and old_sort_order == "manual":
-                    _set_pending_insert(pdf_path, old_source_index)
                 shutil.copy2(source_backup, pdf_path)
                 _reload_page_windows([pdf_path])
-
-            if new_pdf_path is not None:
-                _clear_pending_insert(str(new_pdf_path))
-                _clear_pending_select(str(new_pdf_path))
-                if os.path.exists(new_pdf_path):
-                    send2trash(str(new_pdf_path))
-                if self._get_card_by_path(str(new_pdf_path)):
-                    self._remove_card(str(new_pdf_path))
-
-            if target_path is None and insert_index_clamped is not None:
-                self._sort_order = old_sort_order
-                self._sort_ascending = old_sort_ascending
-
+            self._sort_order = old_sort_order
+            self._sort_ascending = old_sort_ascending
+            self._rebuild_cards_from_paths(old_paths)
             self._refresh_grid()
 
         def redo_extraction() -> None:

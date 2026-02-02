@@ -62,6 +62,23 @@ def get_page_thumbnail(pdf_path: str, page_num: int, size: int = 128) -> QPixmap
         return QPixmap()
 
 
+def get_page_pixmap(pdf_path: str, page_num: int, zoom: float = 1.0) -> QPixmap:
+    """Render a page at the given zoom factor."""
+    try:
+        doc = fitz.open(pdf_path)
+        if page_num >= len(doc):
+            doc.close()
+            return QPixmap()
+        page = doc[page_num]
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+        doc.close()
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(img)
+    except Exception:
+        return QPixmap()
+
+
 def merge_pdfs(output_path: str, pdf_paths: list[str]) -> None:
     """Merge multiple PDFs into one."""
     output_doc = fitz.open()

@@ -1,5 +1,5 @@
 [project]
-name = "justinpdf"
+name = "justicepdf"
 version = "0.1.0"
 description = "JustinPDF - Visual PDF merge/split application."
 requires-python = ">=3.10"
