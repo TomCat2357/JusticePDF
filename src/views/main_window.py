@@ -2,6 +2,7 @@
 """Main window for JusticePDF application."""
 import os
 import logging
+import shutil
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -38,7 +39,7 @@ class MainWindow(QMainWindow):
         self._work_dir.mkdir(parents=True, exist_ok=True)
 
         # Undo manager
-        self._undo_manager = UndoManager()
+        self._undo_manager = UndoManager(max_size=20)
 
         # Drop indicator
         self._drop_indicator = None
@@ -130,6 +131,10 @@ class MainWindow(QMainWindow):
         self._import_btn.clicked.connect(self._on_import)
         toolbar.addWidget(self._import_btn)
 
+        self._export_btn = QPushButton("Export")
+        self._export_btn.clicked.connect(self._on_export)
+        toolbar.addWidget(self._export_btn)
+
         toolbar.addSeparator()
 
         self._rotate_btn = QPushButton("Rotate")
@@ -177,14 +182,44 @@ class MainWindow(QMainWindow):
         select_all_action.triggered.connect(self._on_select_all)
         self.addAction(select_all_action)
 
+        export_action = QAction(self)
+        export_action.setShortcut(QKeySequence("Ctrl+E"))
+        export_action.triggered.connect(self._on_export)
+        self.addAction(export_action)
+
     def _update_button_states(self) -> None:
         """Update toolbar button enabled states."""
         has_selection = len(self._selected_cards) > 0
+        has_any = len(self._cards) > 0
         self._delete_btn.setEnabled(has_selection)
         self._rename_btn.setEnabled(len(self._selected_cards) == 1)
         self._rotate_btn.setEnabled(has_selection)
         self._undo_btn.setEnabled(self._undo_manager.can_undo())
         self._redo_btn.setEnabled(self._undo_manager.can_redo())
+        self._export_btn.setEnabled(has_any)
+
+    def _clear_undo_history(self) -> None:
+        """Clear undo/redo history (for external file changes)."""
+        self._undo_manager.clear()
+        self._update_button_states()
+
+    def _ensure_unique_export_path(self, dst_dir: str, filename: str) -> str:
+        """Return a destination path that does not overwrite existing files.
+
+        If dst_dir/filename already exists, returns dst_dir/<stem> (1).pdf, (2)...
+        """
+        base, ext = os.path.splitext(filename)
+        candidate = os.path.join(dst_dir, filename)
+        if not os.path.exists(candidate):
+            return candidate
+
+        i = 1
+        while True:
+            new_name = f"{base} ({i}){ext}"
+            candidate = os.path.join(dst_dir, new_name)
+            if not os.path.exists(candidate):
+                return candidate
+            i += 1
 
     def _load_existing_files(self) -> None:
         """Load existing PDF files from the work directory."""
@@ -364,65 +399,139 @@ class MainWindow(QMainWindow):
         window.show()
 
     def _on_card_merge(self, target_card: PDFCard, source_path: str) -> None:
-        """Handle card merge (drop cards on another card).
-        
+        """Handle card merge (drop cards on another card) with undo support.
+
         Supports multiple selected cards - merges all into target.
-        Order: earlier cards (in grid) appear first in merged PDF.
+        Order: earlier cards (in grid) appear first in merged PDF (sources first, then target).
+
+        Undo restores:
+        - File bytes of target + all merged sources
+        - Grid order
+        - Selection state before the merge
+
+        Redo restores:
+        - Merged state (same order)
+        - Selection state after the merge
+
+        Export is NOT an undoable action and should not affect undo history.
         """
         from src.utils.pdf_utils import merge_pdfs
         import tempfile
-        import shutil
+        from pathlib import Path
 
-        # Get all source cards (from selection if dragged card is selected)
-        source_cards = []
-        for card in self._cards:
-            if card.pdf_path == source_path:
-                if card in self._selected_cards:
-                    # Use all selected cards in order
-                    source_cards = [c for c in self._cards if c in self._selected_cards and c != target_card]
+        # Snapshot grid order and selection before mutation
+        old_paths = [c.pdf_path for c in self._cards]
+        pre_selected_paths = [c.pdf_path for c in self._selected_cards]
+
+        target_path = target_card.pdf_path
+
+        # Determine source cards (selection-aware)
+        source_cards: list[PDFCard] = []
+        for c in self._cards:
+            if c.pdf_path == source_path:
+                if c in self._selected_cards:
+                    source_cards = [x for x in self._cards if x in self._selected_cards and x.pdf_path != target_path]
                 else:
-                    source_cards = [card]
+                    if c.pdf_path != target_path:
+                        source_cards = [c]
                 break
 
         if not source_cards:
             return
 
-        target_path = target_card.pdf_path
-        source_paths = [c.pdf_path for c in source_cards] + [target_path]
+        source_paths = [c.pdf_path for c in source_cards]
 
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp_path = tmp.name
+        # New order after merge: remove merged sources, keep target
+        new_paths = [p for p in old_paths if p not in set(source_paths)]
+
+        # Backup involved PDFs (target + sources) so undo/redo is byte-stable
+        backup_dir = tempfile.mkdtemp(prefix="justicepdf_merge_backup_")
+        backups: dict[str, str] = {}
+        for p in [*source_paths, target_path]:
+            src = Path(p)
+            dst = Path(backup_dir) / f"{src.stem}__{abs(hash(p))}{src.suffix}"
+            shutil.copy2(p, dst)
+            backups[p] = str(dst)
+
+        def _select_paths(paths: list[str]) -> None:
+            self._clear_selection()
+            for card in self._cards:
+                if card.pdf_path in paths:
+                    card.set_selected(True)
+                    self._selected_cards.append(card)
+            self._update_button_states()
+
+        # Post-selection is captured after do_merge runs once
+        post_selected_paths: list[str] = []
+
+        def do_merge() -> None:
+            nonlocal post_selected_paths
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                merge_pdfs(tmp_path, source_paths + [target_path])
+                shutil.move(tmp_path, target_path)
+
+                # Trash the source PDFs
+                for p in source_paths:
+                    send2trash(p)
+
+                # Rebuild cards from paths (avoid stale QWidget references)
+                self._rebuild_cards_from_paths(new_paths)
+                self._refresh_grid()
+
+                # Select target only (consistent post-merge UX), and remember it for redo
+                _select_paths([target_path])
+                post_selected_paths = [target_path]
+
+                card = self._get_card_by_path(target_path)
+                if card:
+                    card.refresh()
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+        def undo_merge() -> None:
+            # Restore file bytes
+            for original_path, backup_path in backups.items():
+                shutil.copy2(backup_path, original_path)
+
+            self._rebuild_cards_from_paths(old_paths)
+            self._refresh_grid()
+            _select_paths(pre_selected_paths)
+
+        def redo_merge() -> None:
+            do_merge()
+            # Ensure redo selection matches the post-merge selection
+            if post_selected_paths:
+                _select_paths(post_selected_paths)
 
         try:
-            merge_pdfs(tmp_path, source_paths)
-            shutil.move(tmp_path, target_path)
-
-            # Remove source cards
-            for card in source_cards:
-                if card in self._selected_cards:
-                    self._selected_cards.remove(card)
-                self._cards.remove(card)
-                send2trash(card.pdf_path)
-                card.deleteLater()
-
-            target_card.refresh()
-
-            # Select target card
-            self._clear_selection()
-            target_card.set_selected(True)
-            self._selected_cards.append(target_card)
-
-            self._refresh_grid()
-        except Exception as e:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            do_merge()
+        except Exception:
+            # Best-effort rollback
+            try:
+                undo_merge()
+            except Exception:
+                pass
             raise
+
+        # Register undo action
+        self._undo_manager.add_action(UndoAction(
+            description=f"Merge {len(source_paths)} file(s)",
+            undo_func=undo_merge,
+            redo_func=redo_merge,
+        ))
 
     def _on_file_added(self, path: str) -> None:
         """Handle new file added to folder."""
         for card in self._cards:
             if card.pdf_path == path:
                 return
+        self._clear_undo_history()
         new_card = self._add_card(path, insert_index=None)
         self._refresh_grid()
 
@@ -507,6 +616,10 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Import PDF", "", "PDF Files (*.pdf)"
         )
+        if not paths:
+            return
+
+        self._clear_undo_history()
 
         for src_path in paths:
             filename = os.path.basename(src_path)
@@ -520,6 +633,46 @@ class MainWindow(QMainWindow):
 
             import shutil
             shutil.copy2(src_path, dest_path)
+
+    def _on_export(self) -> None:
+        """Export selected PDFs (or all PDFs if none selected) to a chosen folder."""
+        targets = [c.pdf_path for c in self._selected_cards] if self._selected_cards else [c.pdf_path for c in self._cards]
+
+        if not targets:
+            QMessageBox.information(self, "Export", "エクスポート対象のPDFがありません。")
+            return
+
+        dst_dir = QFileDialog.getExistingDirectory(self, "エクスポート先フォルダを選択")
+        if not dst_dir:
+            return
+
+        ok = 0
+        failed: list[tuple[str, str]] = []
+
+        for src in targets:
+            try:
+                if not os.path.exists(src):
+                    failed.append((src, "元ファイルが見つかりません"))
+                    continue
+
+                filename = os.path.basename(src)
+                dst_path = self._ensure_unique_export_path(dst_dir, filename)
+                shutil.copy2(src, dst_path)
+                ok += 1
+            except Exception as e:
+                failed.append((src, str(e)))
+
+        if failed:
+            details = "\n".join([f"- {os.path.basename(s)}: {r}" for s, r in failed[:20]])
+            if len(failed) > 20:
+                details += f"\n...（他 {len(failed) - 20} 件）"
+            QMessageBox.warning(
+                self,
+                "エクスポート結果",
+                f"{ok} 件コピーしました。\n失敗: {len(failed)} 件\n\n{details}",
+            )
+        else:
+            QMessageBox.information(self, "エクスポート結果", f"{ok} 件コピーしました。")
 
     def _on_rotate(self) -> None:
         """Handle rotate action."""
@@ -1113,10 +1266,13 @@ class MainWindow(QMainWindow):
     def _handle_external_file_drop(self, urls) -> None:
         """Handle external file drop (import)."""
         import shutil
-        for url in urls:
+        pdf_urls = [url for url in urls if url.toLocalFile().lower().endswith('.pdf')]
+        if not pdf_urls:
+            return
+
+        self._clear_undo_history()
+        for url in pdf_urls:
             src_path = url.toLocalFile()
-            if not src_path.lower().endswith('.pdf'):
-                continue
 
             filename = os.path.basename(src_path)
             dest_path = self._work_dir / filename
