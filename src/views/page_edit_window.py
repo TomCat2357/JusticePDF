@@ -4,7 +4,8 @@ import logging
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
-    QInputDialog, QLabel, QFrame, QApplication, QRubberBand, QSlider
+    QInputDialog, QLabel, QFrame, QApplication, QRubberBand, QSlider,
+    QToolButton, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QPoint
 from PyQt6.QtGui import QAction, QKeySequence, QDrag
@@ -187,6 +188,8 @@ class PageEditWindow(QMainWindow):
         self._zoom_label = None
         self._zoom_slider = None
         self._zoom_percent_label = None
+        self._zoom_prev_btn = None
+        self._zoom_next_btn = None
         self._zoom_page_num = None
         self._zoom_factor = 1.0
 
@@ -279,7 +282,42 @@ class PageEditWindow(QMainWindow):
         self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._zoom_label.wheel_zoom.connect(self._on_zoom_wheel)
         self._zoom_scroll.setWidget(self._zoom_label)
-        zoom_layout.addWidget(self._zoom_scroll)
+
+        nav_button_style = (
+            "QToolButton { background-color: #f2f2f2; border: 2px solid #4c4c4c; "
+            "border-radius: 8px; padding: 4px; }"
+            "QToolButton:hover { background-color: #dbe8ff; }"
+            "QToolButton:pressed { background-color: #bcd4ff; }"
+            "QToolButton:disabled { background-color: #e0e0e0; border-color: #aaaaaa; }"
+            "QToolButton::arrow { width: 18px; height: 18px; }"
+        )
+
+        self._zoom_prev_btn = QToolButton()
+        self._zoom_prev_btn.setArrowType(Qt.ArrowType.LeftArrow)
+        self._zoom_prev_btn.setToolTip("Previous page")
+        self._zoom_prev_btn.setAutoRaise(False)
+        self._zoom_prev_btn.setFixedWidth(56)
+        self._zoom_prev_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._zoom_prev_btn.setStyleSheet(nav_button_style)
+        self._zoom_prev_btn.clicked.connect(self._on_zoom_prev_page)
+
+        self._zoom_next_btn = QToolButton()
+        self._zoom_next_btn.setArrowType(Qt.ArrowType.RightArrow)
+        self._zoom_next_btn.setToolTip("Next page")
+        self._zoom_next_btn.setAutoRaise(False)
+        self._zoom_next_btn.setFixedWidth(56)
+        self._zoom_next_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._zoom_next_btn.setStyleSheet(nav_button_style)
+        self._zoom_next_btn.clicked.connect(self._on_zoom_next_page)
+
+        nav_container = QWidget()
+        nav_layout = QHBoxLayout(nav_container)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(0)
+        nav_layout.addWidget(self._zoom_prev_btn)
+        nav_layout.addWidget(self._zoom_scroll, 1)
+        nav_layout.addWidget(self._zoom_next_btn)
+        zoom_layout.addWidget(nav_container)
 
         layout.addWidget(self._zoom_view)
         self._zoom_view.hide()
@@ -476,10 +514,46 @@ class PageEditWindow(QMainWindow):
     def _on_zoom_reset(self) -> None:
         self._set_zoom_percent(100)
 
+    def _on_zoom_prev_page(self) -> None:
+        if self._zoom_page_num is None:
+            return
+        if self._zoom_page_num <= 0:
+            self._update_zoom_nav_buttons()
+            return
+        self._zoom_page_num -= 1
+        self._render_zoom_page()
+
+    def _on_zoom_next_page(self) -> None:
+        if self._zoom_page_num is None:
+            return
+        page_count = get_page_count(self._pdf_path)
+        if self._zoom_page_num >= page_count - 1:
+            self._update_zoom_nav_buttons(page_count)
+            return
+        self._zoom_page_num += 1
+        self._render_zoom_page()
+
+    def _update_zoom_nav_buttons(self, page_count: int | None = None) -> None:
+        if not self._zoom_prev_btn or not self._zoom_next_btn:
+            return
+        if self._zoom_page_num is None:
+            self._zoom_prev_btn.setEnabled(False)
+            self._zoom_next_btn.setEnabled(False)
+            return
+        if page_count is None:
+            page_count = get_page_count(self._pdf_path)
+        if page_count <= 0:
+            self._zoom_prev_btn.setEnabled(False)
+            self._zoom_next_btn.setEnabled(False)
+            return
+        self._zoom_prev_btn.setEnabled(self._zoom_page_num > 0)
+        self._zoom_next_btn.setEnabled(self._zoom_page_num < page_count - 1)
+
     def _render_zoom_page(self) -> None:
         if self._zoom_page_num is None or not self._zoom_label:
             return
         page_count = get_page_count(self._pdf_path)
+        self._update_zoom_nav_buttons(page_count)
         if self._zoom_page_num >= page_count:
             self._exit_zoom_view()
             return
