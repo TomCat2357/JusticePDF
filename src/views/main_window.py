@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QToolBar, QPushButton, QScrollArea, QGridLayout,
     QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand
 )
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtGui import QAction, QKeySequence
 from send2trash import send2trash
 
@@ -33,6 +33,8 @@ class MainWindow(QMainWindow):
         self._selected_cards: list[PDFCard] = []
         self._sort_order = "name"  # "name", "date", or "manual"
         self._sort_ascending = True
+        # Ensure initial layout uses the same logic as subsequent resizes
+        self._did_initial_grid_layout = False
 
         # Setup working directory
         self._work_dir = Path.home() / "Documents" / "PDFs"
@@ -76,14 +78,15 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        layout.addWidget(scroll)
+        # Keep as an attribute so we can reliably use viewport width for column calculation.
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        layout.addWidget(self._scroll_area)
 
         self._container = QWidget()
         self._container.setAcceptDrops(True)
-        scroll.setWidget(self._container)
+        self._scroll_area.setWidget(self._container)
 
         self._grid_layout = QGridLayout(self._container)
         self._grid_layout.setSpacing(10)
@@ -225,7 +228,24 @@ class MainWindow(QMainWindow):
         """Load existing PDF files from the work directory."""
         for pdf_path in self._watcher.get_pdf_files():
             self._add_card(pdf_path)
-        self._refresh_grid()
+        # Do not refresh here: at this point viewport width is often 0 and causes "initial-only" layout.
+        # Initial refresh is triggered once after the window is shown (showEvent).
+
+    def showEvent(self, event) -> None:
+        """Run the first grid layout after the window is shown so viewport width is valid."""
+        super().showEvent(event)
+        if not self._did_initial_grid_layout:
+            self._did_initial_grid_layout = True
+            QTimer.singleShot(0, self._refresh_grid)
+
+    def _grid_available_width(self) -> int:
+        """Width source for column calculation (always consistent)."""
+        # Use viewport width; it's stable and matches what the user actually sees.
+        w = int(self._scroll_area.viewport().width()) if hasattr(self, "_scroll_area") else 0
+        if w > 0:
+            return w
+        # Fallback (very early lifecycle). Once shown, showEvent will refresh again.
+        return int(self.width())
 
     def _add_card(self, pdf_path: str, insert_index: int | None = None) -> PDFCard:
         """Add a new card for a PDF file."""
@@ -285,11 +305,17 @@ class MainWindow(QMainWindow):
 
         self._sort_cards()
 
-        # Use window width if container width is not yet set
-        available_width = self._container.width()
-        if available_width < 100:  # Not yet properly sized
-            available_width = self.width() - 40  # Account for margins and scrollbar
-        cols = max(1, available_width // (PDFCard.CARD_WIDTH + 20))
+        available_width = self._grid_available_width()
+        spacing = self._grid_layout.horizontalSpacing()
+        if spacing < 0:
+            spacing = self._grid_layout.spacing()
+        spacing = int(spacing)
+        m = self._grid_layout.contentsMargins()
+        usable = max(1, int(available_width) - int(m.left() + m.right()))
+
+        # n*W + (n-1)*S <= usable  => cols = floor((usable + S) / (W + S))
+        w = int(PDFCard.CARD_WIDTH)
+        cols = max(1, int((usable + spacing) // (w + spacing)))
         
         for i, card in enumerate(self._cards):
             row = i // cols
@@ -1440,6 +1466,7 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         """Handle window resize."""
         super().resizeEvent(event)
+        # As requested: even tiny resizes can reflow. The key fix is that the logic is identical to initial.
         self._refresh_grid()
 
     def closeEvent(self, event) -> None:
