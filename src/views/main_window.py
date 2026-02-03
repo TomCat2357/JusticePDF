@@ -45,6 +45,8 @@ class MainWindow(QMainWindow):
         self._sort_ascending = True
         # Ensure initial layout uses the same logic as subsequent resizes
         self._did_initial_grid_layout = False
+        self._internal_adds: set[str] = set()
+        self._internal_removes: set[str] = set()
 
         # Setup working directory
         self._work_dir = Path.home() / "Documents" / "PDFs"
@@ -215,6 +217,20 @@ class MainWindow(QMainWindow):
         """Clear undo/redo history (for external file changes)."""
         self._undo_manager.clear()
         self._update_button_states()
+
+    def _normalize_path(self, path: str) -> str:
+        """Normalize paths for internal tracking."""
+        return os.path.abspath(path)
+
+    def _register_internal_add(self, paths: list[str]) -> None:
+        """Mark paths as internally added to avoid clearing undo history."""
+        for path in paths:
+            self._internal_adds.add(self._normalize_path(path))
+
+    def _register_internal_remove(self, paths: list[str]) -> None:
+        """Mark paths as internally removed to avoid clearing undo history."""
+        for path in paths:
+            self._internal_removes.add(self._normalize_path(path))
 
     def _ensure_unique_export_path(self, dst_dir: str, filename: str) -> str:
         """Return a destination path that does not overwrite existing files.
@@ -556,6 +572,7 @@ class MainWindow(QMainWindow):
                 shutil.move(tmp_path, merge_dest_path)
 
                 # Trash the target and other source PDFs (keep first source as merge destination)
+                self._register_internal_remove([target_path] + source_paths[1:])
                 send2trash(target_path)
                 for p in source_paths[1:]:
                     send2trash(p)
@@ -580,6 +597,7 @@ class MainWindow(QMainWindow):
                         pass
 
         def undo_merge() -> None:
+            self._register_internal_add(list(backups.keys()))
             # Restore file bytes
             for original_path, backup_path in backups.items():
                 shutil.copy2(backup_path, original_path)
@@ -616,12 +634,21 @@ class MainWindow(QMainWindow):
         for card in self._cards:
             if card.pdf_path == path:
                 return
-        self._clear_undo_history()
+        normalized = self._normalize_path(path)
+        if normalized in self._internal_adds:
+            self._internal_adds.discard(normalized)
+        else:
+            self._clear_undo_history()
         new_card = self._add_card(path, insert_index=None)
         self._refresh_grid()
 
     def _on_file_removed(self, path: str) -> None:
         """Handle file removed from folder."""
+        normalized = self._normalize_path(path)
+        if normalized in self._internal_removes:
+            self._internal_removes.discard(normalized)
+        else:
+            self._clear_undo_history()
         self._remove_card(path)
         self._refresh_grid()
         self._update_button_states()
@@ -662,11 +689,13 @@ class MainWindow(QMainWindow):
             backups[path] = str(backup_path)
 
         def do_delete():
+            self._register_internal_remove(paths)
             for path in paths:
                 send2trash(path)
             self._clear_selection()
 
         def undo_delete():
+            self._register_internal_add(list(backups.keys()))
             for original_path, backup_path in backups.items():
                 shutil.copy2(backup_path, original_path)
 
@@ -694,6 +723,8 @@ class MainWindow(QMainWindow):
                 new_name += ".pdf"
             old_path = card.pdf_path
             new_path = os.path.join(os.path.dirname(old_path), new_name)
+            self._register_internal_remove([old_path])
+            self._register_internal_add([new_path])
             os.rename(old_path, new_path)
 
     def _on_import(self) -> None:
@@ -711,7 +742,6 @@ class MainWindow(QMainWindow):
 
     def _import_paths(self, paths: list[str]) -> None:
         """Import PDF or Office files into the work directory."""
-        self._clear_undo_history()
         failed: list[tuple[str, str]] = []
         office_total = sum(
             1 for p in paths if os.path.splitext(p)[1].lower() in _OFFICE_EXTS
@@ -789,12 +819,20 @@ class MainWindow(QMainWindow):
         """Copy a PDF into the work directory with unique name."""
         filename = os.path.basename(src_path)
         dest_path = self._ensure_unique_work_path(filename)
-        shutil.copy2(src_path, dest_path)
+        dest_str = str(dest_path)
+        self._register_internal_add([dest_str])
+        try:
+            shutil.copy2(src_path, dest_path)
+        except Exception:
+            self._internal_adds.discard(self._normalize_path(dest_str))
+            raise
 
     def _convert_office_to_pdf_into_workdir(self, src_path: str) -> None:
         """Convert Office document to PDF and place it in work directory."""
         base_name = os.path.splitext(os.path.basename(src_path))[0]
         dest_path = self._ensure_unique_work_path(f"{base_name}.pdf")
+        dest_str = str(dest_path)
+        self._register_internal_add([dest_str])
 
         # Try Microsoft Office COM first (Windows only)
         if sys.platform == "win32":
@@ -813,6 +851,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.debug(f"LibreOffice conversion failed: {e}")
 
+        self._internal_adds.discard(self._normalize_path(dest_str))
         raise RuntimeError("Office変換に必要なソフトウェアが見つかりません (MS Office または LibreOffice)")
 
     def _convert_via_office_com(self, src_path: str, dest_pdf_path: Path) -> None:
@@ -1344,6 +1383,7 @@ class MainWindow(QMainWindow):
             # Copy files
             for src_path in source_paths:
                 new_path = self._generate_unique_filename(src_path)
+                self._register_internal_add([new_path])
                 shutil.copy2(src_path, new_path)
                 copied_paths.append(new_path)
             
@@ -1376,6 +1416,7 @@ class MainWindow(QMainWindow):
             
             def undo_copy():
                 # Delete copied files and rebuild
+                self._register_internal_remove(copied_paths)
                 for path in copied_paths:
                     if os.path.exists(path):
                         send2trash(path)
@@ -1387,6 +1428,7 @@ class MainWindow(QMainWindow):
                 for i, src_path in enumerate(source_paths):
                     new_path = copied_paths[i]
                     if not os.path.exists(new_path):
+                        self._register_internal_add([new_path])
                         shutil.copy2(src_path, new_path)
                 self._rebuild_cards_from_paths(new_paths)
                 self._sort_order = "manual"
@@ -1406,6 +1448,8 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             # Rollback on error
+            for path in copied_paths:
+                self._internal_adds.discard(self._normalize_path(path))
             for path in copied_paths:
                 if os.path.exists(path):
                     os.unlink(path)
@@ -1624,6 +1668,7 @@ class MainWindow(QMainWindow):
                     return False
 
                 if is_new_target:
+                    self._register_internal_add([target_path])
                     shutil.move(tmp_path, target_path)
                     tmp_path = None
                     self._add_card(target_path, insert_index=insert_index)
@@ -1641,6 +1686,7 @@ class MainWindow(QMainWindow):
                     logger.debug("Removing pages from source")
                     source_was_deleted = remove_pages(pdf_path, page_nums)
                     if source_was_deleted:
+                        self._register_internal_remove([pdf_path])
                         logger.debug("Source file deleted, closing PageEditWindow and removing card")
                         for window in QApplication.topLevelWidgets():
                             if isinstance(window, PageEditWindow) and window._pdf_path == pdf_path:
@@ -1659,6 +1705,7 @@ class MainWindow(QMainWindow):
 
         def undo_extraction() -> None:
             if is_new_target and target_path and os.path.exists(target_path):
+                self._register_internal_remove([target_path])
                 send2trash(target_path)
             if target_backup and target_path and os.path.exists(target_backup):
                 shutil.copy2(target_backup, target_path)
@@ -1666,6 +1713,7 @@ class MainWindow(QMainWindow):
                 _reload_page_windows([target_path])
 
             if source_backup and os.path.exists(source_backup):
+                self._register_internal_add([pdf_path])
                 shutil.copy2(source_backup, pdf_path)
                 _reload_page_windows([pdf_path])
             self._sort_order = old_sort_order
