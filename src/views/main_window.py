@@ -491,9 +491,16 @@ class MainWindow(QMainWindow):
             return
 
         source_paths = [c.pdf_path for c in source_cards]
+        # The first source (drag origin) will be the merge destination
+        merge_dest_path = source_paths[0]
 
-        # New order after merge: remove merged sources, keep target
-        new_paths = [p for p in old_paths if p not in set(source_paths)]
+        # New order after merge: remove all sources, place merge result at target's position
+        new_paths = []
+        for p in old_paths:
+            if p == target_path:
+                new_paths.append(merge_dest_path)  # Replace target position with merge result
+            elif p not in source_paths:
+                new_paths.append(p)  # Keep non-source paths
 
         # Backup involved PDFs (target + sources) so undo/redo is byte-stable
         backup_dir = tempfile.mkdtemp(prefix="justicepdf_merge_backup_")
@@ -521,21 +528,23 @@ class MainWindow(QMainWindow):
                 tmp_path = tmp.name
             try:
                 merge_pdfs(tmp_path, source_paths + [target_path])
-                shutil.move(tmp_path, target_path)
+                shutil.move(tmp_path, merge_dest_path)
 
-                # Trash the source PDFs
-                for p in source_paths:
+                # Trash the target and other source PDFs (keep first source as merge destination)
+                send2trash(target_path)
+                for p in source_paths[1:]:
                     send2trash(p)
 
                 # Rebuild cards from paths (avoid stale QWidget references)
                 self._rebuild_cards_from_paths(new_paths)
+                self._sort_order = "manual"
                 self._refresh_grid()
 
-                # Select target only (consistent post-merge UX), and remember it for redo
-                _select_paths([target_path])
-                post_selected_paths = [target_path]
+                # Select merge destination (first source), and remember it for redo
+                _select_paths([merge_dest_path])
+                post_selected_paths = [merge_dest_path]
 
-                card = self._get_card_by_path(target_path)
+                card = self._get_card_by_path(merge_dest_path)
                 if card:
                     card.refresh()
             finally:
