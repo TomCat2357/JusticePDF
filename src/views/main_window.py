@@ -1,13 +1,16 @@
 # src/views/main_window.py
 """Main window for JusticePDF application."""
 import os
+import sys
 import logging
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
-    QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand
+    QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand, QProgressDialog
 )
 from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtGui import QAction, QKeySequence
@@ -19,6 +22,13 @@ from src.models.undo_manager import UndoManager, UndoAction
 from src.utils.pdf_utils import rotate_pages, get_page_count
 
 logger = logging.getLogger(__name__)
+
+_OFFICE_EXTS = {
+    ".doc", ".docx", ".docm",
+    ".xls", ".xlsx", ".xlsm",
+    ".ppt", ".pptx",
+}
+_IMPORT_EXTS = {".pdf"} | _OFFICE_EXTS
 
 
 class MainWindow(QMainWindow):
@@ -419,6 +429,21 @@ class MainWindow(QMainWindow):
     def _on_card_double_clicked(self, card: PDFCard) -> None:
         """Handle card double-click - open page edit window."""
         from src.views.page_edit_window import PageEditWindow
+        # If a window for this file is already open, bring it to front.
+        for widget in QApplication.topLevelWidgets():
+            if isinstance(widget, PageEditWindow) and widget._pdf_path == card.pdf_path:
+                if widget.isMinimized():
+                    widget.setWindowState(
+                        (widget.windowState() & ~Qt.WindowState.WindowMinimized)
+                        | Qt.WindowState.WindowActive
+                    )
+                widget.show()
+                widget.raise_()
+                widget.activateWindow()
+                # Ensure the card is locked while the window is visible.
+                self.lock_card(card.pdf_path)
+                return
+
         # Lock the card before opening the edit window
         self.lock_card(card.pdf_path)
         window = PageEditWindow(card.pdf_path, self._undo_manager, self)
@@ -673,26 +698,200 @@ class MainWindow(QMainWindow):
 
     def _on_import(self) -> None:
         """Handle import action."""
+        ext_list = " ".join(f"*{e}" for e in sorted(_IMPORT_EXTS))
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Import PDF", "", "PDF Files (*.pdf)"
+            self, "Import", "", f"Importable Files ({ext_list})"
         )
-        if not paths:
-            return
+        if paths:
+            self._import_paths(paths)
 
+    # ─────────────────────────────────────────────────────────────────
+    # Office Import helpers
+    # ─────────────────────────────────────────────────────────────────
+
+    def _import_paths(self, paths: list[str]) -> None:
+        """Import PDF or Office files into the work directory."""
         self._clear_undo_history()
+        failed: list[tuple[str, str]] = []
+        office_total = sum(
+            1 for p in paths if os.path.splitext(p)[1].lower() in _OFFICE_EXTS
+        )
+        office_index = 0
+        progress = None
+        cursor_set = False
+        if office_total:
+            progress = QProgressDialog(
+                "OfficeファイルをPDFに変換中...",
+                None,
+                0,
+                office_total,
+                self,
+            )
+            progress.setWindowTitle("変換中")
+            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            progress.setCancelButton(None)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            cursor_set = True
+            QApplication.processEvents()
 
         for src_path in paths:
-            filename = os.path.basename(src_path)
-            dest_path = self._work_dir / filename
+            ext = os.path.splitext(src_path)[1].lower()
+            if progress and ext in _OFFICE_EXTS:
+                progress.setLabelText(
+                    f"変換中 ({office_index + 1}/{office_total}): "
+                    f"{os.path.basename(src_path)}"
+                )
+                progress.setValue(office_index)
+                QApplication.processEvents()
+            try:
+                if ext == ".pdf":
+                    self._copy_pdf_into_workdir(src_path)
+                elif ext in _OFFICE_EXTS:
+                    try:
+                        self._convert_office_to_pdf_into_workdir(src_path)
+                    finally:
+                        if progress:
+                            office_index += 1
+                            progress.setValue(office_index)
+                            QApplication.processEvents()
+                else:
+                    failed.append((src_path, "未対応の拡張子です"))
+            except Exception as e:
+                failed.append((src_path, str(e)))
 
-            i = 1
-            while dest_path.exists():
-                name, ext = os.path.splitext(filename)
-                dest_path = self._work_dir / f"{name}_{i}{ext}"
-                i += 1
+        if progress:
+            progress.close()
+        if cursor_set:
+            QApplication.restoreOverrideCursor()
 
-            import shutil
-            shutil.copy2(src_path, dest_path)
+        if failed:
+            details = "\n".join(f"- {os.path.basename(s)}: {r}" for s, r in failed[:20])
+            if len(failed) > 20:
+                details += f"\n...（他 {len(failed) - 20} 件）"
+            QMessageBox.warning(self, "インポート結果", f"失敗: {len(failed)} 件\n\n{details}")
+
+    def _ensure_unique_work_path(self, filename: str) -> Path:
+        """Return a unique destination path inside _work_dir."""
+        dest = self._work_dir / filename
+        if not dest.exists():
+            return dest
+        base, ext = os.path.splitext(filename)
+        i = 1
+        while True:
+            candidate = self._work_dir / f"{base}_{i}{ext}"
+            if not candidate.exists():
+                return candidate
+            i += 1
+
+    def _copy_pdf_into_workdir(self, src_path: str) -> None:
+        """Copy a PDF into the work directory with unique name."""
+        filename = os.path.basename(src_path)
+        dest_path = self._ensure_unique_work_path(filename)
+        shutil.copy2(src_path, dest_path)
+
+    def _convert_office_to_pdf_into_workdir(self, src_path: str) -> None:
+        """Convert Office document to PDF and place it in work directory."""
+        base_name = os.path.splitext(os.path.basename(src_path))[0]
+        dest_path = self._ensure_unique_work_path(f"{base_name}.pdf")
+
+        # Try Microsoft Office COM first (Windows only)
+        if sys.platform == "win32":
+            try:
+                self._convert_via_office_com(src_path, dest_path)
+                return
+            except Exception as e:
+                logger.debug(f"Office COM conversion failed: {e}")
+
+        # Fallback to LibreOffice
+        soffice = self._find_soffice()
+        if soffice:
+            try:
+                self._convert_via_libreoffice(src_path, dest_path, soffice)
+                return
+            except Exception as e:
+                logger.debug(f"LibreOffice conversion failed: {e}")
+
+        raise RuntimeError("Office変換に必要なソフトウェアが見つかりません (MS Office または LibreOffice)")
+
+    def _convert_via_office_com(self, src_path: str, dest_pdf_path: Path) -> None:
+        """Convert Office file to PDF using COM automation (Windows + MS Office)."""
+        import win32com.client  # type: ignore
+
+        ext = os.path.splitext(src_path)[1].lower()
+        abs_src = os.path.abspath(src_path)
+        abs_dest = str(dest_pdf_path.resolve())
+
+        if ext in {".doc", ".docx", ".docm"}:
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = False
+            try:
+                doc = word.Documents.Open(abs_src)
+                doc.SaveAs(abs_dest, FileFormat=17)  # wdFormatPDF
+                doc.Close(False)
+            finally:
+                word.Quit()
+
+        elif ext in {".xls", ".xlsx", ".xlsm"}:
+            excel = win32com.client.Dispatch("Excel.Application")
+            excel.Visible = False
+            try:
+                wb = excel.Workbooks.Open(abs_src)
+                wb.ExportAsFixedFormat(0, abs_dest)  # xlTypePDF
+                wb.Close(False)
+            finally:
+                excel.Quit()
+
+        elif ext in {".ppt", ".pptx"}:
+            ppt = win32com.client.Dispatch("PowerPoint.Application")
+            # PowerPoint may need to be visible briefly
+            try:
+                presentation = ppt.Presentations.Open(abs_src, WithWindow=False)
+                presentation.SaveAs(abs_dest, 32)  # ppSaveAsPDF
+                presentation.Close()
+            finally:
+                ppt.Quit()
+
+        else:
+            raise ValueError(f"Unsupported Office extension: {ext}")
+
+    def _find_soffice(self) -> str | None:
+        """Find LibreOffice soffice executable."""
+        candidates = []
+        if sys.platform == "win32":
+            for pf in [os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")]:
+                if pf:
+                    candidates.append(os.path.join(pf, "LibreOffice", "program", "soffice.exe"))
+        else:
+            candidates = ["/usr/bin/soffice", "/usr/local/bin/soffice", "/opt/libreoffice/program/soffice"]
+
+        for path in candidates:
+            if path and os.path.isfile(path):
+                return path
+
+        # Try PATH
+        import shutil as sh
+        return sh.which("soffice")
+
+    def _convert_via_libreoffice(self, src_path: str, dest_pdf_path: Path, soffice: str) -> None:
+        """Convert Office file to PDF using LibreOffice headless."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, src_path],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"soffice failed: {result.stderr.decode(errors='replace')}")
+
+            # Find generated PDF
+            base_name = os.path.splitext(os.path.basename(src_path))[0]
+            generated = os.path.join(tmpdir, f"{base_name}.pdf")
+            if not os.path.exists(generated):
+                raise RuntimeError("LibreOffice did not produce a PDF")
+
+            shutil.move(generated, dest_pdf_path)
 
     def _on_export(self) -> None:
         """Export selected PDFs (or all PDFs if none selected) to a chosen folder."""
@@ -836,7 +1035,8 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
         elif event.mimeData().hasUrls():
             for url in event.mimeData().urls():
-                if url.toLocalFile().lower().endswith('.pdf'):
+                ext = os.path.splitext(url.toLocalFile())[1].lower()
+                if ext in _IMPORT_EXTS:
                     event.acceptProposedAction()
                     return
 
@@ -1325,25 +1525,14 @@ class MainWindow(QMainWindow):
 
     def _handle_external_file_drop(self, urls) -> None:
         """Handle external file drop (import)."""
-        import shutil
-        pdf_urls = [url for url in urls if url.toLocalFile().lower().endswith('.pdf')]
-        if not pdf_urls:
-            return
-
-        self._clear_undo_history()
-        for url in pdf_urls:
-            src_path = url.toLocalFile()
-
-            filename = os.path.basename(src_path)
-            dest_path = self._work_dir / filename
-
-            i = 1
-            while dest_path.exists():
-                name, ext = os.path.splitext(filename)
-                dest_path = self._work_dir / f"{name}_{i}{ext}"
-                i += 1
-
-            shutil.copy2(src_path, dest_path)
+        paths = []
+        for url in urls:
+            local = url.toLocalFile()
+            ext = os.path.splitext(local)[1].lower()
+            if ext in _IMPORT_EXTS:
+                paths.append(local)
+        if paths:
+            self._import_paths(paths)
 
     def _handle_page_extraction(self, data: str, drop_pos=None) -> None:
         """Handle page extraction from page edit window."""
