@@ -3,31 +3,41 @@ import fitz
 from PyQt6.QtGui import QPixmap, QImage
 
 
-def get_thumbnail(pdf_path: str, size: int = 128) -> QPixmap:
-    """Generate a thumbnail of the first page of a PDF."""
+def _render_page_pixmap(
+    pdf_path: str,
+    page_num: int,
+    *,
+    size: int | None = None,
+    zoom: float | None = None,
+) -> QPixmap:
+    """Render a PDF page to a pixmap with either size-based or zoom-based scaling."""
     try:
-        doc = fitz.open(pdf_path)
-        if len(doc) == 0:
-            doc.close()
-            return QPixmap()
-        page = doc[0]
-        zoom = size / max(page.rect.width, page.rect.height)
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
-        doc.close()
+        with fitz.open(pdf_path) as doc:
+            if page_num >= len(doc) or page_num < 0:
+                return QPixmap()
+            page = doc[page_num]
+            if size is not None:
+                scale = size / max(page.rect.width, page.rect.height)
+            else:
+                scale = zoom or 1.0
+            mat = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=mat)
         img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
         return QPixmap.fromImage(img)
     except Exception:
         return QPixmap()
 
 
+def get_thumbnail(pdf_path: str, size: int = 128) -> QPixmap:
+    """Generate a thumbnail of the first page of a PDF."""
+    return _render_page_pixmap(pdf_path, 0, size=size)
+
+
 def get_page_count(pdf_path: str) -> int:
     """Get the number of pages in a PDF."""
     try:
-        doc = fitz.open(pdf_path)
-        count = len(doc)
-        doc.close()
-        return count
+        with fitz.open(pdf_path) as doc:
+            return len(doc)
     except Exception:
         return 0
 
@@ -46,37 +56,12 @@ def create_empty_pdf(pdf_path: str) -> None:
 
 def get_page_thumbnail(pdf_path: str, page_num: int, size: int = 128) -> QPixmap:
     """Generate a thumbnail of a specific page."""
-    try:
-        doc = fitz.open(pdf_path)
-        if page_num >= len(doc):
-            doc.close()
-            return QPixmap()
-        page = doc[page_num]
-        zoom = size / max(page.rect.width, page.rect.height)
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
-        doc.close()
-        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(img)
-    except Exception:
-        return QPixmap()
+    return _render_page_pixmap(pdf_path, page_num, size=size)
 
 
 def get_page_pixmap(pdf_path: str, page_num: int, zoom: float = 1.0) -> QPixmap:
     """Render a page at the given zoom factor."""
-    try:
-        doc = fitz.open(pdf_path)
-        if page_num >= len(doc):
-            doc.close()
-            return QPixmap()
-        page = doc[page_num]
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
-        doc.close()
-        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(img)
-    except Exception:
-        return QPixmap()
+    return _render_page_pixmap(pdf_path, page_num, zoom=zoom)
 
 
 def get_page_words(pdf_path: str, page_num: int) -> list[tuple]:
