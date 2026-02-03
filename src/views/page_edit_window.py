@@ -437,6 +437,7 @@ class PageEditWindow(QMainWindow):
         self._setup_ui()
         self._setup_toolbar()
         self._setup_shortcuts()
+        self._undo_manager.add_listener(self._on_undo_manager_changed)
         self._load_pages()
 
     def _setup_ui(self) -> None:
@@ -617,6 +618,24 @@ class PageEditWindow(QMainWindow):
         self._rotate_btn.setEnabled(has_selection)
         self._undo_btn.setEnabled(self._undo_manager.can_undo())
         self._redo_btn.setEnabled(self._undo_manager.can_redo())
+
+    def _debug_undo_state(self, reason: str) -> None:
+        if not self._undo_btn or not self._redo_btn:
+            return
+        undo_color = "black" if self._undo_btn.isEnabled() else "gray"
+        redo_color = "black" if self._redo_btn.isEnabled() else "gray"
+        logger.debug(
+            "[UndoState][PageEditWindow] %s | undo=%s redo=%s undo_count=%s redo_count=%s",
+            reason,
+            undo_color,
+            redo_color,
+            self._undo_manager.undo_count(),
+            self._undo_manager.redo_count(),
+        )
+
+    def _on_undo_manager_changed(self, reason: str) -> None:
+        self._update_button_states()
+        self._debug_undo_state(reason)
 
     def _load_pages(self) -> None:
         for thumb in self._thumbnails:
@@ -1179,6 +1198,8 @@ class PageEditWindow(QMainWindow):
         from src.views.main_window import MainWindow
         
         logger.debug(f"PageEditWindow closing for {self._pdf_path}")
+
+        self._undo_manager.remove_listener(self._on_undo_manager_changed)
         
         for widget in QApplication.topLevelWidgets():
             if isinstance(widget, MainWindow):

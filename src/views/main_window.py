@@ -68,6 +68,7 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._setup_toolbar()
         self._setup_shortcuts()
+        self._undo_manager.add_listener(self._on_undo_manager_changed)
 
         # Setup folder watcher
         self._watcher = FolderWatcher(str(self._work_dir))
@@ -213,6 +214,24 @@ class MainWindow(QMainWindow):
         self._undo_btn.setEnabled(self._undo_manager.can_undo())
         self._redo_btn.setEnabled(self._undo_manager.can_redo())
         self._export_btn.setEnabled(has_any)
+
+    def _debug_undo_state(self, reason: str) -> None:
+        if not self._undo_btn or not self._redo_btn:
+            return
+        undo_color = "black" if self._undo_btn.isEnabled() else "gray"
+        redo_color = "black" if self._redo_btn.isEnabled() else "gray"
+        logger.debug(
+            "[UndoState][MainWindow] %s | undo=%s redo=%s undo_count=%s redo_count=%s",
+            reason,
+            undo_color,
+            redo_color,
+            self._undo_manager.undo_count(),
+            self._undo_manager.redo_count(),
+        )
+
+    def _on_undo_manager_changed(self, reason: str) -> None:
+        self._update_button_states()
+        self._debug_undo_state(reason)
 
     def _clear_undo_history(self) -> None:
         """Clear undo/redo history (for external file changes)."""
@@ -551,6 +570,7 @@ class MainWindow(QMainWindow):
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                 tmp_path = tmp.name
             try:
+                dest_path = None
                 merge_pdfs(tmp_path, source_paths + [target_path])
                 shutil.move(tmp_path, merge_dest_path)
 
@@ -726,6 +746,7 @@ class MainWindow(QMainWindow):
     def _import_paths(self, paths: list[str]) -> None:
         """Import PDF or Office files into the work directory."""
         failed: list[tuple[str, str]] = []
+        imported_paths: list[str] = []
         office_total = sum(
             1 for p in paths if os.path.splitext(p)[1].lower() in _OFFICE_EXTS
         )
@@ -759,11 +780,12 @@ class MainWindow(QMainWindow):
                 progress.setValue(office_index)
                 QApplication.processEvents()
             try:
+                dest_path = None
                 if ext == ".pdf":
-                    self._copy_pdf_into_workdir(src_path)
+                    dest_path = self._copy_pdf_into_workdir(src_path)
                 elif ext in _OFFICE_EXTS:
                     try:
-                        self._convert_office_to_pdf_into_workdir(src_path)
+                        dest_path = self._convert_office_to_pdf_into_workdir(src_path)
                     finally:
                         if progress:
                             office_index += 1
@@ -771,6 +793,8 @@ class MainWindow(QMainWindow):
                             QApplication.processEvents()
                 else:
                     failed.append((src_path, "未対応の拡張子です"))
+                if dest_path:
+                    imported_paths.append(dest_path)
             except Exception as e:
                 failed.append((src_path, str(e)))
 
@@ -779,13 +803,45 @@ class MainWindow(QMainWindow):
         if cursor_set:
             QApplication.restoreOverrideCursor()
 
+        if imported_paths:
+            backup_dir = tempfile.mkdtemp(prefix="pdfas_import_")
+            backups: dict[str, str] = {}
+            for dest_path in imported_paths:
+                backup_path = str(
+                    ensure_unique_path(
+                        backup_dir,
+                        os.path.basename(dest_path),
+                        pattern="{stem}_{i}{ext}",
+                    )
+                )
+                shutil.copy2(dest_path, backup_path)
+                backups[dest_path] = backup_path
+
+            def undo_import() -> None:
+                self._register_internal_remove(list(backups.keys()))
+                for dest_path in backups.keys():
+                    if os.path.exists(dest_path):
+                        send2trash(dest_path)
+
+            def redo_import() -> None:
+                for dest_path, backup_path in backups.items():
+                    if os.path.exists(backup_path) and not os.path.exists(dest_path):
+                        self._register_internal_add([dest_path])
+                        shutil.copy2(backup_path, dest_path)
+
+            self._undo_manager.add_action(UndoAction(
+                description=f"Import {len(imported_paths)} file(s)",
+                undo_func=undo_import,
+                redo_func=redo_import
+            ))
+
         if failed:
             details = "\n".join(f"- {os.path.basename(s)}: {r}" for s, r in failed[:20])
             if len(failed) > 20:
                 details += f"\n...（他 {len(failed) - 20} 件）"
             QMessageBox.warning(self, "インポート結果", f"失敗: {len(failed)} 件\n\n{details}")
 
-    def _copy_pdf_into_workdir(self, src_path: str) -> None:
+    def _copy_pdf_into_workdir(self, src_path: str) -> str:
         """Copy a PDF into the work directory with unique name."""
         filename = os.path.basename(src_path)
         dest_path = ensure_unique_path(self._work_dir, filename, pattern="{stem}_{i}{ext}")
@@ -796,8 +852,9 @@ class MainWindow(QMainWindow):
         except Exception:
             self._internal_adds.discard(self._normalize_path(dest_str))
             raise
+        return dest_str
 
-    def _convert_office_to_pdf_into_workdir(self, src_path: str) -> None:
+    def _convert_office_to_pdf_into_workdir(self, src_path: str) -> str:
         """Convert Office document to PDF and place it in work directory."""
         base_name = os.path.splitext(os.path.basename(src_path))[0]
         dest_path = ensure_unique_path(self._work_dir, f"{base_name}.pdf", pattern="{stem}_{i}{ext}")
@@ -808,7 +865,7 @@ class MainWindow(QMainWindow):
         if sys.platform == "win32":
             try:
                 self._convert_via_office_com(src_path, dest_path)
-                return
+                return dest_str
             except Exception as e:
                 logger.debug(f"Office COM conversion failed: {e}")
 
@@ -817,7 +874,7 @@ class MainWindow(QMainWindow):
         if soffice:
             try:
                 self._convert_via_libreoffice(src_path, dest_path, soffice)
-                return
+                return dest_str
             except Exception as e:
                 logger.debug(f"LibreOffice conversion failed: {e}")
 
@@ -1690,5 +1747,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         """Handle window close."""
+        self._undo_manager.remove_listener(self._on_undo_manager_changed)
         self._watcher.stop()
         super().closeEvent(event)
