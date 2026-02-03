@@ -422,6 +422,31 @@ class MainWindow(QMainWindow):
         # Lock the card before opening the edit window
         self.lock_card(card.pdf_path)
         window = PageEditWindow(card.pdf_path, self._undo_manager, self)
+
+        # 既存のPageEditWindowの数をカウント（カスケード用）
+        existing_count = sum(
+            1 for w in QApplication.topLevelWidgets()
+            if isinstance(w, PageEditWindow) and w.isVisible() and w is not window
+        )
+
+        # メインウィンドウの右側に配置（カスケード）
+        main_geo = self.geometry()
+        screen = self.screen().availableGeometry()
+        cascade_offset = 150  # ページアイコン約1.5個分
+
+        new_x = main_geo.right() + 10
+
+        # 画面からはみ出る場合は調整
+        if new_x + window.width() > screen.right():
+            new_x = screen.right() - window.width()
+
+        # 下端判定: 画面半分はみ出してもOK
+        max_y = screen.bottom() - window.height() // 2
+        # 一番上に戻っても、またoffsetずつ下がる（サイクル）
+        cycles_fit = max(1, (max_y - main_geo.top()) // cascade_offset + 1)
+        new_y = main_geo.top() + ((existing_count % cycles_fit) * cascade_offset)
+
+        window.move(new_x, new_y)
         window.show()
 
     def _on_card_merge(self, target_card: PDFCard, source_path: str) -> None:
