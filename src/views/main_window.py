@@ -20,6 +20,7 @@ from src.views.pdf_card import PDFCard, PDFCARD_MIME_TYPE
 from src.controllers.folder_watcher import FolderWatcher
 from src.models.undo_manager import UndoManager, UndoAction
 from src.utils.pdf_utils import rotate_pages, get_page_count
+from src.utils.path_utils import ensure_unique_path
 
 logger = logging.getLogger(__name__)
 
@@ -231,24 +232,6 @@ class MainWindow(QMainWindow):
         """Mark paths as internally removed to avoid clearing undo history."""
         for path in paths:
             self._internal_removes.add(self._normalize_path(path))
-
-    def _ensure_unique_export_path(self, dst_dir: str, filename: str) -> str:
-        """Return a destination path that does not overwrite existing files.
-
-        If dst_dir/filename already exists, returns dst_dir/<stem> (1).pdf, (2)...
-        """
-        base, ext = os.path.splitext(filename)
-        candidate = os.path.join(dst_dir, filename)
-        if not os.path.exists(candidate):
-            return candidate
-
-        i = 1
-        while True:
-            new_name = f"{base} ({i}){ext}"
-            candidate = os.path.join(dst_dir, new_name)
-            if not os.path.exists(candidate):
-                return candidate
-            i += 1
 
     def _load_existing_files(self) -> None:
         """Load existing PDF files from the work directory."""
@@ -802,23 +785,10 @@ class MainWindow(QMainWindow):
                 details += f"\n...（他 {len(failed) - 20} 件）"
             QMessageBox.warning(self, "インポート結果", f"失敗: {len(failed)} 件\n\n{details}")
 
-    def _ensure_unique_work_path(self, filename: str) -> Path:
-        """Return a unique destination path inside _work_dir."""
-        dest = self._work_dir / filename
-        if not dest.exists():
-            return dest
-        base, ext = os.path.splitext(filename)
-        i = 1
-        while True:
-            candidate = self._work_dir / f"{base}_{i}{ext}"
-            if not candidate.exists():
-                return candidate
-            i += 1
-
     def _copy_pdf_into_workdir(self, src_path: str) -> None:
         """Copy a PDF into the work directory with unique name."""
         filename = os.path.basename(src_path)
-        dest_path = self._ensure_unique_work_path(filename)
+        dest_path = ensure_unique_path(self._work_dir, filename, pattern="{stem}_{i}{ext}")
         dest_str = str(dest_path)
         self._register_internal_add([dest_str])
         try:
@@ -830,7 +800,7 @@ class MainWindow(QMainWindow):
     def _convert_office_to_pdf_into_workdir(self, src_path: str) -> None:
         """Convert Office document to PDF and place it in work directory."""
         base_name = os.path.splitext(os.path.basename(src_path))[0]
-        dest_path = self._ensure_unique_work_path(f"{base_name}.pdf")
+        dest_path = ensure_unique_path(self._work_dir, f"{base_name}.pdf", pattern="{stem}_{i}{ext}")
         dest_str = str(dest_path)
         self._register_internal_add([dest_str])
 
@@ -954,7 +924,7 @@ class MainWindow(QMainWindow):
                     continue
 
                 filename = os.path.basename(src)
-                dst_path = self._ensure_unique_export_path(dst_dir, filename)
+                dst_path = ensure_unique_path(dst_dir, filename, pattern="{stem} ({i}){ext}")
                 shutil.copy2(src, dst_path)
                 ok += 1
             except Exception as e:
@@ -1327,42 +1297,6 @@ class MainWindow(QMainWindow):
             redo_func=redo_reorder
         ))
 
-    def _generate_unique_filename(self, src_path: str) -> str:
-        """Generate a unique filename for copied PDF.
-        
-        Format: filename_copy_1.pdf, filename_copy_2.pdf, etc.
-        """
-        from pathlib import Path
-        
-        src = Path(src_path)
-        base_name = src.stem
-        parent = src.parent
-        
-        # Find next available copy number
-        copy_num = 1
-        while True:
-            new_name = f"{base_name}_copy_{copy_num}.pdf"
-            new_path = parent / new_name
-            if not new_path.exists():
-                return str(new_path)
-            copy_num += 1
-
-    def _generate_unique_page_extract_filename(self, src_path: str) -> str:
-        """Generate a unique filename for extracted pages."""
-        from pathlib import Path
-
-        src = Path(src_path)
-        base_name = src.stem
-        parent = self._work_dir
-
-        extract_num = 1
-        while True:
-            new_name = f"{base_name}_pages_{extract_num}.pdf"
-            new_path = parent / new_name
-            if not new_path.exists():
-                return str(new_path)
-            extract_num += 1
-
     def _handle_card_copy(self, source_paths_str: str, drop_pos) -> None:
         """Handle Ctrl+drag copy operation (insert at position).
         
@@ -1382,7 +1316,14 @@ class MainWindow(QMainWindow):
         try:
             # Copy files
             for src_path in source_paths:
-                new_path = self._generate_unique_filename(src_path)
+                new_path = str(
+                    ensure_unique_path(
+                        Path(src_path).parent,
+                        Path(src_path).name,
+                        pattern="{stem}_copy_{i}{ext}",
+                        use_original=False,
+                    )
+                )
                 self._register_internal_add([new_path])
                 shutil.copy2(src_path, new_path)
                 copied_paths.append(new_path)
@@ -1613,7 +1554,14 @@ class MainWindow(QMainWindow):
             target_path = target_card.pdf_path
             insert_index = None
         else:
-            target_path = self._generate_unique_page_extract_filename(pdf_path)
+            target_path = str(
+                ensure_unique_path(
+                    self._work_dir,
+                    Path(pdf_path).name,
+                    pattern="{stem}_pages_{i}{ext}",
+                    use_original=False,
+                )
+            )
             insert_index = self._get_drop_index(drop_pos)
             logger.debug(f"No target card, creating new PDF at {target_path} (insert_index={insert_index})")
 
