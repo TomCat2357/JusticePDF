@@ -1,6 +1,45 @@
 """PDF utility functions using PyMuPDF."""
+import logging
+
 import fitz
 from PyQt6.QtGui import QPixmap, QImage
+
+
+logger = logging.getLogger(__name__)
+
+
+def _pixmap_to_qpixmap(pix: "fitz.Pixmap") -> QPixmap:
+    """Convert a PyMuPDF Pixmap to QPixmap safely.
+
+    QImage(data, ...) normally references the provided memory. Since pix.samples
+    is backed by pix's internal buffer, we force a deep copy to avoid dangling
+    references after pix is freed.
+    """
+    img = QImage(
+        pix.samples,
+        pix.width,
+        pix.height,
+        pix.stride,
+        QImage.Format.Format_RGB888,
+    ).copy()
+    return QPixmap.fromImage(img)
+
+
+def get_pdf_card_info(pdf_path: str, size: int = 128) -> tuple[QPixmap, int]:
+    """Get (thumbnail, page_count) for main-grid cards with a single PDF open."""
+    try:
+        with fitz.open(pdf_path) as doc:
+            page_count = len(doc)
+            if page_count == 0:
+                return QPixmap(), 0
+            page = doc[0]
+            zoom = size / max(page.rect.width, page.rect.height)
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            return _pixmap_to_qpixmap(pix), page_count
+    except Exception:
+        logger.debug("get_pdf_card_info failed: %s", pdf_path, exc_info=True)
+        return QPixmap(), 0
 
 
 def _render_page_pixmap(
@@ -22,9 +61,16 @@ def _render_page_pixmap(
                 scale = zoom or 1.0
             mat = fitz.Matrix(scale, scale)
             pix = page.get_pixmap(matrix=mat)
-        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(img)
+        return _pixmap_to_qpixmap(pix)
     except Exception:
+        logger.debug(
+            "_render_page_pixmap failed: pdf=%s page=%s size=%s zoom=%s",
+            pdf_path,
+            page_num,
+            size,
+            zoom,
+            exc_info=True,
+        )
         return QPixmap()
 
 
@@ -39,6 +85,7 @@ def get_page_count(pdf_path: str) -> int:
         with fitz.open(pdf_path) as doc:
             return len(doc)
     except Exception:
+        logger.debug("get_page_count failed: %s", pdf_path, exc_info=True)
         return 0
 
 
@@ -73,6 +120,12 @@ def get_page_words(pdf_path: str, page_num: int) -> list[tuple]:
             page = doc[page_num]
             return page.get_text("words")
     except Exception:
+        logger.debug(
+            "get_page_words failed: pdf=%s page=%s",
+            pdf_path,
+            page_num,
+            exc_info=True,
+        )
         return []
 
 
@@ -98,6 +151,12 @@ def get_page_links(pdf_path: str, page_num: int) -> list[dict]:
             normalized.append(item)
         return normalized
     except Exception:
+        logger.debug(
+            "get_page_links failed: pdf=%s page=%s",
+            pdf_path,
+            page_num,
+            exc_info=True,
+        )
         return []
 
 

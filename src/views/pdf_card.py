@@ -2,8 +2,8 @@
 import os
 from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel, QApplication, QWidget
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint
-from PyQt6.QtGui import QDrag
-from src.utils.pdf_utils import get_thumbnail, get_page_count
+from PyQt6.QtGui import QDrag, QPixmap
+from src.utils.pdf_utils import get_pdf_card_info
 
 PDFCARD_MIME_TYPE = "application/x-pdfas-card"
 
@@ -76,15 +76,18 @@ class PDFCard(QFrame):
 
     def _load_pdf_info(self) -> None:
         """Load PDF information and thumbnail."""
+        thumbnail, page_count = get_pdf_card_info(self._pdf_path, self.THUMBNAIL_SIZE)
+
         # Thumbnail
-        thumbnail = get_thumbnail(self._pdf_path, self.THUMBNAIL_SIZE)
         if not thumbnail.isNull():
             self._thumbnail_label.setPixmap(thumbnail)
+            self._thumbnail_label.setText("")
         else:
+            self._thumbnail_label.setPixmap(QPixmap())
             self._thumbnail_label.setText("(empty)")
 
-        # Page count
-        self._page_count = get_page_count(self._pdf_path)
+        # Page count (avoid opening PDF twice)
+        self._page_count = page_count
         self._page_count_label.setText(f"{self._page_count}p")
         self._page_count_label.adjustSize()
         # Reposition to top-right after text change
