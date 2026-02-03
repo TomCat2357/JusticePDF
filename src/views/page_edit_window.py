@@ -4,15 +4,16 @@ import logging
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
-    QInputDialog, QLabel, QFrame, QApplication, QRubberBand, QSlider,
+    QInputDialog, QLabel, QFrame, QApplication, QRubberBand,
     QToolButton, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QPoint
-from PyQt6.QtGui import QAction, QKeySequence, QDrag
+from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl
+from PyQt6.QtGui import QAction, QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices
 
 from src.utils.pdf_utils import (
-    get_page_thumbnail, get_page_pixmap, get_page_count, rotate_pages,
-    remove_pages, reorder_pages, extract_pages, insert_pages
+    get_page_thumbnail, get_page_pixmap, get_page_words, get_page_links,
+    get_page_count, rotate_pages, remove_pages, reorder_pages, extract_pages,
+    insert_pages
 )
 from src.models.undo_manager import UndoManager, UndoAction
 
@@ -157,16 +158,248 @@ class PageThumbnail(QFrame):
         logger.debug(f"Drag completed with result: {result}")
 
 
-class ZoomLabel(QLabel):
+class ZoomPageWidget(QWidget):
     wheel_zoom = pyqtSignal(int)
+    link_clicked = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = None
+        self._zoom_factor = 1.0
+        self._words: list[tuple] = []
+        self._word_rects: list[QRectF] = []
+        self._links: list[dict] = []
+        self._link_rects: list[QRectF | None] = []
+        self._selected_word_indices: list[int] = []
+        self._selection_origin: QPoint | None = None
+        self._selection_rect: QRect | None = None
+        self._selection_active = False
+        self._pressed_link: dict | None = None
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+
+    def sizeHint(self):
+        if self._pixmap and not self._pixmap.isNull():
+            return self._pixmap.size()
+        return super().sizeHint()
+
+    def set_page(self, pixmap, words, links, zoom_factor: float) -> None:
+        self._pixmap = pixmap
+        self._zoom_factor = zoom_factor or 1.0
+        self._words = words or []
+        self._links = links or []
+
+        scale = self._zoom_factor
+        self._word_rects = []
+        for word in self._words:
+            if len(word) < 4:
+                continue
+            x0, y0, x1, y1 = word[0], word[1], word[2], word[3]
+            self._word_rects.append(QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale))
+
+        self._link_rects = []
+        for link in self._links:
+            rect = link.get("from")
+            if rect is None:
+                self._link_rects.append(None)
+                continue
+            x0, y0, x1, y1 = rect
+            self._link_rects.append(QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale))
+
+        self._selected_word_indices = []
+        self._selection_origin = None
+        self._selection_rect = None
+        self._selection_active = False
+        self._pressed_link = None
+        if self._pixmap and not self._pixmap.isNull():
+            self.setMinimumSize(self._pixmap.size())
+        else:
+            self.setMinimumSize(0, 0)
+        self.updateGeometry()
+        self.update()
+
+    def _pixmap_offset(self) -> QPoint:
+        if not self._pixmap or self._pixmap.isNull():
+            return QPoint(0, 0)
+        x = max(0, (self.width() - self._pixmap.width()) // 2)
+        y = max(0, (self.height() - self._pixmap.height()) // 2)
+        return QPoint(x, y)
+
+    def _point_in_pixmap(self, pos: QPoint) -> QPointF | None:
+        if not self._pixmap or self._pixmap.isNull():
+            return None
+        offset = self._pixmap_offset()
+        x = pos.x() - offset.x()
+        y = pos.y() - offset.y()
+        if x < 0 or y < 0 or x > self._pixmap.width() or y > self._pixmap.height():
+            return None
+        return QPointF(x, y)
+
+    def _link_at(self, pos: QPoint) -> dict | None:
+        pix_pos = self._point_in_pixmap(pos)
+        if pix_pos is None:
+            return None
+        for i, rect in enumerate(self._link_rects):
+            if rect and rect.contains(pix_pos):
+                return self._links[i]
+        return None
+
+    def _word_index_at(self, pos: QPoint) -> int | None:
+        pix_pos = self._point_in_pixmap(pos)
+        if pix_pos is None:
+            return None
+        for i, rect in enumerate(self._word_rects):
+            if rect.contains(pix_pos):
+                return i
+        return None
+
+    def _update_selection(self) -> None:
+        if not self._pixmap or self._pixmap.isNull() or self._selection_rect is None:
+            self._selected_word_indices = []
+            return
+        offset = self._pixmap_offset()
+        sel = QRectF(self._selection_rect.normalized())
+        sel.translate(-offset.x(), -offset.y())
+        pix_bounds = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
+        sel = sel.intersected(pix_bounds)
+        if sel.isEmpty():
+            self._selected_word_indices = []
+            return
+        selected = []
+        for i, rect in enumerate(self._word_rects):
+            if rect.intersects(sel):
+                selected.append(i)
+        self._selected_word_indices = selected
+
+    def _selected_text(self) -> str:
+        if not self._selected_word_indices:
+            return ""
+        selected_words = [self._words[i] for i in self._selected_word_indices if i < len(self._words)]
+        selected_words.sort(key=lambda w: (w[5], w[6], w[7]) if len(w) > 7 else (0, 0, 0))
+        lines: list[str] = []
+        current_line: list[str] = []
+        current_key = None
+        for word in selected_words:
+            if len(word) < 5:
+                continue
+            key = (word[5], word[6]) if len(word) > 6 else (0, 0)
+            if current_key is None:
+                current_key = key
+            if key != current_key:
+                if current_line:
+                    lines.append(" ".join(current_line))
+                current_line = [word[4]]
+                current_key = key
+            else:
+                current_line.append(word[4])
+        if current_line:
+            lines.append(" ".join(current_line))
+        return "\n".join(lines)
+
+    def _update_cursor(self, pos: QPoint) -> None:
+        if self._link_at(pos):
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            return
+        if self._word_index_at(pos) is not None:
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+            return
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self.palette().brush(self.backgroundRole()))
+        if self._pixmap and not self._pixmap.isNull():
+            offset = self._pixmap_offset()
+            painter.drawPixmap(offset, self._pixmap)
+
+            if self._selected_word_indices:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(0, 120, 215, 80))
+                for idx in self._selected_word_indices:
+                    if idx < len(self._word_rects):
+                        rect = self._word_rects[idx].translated(QPointF(offset))
+                        painter.drawRect(rect)
+
+        if self._selection_rect is not None:
+            pen = QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self._selection_rect.normalized())
 
     def wheelEvent(self, event) -> None:
-        delta = event.angleDelta().y()
-        if delta == 0:
-            return
-        step = 5 if delta > 0 else -5
-        self.wheel_zoom.emit(step)
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Ctrl+ホイールでズーム
+            delta = event.angleDelta().y()
+            if delta == 0:
+                return
+            step = 5 if delta > 0 else -5
+            self.wheel_zoom.emit(step)
+            event.accept()
+        else:
+            # 通常スクロールは親に伝播
+            event.ignore()
+
+    def mousePressEvent(self, event) -> None:
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.setFocus()
+                self._selection_origin = event.pos()
+                self._selection_rect = QRect(self._selection_origin, self._selection_origin)
+                self._pressed_link = self._link_at(event.pos())
+                self._selection_active = self._pressed_link is None
+                if self._selection_active:
+                    self._update_selection()
+                self.update()
+        except Exception as e:
+            logger.exception("Error in ZoomPageWidget.mousePressEvent")
         event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        try:
+            if event.buttons() & Qt.MouseButton.LeftButton and self._selection_origin is not None:
+                if not self._selection_active:
+                    if (event.pos() - self._selection_origin).manhattanLength() >= QApplication.startDragDistance():
+                        self._selection_active = True
+                        self._pressed_link = None
+                if self._selection_active:
+                    self._selection_rect = QRect(self._selection_origin, event.pos()).normalized()
+                    self._update_selection()
+                    self.update()
+            else:
+                self._update_cursor(event.pos())
+        except Exception as e:
+            logger.exception("Error in ZoomPageWidget.mouseMoveEvent")
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                if self._selection_active:
+                    if self._selection_rect is not None:
+                        rect = self._selection_rect.normalized()
+                        if rect.width() < 3 and rect.height() < 3:
+                            idx = self._word_index_at(event.pos())
+                            self._selected_word_indices = [idx] if idx is not None else []
+                    self._selection_rect = None
+                    self._selection_active = False
+                else:
+                    if self._pressed_link is not None:
+                        self.link_clicked.emit(self._pressed_link)
+                self._selection_origin = None
+                self._pressed_link = None
+                self.update()
+        except Exception as e:
+            logger.exception("Error in ZoomPageWidget.mouseReleaseEvent")
+        event.accept()
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.StandardKey.Copy):
+            text = self._selected_text()
+            if text:
+                QApplication.clipboard().setText(text)
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 class PageEditWindow(QMainWindow):
@@ -186,12 +419,12 @@ class PageEditWindow(QMainWindow):
         self._zoom_view = None
         self._zoom_scroll = None
         self._zoom_label = None
-        self._zoom_slider = None
         self._zoom_percent_label = None
         self._zoom_prev_btn = None
         self._zoom_next_btn = None
         self._zoom_page_num = None
         self._zoom_factor = 1.0
+        self._zoom_text_cache: dict[int, tuple[list[tuple], list[dict]]] = {}
 
         # Drop indicator
         self._drop_indicator = None
@@ -256,13 +489,6 @@ class PageEditWindow(QMainWindow):
         self._zoom_out_btn.clicked.connect(self._on_zoom_out)
         controls_layout.addWidget(self._zoom_out_btn)
 
-        self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        self._zoom_slider.setRange(self.ZOOM_MIN, self.ZOOM_MAX)
-        self._zoom_slider.setValue(100)
-        self._zoom_slider.setSingleStep(self.ZOOM_STEP)
-        self._zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
-        controls_layout.addWidget(self._zoom_slider)
-
         self._zoom_in_btn = QPushButton("+")
         self._zoom_in_btn.clicked.connect(self._on_zoom_in)
         controls_layout.addWidget(self._zoom_in_btn)
@@ -278,9 +504,11 @@ class PageEditWindow(QMainWindow):
 
         self._zoom_scroll = QScrollArea()
         self._zoom_scroll.setWidgetResizable(True)
-        self._zoom_label = ZoomLabel()
-        self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._zoom_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._zoom_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._zoom_label = ZoomPageWidget()
         self._zoom_label.wheel_zoom.connect(self._on_zoom_wheel)
+        self._zoom_label.link_clicked.connect(self._on_zoom_link_clicked)
         self._zoom_scroll.setWidget(self._zoom_label)
 
         nav_button_style = (
@@ -395,6 +623,7 @@ class PageEditWindow(QMainWindow):
             thumb.deleteLater()
         self._thumbnails.clear()
         self._selected_thumbnails.clear()
+        self._zoom_text_cache.clear()
 
         page_count = get_page_count(self._pdf_path)
         for i in range(page_count):
@@ -487,28 +716,21 @@ class PageEditWindow(QMainWindow):
 
     def _set_zoom_percent(self, value: int) -> None:
         value = max(self.ZOOM_MIN, min(self.ZOOM_MAX, value))
-        if self._zoom_slider:
-            self._zoom_slider.blockSignals(True)
-            self._zoom_slider.setValue(value)
-            self._zoom_slider.blockSignals(False)
         self._zoom_factor = value / 100.0
         if self._zoom_percent_label:
             self._zoom_percent_label.setText(f"{value}%")
         self._render_zoom_page()
 
-    def _on_zoom_slider_changed(self, value: int) -> None:
-        self._set_zoom_percent(value)
-
     def _on_zoom_wheel(self, step: int) -> None:
-        current = self._zoom_slider.value() if self._zoom_slider else 100
+        current = int(self._zoom_factor * 100)
         self._set_zoom_percent(current + step)
 
     def _on_zoom_in(self) -> None:
-        current = self._zoom_slider.value() if self._zoom_slider else 100
+        current = int(self._zoom_factor * 100)
         self._set_zoom_percent(current + self.ZOOM_STEP)
 
     def _on_zoom_out(self) -> None:
-        current = self._zoom_slider.value() if self._zoom_slider else 100
+        current = int(self._zoom_factor * 100)
         self._set_zoom_percent(current - self.ZOOM_STEP)
 
     def _on_zoom_reset(self) -> None:
@@ -558,9 +780,29 @@ class PageEditWindow(QMainWindow):
             self._exit_zoom_view()
             return
         pixmap = get_page_pixmap(self._pdf_path, self._zoom_page_num, self._zoom_factor)
-        if not pixmap.isNull():
-            self._zoom_label.setPixmap(pixmap)
-            self._zoom_label.adjustSize()
+        words = []
+        links = []
+        if self._zoom_page_num in self._zoom_text_cache:
+            words, links = self._zoom_text_cache[self._zoom_page_num]
+        else:
+            words = get_page_words(self._pdf_path, self._zoom_page_num)
+            links = get_page_links(self._pdf_path, self._zoom_page_num)
+            self._zoom_text_cache[self._zoom_page_num] = (words, links)
+        self._zoom_label.set_page(pixmap, words, links, self._zoom_factor)
+
+    def _on_zoom_link_clicked(self, link: dict) -> None:
+        uri = link.get("uri")
+        if uri:
+            QDesktopServices.openUrl(QUrl(uri))
+            return
+        file_path = link.get("file")
+        if file_path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
+            return
+        target_page = link.get("page")
+        if isinstance(target_page, int):
+            self._zoom_page_num = target_page
+            self._render_zoom_page()
 
     def _on_undo(self) -> None:
         self._undo_manager.undo()

@@ -79,6 +79,43 @@ def get_page_pixmap(pdf_path: str, page_num: int, zoom: float = 1.0) -> QPixmap:
         return QPixmap()
 
 
+def get_page_words(pdf_path: str, page_num: int) -> list[tuple]:
+    """Extract word-level text with coordinates for a page."""
+    try:
+        with fitz.open(pdf_path) as doc:
+            if page_num >= len(doc):
+                return []
+            page = doc[page_num]
+            return page.get_text("words")
+    except Exception:
+        return []
+
+
+def get_page_links(pdf_path: str, page_num: int) -> list[dict]:
+    """Extract link annotations with rectangles for a page."""
+    try:
+        with fitz.open(pdf_path) as doc:
+            if page_num >= len(doc):
+                return []
+            page = doc[page_num]
+            links = page.get_links()
+        normalized: list[dict] = []
+        for link in links:
+            rect = link.get("from")
+            if rect is None:
+                rect_tuple = None
+            elif hasattr(rect, "x0"):
+                rect_tuple = (rect.x0, rect.y0, rect.x1, rect.y1)
+            else:
+                rect_tuple = tuple(rect)
+            item = dict(link)
+            item["from"] = rect_tuple
+            normalized.append(item)
+        return normalized
+    except Exception:
+        return []
+
+
 def merge_pdfs(output_path: str, pdf_paths: list[str]) -> None:
     """Merge multiple PDFs into one."""
     output_doc = fitz.open()
