@@ -1293,6 +1293,7 @@ class MainWindow(QMainWindow):
 
         logger.debug(f"MainWindow.dropEvent called, mimeData formats: {event.mimeData().formats()}")
         
+        drop_mode = self._drop_indicator_index
         self._hide_drop_indicator()
         # Reset any card highlighting
         for card in self._cards:
@@ -1308,7 +1309,7 @@ class MainWindow(QMainWindow):
             is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
             logger.debug(f"is_copy={is_copy}, _drop_indicator_index={self._drop_indicator_index}")
             
-            if self._drop_indicator_index == -2:  # Overlay mode (merge)
+            if drop_mode == -2:  # Overlay mode (merge)
                 target_card = self._get_card_at_pos(drop_pos)
                 if target_card:
                     if is_copy:
@@ -1713,11 +1714,23 @@ class MainWindow(QMainWindow):
                 card.set_selected(True)
                 self._selected_cards.append(card)
 
-        def _reload_page_windows(paths: list[str]) -> None:
+        def _reload_page_windows(paths: list[str], removed_indices: dict[str, list[int]] | None = None) -> None:
+            """PageEditWindowのページを更新する
+
+            Args:
+                paths: 更新対象のPDFパスのリスト
+                removed_indices: パスごとの削除されたページインデックスの辞書（差分更新用）
+            """
             for window in QApplication.topLevelWidgets():
                 if isinstance(window, PageEditWindow) and window._pdf_path in paths:
                     logger.debug(f"Reloading pages in PageEditWindow for {window._pdf_path}")
-                    window._load_pages()
+                    # 差分更新が可能な場合は差分更新を使用
+                    if removed_indices and window._pdf_path in removed_indices:
+                        indices = removed_indices[window._pdf_path]
+                        logger.debug(f"Using differential update for indices: {indices}")
+                        window._remove_page_thumbnails(indices)
+                    else:
+                        window._load_pages()
 
         def do_extraction() -> bool:
             nonlocal source_was_deleted
@@ -1758,7 +1771,8 @@ class MainWindow(QMainWindow):
                         self._remove_card(pdf_path)
                         self._refresh_grid()
                     else:
-                        _reload_page_windows([pdf_path])
+                        # 差分更新を使用（page_numsが削除されたインデックス）
+                        _reload_page_windows([pdf_path], {pdf_path: page_nums})
                 
                 return True
             finally:

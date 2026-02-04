@@ -638,13 +638,29 @@ class PageEditWindow(QMainWindow):
         self._debug_undo_state(reason)
 
     def _load_pages(self) -> None:
+        # 既存のサムネイルをグリッドから先に取り除く
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            # setParent(None)は呼ばない（deleteLater()で処理される）
+
         for thumb in self._thumbnails:
             thumb.deleteLater()
         self._thumbnails.clear()
         self._selected_thumbnails.clear()
         self._zoom_text_cache.clear()
 
+        # ファイル存在チェック
+        if not os.path.exists(self._pdf_path):
+            return
+
         page_count = get_page_count(self._pdf_path)
+        if page_count == 0:
+            return
+
+        # ズームビューのページ番号を調整
+        if self._zoom_page_num is not None and self._zoom_page_num >= page_count:
+            self._zoom_page_num = max(0, page_count - 1)
+
         for i in range(page_count):
             thumb = PageThumbnail(self._pdf_path, i)
             thumb.clicked.connect(self._on_thumbnail_clicked)
@@ -657,21 +673,63 @@ class PageEditWindow(QMainWindow):
     def _refresh_grid(self) -> None:
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
+            # 削除予定のウィジェットには触らない
+            widget = item.widget()
+            if widget and widget in self._thumbnails:
+                widget.setParent(None)
 
         # Use window width if container width is not yet set
         available_width = self._container.width()
         if available_width < 100:  # Not yet properly sized
             available_width = self.width() - 40  # Account for margins and scrollbar
         cols = max(1, available_width // (PageThumbnail.THUMBNAIL_SIZE + 20))
-        
+
         visible_thumbs = [t for t in self._thumbnails if not t._explicitly_hidden]
         for i, thumb in enumerate(visible_thumbs):
             row = i // cols
             col = i % cols
             self._grid_layout.addWidget(thumb, row, col)
             thumb.setVisible(True)
+
+    def _remove_page_thumbnails(self, page_indices: list[int]) -> None:
+        """指定されたページのサムネイルを削除（差分更新）"""
+        # グリッドから全サムネイルを一旦取り除く
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget and widget in self._thumbnails:
+                widget.setParent(None)
+
+        # 指定されたインデックスのサムネイルを削除（逆順で処理）
+        for idx in sorted(page_indices, reverse=True):
+            if 0 <= idx < len(self._thumbnails):
+                thumb = self._thumbnails.pop(idx)
+                if thumb in self._selected_thumbnails:
+                    self._selected_thumbnails.remove(thumb)
+                thumb.deleteLater()
+
+        # ページ番号を再割り当て
+        for i, thumb in enumerate(self._thumbnails):
+            thumb._page_num = i
+            thumb._display_num = i
+            thumb._number_label.setText(str(i + 1))
+
+        # ズームビューのページ番号を調整
+        if self._zoom_page_num is not None:
+            page_count = len(self._thumbnails)
+            if page_count == 0:
+                self._zoom_page_num = None
+                if self._zoom_view and self._zoom_view.isVisible():
+                    self._exit_zoom_view()
+            elif self._zoom_page_num >= page_count:
+                self._zoom_page_num = max(0, page_count - 1)
+                if self._zoom_view and self._zoom_view.isVisible():
+                    self._render_zoom_page()
+
+        # ズームテキストキャッシュをクリア（ページ番号が変わるため）
+        self._zoom_text_cache.clear()
+
+        self._refresh_grid()
 
     def _clear_selection(self) -> None:
         for thumb in self._selected_thumbnails:

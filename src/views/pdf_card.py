@@ -225,27 +225,6 @@ class PDFCard(QFrame):
             self.double_clicked.emit(self)
         super().mouseDoubleClickEvent(event)
 
-    def dragEnterEvent(self, event) -> None:
-        """Handle drag enter event."""
-        # Locked cards cannot accept drops
-        if self._is_locked:
-            event.ignore()
-            return
-            
-        if event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
-            data = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')
-            source_paths = data.split('|')
-            # Accept if any source is different from this card
-            if any(p != self._pdf_path for p in source_paths):
-                self.setStyleSheet("PDFCard { background-color: #90EE90; border: 2px solid #228B22; }")
-                event.acceptProposedAction()
-                return
-        event.ignore()
-
-    def dragLeaveEvent(self, event) -> None:
-        """Handle drag leave event."""
-        self._update_style()
-
     def dropEvent(self, event) -> None:
         """Handle drop event."""
         # Locked cards cannot accept drops
