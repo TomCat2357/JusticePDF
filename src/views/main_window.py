@@ -49,6 +49,12 @@ class MainWindow(QMainWindow):
         self._internal_adds: set[str] = set()
         self._internal_removes: set[str] = set()
 
+        # Debounce file modified events (path -> single-shot timer)
+        self._modified_timers: dict[str, QTimer] = {}
+        # Track last processed mtime to avoid redundant refreshes
+        self._modified_last_mtime: dict[str, float] = {}
+        self._modified_debounce_ms = 250
+
         # Setup working directory
         self._work_dir = Path.home() / "Documents" / "PDFs"
         self._work_dir.mkdir(parents=True, exist_ok=True)
@@ -647,6 +653,8 @@ class MainWindow(QMainWindow):
 
     def _on_file_removed(self, path: str) -> None:
         """Handle file removed from folder."""
+        # If a save is in progress, there may be a pending debounced refresh.
+        self._cancel_debounced_modified(path)
         normalized = self._normalize_path(path)
         if normalized in self._internal_removes:
             self._internal_removes.discard(normalized)
@@ -657,10 +665,60 @@ class MainWindow(QMainWindow):
         self._update_button_states()
 
     def _on_file_modified(self, path: str) -> None:
-        """Handle file modified."""
+        """Handle file modified.
+
+        Many editors save by writing the file multiple times. Debounce per-path to avoid
+        repeated expensive refreshes (PDF open, thumbnail regen, layout).
+        """
+        self._schedule_debounced_modified(path)
+
+    def _schedule_debounced_modified(self, path: str) -> None:
+        """Debounce refresh for a modified PDF path."""
+        normalized = self._normalize_path(path)
+
+        timer = self._modified_timers.get(normalized)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda p=path: self._process_debounced_modified(p))
+            self._modified_timers[normalized] = timer
+
+        # Restart debounce window on every modified event
+        timer.start(self._modified_debounce_ms)
+
+    def _cancel_debounced_modified(self, path: str) -> None:
+        """Cancel any pending debounced refresh for the given path."""
+        normalized = self._normalize_path(path)
+        timer = self._modified_timers.pop(normalized, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        self._modified_last_mtime.pop(normalized, None)
+
+    def _process_debounced_modified(self, path: str) -> None:
+        """Run the actual refresh once after debounce window ends."""
+        normalized = self._normalize_path(path)
+
+        # File might be temporarily missing while being replaced.
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            logger.debug("modified debounce: file missing or inaccessible: %s", path)
+            return
+
+        last = self._modified_last_mtime.get(normalized)
+        if last is not None and mtime == last:
+            # No real change since last processed refresh.
+            return
+
+        self._modified_last_mtime[normalized] = mtime
+
         for card in self._cards:
-            if card.pdf_path == path:
-                card.refresh()
+            if self._normalize_path(card.pdf_path) == normalized:
+                try:
+                    card.refresh()
+                except Exception:
+                    logger.debug("modified debounce: card.refresh() failed for %s", path, exc_info=True)
                 break
 
     def _on_undo(self) -> None:
