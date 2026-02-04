@@ -1,5 +1,8 @@
 """PDF utility functions using PyMuPDF."""
 import logging
+import os
+import shutil
+import tempfile
 
 import fitz
 from PyQt6.QtGui import QPixmap, QImage
@@ -169,6 +172,58 @@ def merge_pdfs(output_path: str, pdf_paths: list[str]) -> None:
         src_doc.close()
     output_doc.save(output_path)
     output_doc.close()
+
+
+def merge_pdfs_in_place(
+    dest_path: str,
+    pdf_paths: list[str],
+    *,
+    insert_at: int | None = None,
+) -> None:
+    """Merge PDFs into an existing destination file in place.
+
+    If insert_at is None, append to end. Otherwise insert sequentially starting at insert_at.
+    Uses incremental save when possible; falls back to full save to temp.
+    """
+    if not pdf_paths:
+        return
+
+    tmp_path: str | None = None
+    dest_doc = fitz.open(dest_path)
+    try:
+        if insert_at is None:
+            for path in pdf_paths:
+                if path == dest_path:
+                    continue
+                with fitz.open(path) as src_doc:
+                    dest_doc.insert_pdf(src_doc)
+        else:
+            idx = insert_at
+            for path in pdf_paths:
+                if path == dest_path:
+                    continue
+                with fitz.open(path) as src_doc:
+                    dest_doc.insert_pdf(src_doc, start_at=idx)
+                    idx += len(src_doc)
+        try:
+            dest_doc.saveIncr()
+            return
+        except Exception:
+            pass
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            dest_doc.save(tmp_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+    finally:
+        dest_doc.close()
+
+    if tmp_path is not None:
+        shutil.move(tmp_path, dest_path)
 
 
 def extract_pages(src_path: str, output_path: str, page_indices: list[int]) -> bool:

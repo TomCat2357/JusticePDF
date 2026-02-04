@@ -515,7 +515,7 @@ class MainWindow(QMainWindow):
 
         Export is NOT an undoable action and should not affect undo history.
         """
-        from src.utils.pdf_utils import merge_pdfs
+        from src.utils.pdf_utils import merge_pdfs_in_place
         import tempfile
         from pathlib import Path
 
@@ -573,37 +573,26 @@ class MainWindow(QMainWindow):
 
         def do_merge() -> None:
             nonlocal post_selected_paths
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp_path = tmp.name
-            try:
-                dest_path = None
-                merge_pdfs(tmp_path, source_paths + [target_path])
-                shutil.move(tmp_path, merge_dest_path)
+            merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path])
 
-                # Trash the target and other source PDFs (keep first source as merge destination)
-                self._register_internal_remove([target_path] + source_paths[1:])
-                send2trash(target_path)
-                for p in source_paths[1:]:
-                    send2trash(p)
+            # Trash the target and other source PDFs (keep first source as merge destination)
+            self._register_internal_remove([target_path] + source_paths[1:])
+            send2trash(target_path)
+            for p in source_paths[1:]:
+                send2trash(p)
 
-                # Rebuild cards from paths (avoid stale QWidget references)
-                self._rebuild_cards_from_paths(new_paths)
-                self._sort_order = "manual"
-                self._refresh_grid()
+            # Rebuild cards from paths (avoid stale QWidget references)
+            self._rebuild_cards_from_paths(new_paths)
+            self._sort_order = "manual"
+            self._refresh_grid()
 
-                # Select merge destination (first source), and remember it for redo
-                _select_paths([merge_dest_path])
-                post_selected_paths = [merge_dest_path]
+            # Select merge destination (first source), and remember it for redo
+            _select_paths([merge_dest_path])
+            post_selected_paths = [merge_dest_path]
 
-                card = self._get_card_by_path(merge_dest_path)
-                if card:
-                    card.refresh()
-            finally:
-                if os.path.exists(tmp_path):
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+            card = self._get_card_by_path(merge_dest_path)
+            if card:
+                card.refresh()
 
         def undo_merge() -> None:
             self._register_internal_add(list(backups.keys()))
@@ -1522,7 +1511,7 @@ class MainWindow(QMainWindow):
         Copies source PDF pages to the beginning of target PDF.
         Source files remain unchanged.
         """
-        from src.utils.pdf_utils import merge_pdfs
+        from src.utils.pdf_utils import merge_pdfs_in_place
         import tempfile
         import shutil
         
@@ -1536,11 +1525,7 @@ class MainWindow(QMainWindow):
         
         try:
             # Merge: source pages first, then target pages
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp_path = tmp.name
-            
-            merge_pdfs(tmp_path, source_paths + [target_path])
-            shutil.move(tmp_path, target_path)
+            merge_pdfs_in_place(target_path, source_paths, insert_at=0)
             
             target_card.refresh()
             
@@ -1555,10 +1540,7 @@ class MainWindow(QMainWindow):
                 target_card.refresh()
             
             def redo_copy_merge():
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                    tmp_path = tmp.name
-                merge_pdfs(tmp_path, source_paths + [target_path])
-                shutil.move(tmp_path, target_path)
+                merge_pdfs_in_place(target_path, source_paths, insert_at=0)
                 target_card.refresh()
             
             self._undo_manager.add_action(UndoAction(
@@ -1567,11 +1549,9 @@ class MainWindow(QMainWindow):
                 redo_func=redo_copy_merge
             ))
             
-        except Exception as e:
+        except Exception:
             # Rollback on error
             shutil.copy2(backup_path, target_path)
-            if 'tmp_path' in dir() and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
             raise
         finally:
             # Keep backup for undo; it will be cleaned up eventually
