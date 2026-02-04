@@ -923,7 +923,8 @@ class PageEditWindow(QMainWindow):
         ))
 
     def _on_rename(self) -> None:
-        old_name = os.path.basename(self._pdf_path)
+        old_path = self._pdf_path
+        old_name = os.path.basename(old_path)
         new_name, ok = QInputDialog.getText(
             self, "Rename", "New name:", text=old_name
         )
@@ -931,10 +932,43 @@ class PageEditWindow(QMainWindow):
         if ok and new_name and new_name != old_name:
             if not new_name.lower().endswith(".pdf"):
                 new_name += ".pdf"
-            new_path = os.path.join(os.path.dirname(self._pdf_path), new_name)
-            os.rename(self._pdf_path, new_path)
-            self._pdf_path = new_path
-            self.setWindowTitle(f"JusticePDF - Edit: {new_name}")
+            new_path = os.path.join(os.path.dirname(old_path), new_name)
+            if os.path.abspath(old_path) == os.path.abspath(new_path):
+                return
+
+            def _get_main_window():
+                from PyQt6.QtWidgets import QApplication
+                from src.views.main_window import MainWindow
+
+                for widget in QApplication.topLevelWidgets():
+                    if isinstance(widget, MainWindow):
+                        return widget
+                return None
+
+            def do_rename() -> None:
+                main_window = _get_main_window()
+                if main_window:
+                    main_window._perform_rename(old_path, new_path)
+                else:
+                    os.rename(old_path, new_path)
+                    self._pdf_path = new_path
+                    self.setWindowTitle(f"JusticePDF - Edit: {new_name}")
+
+            def undo_rename() -> None:
+                main_window = _get_main_window()
+                if main_window:
+                    main_window._perform_rename(new_path, old_path)
+                else:
+                    os.rename(new_path, old_path)
+                    self._pdf_path = old_path
+                    self.setWindowTitle(f"JusticePDF - Edit: {old_name}")
+
+            do_rename()
+            self._undo_manager.add_action(UndoAction(
+                description="Rename PDF",
+                undo_func=undo_rename,
+                redo_func=do_rename
+            ))
 
     def _on_rotate(self) -> None:
         if not self._selected_thumbnails:

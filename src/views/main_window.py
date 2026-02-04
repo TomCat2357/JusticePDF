@@ -42,12 +42,16 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._cards: list[PDFCard] = []
         self._selected_cards: list[PDFCard] = []
-        self._sort_order = "name"  # "name", "date", or "manual"
+        self._sort_order = "manual"  # "name", "date", or "manual"
         self._sort_ascending = True
         # Ensure initial layout uses the same logic as subsequent resizes
         self._did_initial_grid_layout = False
         self._internal_adds: set[str] = set()
         self._internal_removes: set[str] = set()
+        self._pending_rename_old_to_new: dict[str, str] = {}
+        self._pending_rename_new_to_old: dict[str, str] = {}
+        self._pending_rename_removed: set[str] = set()
+        self._pending_rename_added: set[str] = set()
 
         # Debounce file modified events (path -> single-shot timer)
         self._modified_timers: dict[str, QTimer] = {}
@@ -258,6 +262,58 @@ class MainWindow(QMainWindow):
         for path in paths:
             self._internal_removes.add(self._normalize_path(path))
 
+    def _track_pending_rename(self, old_path: str, new_path: str) -> None:
+        old_norm = self._normalize_path(old_path)
+        new_norm = self._normalize_path(new_path)
+        self._pending_rename_old_to_new[old_norm] = new_norm
+        self._pending_rename_new_to_old[new_norm] = old_norm
+
+    def _finalize_pending_rename(self, old_norm: str, new_norm: str) -> None:
+        if old_norm in self._pending_rename_removed and new_norm in self._pending_rename_added:
+            self._pending_rename_removed.discard(old_norm)
+            self._pending_rename_added.discard(new_norm)
+            self._pending_rename_old_to_new.pop(old_norm, None)
+            self._pending_rename_new_to_old.pop(new_norm, None)
+
+    def _update_page_edit_windows_for_rename(self, old_path: str, new_path: str) -> None:
+        from PyQt6.QtWidgets import QApplication
+        from src.views.page_edit_window import PageEditWindow
+
+        new_name = os.path.basename(new_path)
+        for widget in QApplication.topLevelWidgets():
+            if isinstance(widget, PageEditWindow) and widget._pdf_path == old_path:
+                widget._pdf_path = new_path
+                widget.setWindowTitle(f"JusticePDF - Edit: {new_name}")
+
+    def _perform_rename(self, old_path: str, new_path: str) -> None:
+        old_norm = self._normalize_path(old_path)
+        new_norm = self._normalize_path(new_path)
+        if old_norm == new_norm:
+            return
+
+        self._track_pending_rename(old_path, new_path)
+        self._register_internal_remove([old_path])
+        self._register_internal_add([new_path])
+
+        try:
+            os.rename(old_path, new_path)
+        except Exception:
+            self._pending_rename_old_to_new.pop(old_norm, None)
+            self._pending_rename_new_to_old.pop(new_norm, None)
+            self._pending_rename_removed.discard(old_norm)
+            self._pending_rename_added.discard(new_norm)
+            self._internal_removes.discard(old_norm)
+            self._internal_adds.discard(new_norm)
+            raise
+
+        card = self._get_card_by_path(old_path)
+        if card:
+            card._pdf_path = new_path
+            card.refresh()
+        self._update_page_edit_windows_for_rename(old_path, new_path)
+        self._refresh_grid()
+        self._update_button_states()
+
     def _load_existing_files(self) -> None:
         """Load existing PDF files from the work directory."""
         for pdf_path in self._watcher.get_pdf_files():
@@ -330,14 +386,15 @@ class MainWindow(QMainWindow):
         else:
             logger.debug(f"No card found for {pdf_path}")
 
-    def _refresh_grid(self) -> None:
+    def _refresh_grid(self, *, sort_cards: bool = False) -> None:
         """Refresh the grid layout."""
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
             if item.widget():
                 item.widget().setParent(None)
 
-        self._sort_cards()
+        if sort_cards:
+            self._sort_cards()
 
         available_width = self._grid_available_width()
         spacing = self._grid_layout.horizontalSpacing()
@@ -629,10 +686,17 @@ class MainWindow(QMainWindow):
 
     def _on_file_added(self, path: str) -> None:
         """Handle new file added to folder."""
+        normalized = self._normalize_path(path)
+        if normalized in self._pending_rename_new_to_old:
+            self._internal_adds.discard(normalized)
+            self._pending_rename_added.add(normalized)
+            old_norm = self._pending_rename_new_to_old.get(normalized)
+            if old_norm:
+                self._finalize_pending_rename(old_norm, normalized)
+            return
         for card in self._cards:
             if card.pdf_path == path:
                 return
-        normalized = self._normalize_path(path)
         if normalized in self._internal_adds:
             self._internal_adds.discard(normalized)
         else:
@@ -645,6 +709,13 @@ class MainWindow(QMainWindow):
         # If a save is in progress, there may be a pending debounced refresh.
         self._cancel_debounced_modified(path)
         normalized = self._normalize_path(path)
+        if normalized in self._pending_rename_old_to_new:
+            self._internal_removes.discard(normalized)
+            self._pending_rename_removed.add(normalized)
+            new_norm = self._pending_rename_old_to_new.get(normalized)
+            if new_norm:
+                self._finalize_pending_rename(normalized, new_norm)
+            return
         if normalized in self._internal_removes:
             self._internal_removes.discard(normalized)
         else:
@@ -773,9 +844,21 @@ class MainWindow(QMainWindow):
                 new_name += ".pdf"
             old_path = card.pdf_path
             new_path = os.path.join(os.path.dirname(old_path), new_name)
-            self._register_internal_remove([old_path])
-            self._register_internal_add([new_path])
-            os.rename(old_path, new_path)
+            if self._normalize_path(old_path) == self._normalize_path(new_path):
+                return
+
+            def do_rename() -> None:
+                self._perform_rename(old_path, new_path)
+
+            def undo_rename() -> None:
+                self._perform_rename(new_path, old_path)
+
+            do_rename()
+            self._undo_manager.add_action(UndoAction(
+                description="Rename PDF",
+                undo_func=undo_rename,
+                redo_func=do_rename
+            ))
 
     def _on_import(self) -> None:
         """Handle import action."""
@@ -1116,6 +1199,7 @@ class MainWindow(QMainWindow):
             self._sort_ascending = default_ascending
 
         new_ascending = self._sort_ascending
+        self._sort_cards()
         self._refresh_grid()
         new_paths = [card.pdf_path for card in self._cards]
 
