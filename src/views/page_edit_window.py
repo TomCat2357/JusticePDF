@@ -1,5 +1,6 @@
 """Page edit window for editing PDF pages."""
 import os
+import shutil
 import logging
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -613,10 +614,21 @@ class PageEditWindow(QMainWindow):
         select_all_action.triggered.connect(self._on_select_all)
         self.addAction(select_all_action)
 
+        rotate_action = QAction(self)
+        rotate_action.setShortcut(QKeySequence(Qt.Key.Key_R))
+        rotate_action.triggered.connect(self._on_rotate)
+        self.addAction(rotate_action)
+
     def _update_button_states(self) -> None:
         has_selection = len(self._selected_thumbnails) > 0
-        self._delete_btn.setEnabled(has_selection)
-        self._rotate_btn.setEnabled(has_selection)
+        zoom_active = bool(
+            self._zoom_view
+            and self._zoom_view.isVisible()
+            and self._zoom_page_num is not None
+        )
+        can_edit_pages = has_selection or zoom_active
+        self._delete_btn.setEnabled(can_edit_pages)
+        self._rotate_btn.setEnabled(can_edit_pages)
         self._undo_btn.setEnabled(self._undo_manager.can_undo())
         self._redo_btn.setEnabled(self._undo_manager.can_redo())
 
@@ -797,12 +809,14 @@ class PageEditWindow(QMainWindow):
             self._grid_scroll.hide()
         if self._zoom_view:
             self._zoom_view.show()
+        self._update_button_states()
 
     def _exit_zoom_view(self) -> None:
         if self._zoom_view:
             self._zoom_view.hide()
         if self._grid_scroll:
             self._grid_scroll.show()
+        self._update_button_states()
 
     def _set_zoom_percent(self, value: int) -> None:
         value = max(self.ZOOM_MIN, min(self.ZOOM_MAX, value))
@@ -905,6 +919,11 @@ class PageEditWindow(QMainWindow):
         self._update_button_states()
 
     def _on_delete(self) -> None:
+        # ズームビュー表示中の場合
+        if self._zoom_view and self._zoom_view.isVisible():
+            self._delete_zoom_page()
+            return
+
         if not self._selected_thumbnails:
             return
 
@@ -912,6 +931,16 @@ class PageEditWindow(QMainWindow):
 
         indices = sorted([t.page_num for t in self._selected_thumbnails], reverse=True)
         pdf_path = self._pdf_path
+
+        # 全ページ削除かチェック
+        page_count = get_page_count(pdf_path)
+        if len(indices) >= page_count:
+            # 全ページ削除 → ファイル削除＋UNDO対応
+            backup_fd, backup_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(backup_fd)
+            shutil.copy2(pdf_path, backup_path)
+            self._delete_all_pages(backup_path)
+            return
 
         backup_fd, backup_path = tempfile.mkstemp(suffix=".pdf")
         os.close(backup_fd)
@@ -984,6 +1013,11 @@ class PageEditWindow(QMainWindow):
             ))
 
     def _on_rotate(self) -> None:
+        # ズームビュー表示中の場合
+        if self._zoom_view and self._zoom_view.isVisible():
+            self._rotate_zoom_page()
+            return
+
         if not self._selected_thumbnails:
             return
 
@@ -1015,6 +1049,157 @@ class PageEditWindow(QMainWindow):
             thumb.set_selected(True)
             self._selected_thumbnails.append(thumb)
         self._update_button_states()
+
+    def _delete_zoom_page(self) -> None:
+        """ズームビュー表示中のページを削除"""
+        import tempfile
+
+        if self._zoom_page_num is None:
+            return
+
+        pdf_path = self._pdf_path
+        page_count = get_page_count(pdf_path)
+        current_page = self._zoom_page_num
+
+        # 全ページ削除かチェック
+        if page_count <= 1:
+            backup_fd, backup_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(backup_fd)
+            shutil.copy2(pdf_path, backup_path)
+            self._delete_all_pages_from_zoom(backup_path)
+            return
+
+        # 削除後に表示するページを計算
+        if current_page >= page_count - 1:
+            # 最後のページを削除 → 一つ前のページを表示
+            next_page = current_page - 1
+        else:
+            # それ以外 → 同じインデックス（次のページが繰り上がる）
+            next_page = current_page
+
+        # バックアップ作成
+        backup_fd, backup_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(backup_fd)
+        extract_pages(pdf_path, backup_path, [current_page])
+
+        deleted_page = current_page
+
+        def do_delete():
+            remove_pages(pdf_path, [deleted_page])
+            self._remove_page_thumbnails([deleted_page])
+            self._zoom_text_cache.clear()
+            if self._zoom_view and self._zoom_view.isVisible():
+                new_page_count = get_page_count(pdf_path)
+                if new_page_count > 0:
+                    self._zoom_page_num = min(next_page, new_page_count - 1)
+                    self._render_zoom_page()
+
+        def undo_delete():
+            insert_pages(pdf_path, backup_path, [deleted_page])
+            self._load_pages()
+            self._zoom_text_cache.clear()
+            if self._zoom_view and self._zoom_view.isVisible():
+                self._zoom_page_num = deleted_page
+                self._render_zoom_page()
+
+        do_delete()
+
+        self._undo_manager.add_action(UndoAction(
+            description="Delete page from zoom view",
+            undo_func=undo_delete,
+            redo_func=do_delete
+        ))
+
+    def _rotate_zoom_page(self) -> None:
+        """ズームビュー表示中のページを回転"""
+        if self._zoom_page_num is None:
+            return
+
+        pdf_path = self._pdf_path
+        page_num = self._zoom_page_num
+
+        def do_rotate():
+            rotate_pages(pdf_path, [page_num], 90)
+            # ズームテキストキャッシュをクリアして再描画
+            self._zoom_text_cache.pop(page_num, None)
+            if self._zoom_view and self._zoom_view.isVisible():
+                self._render_zoom_page()
+            # サムネイルも更新
+            if page_num < len(self._thumbnails):
+                self._thumbnails[page_num].refresh()
+
+        def undo_rotate():
+            rotate_pages(pdf_path, [page_num], 270)
+            self._zoom_text_cache.pop(page_num, None)
+            if self._zoom_view and self._zoom_view.isVisible():
+                self._render_zoom_page()
+            if page_num < len(self._thumbnails):
+                self._thumbnails[page_num].refresh()
+
+        do_rotate()
+
+        self._undo_manager.add_action(UndoAction(
+            description="Rotate page from zoom view",
+            undo_func=undo_rotate,
+            redo_func=do_rotate
+        ))
+
+    def _delete_all_pages(self, backup_path: str) -> None:
+        """全ページ削除（ファイルをゴミ箱へ移動し、UNDO対応）"""
+        from send2trash import send2trash
+        from src.views.main_window import MainWindow
+
+        pdf_path = self._pdf_path
+
+        def _get_main_window():
+            for widget in QApplication.topLevelWidgets():
+                if isinstance(widget, MainWindow):
+                    return widget
+            return None
+
+        def _close_edit_windows() -> None:
+            for widget in QApplication.topLevelWidgets():
+                if isinstance(widget, PageEditWindow) and widget._pdf_path == pdf_path:
+                    widget.close()
+
+        def do_delete():
+            main_window = _get_main_window()
+            if main_window:
+                main_window._register_internal_remove([pdf_path])
+                main_window._remove_card(pdf_path)
+                main_window._refresh_grid()
+            # ファイルをゴミ箱へ
+            if os.path.exists(pdf_path):
+                send2trash(pdf_path)
+            # このPDFのPageEditWindowをすべて閉じる
+            _close_edit_windows()
+
+        def undo_delete():
+            main_window = _get_main_window()
+            if main_window:
+                main_window._register_internal_add([pdf_path])
+            # バックアップからファイル復元
+            shutil.copy2(backup_path, pdf_path)
+            if main_window:
+                restored_card = main_window._get_card_by_path(pdf_path)
+                if restored_card is None:
+                    restored_card = main_window._add_card(pdf_path)
+                    main_window._refresh_grid()
+                    main_window._internal_adds.discard(main_window._normalize_path(pdf_path))
+                # 復元後は編集画面を再度開く
+                main_window._on_card_double_clicked(restored_card)
+
+        do_delete()
+
+        self._undo_manager.add_action(UndoAction(
+            description="Delete all pages (file to trash)",
+            undo_func=undo_delete,
+            redo_func=do_delete
+        ))
+
+    def _delete_all_pages_from_zoom(self, backup_path: str) -> None:
+        """ズームビューから最後の1ページ削除時の処理"""
+        self._delete_all_pages(backup_path)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
