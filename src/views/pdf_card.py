@@ -17,7 +17,7 @@ class PDFCard(QFrame):
 
     clicked = pyqtSignal(object)  # Emits self when clicked
     double_clicked = pyqtSignal(object)  # Emits self when double-clicked
-    dropped_on = pyqtSignal(object, str)  # Emits (self, source_path) when another card is dropped on this card
+    dropped_on = pyqtSignal(object, str)  # Emits (self, source_paths_str) when another card is dropped on this card
 
     CARD_WIDTH = 150
     THUMBNAIL_SIZE = 120
@@ -236,6 +236,6 @@ class PDFCard(QFrame):
             data = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')
             source_paths = [p for p in data.split('|') if p != self._pdf_path]
             if source_paths:
-                self.dropped_on.emit(self, source_paths[0])  # Signal first, MainWindow handles all
+                self.dropped_on.emit(self, '|'.join(source_paths))
                 event.acceptProposedAction()
         self._update_style()

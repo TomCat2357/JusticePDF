@@ -555,7 +555,7 @@ class MainWindow(QMainWindow):
         window.move(new_x, new_y)
         window.show()
 
-    def _on_card_merge(self, target_card: PDFCard, source_path: str) -> None:
+    def _on_card_merge(self, target_card: PDFCard, source_paths_str: str) -> None:
         """Handle card merge (drop cards on another card) with undo support.
 
         Supports multiple selected cards - merges all into target.
@@ -582,22 +582,24 @@ class MainWindow(QMainWindow):
 
         target_path = target_card.pdf_path
 
-        # Determine source cards (selection-aware)
-        source_cards: list[PDFCard] = []
-        for c in self._cards:
-            if c.pdf_path == source_path:
-                if c in self._selected_cards:
-                    source_cards = [x for x in self._cards if x in self._selected_cards and x.pdf_path != target_path]
-                else:
-                    if c.pdf_path != target_path:
-                        source_cards = [c]
-                break
+        raw_paths = [p for p in source_paths_str.split('|') if p]
+        card_paths = {c.pdf_path for c in self._cards}
+        source_paths = [p for p in raw_paths if p in card_paths and p != target_path]
 
-        if not source_cards:
+        # Backward-compat: if only one path provided and it's part of a multi-selection,
+        # use the full selection order (grid order) instead.
+        if len(source_paths) == 1:
+            src_card = self._get_card_by_path(source_paths[0])
+            if src_card and src_card in self._selected_cards and len(self._selected_cards) > 1:
+                source_paths = [
+                    c.pdf_path for c in self._cards
+                    if c in self._selected_cards and c.pdf_path != target_path
+                ]
+
+        if not source_paths:
             return
 
-        source_paths = [c.pdf_path for c in source_cards]
-        # The first source (drag origin) will be the merge destination
+        # The first source (drag order) will be the merge destination
         merge_dest_path = source_paths[0]
 
         # New order after merge: remove all sources, place merge result at target's position
@@ -863,11 +865,13 @@ class MainWindow(QMainWindow):
     def _on_import(self) -> None:
         """Handle import action."""
         ext_list = " ".join(f"*{e}" for e in sorted(_IMPORT_EXTS))
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Import", "", f"Importable Files ({ext_list})"
-        )
-        if paths:
-            self._import_paths(paths)
+        dialog = QFileDialog(self, "Import")
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        dialog.setNameFilter(f"Importable Files ({ext_list})")
+        if dialog.exec():
+            paths = dialog.selectedFiles()
+            if paths:
+                self._import_paths(paths)
 
     # ─────────────────────────────────────────────────────────────────
     # Office Import helpers

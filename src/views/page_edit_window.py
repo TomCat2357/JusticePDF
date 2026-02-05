@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QInputDialog, QLabel, QFrame, QApplication, QRubberBand,
     QToolButton, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl
+from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl, QTimer, QEvent
 from PyQt6.QtGui import QAction, QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices
 
 from src.utils.pdf_utils import (
@@ -413,6 +413,7 @@ class PageEditWindow(QMainWindow):
         super().__init__(parent)
         self._pdf_path = pdf_path
         self._undo_manager = undo_manager
+        self._did_initial_grid_layout = False
         self._thumbnails: list[PageThumbnail] = []
         self._selected_thumbnails: list[PageThumbnail] = []
         self._grid_scroll = None
@@ -670,6 +671,13 @@ class PageEditWindow(QMainWindow):
         if self._zoom_view and self._zoom_view.isVisible():
             self._render_zoom_page()
 
+    def _grid_available_width(self) -> int:
+        """Width source for column calculation (always consistent)."""
+        w = int(self._grid_scroll.viewport().width()) if self._grid_scroll else 0
+        if w > 0:
+            return w
+        return int(self.width())
+
     def _refresh_grid(self) -> None:
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
@@ -678,11 +686,16 @@ class PageEditWindow(QMainWindow):
             if widget and widget in self._thumbnails:
                 widget.setParent(None)
 
-        # Use window width if container width is not yet set
-        available_width = self._container.width()
-        if available_width < 100:  # Not yet properly sized
-            available_width = self.width() - 40  # Account for margins and scrollbar
-        cols = max(1, available_width // (PageThumbnail.THUMBNAIL_SIZE + 20))
+        available_width = self._grid_available_width()
+        spacing = self._grid_layout.horizontalSpacing()
+        if spacing < 0:
+            spacing = self._grid_layout.spacing()
+        spacing = int(spacing)
+        m = self._grid_layout.contentsMargins()
+        usable = max(1, int(available_width) - int(m.left() + m.right()))
+
+        w = int(PageThumbnail.THUMBNAIL_SIZE)
+        cols = max(1, int((usable + spacing) // (w + spacing)))
 
         visible_thumbs = [t for t in self._thumbnails if not t._explicitly_hidden]
         for i, thumb in enumerate(visible_thumbs):
@@ -1006,6 +1019,13 @@ class PageEditWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._refresh_grid()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Run one post-show reflow so initial column count uses stable viewport width.
+        if not self._did_initial_grid_layout:
+            self._did_initial_grid_layout = True
+            QTimer.singleShot(0, self._refresh_grid)
 
     def mousePressEvent(self, event) -> None:
         """Handle mouse press - start rubber band selection on empty area."""
