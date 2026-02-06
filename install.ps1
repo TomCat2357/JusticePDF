@@ -1,210 +1,284 @@
-# install.ps1
-# JusticePDF installer (Windows / PowerShell)
-# - Scoop (optional install)
-# - Python (prefer Scoop Python; reject Microsoft Store alias python.exe)
-# - Create venv
-# - Install dependencies + editable install WITHOUT activation
-# - Create Desktop + Project folder shortcut
-#
-# NOTE:
-# - Do NOT run `scoop update *` (updates all apps like nodejs-lts, and may break due to unrelated packages).
-# - Update only Scoop itself + buckets, and (optionally) only the packages this installer cares about.
-
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Write-Step([string]$msg) {
-  Write-Host $msg
-}
+$DESIRED_PYTHON_VERSION = "3.13.11"   # user intent
+$DESIRED_SERIES = "3.13."            # fallback series
 
-function Assert-NotWindowsAppsPython {
-  $cmd = Get-Command python -ErrorAction SilentlyContinue
-  if (-not $cmd) { return }
+$PYENV_ROOT = Join-Path $env:USERPROFILE ".pyenv"
+$PYENV_HOME = Join-Path $PYENV_ROOT "pyenv-win"   # clone target folder
 
-  $src = $cmd.Source
-  if ($src -and $src -like "*\AppData\Local\Microsoft\WindowsApps\python.exe") {
-    Write-Host ""
-    Write-Host "ERROR: 'python' points to Microsoft Store App Execution Alias:" -ForegroundColor Red
-    Write-Host "  $src" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Fix (recommended):" -ForegroundColor Yellow
-    Write-Host "  Settings -> Apps -> Advanced app settings -> App execution aliases"
-    Write-Host "  Turn OFF: python.exe / python3.exe"
-    Write-Host ""
-    Write-Host "Then install real Python (recommended: Scoop):" -ForegroundColor Yellow
-    Write-Host "  scoop install python"
-    throw "Invalid python (WindowsApps alias)."
+function Write-Step([string]$msg) { Write-Host $msg }
+
+function Add-ToUserPath([string]$Dir) {
+  if (-not (Test-Path $Dir)) { return }
+  $dirNorm = $Dir.TrimEnd('\\')
+
+  $current = [Environment]::GetEnvironmentVariable("Path","User")
+  if (-not $current) { $current = "" }
+
+  $parts = $current -split ';' | Where-Object { $_ -and $_.Trim() -ne "" }
+  $exists = $false
+  foreach ($p in $parts) {
+    if ($p.TrimEnd('\\') -ieq $dirNorm) { $exists = $true; break }
+  }
+
+  if (-not $exists) {
+    $new = ($parts + $dirNorm) -join ';'
+    [Environment]::SetEnvironmentVariable("Path", $new, "User")
+    Write-Host "User PATH added: $dirNorm"
+  }
+
+  $sessParts = $env:Path -split ';' | ForEach-Object { $_.TrimEnd('\\') }
+  if (-not ($sessParts | Where-Object { $_ -ieq $dirNorm })) {
+    $env:Path = "$env:Path;$dirNorm"
+    Write-Host "Session PATH added: $dirNorm"
   }
 }
 
-function Ensure-Scoop {
+function Set-UserEnv([string]$Name, [string]$Value) {
+  $cur = [Environment]::GetEnvironmentVariable($Name, "User")
+  if ($cur -ne $Value) {
+    [Environment]::SetEnvironmentVariable($Name, $Value, "User")
+    Write-Host "User ENV set: $Name=$Value"
+  }
+  # reflect in current session (dynamic env var name)
+  Set-Item -Path ("Env:\" + $Name) -Value $Value
+}
+
+function Remove-IfExists([string]$Path) { if (Test-Path $Path) { Remove-Item $Path -Recurse -Force } }
+
+function Ensure-GitOrScoopGit {
+  $git = Get-Command git -ErrorAction SilentlyContinue
+  if ($git) { return }
+
   $scoop = Get-Command scoop -ErrorAction SilentlyContinue
   if ($scoop) {
-    Write-Step "[1/5] Scoop already installed. Skipping."
+    Write-Host "Installing git via Scoop..."
+    scoop install git | Out-Host
     return
   }
 
-  Write-Step "[1/5] Installing Scoop..."
-  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  Invoke-Expression (Invoke-RestMethod -UseBasicParsing "https://get.scoop.sh")
+  throw "git is required but not found. Please install Git for Windows (or Scoop) and re-run."
 }
 
-function Update-ScoopMinimal {
-  Write-Host "Updating Scoop..."
-  try {
-    scoop update
-    Write-Host "Updating buckets..."
-    scoop bucket update
-    Write-Host "Scoop core/buckets updated successfully!"
-  } catch {
-    Write-Warning "Scoop update failed. Continuing. Details: $($_.Exception.Message)"
-  }
+function Find-PyenvBat([string]$BaseDir) {
+  $hit = Get-ChildItem -Path $BaseDir -Recurse -Filter "pyenv.bat" -File -ErrorAction SilentlyContinue |
+         Where-Object { $_.FullName -match "\\\\pyenv-win\\\\bin\\\\pyenv\\.bat$" } |
+         Select-Object -First 1
+  if ($hit) { return $hit.FullName }
+
+  $hit2 = Get-ChildItem -Path $BaseDir -Recurse -Filter "pyenv.bat" -File -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+  if ($hit2) { return $hit2.FullName }
+
+  return $null
 }
 
-function Ensure-Git {
-  $git = Get-Command git -ErrorAction SilentlyContinue
-  if (-not $git) {
-    Write-Host "Installing git (Scoop)..."
-    try {
-      scoop install git | Out-Host
-    } catch {
-      Write-Warning "Failed to install git via Scoop. Continuing. Details: $($_.Exception.Message)"
+function Ensure-PyenvWinLatest {
+  Write-Step "[1/7] Installing/Repairing pyenv-win (official) ..."
+  Ensure-GitOrScoopGit
+
+  if (-not (Test-Path $PYENV_ROOT)) { New-Item -ItemType Directory -Path $PYENV_ROOT | Out-Null }
+
+  if (Test-Path $PYENV_HOME) {
+    if (Test-Path (Join-Path $PYENV_HOME ".git")) {
+      Write-Host "Updating existing pyenv-win repo..."
+      Push-Location $PYENV_HOME
+      try {
+        & git fetch --all --prune | Out-Host
+        & git reset --hard origin/master | Out-Host
+      } finally { Pop-Location }
+    } else {
+      Write-Warning "Existing $PYENV_HOME exists but is not a git repo. Reinstalling..."
+      Remove-IfExists $PYENV_HOME
     }
-    return
   }
 
-  try {
-    $ver = (& git --version) -replace '^git version\s+',''
-    Write-Host "WARN  'git' ($ver) is already installed."
-    Write-Host "Use 'scoop update git' to install a new version."
-  } catch {
-    Write-Host "WARN  'git' is already installed."
-    Write-Host "Use 'scoop update git' to install a new version."
-  }
-}
-
-function Ensure-Python {
-  Assert-NotWindowsAppsPython
-
-  $python = Get-Command python -ErrorAction SilentlyContinue
-  if ($python) {
-    try {
-      $ver = & python --version 2>&1
-      if ($ver -match "^Python\s+\d+\.\d+\.\d+") {
-        Write-Step "[2/5] Python already installed. Skipping."
-        return
-      }
-    } catch {}
+  if (-not (Test-Path $PYENV_HOME)) {
+    Write-Host "Cloning pyenv-win..."
+    Push-Location $PYENV_ROOT
+    try { & git clone https://github.com/pyenv-win/pyenv-win.git pyenv-win | Out-Host }
+    finally { Pop-Location }
   }
 
-  Write-Step "[2/5] Installing Python (Scoop)..."
-  scoop install python | Out-Host
+  $pyenvBat = Find-PyenvBat -BaseDir $PYENV_HOME
+  if (-not $pyenvBat) { throw "pyenv.bat not found under: $PYENV_HOME" }
 
-  if (Get-Command refreshenv -ErrorAction SilentlyContinue) {
-    refreshenv | Out-Null
-  }
+  $pyenvBin = Split-Path -Parent $pyenvBat
+  $pyenvWin = Split-Path -Parent $pyenvBin
+  $pyenvShims = Join-Path $pyenvWin "shims"
+  if (-not (Test-Path $pyenvShims)) { New-Item -ItemType Directory -Path $pyenvShims | Out-Null }
 
-  Assert-NotWindowsAppsPython
+  # Set recommended env vars (root fix)
+  Set-UserEnv "PYENV" $pyenvBat
+  Set-UserEnv "PYENV_ROOT" $pyenvWin
+  Set-UserEnv "PYENV_HOME" $pyenvWin
 
-  $ver2 = & python --version 2>&1
-  if ($ver2 -notmatch "^Python\s+\d+\.\d+\.\d+") {
-    throw "Python installation did not result in a working python.exe. Output: $ver2"
-  }
-}
+  Add-ToUserPath $pyenvBin
+  Add-ToUserPath $pyenvShims
 
-function New-Venv([string]$ProjectDir) {
-  $venvPath = Join-Path $ProjectDir ".venv"
-  Write-Step "[3/5] Creating virtual environment at $venvPath ..."
-
-  & python -m venv $venvPath
-
-  $venvPython = Join-Path $venvPath "Scripts\python.exe"
-  if (-not (Test-Path $venvPython)) {
-    throw "venv python not found: $venvPython"
-  }
+  $v = (& $pyenvBat --version) 2>$null
+  Write-Host "pyenv: $v"
 
   return @{
-    VenvPath   = $venvPath
-    VenvPython = $venvPython
+    PyenvBat = $pyenvBat
+    PyenvBin = $pyenvBin
+    PyenvWin = $pyenvWin
+    PyenvShims = $pyenvShims
   }
+}
+
+function Get-AvailableVersions([string]$PyenvBat) {
+  # Normalizes the list output to version tokens
+  $raw = (& $PyenvBat install --list) 2>$null
+  if (-not $raw) { return @() }
+
+  $vers = @()
+  foreach ($line in ($raw -split "`r?`n")) {
+    $t = $line.Trim()
+    if ($t -match "^\\d+\\.\\d+\\.\\d+$") { $vers += $t }
+  }
+  return $vers
+}
+
+function Select-PythonVersion([string]$PyenvBat) {
+  $vers = Get-AvailableVersions -PyenvBat $PyenvBat
+  if (-not $vers -or $vers.Count -eq 0) {
+    throw "pyenv install --list returned no parsable versions."
+  }
+
+  if ($vers -contains $DESIRED_PYTHON_VERSION) {
+    return $DESIRED_PYTHON_VERSION
+  }
+
+  # fallback: choose max version within 3.13.*
+  $cands = $vers | Where-Object { $_.StartsWith($DESIRED_SERIES) }
+  if (-not $cands -or $cands.Count -eq 0) {
+    throw "Desired series '$DESIRED_SERIES' is not available in pyenv definitions. Please choose another version series."
+  }
+
+  # Parse semantic versions and choose the latest
+  $parsed = $cands | ForEach-Object {
+    $p = $_.Split('.')
+    [PSCustomObject]@{ v=$_; major=[int]$p[0]; minor=[int]$p[1]; patch=[int]$p[2] }
+  } | Sort-Object major, minor, patch -Descending
+
+  return ($parsed | Select-Object -First 1).v
+}
+
+function Fix-PythonVersionFile([string]$ProjectDir, [string]$Version) {
+  $pv = Join-Path $ProjectDir ".python-version"
+  Set-Content -Path $pv -Value $Version -Encoding ASCII
+}
+
+function Ensure-PythonPinned([string]$ProjectDir, [string]$PyenvBat) {
+  Write-Step "[2/7] Selecting installable Python version..."
+  $chosen = Select-PythonVersion -PyenvBat $PyenvBat
+
+  if ($chosen -ne $DESIRED_PYTHON_VERSION) {
+    Write-Warning "Requested $DESIRED_PYTHON_VERSION is not available in pyenv definitions. Falling back to latest available $DESIRED_SERIES*: $chosen"
+  } else {
+    Write-Host "Using requested Python version: $chosen"
+  }
+
+  Write-Step "[3/7] Installing Python $chosen via pyenv-win..."
+  Fix-PythonVersionFile -ProjectDir $ProjectDir -Version $chosen
+
+  $installed = (& $PyenvBat versions --bare) 2>$null
+  if (-not ($installed -contains $chosen)) {
+    & $PyenvBat install $chosen | Out-Host
+  } else {
+    Write-Host "Python $chosen already installed."
+  }
+
+  Push-Location $ProjectDir
+  try {
+    & $PyenvBat local $chosen | Out-Null
+    & $PyenvBat rehash | Out-Null
+  } finally { Pop-Location }
+
+  $pyPath = (& $PyenvBat which python) 2>&1
+  if (-not $pyPath -or ($pyPath -notmatch "python\\.exe$") -or -not (Test-Path $pyPath)) {
+    throw "pyenv which python failed. Output: $pyPath"
+  }
+
+  $ver = & $pyPath --version 2>&1
+  if ($ver -notmatch ("Python\\s+" + [regex]::Escape($chosen))) {
+    throw "Resolved python is not $chosen. Got: $ver (`$pyPath=$pyPath)"
+  }
+
+  return @{ PythonPath = $pyPath; Version = $chosen }
+}
+
+function Remove-ExistingVenv([string]$ProjectDir) {
+  $venv = Join-Path $ProjectDir ".venv"
+  if (Test-Path $venv) {
+    Write-Step "[4/7] Removing existing venv..."
+    Remove-Item $venv -Recurse -Force
+  }
+}
+
+function New-Venv([string]$ProjectDir, [string]$PythonPath) {
+  $venvPath = Join-Path $ProjectDir ".venv"
+  Write-Step "[5/7] Creating venv at $venvPath ..."
+  & $PythonPath -m venv $venvPath
+  $venvPython = Join-Path $venvPath "Scripts\\python.exe"
+  if (-not (Test-Path $venvPython)) { throw "venv python not found: $venvPython" }
+  return @{ VenvPath=$venvPath; VenvPython=$venvPython }
 }
 
 function Install-Project([string]$ProjectDir, [string]$VenvPython) {
-  Write-Step "[4/5] (Skip) Activating virtual environment..."
-
-  Write-Step "[5/5] Installing JusticePDF..."
+  Write-Step "[6/7] Installing JusticePDF (editable) ..."
   & $VenvPython -m ensurepip --upgrade | Out-Host
-  & $VenvPython -m pip install --upgrade pip | Out-Host
+#  & $VenvPython -m pip install --upgrade pip | Out-Host
   & $VenvPython -m pip install -e $ProjectDir | Out-Host
 }
 
-# -------------------------
-# Shortcut helpers
-# -------------------------
-
 function Create-Shortcut([string]$ShortcutPath, [string]$ProjectDir) {
-  $Pythonw = Join-Path $ProjectDir ".venv\Scripts\pythonw.exe"
-
-  if (-not (Test-Path $Pythonw)) {
-    Write-Warning "Shortcut skipped: pythonw.exe not found: $Pythonw"
-    return
-  }
-
-  try {
-    $WshShell = New-Object -ComObject WScript.Shell
-    $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-    $Shortcut.TargetPath = $Pythonw
-    $Shortcut.Arguments = "-m src.main"
-    $Shortcut.WorkingDirectory = $ProjectDir
-    $Shortcut.IconLocation = $Pythonw
-    $Shortcut.Save()
-    Write-Host "Created shortcut: $ShortcutPath"
-  } catch {
-    Write-Warning "Failed to create shortcut: $ShortcutPath"
-    Write-Warning "Details: $($_.Exception.Message)"
-  }
+  $Pythonw = Join-Path $ProjectDir ".venv\\Scripts\\pythonw.exe"
+  if (-not (Test-Path $Pythonw)) { Write-Warning "Shortcut skipped: pythonw.exe not found: $Pythonw"; return }
+  $WshShell = New-Object -ComObject WScript.Shell
+  $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
+  $Shortcut.TargetPath = $Pythonw
+  $Shortcut.Arguments = "-m src.main"
+  $Shortcut.WorkingDirectory = $ProjectDir
+  $Shortcut.IconLocation = $Pythonw
+  $Shortcut.Save()
 }
 
 function Create-Shortcuts([string]$ProjectDir) {
-  # Desktop
+  Write-Step "[7/7] Creating shortcuts..."
   $Desktop = [Environment]::GetFolderPath("Desktop")
-  $DesktopShortcut = Join-Path $Desktop "JusticePDF.lnk"
-  Create-Shortcut -ShortcutPath $DesktopShortcut -ProjectDir $ProjectDir
-
-  # Project folder (same as install.ps1)
-  $ProjectShortcut = Join-Path $ProjectDir "JusticePDF.lnk"
-  Create-Shortcut -ShortcutPath $ProjectShortcut -ProjectDir $ProjectDir
+  Create-Shortcut -ShortcutPath (Join-Path $Desktop "JusticePDF.lnk") -ProjectDir $ProjectDir
+  Create-Shortcut -ShortcutPath (Join-Path $ProjectDir "JusticePDF.lnk") -ProjectDir $ProjectDir
 }
 
 # -------------------------
 # Main
 # -------------------------
 
-$OriginalDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-Write-Step "=== Install Scoop, Python, venv, and JusticePDF ==="
-Write-Step "[PRE] Original directory saved: $OriginalDir"
-Write-Step "[PRE] Switching to user home directory..."
-Set-Location $HOME
-Write-Host "Current directory: $(Get-Location)"
+Write-Step "=== Root-fix install: pyenv-win official + Python $DESIRED_PYTHON_VERSION (fallback to latest $DESIRED_SERIES*) + venv + JusticePDF ==="
+Write-Host "ProjectDir: $ProjectDir"
+Write-Host "PYENV_HOME: $PYENV_HOME"
 
-Ensure-Scoop
-Update-ScoopMinimal
-Ensure-Git
-Ensure-Python
+$pyenvInfo = Ensure-PyenvWinLatest
 
-Set-Location $OriginalDir
+Remove-ExistingVenv -ProjectDir $ProjectDir
+$pinned = Ensure-PythonPinned -ProjectDir $ProjectDir -PyenvBat $pyenvInfo.PyenvBat
 
-$venvInfo = New-Venv -ProjectDir $OriginalDir
-Install-Project -ProjectDir $OriginalDir -VenvPython $venvInfo.VenvPython
+$venvInfo = New-Venv -ProjectDir $ProjectDir -PythonPath $pinned.PythonPath
+Install-Project -ProjectDir $ProjectDir -VenvPython $venvInfo.VenvPython
+Create-Shortcuts -ProjectDir $ProjectDir
 
 Write-Host ""
 Write-Host "=== Done ==="
-Write-Host "Run (without activation):"
-Write-Host "  $($venvInfo.VenvPython) -m src.main"
+Write-Host "Pinned:"
+Write-Host "  Python requested: $DESIRED_PYTHON_VERSION"
+Write-Host "  Python installed: $($pinned.Version)"
+Write-Host "  pyenv          : $($pyenvInfo.PyenvBat)"
+Write-Host "  venv           : $($venvInfo.VenvPath)"
 Write-Host ""
-Write-Host "Or activate manually if available:"
-Write-Host "  .\.venv\Scripts\Activate.ps1"
-
-Create-Shortcuts -ProjectDir $OriginalDir
+Write-Host "Run:"
+Write-Host "  $($venvInfo.VenvPython) -m src.main"

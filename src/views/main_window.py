@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QToolBar, QPushButton, QScrollArea, QGridLayout,
     QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand, QProgressDialog
 )
-from PyQt6.QtCore import Qt, QSize, QTimer
+from PyQt6.QtCore import Qt, QSize, QTimer, QEvent
 from PyQt6.QtGui import QAction, QKeySequence
 from send2trash import send2trash
 
@@ -38,6 +38,10 @@ class MainWindow(QMainWindow):
     Displays PDF files as cards in a grid layout.
     """
 
+    PREVIEW_THUMB_MIN = 80
+    PREVIEW_THUMB_MAX = 400
+    PREVIEW_THUMB_STEP = 20
+
     def __init__(self):
         super().__init__()
         self._cards: list[PDFCard] = []
@@ -52,6 +56,9 @@ class MainWindow(QMainWindow):
         self._pending_rename_new_to_old: dict[str, str] = {}
         self._pending_rename_removed: set[str] = set()
         self._pending_rename_added: set[str] = set()
+        self._preview_thumb_size = PDFCard.THUMBNAIL_SIZE
+        self._preview_card_ratio = PDFCard.CARD_WIDTH / PDFCard.THUMBNAIL_SIZE
+        self._preview_card_width = int(round(self._preview_thumb_size * self._preview_card_ratio))
 
         # Debounce file modified events (path -> single-shot timer)
         self._modified_timers: dict[str, QTimer] = {}
@@ -106,6 +113,7 @@ class MainWindow(QMainWindow):
         self._scroll_area = QScrollArea()
         self._scroll_area.setWidgetResizable(True)
         self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll_area.viewport().installEventFilter(self)
         layout.addWidget(self._scroll_area)
 
         self._container = QWidget()
@@ -339,7 +347,11 @@ class MainWindow(QMainWindow):
 
     def _add_card(self, pdf_path: str, insert_index: int | None = None) -> PDFCard:
         """Add a new card for a PDF file."""
-        card = PDFCard(pdf_path)
+        card = PDFCard(
+            pdf_path,
+            card_width=self._preview_card_width,
+            thumb_size=self._preview_thumb_size,
+        )
         card.clicked.connect(self._on_card_clicked)
         card.double_clicked.connect(self._on_card_double_clicked)
         card.dropped_on.connect(self._on_card_merge)
@@ -365,7 +377,11 @@ class MainWindow(QMainWindow):
         # Create new cards for existing files
         for path in paths:
             if os.path.exists(path):
-                card = PDFCard(path)
+                card = PDFCard(
+                    path,
+                    card_width=self._preview_card_width,
+                    thumb_size=self._preview_thumb_size,
+                )
                 card.clicked.connect(self._on_card_clicked)
                 card.double_clicked.connect(self._on_card_double_clicked)
                 card.dropped_on.connect(self._on_card_merge)
@@ -405,7 +421,7 @@ class MainWindow(QMainWindow):
         usable = max(1, int(available_width) - int(m.left() + m.right()))
 
         # n*W + (n-1)*S <= usable  => cols = floor((usable + S) / (W + S))
-        w = int(PDFCard.CARD_WIDTH)
+        w = int(self._preview_card_width)
         cols = max(1, int((usable + spacing) // (w + spacing)))
         
         for i, card in enumerate(self._cards):
@@ -431,6 +447,28 @@ class MainWindow(QMainWindow):
             card.set_selected(False)
         self._selected_cards.clear()
         self._update_button_states()
+
+    def _set_preview_thumb_size(self, size: int) -> None:
+        size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
+        if size == self._preview_thumb_size:
+            return
+        self._preview_thumb_size = size
+        self._preview_card_width = int(round(self._preview_thumb_size * self._preview_card_ratio))
+        for card in self._cards:
+            card.set_preview_size(self._preview_card_width, self._preview_thumb_size)
+        self._refresh_grid()
+
+    def eventFilter(self, obj, event) -> bool:
+        scroll_area = getattr(self, "_scroll_area", None)
+        if scroll_area and obj is scroll_area.viewport() and event.type() == QEvent.Type.Wheel:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                delta = event.angleDelta().y()
+                if delta != 0:
+                    step = self.PREVIEW_THUMB_STEP if delta > 0 else -self.PREVIEW_THUMB_STEP
+                    self._set_preview_thumb_size(self._preview_thumb_size + step)
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
 
     def mousePressEvent(self, event) -> None:
         """Handle mouse press - clear selection when clicking empty area or start rubber band."""
@@ -1523,7 +1561,11 @@ class MainWindow(QMainWindow):
             
             # Add cards for copied files
             for i, new_path in enumerate(copied_paths):
-                card = PDFCard(new_path)
+                card = PDFCard(
+                    new_path,
+                    card_width=self._preview_card_width,
+                    thumb_size=self._preview_thumb_size,
+                )
                 card.clicked.connect(self._on_card_clicked)
                 card.double_clicked.connect(self._on_card_double_clicked)
                 card.dropped_on.connect(self._on_card_merge)

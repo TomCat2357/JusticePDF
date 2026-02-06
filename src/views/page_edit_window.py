@@ -30,7 +30,7 @@ class PageThumbnail(QFrame):
     clicked = pyqtSignal(object)
     THUMBNAIL_SIZE = 120
 
-    def __init__(self, pdf_path: str, page_num: int, display_num: int = None, parent=None):
+    def __init__(self, pdf_path: str, page_num: int, display_num: int = None, parent=None, *, thumb_size: int | None = None):
         super().__init__(parent)
         self._pdf_path = pdf_path
         self._page_num = page_num
@@ -38,12 +38,13 @@ class PageThumbnail(QFrame):
         self._is_selected = False
         self._explicitly_hidden = False
         self._drag_start_pos = None
+        self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
         self.setAcceptDrops(True)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
         """Set up the thumbnail UI."""
-        self.setFixedSize(self.THUMBNAIL_SIZE + 10, self.THUMBNAIL_SIZE + 30)
+        self.setFixedSize(self._thumb_size + 10, self._thumb_size + 30)
         self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
 
         layout = QVBoxLayout(self)
@@ -51,7 +52,7 @@ class PageThumbnail(QFrame):
         layout.setSpacing(2)
 
         self._image_label = QLabel()
-        self._image_label.setFixedSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE)
+        self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._image_label.setStyleSheet("background-color: #f0f0f0;")
         layout.addWidget(self._image_label)
@@ -65,7 +66,7 @@ class PageThumbnail(QFrame):
 
     def _load_thumbnail(self) -> None:
         """Load the page thumbnail."""
-        pixmap = get_page_thumbnail(self._pdf_path, self._page_num, self.THUMBNAIL_SIZE)
+        pixmap = get_page_thumbnail(self._pdf_path, self._page_num, self._thumb_size)
         if not pixmap.isNull():
             self._image_label.setPixmap(pixmap)
 
@@ -90,6 +91,13 @@ class PageThumbnail(QFrame):
 
     def refresh(self) -> None:
         self._load_thumbnail()
+
+    def set_thumbnail_size(self, size: int) -> None:
+        self._thumb_size = int(size)
+        self.setFixedSize(self._thumb_size + 10, self._thumb_size + 30)
+        self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
+        self._load_thumbnail()
+        self.updateGeometry()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -409,6 +417,9 @@ class PageEditWindow(QMainWindow):
     ZOOM_MIN = 25
     ZOOM_MAX = 400
     ZOOM_STEP = 5
+    PREVIEW_THUMB_MIN = 80
+    PREVIEW_THUMB_MAX = 400
+    PREVIEW_THUMB_STEP = 20
 
     def __init__(self, pdf_path: str, undo_manager: UndoManager, parent=None):
         super().__init__(parent)
@@ -427,6 +438,7 @@ class PageEditWindow(QMainWindow):
         self._zoom_page_num = None
         self._zoom_factor = 1.0
         self._zoom_text_cache: dict[int, tuple[list[tuple], list[dict]]] = {}
+        self._thumb_size = PageThumbnail.THUMBNAIL_SIZE
 
         # Drop indicator
         self._drop_indicator = None
@@ -455,6 +467,7 @@ class PageEditWindow(QMainWindow):
 
         self._grid_scroll = QScrollArea()
         self._grid_scroll.setWidgetResizable(True)
+        self._grid_scroll.viewport().installEventFilter(self)
         layout.addWidget(self._grid_scroll)
 
         self._container = QWidget()
@@ -675,7 +688,7 @@ class PageEditWindow(QMainWindow):
             self._zoom_page_num = max(0, page_count - 1)
 
         for i in range(page_count):
-            thumb = PageThumbnail(self._pdf_path, i)
+            thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
             thumb.clicked.connect(self._on_thumbnail_clicked)
             self._thumbnails.append(thumb)
 
@@ -706,7 +719,7 @@ class PageEditWindow(QMainWindow):
         m = self._grid_layout.contentsMargins()
         usable = max(1, int(available_width) - int(m.left() + m.right()))
 
-        w = int(PageThumbnail.THUMBNAIL_SIZE)
+        w = int(self._thumb_size)
         cols = max(1, int((usable + spacing) // (w + spacing)))
 
         visible_thumbs = [t for t in self._thumbnails if not t._explicitly_hidden]
@@ -761,6 +774,29 @@ class PageEditWindow(QMainWindow):
             thumb.set_selected(False)
         self._selected_thumbnails.clear()
         self._update_button_states()
+
+    def _set_thumbnail_size(self, size: int) -> None:
+        size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
+        if size == self._thumb_size:
+            return
+        self._thumb_size = size
+        for thumb in self._thumbnails:
+            thumb.set_thumbnail_size(self._thumb_size)
+        self._refresh_grid()
+
+    def eventFilter(self, obj, event) -> bool:
+        grid_scroll = getattr(self, "_grid_scroll", None)
+        if grid_scroll and obj is grid_scroll.viewport() and event.type() == QEvent.Type.Wheel:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                if self._zoom_view and self._zoom_view.isVisible():
+                    return False
+                delta = event.angleDelta().y()
+                if delta != 0:
+                    step = self.PREVIEW_THUMB_STEP if delta > 0 else -self.PREVIEW_THUMB_STEP
+                    self._set_thumbnail_size(self._thumb_size + step)
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
 
     def hide_page(self, page_num: int) -> None:
         for thumb in self._thumbnails:

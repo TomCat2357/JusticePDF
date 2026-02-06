@@ -1,7 +1,7 @@
 """PDF card widget for displaying PDF files."""
 import os
 from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel, QApplication, QWidget
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QUrl
 from PyQt6.QtGui import QDrag, QPixmap
 from src.utils.pdf_utils import get_pdf_card_info
 
@@ -22,13 +22,15 @@ class PDFCard(QFrame):
     CARD_WIDTH = 150
     THUMBNAIL_SIZE = 120
 
-    def __init__(self, pdf_path: str, parent=None):
+    def __init__(self, pdf_path: str, parent=None, *, card_width: int | None = None, thumb_size: int | None = None):
         super().__init__(parent)
         self._pdf_path = pdf_path
         self._is_selected = False
         self._is_locked = False
         self._page_count = 0
         self._drag_start_pos = None
+        self._card_width = int(card_width) if card_width is not None else self.CARD_WIDTH
+        self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
         self.setAcceptDrops(True)
 
         self._setup_ui()
@@ -36,7 +38,7 @@ class PDFCard(QFrame):
 
     def _setup_ui(self) -> None:
         """Set up the card UI."""
-        self.setFixedWidth(self.CARD_WIDTH)
+        self.setFixedWidth(self._card_width)
         self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
         self.setLineWidth(1)
 
@@ -45,26 +47,26 @@ class PDFCard(QFrame):
         layout.setSpacing(5)
 
         # Thumbnail container with page count overlay
-        thumbnail_container = QWidget()
-        thumbnail_container.setFixedSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE)
+        self._thumbnail_container = QWidget()
+        self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
         
         # Thumbnail
-        self._thumbnail_label = QLabel(thumbnail_container)
-        self._thumbnail_label.setFixedSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE)
+        self._thumbnail_label = QLabel(self._thumbnail_container)
+        self._thumbnail_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._thumbnail_label.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
         self._thumbnail_label.move(0, 0)
 
         # Page count overlay (top-right of thumbnail)
-        self._page_count_label = QLabel("0p", thumbnail_container)
+        self._page_count_label = QLabel("0p", self._thumbnail_container)
         self._page_count_label.setStyleSheet(
             "background-color: rgba(0, 0, 0, 0.7); color: white; padding: 2px 5px; border-radius: 3px; font-size: 11px;"
         )
         self._page_count_label.adjustSize()
-        self._page_count_label.move(self.THUMBNAIL_SIZE - self._page_count_label.width() - 3, 3)
+        self._page_count_label.move(self._thumb_size - self._page_count_label.width() - 3, 3)
         self._page_count_label.raise_()
 
-        layout.addWidget(thumbnail_container, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._thumbnail_container, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Filename only (no page count below)
         self._filename_label = QLabel()
@@ -76,7 +78,7 @@ class PDFCard(QFrame):
 
     def _load_pdf_info(self) -> None:
         """Load PDF information and thumbnail."""
-        thumbnail, page_count = get_pdf_card_info(self._pdf_path, self.THUMBNAIL_SIZE)
+        thumbnail, page_count = get_pdf_card_info(self._pdf_path, self._thumb_size)
 
         # Thumbnail
         if not thumbnail.isNull():
@@ -91,7 +93,7 @@ class PDFCard(QFrame):
         self._page_count_label.setText(f"{self._page_count}p")
         self._page_count_label.adjustSize()
         # Reposition to top-right after text change
-        self._page_count_label.move(self.THUMBNAIL_SIZE - self._page_count_label.width() - 3, 3)
+        self._page_count_label.move(self._thumb_size - self._page_count_label.width() - 3, 3)
 
         # Filename
         self._filename_label.setText(os.path.basename(self._pdf_path))
@@ -149,6 +151,16 @@ class PDFCard(QFrame):
         self._is_locked = locked
         self._update_style()
 
+    def set_preview_size(self, card_width: int, thumb_size: int) -> None:
+        """Update card and thumbnail sizes (for Ctrl+wheel preview zoom)."""
+        self._card_width = int(card_width)
+        self._thumb_size = int(thumb_size)
+        self.setFixedWidth(self._card_width)
+        self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
+        self._thumbnail_label.setFixedSize(self._thumb_size, self._thumb_size)
+        self._load_pdf_info()
+        self.updateGeometry()
+
     def refresh(self) -> None:
         """Refresh the card display."""
         self._load_pdf_info()
@@ -191,6 +203,9 @@ class PDFCard(QFrame):
         mime_data = QMimeData()
         data = '|'.join(selected_paths).encode('utf-8')
         mime_data.setData(PDFCARD_MIME_TYPE, data)
+        urls = [QUrl.fromLocalFile(p) for p in selected_paths if os.path.exists(p)]
+        if urls:
+            mime_data.setUrls(urls)
         drag.setMimeData(mime_data)
 
         # Create drag pixmap
@@ -217,7 +232,8 @@ class PDFCard(QFrame):
         drag.setPixmap(pixmap)
         drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
 
-        drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
+        # Export drag should always be copy (external drop).
+        drag.exec(Qt.DropAction.CopyAction)
 
     def mouseDoubleClickEvent(self, event) -> None:
         """Handle double-click events."""
