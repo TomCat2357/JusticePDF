@@ -1,210 +1,388 @@
-# install.ps1
-# JusticePDF installer (Windows / PowerShell)
-# - Scoop (optional install)
-# - Python (prefer Scoop Python; reject Microsoft Store alias python.exe)
-# - Create venv
-# - Install dependencies + editable install WITHOUT activation
-# - Create Desktop + Project folder shortcut
-#
-# NOTE:
-# - Do NOT run `scoop update *` (updates all apps like nodejs-lts, and may break due to unrelated packages).
-# - Update only Scoop itself + buckets, and (optionally) only the packages this installer cares about.
-
+#requires -Version 5.1
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Write-Step([string]$msg) {
-  Write-Host $msg
-}
-
-function Assert-NotWindowsAppsPython {
-  $cmd = Get-Command python -ErrorAction SilentlyContinue
-  if (-not $cmd) { return }
-
-  $src = $cmd.Source
-  if ($src -and $src -like "*\AppData\Local\Microsoft\WindowsApps\python.exe") {
-    Write-Host ""
-    Write-Host "ERROR: 'python' points to Microsoft Store App Execution Alias:" -ForegroundColor Red
-    Write-Host "  $src" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Fix (recommended):" -ForegroundColor Yellow
-    Write-Host "  Settings -> Apps -> Advanced app settings -> App execution aliases"
-    Write-Host "  Turn OFF: python.exe / python3.exe"
-    Write-Host ""
-    Write-Host "Then install real Python (recommended: Scoop):" -ForegroundColor Yellow
-    Write-Host "  scoop install python"
-    throw "Invalid python (WindowsApps alias)."
-  }
-}
-
-function Ensure-Scoop {
-  $scoop = Get-Command scoop -ErrorAction SilentlyContinue
-  if ($scoop) {
-    Write-Step "[1/5] Scoop already installed. Skipping."
-    return
-  }
-
-  Write-Step "[1/5] Installing Scoop..."
-  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  Invoke-Expression (Invoke-RestMethod -UseBasicParsing "https://get.scoop.sh")
-}
-
-function Update-ScoopMinimal {
-  Write-Host "Updating Scoop..."
-  try {
-    scoop update
-    Write-Host "Updating buckets..."
-    scoop bucket update
-    Write-Host "Scoop core/buckets updated successfully!"
-  } catch {
-    Write-Warning "Scoop update failed. Continuing. Details: $($_.Exception.Message)"
-  }
-}
-
-function Ensure-Git {
-  $git = Get-Command git -ErrorAction SilentlyContinue
-  if (-not $git) {
-    Write-Host "Installing git (Scoop)..."
-    try {
-      scoop install git | Out-Host
-    } catch {
-      Write-Warning "Failed to install git via Scoop. Continuing. Details: $($_.Exception.Message)"
+# Script directory (PS 5.1)
+$script:ScriptDir = $PSScriptRoot
+if (-not $script:ScriptDir -or $script:ScriptDir.Trim() -eq "")
+{
+    if ($PSCommandPath)
+    { $script:ScriptDir = Split-Path -Parent $PSCommandPath 
     }
-    return
-  }
-
-  try {
-    $ver = (& git --version) -replace '^git version\s+',''
-    Write-Host "WARN  'git' ($ver) is already installed."
-    Write-Host "Use 'scoop update git' to install a new version."
-  } catch {
-    Write-Host "WARN  'git' is already installed."
-    Write-Host "Use 'scoop update git' to install a new version."
-  }
+}
+if (-not $script:ScriptDir -or $script:ScriptDir.Trim() -eq "")
+{
+    throw "Could not determine script directory."
 }
 
-function Ensure-Python {
-  Assert-NotWindowsAppsPython
+# =========================
+# Config
+# =========================
+$ProjectName   = "JusticePDF"
+$PythonVersion = "3.13.11"
+$ScoopRoot     = Join-Path $env:USERPROFILE "scoop"
 
-  $python = Get-Command python -ErrorAction SilentlyContinue
-  if ($python) {
-    try {
-      $ver = & python --version 2>&1
-      if ($ver -match "^Python\s+\d+\.\d+\.\d+") {
-        Write-Step "[2/5] Python already installed. Skipping."
-        return
-      }
-    } catch {}
-  }
-
-  Write-Step "[2/5] Installing Python (Scoop)..."
-  scoop install python | Out-Host
-
-  if (Get-Command refreshenv -ErrorAction SilentlyContinue) {
-    refreshenv | Out-Null
-  }
-
-  Assert-NotWindowsAppsPython
-
-  $ver2 = & python --version 2>&1
-  if ($ver2 -notmatch "^Python\s+\d+\.\d+\.\d+") {
-    throw "Python installation did not result in a working python.exe. Output: $ver2"
-  }
+# =========================
+# Helpers
+# =========================
+function Write-Section([string]$Title)
+{
+    Write-Host ""
+    Write-Host ("=== " + $Title + " ===") -ForegroundColor Cyan
+}
+function Write-Info([string]$Msg)
+{ Write-Host ("[INFO] " + $Msg) -ForegroundColor Gray 
+}
+function Write-Ok([string]$Msg)
+{ Write-Host ("[OK]   " + $Msg) -ForegroundColor Green 
+}
+function Write-Warn([string]$Msg)
+{ Write-Host ("[WARN] " + $Msg) -ForegroundColor Yellow 
+}
+function Write-Err([string]$Msg)
+{ Write-Host ("[ERR]  " + $Msg) -ForegroundColor Red 
 }
 
-function New-Venv([string]$ProjectDir) {
-  $venvPath = Join-Path $ProjectDir ".venv"
-  Write-Step "[3/5] Creating virtual environment at $venvPath ..."
-
-  & python -m venv $venvPath
-
-  $venvPython = Join-Path $venvPath "Scripts\python.exe"
-  if (-not (Test-Path $venvPython)) {
-    throw "venv python not found: $venvPython"
-  }
-
-  return @{
-    VenvPath   = $venvPath
-    VenvPython = $venvPython
-  }
+function Has-Command([string]$Name)
+{
+    return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
-function Install-Project([string]$ProjectDir, [string]$VenvPython) {
-  Write-Step "[4/5] (Skip) Activating virtual environment..."
-
-  Write-Step "[5/5] Installing JusticePDF..."
-  & $VenvPython -m ensurepip --upgrade | Out-Host
-  & $VenvPython -m pip install --upgrade pip | Out-Host
-  & $VenvPython -m pip install -e $ProjectDir | Out-Host
+function Set-EnvVar([string]$Name, [string]$Value)
+{
+    Set-Item -Path ("Env:" + $Name) -Value $Value
 }
 
-# -------------------------
-# Shortcut helpers
-# -------------------------
+function Refresh-ProcessPath
+{
+    $machine = [Environment]::GetEnvironmentVariable("Path", "Machine"); if ($null -eq $machine)
+    { $machine = "" 
+    }
+    $user    = [Environment]::GetEnvironmentVariable("Path", "User");    if ($null -eq $user)
+    { $user = "" 
+    }
+    Set-EnvVar "Path" ($machine + ";" + $user)
+}
 
-function Create-Shortcut([string]$ShortcutPath, [string]$ProjectDir) {
-  $Pythonw = Join-Path $ProjectDir ".venv\Scripts\pythonw.exe"
+function Append-PathOnce([string]$Dir)
+{
+    if (-not $Dir)
+    { return 
+    }
+    $cur = [Environment]::GetEnvironmentVariable("Path", "Process")
+    if ($null -eq $cur)
+    { $cur = "" 
+    }
+    $parts = $cur -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+    if ($parts -notcontains $Dir)
+    {
+        Set-EnvVar "Path" (($parts + $Dir) -join ';')
+    }
+}
 
-  if (-not (Test-Path $Pythonw)) {
-    Write-Warning "Shortcut skipped: pythonw.exe not found: $Pythonw"
-    return
-  }
-
-  try {
+function Create-Shortcut([string]$ShortcutPath, [string]$TargetPath, [string]$Arguments, [string]$WorkingDir)
+{
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-    $Shortcut.TargetPath = $Pythonw
-    $Shortcut.Arguments = "-m src.main"
-    $Shortcut.WorkingDirectory = $ProjectDir
-    $Shortcut.IconLocation = $Pythonw
+    $Shortcut.TargetPath = $TargetPath
+    $Shortcut.Arguments = $Arguments
+    $Shortcut.WorkingDirectory = $WorkingDir
     $Shortcut.Save()
-    Write-Host "Created shortcut: $ShortcutPath"
-  } catch {
-    Write-Warning "Failed to create shortcut: $ShortcutPath"
-    Write-Warning "Details: $($_.Exception.Message)"
-  }
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($WshShell) | Out-Null
 }
 
-function Create-Shortcuts([string]$ProjectDir) {
-  # Desktop
-  $Desktop = [Environment]::GetFolderPath("Desktop")
-  $DesktopShortcut = Join-Path $Desktop "JusticePDF.lnk"
-  Create-Shortcut -ShortcutPath $DesktopShortcut -ProjectDir $ProjectDir
+# =========================
+# Scoop
+# =========================
+function Ensure-Scoop
+{
+    Write-Section "Ensure Scoop"
 
-  # Project folder (same as install.ps1)
-  $ProjectShortcut = Join-Path $ProjectDir "JusticePDF.lnk"
-  Create-Shortcut -ShortcutPath $ProjectShortcut -ProjectDir $ProjectDir
+    if (Has-Command "scoop")
+    {
+        $cmd = Get-Command scoop -ErrorAction SilentlyContinue
+        if ($cmd)
+        { Write-Ok ("Scoop is already available: " + $cmd.Source) 
+        }
+        return
+    }
+
+    Write-Info "Scoop not found. Installing..."
+    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
+
+    # Ensure TLS 1.2
+    try
+    { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 
+    } catch
+    {
+    }
+
+    Invoke-Expression (Invoke-RestMethod -UseBasicParsing "https://get.scoop.sh")
+    Refresh-ProcessPath
+
+    if (-not (Has-Command "scoop"))
+    {
+        throw "Scoop install failed. Ensure PowerShell can run scripts and internet is available."
+    }
+
+    Write-Ok "Scoop installed."
 }
 
-# -------------------------
+function Ensure-ScoopBucket([string]$BucketName)
+{
+    if (-not $BucketName -or $BucketName.Trim() -eq "")
+    { return 
+    }
+
+    # scoop bucket list はバージョンにより string ではなく PSCustomObject を返すことがある
+    $raw = $null
+    try
+    { $raw = & scoop bucket list 2>$null 
+    } catch
+    { $raw = $null 
+    }
+
+    $buckets = @()
+    if ($raw)
+    {
+        foreach ($b in $raw)
+        {
+            $s = if ($b -and $b.PSObject.Properties["Name"])
+            { $b.Name 
+            } else
+            { [string]$b 
+            }
+            $s = $s.Trim()
+            if ($s)
+            { $buckets += $s 
+            }
+        }
+    }
+
+    if ($buckets -contains $BucketName)
+    {
+        Write-Ok ("Bucket exists: " + $BucketName)
+        return
+    }
+
+    Write-Info ("Adding bucket: " + $BucketName)
+    & scoop bucket add $BucketName | Out-Host
+    Refresh-ProcessPath
+    Write-Ok ("Bucket added: " + $BucketName)
+}
+
+function Ensure-ScoopApp([string]$AppName, [string]$BucketName = $null)
+{
+    if ($BucketName)
+    { Ensure-ScoopBucket $BucketName 
+    }
+
+    # 文字列/オブジェクトどちらの出力でも成立するよう Out-String で判定
+    $listText = ""
+    try
+    { $listText = (& scoop list 2>$null | Out-String) 
+    } catch
+    { $listText = "" 
+    }
+
+    if ($listText -match ("(?m)^\s*" + [Regex]::Escape($AppName) + "\s"))
+    {
+        Write-Ok ("Already installed: " + $AppName)
+        return
+    }
+
+    Write-Info ("Installing: " + $AppName)
+    & scoop install $AppName | Out-Host
+    Refresh-ProcessPath
+    Write-Ok ("Installed: " + $AppName)
+}
+
+# =========================
+# Python
+# =========================
+function Ensure-Python([string]$Version)
+{
+    Write-Section ("Ensure Python " + $Version)
+    $shimDir = Join-Path $ScoopRoot "shims"
+    Refresh-ProcessPath
+    Append-PathOnce $shimDir
+
+    Ensure-ScoopApp "python" "main"
+
+    # Try exact version manifest first (python@3.13.11), if available
+    try
+    {
+        $target = "python@" + $Version
+        $listText = (& scoop list 2>$null | Out-String)
+        if ($listText -notmatch ("(?m)^\s*" + [Regex]::Escape($target) + "\s"))
+        {
+            Write-Info ("Trying to install exact version: " + $target)
+            & scoop install $target | Out-Host
+            Refresh-ProcessPath
+            Append-PathOnce $shimDir
+        }
+    } catch
+    {
+        Write-Warn ("Could not install python@" + $Version + ". Will use installed python.")
+    }
+
+    if (-not (Has-Command "python"))
+    {
+        throw "python command not found after Scoop install."
+    }
+
+    $pythonList = (& scoop list python 2>$null | Out-String)
+    $verMatch = [Regex]::Match($pythonList, "(?m)^\s*python\s+([0-9][^\s]*)\s+")
+    $ver = $null
+    if ($verMatch.Success)
+    {
+        $ver = $verMatch.Groups[1].Value
+    }
+
+    if ($null -eq $ver -or $ver.Trim() -eq "")
+    {
+        Write-Warn "Could not detect python version from scoop list output."
+    } else
+    {
+        Write-Info ("python version (scoop): " + $ver)
+
+        # Optional strict check: enforce 3.13.11 exactly
+        if ($ver -notmatch [Regex]::Escape($Version))
+        {
+            Write-Warn ("Python version is not exactly " + $Version + ". (actual: " + $ver + ")")
+            # 必須にしたいなら次行を有効化:
+            # throw ("Python " + $Version + " is required but got: " + $ver)
+        }
+    }
+
+    # Ensure shims in PATH after PATH refresh.
+    Refresh-ProcessPath
+    Append-PathOnce $shimDir
+}
+
+function Ensure-Venv([string]$VenvDir)
+{
+    Write-Section ("Ensure venv " + $VenvDir)
+
+    $venvPath = Join-Path $script:ScriptDir $VenvDir
+    if (-not (Test-Path -LiteralPath $venvPath))
+    {
+        Write-Info "Creating venv..."
+        & python -m venv $venvPath | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "Failed to create venv: $venvPath" }
+        Write-Ok "venv created."
+    } else
+    {
+        Write-Ok "venv already exists."
+    }
+
+    $venvPython = Join-Path $venvPath "Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $venvPython))
+    {
+        throw "venv python not found: $venvPython"
+    }
+
+    Write-Info "Upgrading pip..."
+    & $venvPython -m pip install --upgrade pip | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Failed to upgrade pip in venv: $venvPython" }
+
+    return $venvPython
+}
+
+function Install-ProjectDeps([string]$VenvPython)
+{
+    Write-Section "Install project dependencies"
+
+    $pyproject = Join-Path $script:ScriptDir "pyproject.toml"
+    if (-not (Test-Path -LiteralPath $pyproject))
+    {
+        Write-Warn "pyproject.toml not found. Skipping dependency install."
+        return
+    }
+
+    $tempRoot = $env:TEMP
+    if (-not $tempRoot -or $tempRoot.Trim() -eq "")
+    {
+        $tempRoot = [System.IO.Path]::GetTempPath()
+    }
+
+    $pipTempDir = Join-Path $tempRoot "JusticePDF\pip"
+    if (-not (Test-Path -LiteralPath $pipTempDir))
+    {
+        New-Item -Path $pipTempDir -ItemType Directory -Force | Out-Null
+    }
+
+    $oldTmp = [Environment]::GetEnvironmentVariable("TMP", "Process")
+    $oldTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
+
+    Write-Info "Installing project (editable) and deps from pyproject.toml..."
+    Write-Info ("Temporary pip dir: " + $pipTempDir)
+    try
+    {
+        Set-EnvVar "TMP" $pipTempDir
+        Set-EnvVar "TEMP" $pipTempDir
+
+        & $VenvPython -m pip install -e . | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "Failed to install project dependencies." }
+    } finally
+    {
+        if ($null -eq $oldTmp)
+        { Remove-Item -Path Env:TMP -ErrorAction SilentlyContinue
+        } else
+        { Set-EnvVar "TMP" $oldTmp
+        }
+
+        if ($null -eq $oldTemp)
+        { Remove-Item -Path Env:TEMP -ErrorAction SilentlyContinue
+        } else
+        { Set-EnvVar "TEMP" $oldTemp
+        }
+
+        Remove-Item -LiteralPath $pipTempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Ok "Dependencies installed."
+}
+
+# =========================
 # Main
-# -------------------------
+# =========================
+try
+{
+    Write-Section ("Root-fix install: Scoop + Python " + $PythonVersion + " + venv + " + $ProjectName)
 
-$OriginalDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    Ensure-Scoop
 
-Write-Step "=== Install Scoop, Python, venv, and JusticePDF ==="
-Write-Step "[PRE] Original directory saved: $OriginalDir"
-Write-Step "[PRE] Switching to user home directory..."
-Set-Location $HOME
-Write-Host "Current directory: $(Get-Location)"
+    Write-Section "Install Git (Scoop)"
+    Ensure-ScoopApp "git" "main"
 
-Ensure-Scoop
-Update-ScoopMinimal
-Ensure-Git
-Ensure-Python
+    Ensure-Python $PythonVersion
 
-Set-Location $OriginalDir
+    $venvPython = Ensure-Venv ".venv"
+    Install-ProjectDeps $venvPython
 
-$venvInfo = New-Venv -ProjectDir $OriginalDir
-Install-Project -ProjectDir $OriginalDir -VenvPython $venvInfo.VenvPython
+    Write-Section "Create Shortcuts"
+    $pythonwPath = Join-Path $script:ScriptDir ".venv\Scripts\pythonw.exe"
+    $shortcutName = "JusticePDF.lnk"
 
-Write-Host ""
-Write-Host "=== Done ==="
-Write-Host "Run (without activation):"
-Write-Host "  $($venvInfo.VenvPython) -m src.main"
-Write-Host ""
-Write-Host "Or activate manually if available:"
-Write-Host "  .\.venv\Scripts\Activate.ps1"
+    # プロジェクトフォルダにショートカットを作成
+    $projectShortcut = Join-Path $script:ScriptDir $shortcutName
+    Create-Shortcut $projectShortcut $pythonwPath "-m src.main" $script:ScriptDir
+    Write-Ok ("Created: " + $projectShortcut)
 
-Create-Shortcuts -ProjectDir $OriginalDir
+    # デスクトップにショートカットを作成
+    $desktopPath = [Environment]::GetFolderPath("Desktop")
+    $desktopShortcut = Join-Path $desktopPath $shortcutName
+    Create-Shortcut $desktopShortcut $pythonwPath "-m src.main" $script:ScriptDir
+    Write-Ok ("Created: " + $desktopShortcut)
+
+    Write-Section "Done"
+    Write-Info ("venv python: " + $venvPython)
+    Write-Info "Activate: .\.venv\Scripts\Activate.ps1"
+
+} catch
+{
+    Write-Err $_.Exception.Message
+    Write-Err $_.ScriptStackTrace
+    exit 1
+}
