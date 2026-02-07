@@ -1551,7 +1551,7 @@ class MainWindow(QMainWindow):
                     ensure_unique_path(
                         Path(src_path).parent,
                         Path(src_path).name,
-                        pattern="{stem}_copy_{i}{ext}",
+                        pattern="{stem}_{i}{ext}",
                         use_original=False,
                     )
                 )
@@ -1784,7 +1784,7 @@ class MainWindow(QMainWindow):
                 ensure_unique_path(
                     self._work_dir,
                     Path(pdf_path).name,
-                    pattern="{stem}_pages_{i}{ext}",
+                    pattern="{stem}_{i}{ext}",
                     use_original=False,
                 )
             )
