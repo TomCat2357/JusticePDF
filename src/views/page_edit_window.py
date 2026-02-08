@@ -218,7 +218,7 @@ class ZoomPageWidget(QWidget):
 
     def sizeHint(self):
         if self._pixmap and not self._pixmap.isNull():
-            return self._pixmap.size()
+            return self._pixmap.deviceIndependentSize().toSize()
         return super().sizeHint()
 
     def set_page(self, pixmap, words, links, zoom_factor: float) -> None:
@@ -250,7 +250,7 @@ class ZoomPageWidget(QWidget):
         self._selection_active = False
         self._pressed_link = None
         if self._pixmap and not self._pixmap.isNull():
-            self.setMinimumSize(self._pixmap.size())
+            self.setMinimumSize(self._pixmap.deviceIndependentSize().toSize())
         else:
             self.setMinimumSize(0, 0)
         self.updateGeometry()
@@ -259,8 +259,9 @@ class ZoomPageWidget(QWidget):
     def _pixmap_offset(self) -> QPoint:
         if not self._pixmap or self._pixmap.isNull():
             return QPoint(0, 0)
-        x = max(0, (self.width() - self._pixmap.width()) // 2)
-        y = max(0, (self.height() - self._pixmap.height()) // 2)
+        logical_size = self._pixmap.deviceIndependentSize()
+        x = max(0, int((self.width() - logical_size.width()) / 2))
+        y = max(0, int((self.height() - logical_size.height()) / 2))
         return QPoint(x, y)
 
     def _point_in_pixmap(self, pos: QPoint) -> QPointF | None:
@@ -269,7 +270,8 @@ class ZoomPageWidget(QWidget):
         offset = self._pixmap_offset()
         x = pos.x() - offset.x()
         y = pos.y() - offset.y()
-        if x < 0 or y < 0 or x > self._pixmap.width() or y > self._pixmap.height():
+        logical_size = self._pixmap.deviceIndependentSize()
+        if x < 0 or y < 0 or x > logical_size.width() or y > logical_size.height():
             return None
         return QPointF(x, y)
 
@@ -298,7 +300,8 @@ class ZoomPageWidget(QWidget):
         offset = self._pixmap_offset()
         sel = QRectF(self._selection_rect.normalized())
         sel.translate(-offset.x(), -offset.y())
-        pix_bounds = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
+        logical_size = self._pixmap.deviceIndependentSize()
+        pix_bounds = QRectF(0, 0, logical_size.width(), logical_size.height())
         sel = sel.intersected(pix_bounds)
         if sel.isEmpty():
             self._selected_word_indices = []
@@ -1064,7 +1067,9 @@ class PageEditWindow(QMainWindow):
         if self._zoom_page_num >= page_count:
             self._exit_zoom_view()
             return
-        pixmap = get_page_pixmap(self._pdf_path, self._zoom_page_num, self._zoom_factor)
+        dpr = self._zoom_label.devicePixelRatioF()
+        pixmap = get_page_pixmap(self._pdf_path, self._zoom_page_num, self._zoom_factor * dpr)
+        pixmap.setDevicePixelRatio(dpr)
         words = []
         links = []
         if self._zoom_page_num in self._zoom_text_cache:
