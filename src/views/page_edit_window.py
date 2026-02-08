@@ -473,6 +473,10 @@ class PageEditWindow(QMainWindow):
         self._thumb_render_timer = QTimer(self)
         self._thumb_render_timer.setSingleShot(True)
         self._thumb_render_timer.timeout.connect(self._process_thumbnail_render_queue)
+        self._scroll_debounce_timer = QTimer(self)
+        self._scroll_debounce_timer.setSingleShot(True)
+        self._scroll_debounce_timer.setInterval(150)
+        self._scroll_debounce_timer.timeout.connect(self._enqueue_visible_thumbnail_renders)
 
         # Drop indicator
         self._drop_indicator = None
@@ -701,6 +705,7 @@ class PageEditWindow(QMainWindow):
 
     def _reset_thumbnail_render_queue(self) -> None:
         self._thumb_render_timer.stop()
+        self._scroll_debounce_timer.stop()
         self._thumb_render_queue.clear()
         self._thumb_render_queue_set.clear()
 
@@ -742,9 +747,21 @@ class PageEditWindow(QMainWindow):
             if thumb._explicitly_hidden or not thumb.isVisible():
                 continue
             if thumb.geometry().intersects(visible_rect):
-                visible_pages.append(page_num)
-        for page_num in reversed(visible_pages):
-            self._enqueue_thumbnail_render(page_num, priority=True)
+                if not thumb.thumbnail_loaded:
+                    visible_pages.append(page_num)
+        if not visible_pages:
+            self._schedule_thumbnail_render()
+            return
+        visible_set = set(visible_pages)
+        # キュー再構築: 表示中ページを先頭、残りをその後ろ
+        remaining = deque()
+        for pn in self._thumb_render_queue:
+            if pn not in visible_set:
+                remaining.append(pn)
+        new_queue = deque(visible_pages)
+        new_queue.extend(remaining)
+        self._thumb_render_queue = new_queue
+        self._thumb_render_queue_set = set(new_queue)
         self._schedule_thumbnail_render()
 
     def _enqueue_all_thumbnail_renders(self) -> None:
@@ -752,7 +769,7 @@ class PageEditWindow(QMainWindow):
             if thumb._explicitly_hidden:
                 continue
             self._enqueue_thumbnail_render(page_num)
-        self._schedule_thumbnail_render()
+        # 表示ページの優先化後にスケジュール開始（次のイベントループで）
         QTimer.singleShot(0, self._enqueue_visible_thumbnail_renders)
 
     def _request_thumbnail_refresh(self, page_num: int) -> None:
@@ -782,7 +799,7 @@ class PageEditWindow(QMainWindow):
         self._schedule_thumbnail_render()
 
     def _on_grid_viewport_changed(self, _value: int) -> None:
-        self._enqueue_visible_thumbnail_renders()
+        self._scroll_debounce_timer.start()  # デバウンス（スクロール停止150ms後に優先化）
 
     def _load_pages(self) -> None:
         self._reset_thumbnail_render_queue()
