@@ -887,6 +887,14 @@ class MainWindow(QMainWindow):
             if self._normalize_path(old_path) == self._normalize_path(new_path):
                 return
 
+            if os.path.exists(new_path):
+                new_path = str(ensure_unique_path(
+                    os.path.dirname(old_path),
+                    new_name,
+                    pattern="{stem}({i}){ext}",
+                    use_original=False,
+                ))
+
             def do_rename() -> None:
                 self._perform_rename(old_path, new_path)
 
@@ -983,7 +991,7 @@ class MainWindow(QMainWindow):
                     ensure_unique_path(
                         backup_dir,
                         os.path.basename(dest_path),
-                        pattern="{stem}_{i}{ext}",
+                        pattern="{stem}({i}){ext}",
                     )
                 )
                 shutil.copy2(dest_path, backup_path)
@@ -1016,7 +1024,7 @@ class MainWindow(QMainWindow):
     def _copy_pdf_into_workdir(self, src_path: str) -> str:
         """Copy a PDF into the work directory with unique name."""
         filename = os.path.basename(src_path)
-        dest_path = ensure_unique_path(self._work_dir, filename, pattern="{stem}_{i}{ext}")
+        dest_path = ensure_unique_path(self._work_dir, filename, pattern="{stem}({i}){ext}")
         dest_str = str(dest_path)
         self._register_internal_add([dest_str])
         try:
@@ -1029,7 +1037,7 @@ class MainWindow(QMainWindow):
     def _convert_office_to_pdf_into_workdir(self, src_path: str) -> str:
         """Convert Office document to PDF and place it in work directory."""
         base_name = os.path.splitext(os.path.basename(src_path))[0]
-        dest_path = ensure_unique_path(self._work_dir, f"{base_name}.pdf", pattern="{stem}_{i}{ext}")
+        dest_path = ensure_unique_path(self._work_dir, f"{base_name}.pdf", pattern="{stem}({i}){ext}")
         dest_str = str(dest_path)
         self._register_internal_add([dest_str])
 
@@ -1153,7 +1161,7 @@ class MainWindow(QMainWindow):
                     continue
 
                 filename = os.path.basename(src)
-                dst_path = ensure_unique_path(dst_dir, filename, pattern="{stem} ({i}){ext}")
+                dst_path = ensure_unique_path(dst_dir, filename, pattern="{stem}({i}){ext}")
                 shutil.copy2(src, dst_path)
                 ok += 1
             except Exception as e:
@@ -1551,7 +1559,7 @@ class MainWindow(QMainWindow):
                     ensure_unique_path(
                         Path(src_path).parent,
                         Path(src_path).name,
-                        pattern="{stem}_{i}{ext}",
+                        pattern="{stem}({i}){ext}",
                         use_original=False,
                     )
                 )
@@ -1784,7 +1792,7 @@ class MainWindow(QMainWindow):
                 ensure_unique_path(
                     self._work_dir,
                     Path(pdf_path).name,
-                    pattern="{stem}_{i}{ext}",
+                    pattern="{stem}({i}){ext}",
                     use_original=False,
                 )
             )
