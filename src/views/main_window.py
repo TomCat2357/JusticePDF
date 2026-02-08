@@ -13,10 +13,16 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand, QProgressDialog
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QPoint, QRect
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtGui import QKeySequence
 from send2trash import send2trash
 
 from src.views.pdf_card import PDFCard, PDFCARD_MIME_TYPE
+from src.views.view_helpers import (
+    clear_selection,
+    log_undo_state,
+    register_shortcuts,
+    viewport_width_or_fallback,
+)
 from src.controllers.folder_watcher import FolderWatcher
 from src.models.undo_manager import UndoManager, UndoAction
 from src.utils.pdf_utils import rotate_pages, get_page_count
@@ -198,35 +204,17 @@ class MainWindow(QMainWindow):
 
     def _setup_shortcuts(self) -> None:
         """Set up keyboard shortcuts."""
-        undo_action = QAction(self)
-        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
-        undo_action.triggered.connect(self._on_undo)
-        self.addAction(undo_action)
-
-        redo_action = QAction(self)
-        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
-        redo_action.triggered.connect(self._on_redo)
-        self.addAction(redo_action)
-
-        delete_action = QAction(self)
-        delete_action.setShortcut(QKeySequence.StandardKey.Delete)
-        delete_action.triggered.connect(self._on_delete)
-        self.addAction(delete_action)
-
-        rename_action = QAction(self)
-        rename_action.setShortcut(QKeySequence(Qt.Key.Key_F2))
-        rename_action.triggered.connect(self._on_rename)
-        self.addAction(rename_action)
-
-        select_all_action = QAction(self)
-        select_all_action.setShortcut(QKeySequence.StandardKey.SelectAll)
-        select_all_action.triggered.connect(self._on_select_all)
-        self.addAction(select_all_action)
-
-        export_action = QAction(self)
-        export_action.setShortcut(QKeySequence("Ctrl+E"))
-        export_action.triggered.connect(self._on_export)
-        self.addAction(export_action)
+        register_shortcuts(
+            self,
+            (
+                (QKeySequence.StandardKey.Undo, self._on_undo),
+                (QKeySequence.StandardKey.Redo, self._on_redo),
+                (QKeySequence.StandardKey.Delete, self._on_delete),
+                (QKeySequence(Qt.Key.Key_F2), self._on_rename),
+                (QKeySequence.StandardKey.SelectAll, self._on_select_all),
+                (QKeySequence("Ctrl+E"), self._on_export),
+            ),
+        )
 
     def _update_button_states(self) -> None:
         """Update toolbar button enabled states."""
@@ -240,17 +228,13 @@ class MainWindow(QMainWindow):
         self._export_btn.setEnabled(has_any)
 
     def _debug_undo_state(self, reason: str) -> None:
-        if not self._undo_btn or not self._redo_btn:
-            return
-        undo_color = "black" if self._undo_btn.isEnabled() else "gray"
-        redo_color = "black" if self._redo_btn.isEnabled() else "gray"
-        logger.debug(
-            "[UndoState][MainWindow] %s | undo=%s redo=%s undo_count=%s redo_count=%s",
-            reason,
-            undo_color,
-            redo_color,
-            self._undo_manager.undo_count(),
-            self._undo_manager.redo_count(),
+        log_undo_state(
+            logger=logger,
+            context_name="MainWindow",
+            reason=reason,
+            undo_button=self._undo_btn,
+            redo_button=self._redo_btn,
+            undo_manager=self._undo_manager,
         )
 
     def _on_undo_manager_changed(self, reason: str) -> None:
@@ -344,12 +328,11 @@ class MainWindow(QMainWindow):
 
     def _grid_available_width(self) -> int:
         """Width source for column calculation (always consistent)."""
-        # Use viewport width; it's stable and matches what the user actually sees.
-        w = int(self._scroll_area.viewport().width()) if hasattr(self, "_scroll_area") else 0
-        if w > 0:
-            return w
-        # Fallback (very early lifecycle). Once shown, showEvent will refresh again.
-        return int(self.width())
+        # Fallback is only for the very early lifecycle before viewport width is ready.
+        return viewport_width_or_fallback(
+            getattr(self, "_scroll_area", None),
+            self.width(),
+        )
 
     def _add_card(self, pdf_path: str, insert_index: int | None = None) -> PDFCard:
         """Add a new card for a PDF file."""
@@ -467,9 +450,7 @@ class MainWindow(QMainWindow):
 
     def _clear_selection(self) -> None:
         """Clear all selections."""
-        for card in self._selected_cards:
-            card.set_selected(False)
-        self._selected_cards.clear()
+        clear_selection(self._selected_cards)
         self._update_button_states()
 
     def _set_preview_thumb_size(self, size: int) -> None:

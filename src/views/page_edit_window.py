@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QToolButton, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl, QTimer, QEvent
-from PyQt6.QtGui import QAction, QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices, QPixmap
+from PyQt6.QtGui import QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices, QPixmap
 
 from src.utils.pdf_utils import (
     get_page_thumbnail, get_page_pixmap, get_page_words, get_page_links,
@@ -18,6 +18,12 @@ from src.utils.pdf_utils import (
     insert_pages, render_page_thumbnails_batch
 )
 from src.models.undo_manager import UndoManager, UndoAction
+from src.views.view_helpers import (
+    clear_selection,
+    log_undo_state,
+    register_shortcuts,
+    viewport_width_or_fallback,
+)
 
 PAGETHUMBNAIL_MIME_TYPE = "application/x-pdfas-page"
 PDFCARD_MIME_TYPE = "application/x-pdfas-card"
@@ -651,35 +657,17 @@ class PageEditWindow(QMainWindow):
         self._update_button_states()
 
     def _setup_shortcuts(self) -> None:
-        undo_action = QAction(self)
-        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
-        undo_action.triggered.connect(self._on_undo)
-        self.addAction(undo_action)
-
-        redo_action = QAction(self)
-        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
-        redo_action.triggered.connect(self._on_redo)
-        self.addAction(redo_action)
-
-        delete_action = QAction(self)
-        delete_action.setShortcut(QKeySequence.StandardKey.Delete)
-        delete_action.triggered.connect(self._on_delete)
-        self.addAction(delete_action)
-
-        rename_action = QAction(self)
-        rename_action.setShortcut(QKeySequence(Qt.Key.Key_F2))
-        rename_action.triggered.connect(self._on_rename)
-        self.addAction(rename_action)
-
-        select_all_action = QAction(self)
-        select_all_action.setShortcut(QKeySequence.StandardKey.SelectAll)
-        select_all_action.triggered.connect(self._on_select_all)
-        self.addAction(select_all_action)
-
-        rotate_action = QAction(self)
-        rotate_action.setShortcut(QKeySequence(Qt.Key.Key_R))
-        rotate_action.triggered.connect(self._on_rotate)
-        self.addAction(rotate_action)
+        register_shortcuts(
+            self,
+            (
+                (QKeySequence.StandardKey.Undo, self._on_undo),
+                (QKeySequence.StandardKey.Redo, self._on_redo),
+                (QKeySequence.StandardKey.Delete, self._on_delete),
+                (QKeySequence(Qt.Key.Key_F2), self._on_rename),
+                (QKeySequence.StandardKey.SelectAll, self._on_select_all),
+                (QKeySequence(Qt.Key.Key_R), self._on_rotate),
+            ),
+        )
 
     def _update_button_states(self) -> None:
         has_selection = len(self._selected_thumbnails) > 0
@@ -695,17 +683,13 @@ class PageEditWindow(QMainWindow):
         self._redo_btn.setEnabled(self._undo_manager.can_redo())
 
     def _debug_undo_state(self, reason: str) -> None:
-        if not self._undo_btn or not self._redo_btn:
-            return
-        undo_color = "black" if self._undo_btn.isEnabled() else "gray"
-        redo_color = "black" if self._redo_btn.isEnabled() else "gray"
-        logger.debug(
-            "[UndoState][PageEditWindow] %s | undo=%s redo=%s undo_count=%s redo_count=%s",
-            reason,
-            undo_color,
-            redo_color,
-            self._undo_manager.undo_count(),
-            self._undo_manager.redo_count(),
+        log_undo_state(
+            logger=logger,
+            context_name="PageEditWindow",
+            reason=reason,
+            undo_button=self._undo_btn,
+            redo_button=self._redo_btn,
+            undo_manager=self._undo_manager,
         )
 
     def _on_undo_manager_changed(self, reason: str) -> None:
@@ -847,10 +831,7 @@ class PageEditWindow(QMainWindow):
 
     def _grid_available_width(self) -> int:
         """Width source for column calculation (always consistent)."""
-        w = int(self._grid_scroll.viewport().width()) if self._grid_scroll else 0
-        if w > 0:
-            return w
-        return int(self.width())
+        return viewport_width_or_fallback(self._grid_scroll, self.width())
 
     def _refresh_grid(self) -> None:
         while self._grid_layout.count():
@@ -922,9 +903,7 @@ class PageEditWindow(QMainWindow):
         self._enqueue_all_thumbnail_renders()
 
     def _clear_selection(self) -> None:
-        for thumb in self._selected_thumbnails:
-            thumb.set_selected(False)
-        self._selected_thumbnails.clear()
+        clear_selection(self._selected_thumbnails)
         self._update_button_states()
 
     def _set_thumbnail_size(self, size: int) -> None:
