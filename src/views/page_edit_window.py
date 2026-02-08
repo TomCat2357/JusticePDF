@@ -2,6 +2,7 @@
 import os
 import shutil
 import logging
+from collections import deque
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
@@ -9,7 +10,7 @@ from PyQt6.QtWidgets import (
     QToolButton, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl, QTimer, QEvent
-from PyQt6.QtGui import QAction, QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices
+from PyQt6.QtGui import QAction, QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices, QPixmap
 
 from src.utils.pdf_utils import (
     get_page_thumbnail, get_page_pixmap, get_page_words, get_page_links,
@@ -39,6 +40,7 @@ class PageThumbnail(QFrame):
         self._explicitly_hidden = False
         self._drag_start_pos = None
         self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
+        self._thumbnail_loaded = False
         self.setAcceptDrops(True)
         self._setup_ui()
 
@@ -61,14 +63,29 @@ class PageThumbnail(QFrame):
         self._number_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._number_label)
 
-        self._load_thumbnail()
+        self.invalidate_thumbnail()
         self._update_style()
 
-    def _load_thumbnail(self) -> None:
-        """Load the page thumbnail."""
+    @property
+    def thumbnail_loaded(self) -> bool:
+        return self._thumbnail_loaded
+
+    def invalidate_thumbnail(self) -> None:
+        self._thumbnail_loaded = False
+        self._image_label.setPixmap(QPixmap())
+        self._image_label.setText("PDF")
+
+    def load_thumbnail(self) -> bool:
         pixmap = get_page_thumbnail(self._pdf_path, self._page_num, self._thumb_size)
-        if not pixmap.isNull():
-            self._image_label.setPixmap(pixmap)
+        if pixmap.isNull():
+            self._image_label.setPixmap(QPixmap())
+            self._image_label.setText("...")
+            self._thumbnail_loaded = False
+            return False
+        self._image_label.setPixmap(pixmap)
+        self._image_label.setText("")
+        self._thumbnail_loaded = True
+        return True
 
     def _update_style(self) -> None:
         """Update style based on selection."""
@@ -90,13 +107,14 @@ class PageThumbnail(QFrame):
         self._update_style()
 
     def refresh(self) -> None:
-        self._load_thumbnail()
+        self.invalidate_thumbnail()
+        self.load_thumbnail()
 
     def set_thumbnail_size(self, size: int) -> None:
         self._thumb_size = int(size)
         self.setFixedSize(self._thumb_size + 10, self._thumb_size + 30)
         self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
-        self._load_thumbnail()
+        self.invalidate_thumbnail()
         self.updateGeometry()
 
     def mousePressEvent(self, event) -> None:
@@ -439,6 +457,11 @@ class PageEditWindow(QMainWindow):
         self._zoom_factor = 1.0
         self._zoom_text_cache: dict[int, tuple[list[tuple], list[dict]]] = {}
         self._thumb_size = PageThumbnail.THUMBNAIL_SIZE
+        self._thumb_render_queue: deque[int] = deque()
+        self._thumb_render_queue_set: set[int] = set()
+        self._thumb_render_timer = QTimer(self)
+        self._thumb_render_timer.setSingleShot(True)
+        self._thumb_render_timer.timeout.connect(self._process_thumbnail_render_queue)
 
         # Drop indicator
         self._drop_indicator = None
@@ -452,7 +475,7 @@ class PageEditWindow(QMainWindow):
         self._setup_toolbar()
         self._setup_shortcuts()
         self._undo_manager.add_listener(self._on_undo_manager_changed)
-        self._load_pages()
+        QTimer.singleShot(0, self._load_pages)
 
     def _setup_ui(self) -> None:
         self.setWindowTitle(f"JusticePDF - Edit: {os.path.basename(self._pdf_path)}")
@@ -468,6 +491,8 @@ class PageEditWindow(QMainWindow):
         self._grid_scroll = QScrollArea()
         self._grid_scroll.setWidgetResizable(True)
         self._grid_scroll.viewport().installEventFilter(self)
+        self._grid_scroll.verticalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
+        self._grid_scroll.horizontalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
         layout.addWidget(self._grid_scroll)
 
         self._container = QWidget()
@@ -663,7 +688,85 @@ class PageEditWindow(QMainWindow):
         self._update_button_states()
         self._debug_undo_state(reason)
 
+    def _reset_thumbnail_render_queue(self) -> None:
+        self._thumb_render_timer.stop()
+        self._thumb_render_queue.clear()
+        self._thumb_render_queue_set.clear()
+
+    def _schedule_thumbnail_render(self) -> None:
+        if self._thumb_render_queue and not self._thumb_render_timer.isActive():
+            self._thumb_render_timer.start(0)
+
+    def _enqueue_thumbnail_render(self, page_num: int, *, priority: bool = False) -> None:
+        if page_num < 0 or page_num >= len(self._thumbnails):
+            return
+        thumb = self._thumbnails[page_num]
+        if thumb._explicitly_hidden or thumb.thumbnail_loaded:
+            return
+        if page_num in self._thumb_render_queue_set:
+            return
+        if priority:
+            self._thumb_render_queue.appendleft(page_num)
+        else:
+            self._thumb_render_queue.append(page_num)
+        self._thumb_render_queue_set.add(page_num)
+
+    def _visible_rect_in_container(self) -> QRect:
+        if not self._grid_scroll:
+            return QRect()
+        viewport = self._grid_scroll.viewport()
+        top_left = self._container.mapFrom(viewport, QPoint(0, 0))
+        bottom_right = self._container.mapFrom(
+            viewport,
+            QPoint(max(0, viewport.width() - 1), max(0, viewport.height() - 1)),
+        )
+        return QRect(top_left, bottom_right).normalized()
+
+    def _enqueue_visible_thumbnail_renders(self) -> None:
+        if not self._thumbnails or not self._grid_scroll:
+            return
+        visible_rect = self._visible_rect_in_container()
+        for page_num, thumb in enumerate(self._thumbnails):
+            if thumb._explicitly_hidden or not thumb.isVisible():
+                continue
+            if thumb.geometry().intersects(visible_rect):
+                self._enqueue_thumbnail_render(page_num, priority=True)
+        self._schedule_thumbnail_render()
+
+    def _enqueue_all_thumbnail_renders(self) -> None:
+        self._enqueue_visible_thumbnail_renders()
+        for page_num, thumb in enumerate(self._thumbnails):
+            if thumb._explicitly_hidden:
+                continue
+            self._enqueue_thumbnail_render(page_num)
+        self._schedule_thumbnail_render()
+
+    def _request_thumbnail_refresh(self, page_num: int) -> None:
+        if page_num < 0 or page_num >= len(self._thumbnails):
+            return
+        thumb = self._thumbnails[page_num]
+        thumb.invalidate_thumbnail()
+        self._enqueue_thumbnail_render(page_num, priority=True)
+        self._schedule_thumbnail_render()
+
+    def _process_thumbnail_render_queue(self) -> None:
+        while self._thumb_render_queue:
+            page_num = self._thumb_render_queue.popleft()
+            self._thumb_render_queue_set.discard(page_num)
+            if page_num < 0 or page_num >= len(self._thumbnails):
+                continue
+            thumb = self._thumbnails[page_num]
+            if thumb._explicitly_hidden or thumb.thumbnail_loaded:
+                continue
+            thumb.load_thumbnail()
+            break
+        self._schedule_thumbnail_render()
+
+    def _on_grid_viewport_changed(self, _value: int) -> None:
+        self._enqueue_visible_thumbnail_renders()
+
     def _load_pages(self) -> None:
+        self._reset_thumbnail_render_queue()
         # 既存のサムネイルをグリッドから先に取り除く
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
@@ -693,6 +796,7 @@ class PageEditWindow(QMainWindow):
             self._thumbnails.append(thumb)
 
         self._refresh_grid()
+        self._enqueue_all_thumbnail_renders()
         if self._zoom_view and self._zoom_view.isVisible():
             self._render_zoom_page()
 
@@ -728,9 +832,11 @@ class PageEditWindow(QMainWindow):
             col = i % cols
             self._grid_layout.addWidget(thumb, row, col)
             thumb.setVisible(True)
+        self._enqueue_visible_thumbnail_renders()
 
     def _remove_page_thumbnails(self, page_indices: list[int]) -> None:
         """指定されたページのサムネイルを削除（差分更新）"""
+        self._reset_thumbnail_render_queue()
         # グリッドから全サムネイルを一旦取り除く
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
@@ -768,6 +874,7 @@ class PageEditWindow(QMainWindow):
         self._zoom_text_cache.clear()
 
         self._refresh_grid()
+        self._enqueue_all_thumbnail_renders()
 
     def _clear_selection(self) -> None:
         for thumb in self._selected_thumbnails:
@@ -779,10 +886,12 @@ class PageEditWindow(QMainWindow):
         size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
         if size == self._thumb_size:
             return
+        self._reset_thumbnail_render_queue()
         self._thumb_size = size
         for thumb in self._thumbnails:
             thumb.set_thumbnail_size(self._thumb_size)
         self._refresh_grid()
+        self._enqueue_all_thumbnail_renders()
 
     def eventFilter(self, obj, event) -> bool:
         grid_scroll = getattr(self, "_grid_scroll", None)
@@ -1064,12 +1173,12 @@ class PageEditWindow(QMainWindow):
         def do_rotate():
             rotate_pages(pdf_path, indices, 90)
             for thumb in selected_thumbs:
-                thumb.refresh()
+                self._request_thumbnail_refresh(thumb.page_num)
 
         def undo_rotate():
             rotate_pages(pdf_path, indices, 270)
             for thumb in selected_thumbs:
-                thumb.refresh()
+                self._request_thumbnail_refresh(thumb.page_num)
 
         do_rotate()
 
@@ -1162,7 +1271,7 @@ class PageEditWindow(QMainWindow):
                 self._render_zoom_page()
             # サムネイルも更新
             if page_num < len(self._thumbnails):
-                self._thumbnails[page_num].refresh()
+                self._request_thumbnail_refresh(page_num)
 
         def undo_rotate():
             rotate_pages(pdf_path, [page_num], 270)
@@ -1170,7 +1279,7 @@ class PageEditWindow(QMainWindow):
             if self._zoom_view and self._zoom_view.isVisible():
                 self._render_zoom_page()
             if page_num < len(self._thumbnails):
-                self._thumbnails[page_num].refresh()
+                self._request_thumbnail_refresh(page_num)
 
         do_rotate()
 
@@ -1532,6 +1641,7 @@ class PageEditWindow(QMainWindow):
         
         logger.debug(f"PageEditWindow closing for {self._pdf_path}")
 
+        self._reset_thumbnail_render_queue()
         self._undo_manager.remove_listener(self._on_undo_manager_changed)
         
         for widget in QApplication.topLevelWidgets():
