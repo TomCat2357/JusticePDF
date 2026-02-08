@@ -465,6 +465,7 @@ class PageEditWindow(QMainWindow):
         self._zoom_scroll = None
         self._zoom_label = None
         self._zoom_percent_label = None
+        self._zoom_page_label = None
         self._zoom_prev_btn = None
         self._zoom_next_btn = None
         self._zoom_page_num = None
@@ -558,6 +559,11 @@ class PageEditWindow(QMainWindow):
 
         self._zoom_percent_label = QLabel("100%")
         controls_layout.addWidget(self._zoom_percent_label)
+
+        controls_layout.addStretch()
+
+        self._zoom_page_label = QLabel("")
+        controls_layout.addWidget(self._zoom_page_label)
 
         zoom_layout.addWidget(zoom_controls)
 
@@ -996,10 +1002,20 @@ class PageEditWindow(QMainWindow):
         self._update_button_states()
 
     def _exit_zoom_view(self) -> None:
+        last_page = self._zoom_page_num
         if self._zoom_view:
             self._zoom_view.hide()
         if self._grid_scroll:
             self._grid_scroll.show()
+        # 最後に表示していたページを選択状態にする
+        if last_page is not None and 0 <= last_page < len(self._thumbnails):
+            self._clear_selection()
+            thumb = self._thumbnails[last_page]
+            thumb.set_selected(True)
+            self._selected_thumbnails.append(thumb)
+            # サムネイルが見える位置にスクロール
+            if self._grid_scroll:
+                self._grid_scroll.ensureWidgetVisible(thumb)
         self._update_button_states()
 
     def _set_zoom_percent(self, value: int) -> None:
@@ -1064,6 +1080,8 @@ class PageEditWindow(QMainWindow):
             return
         page_count = get_page_count(self._pdf_path)
         self._update_zoom_nav_buttons(page_count)
+        if self._zoom_page_label:
+            self._zoom_page_label.setText(f"{self._zoom_page_num + 1} / {page_count}")
         if self._zoom_page_num >= page_count:
             self._exit_zoom_view()
             return
