@@ -15,7 +15,7 @@ from PyQt6.QtGui import QAction, QKeySequence, QDrag, QPainter, QColor, QPen, QD
 from src.utils.pdf_utils import (
     get_page_thumbnail, get_page_pixmap, get_page_words, get_page_links,
     get_page_count, rotate_pages, remove_pages, reorder_pages, extract_pages,
-    insert_pages
+    insert_pages, render_page_thumbnails_batch
 )
 from src.models.undo_manager import UndoManager, UndoAction
 
@@ -86,6 +86,17 @@ class PageThumbnail(QFrame):
         self._image_label.setText("")
         self._thumbnail_loaded = True
         return True
+
+    def set_pixmap_direct(self, pixmap: QPixmap) -> None:
+        """Set a pre-rendered pixmap directly (for batch rendering)."""
+        if pixmap.isNull():
+            self._image_label.setPixmap(QPixmap())
+            self._image_label.setText("...")
+            self._thumbnail_loaded = False
+        else:
+            self._image_label.setPixmap(pixmap)
+            self._image_label.setText("")
+            self._thumbnail_loaded = True
 
     def _update_style(self) -> None:
         """Update style based on selection."""
@@ -753,7 +764,8 @@ class PageEditWindow(QMainWindow):
         self._schedule_thumbnail_render()
 
     def _process_thumbnail_render_queue(self) -> None:
-        while self._thumb_render_queue:
+        batch: list[int] = []
+        while self._thumb_render_queue and len(batch) < 5:
             page_num = self._thumb_render_queue.popleft()
             self._thumb_render_queue_set.discard(page_num)
             if page_num < 0 or page_num >= len(self._thumbnails):
@@ -761,8 +773,12 @@ class PageEditWindow(QMainWindow):
             thumb = self._thumbnails[page_num]
             if thumb._explicitly_hidden or thumb.thumbnail_loaded:
                 continue
-            thumb.load_thumbnail()
-            break
+            batch.append(page_num)
+        if batch:
+            pixmaps = render_page_thumbnails_batch(self._pdf_path, batch, self._thumb_size)
+            for pn in batch:
+                if pn < len(self._thumbnails):
+                    self._thumbnails[pn].set_pixmap_direct(pixmaps.get(pn, QPixmap()))
         self._schedule_thumbnail_render()
 
     def _on_grid_viewport_changed(self, _value: int) -> None:

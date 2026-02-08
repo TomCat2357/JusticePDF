@@ -31,6 +31,7 @@ class PDFCard(QFrame):
         self._drag_start_pos = None
         self._card_width = int(card_width) if card_width is not None else self.CARD_WIDTH
         self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
+        self._original_pixmap: QPixmap | None = None
         self.setAcceptDrops(True)
 
         self._setup_ui()
@@ -81,6 +82,7 @@ class PDFCard(QFrame):
         thumbnail, page_count = get_pdf_card_info(self._pdf_path, self._thumb_size)
 
         # Thumbnail
+        self._original_pixmap = thumbnail if not thumbnail.isNull() else None
         if not thumbnail.isNull():
             self._thumbnail_label.setPixmap(thumbnail)
             self._thumbnail_label.setText("")
@@ -160,6 +162,29 @@ class PDFCard(QFrame):
         self._thumbnail_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._load_pdf_info()
         self.updateGeometry()
+
+    def set_preview_size_fast(self, card_width: int, thumb_size: int) -> None:
+        """Update sizes with fast Qt-side scaling (no fitz re-render)."""
+        self._card_width = int(card_width)
+        self._thumb_size = int(thumb_size)
+        self.setFixedWidth(self._card_width)
+        self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
+        self._thumbnail_label.setFixedSize(self._thumb_size, self._thumb_size)
+        # Reposition page count label
+        self._page_count_label.adjustSize()
+        self._page_count_label.move(self._thumb_size - self._page_count_label.width() - 3, 3)
+        if self._original_pixmap and not self._original_pixmap.isNull():
+            scaled = self._original_pixmap.scaled(
+                self._thumb_size, self._thumb_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._thumbnail_label.setPixmap(scaled)
+        self.updateGeometry()
+
+    def render_high_quality(self) -> None:
+        """Re-render the thumbnail at full quality for current size."""
+        self._load_pdf_info()
 
     def refresh(self) -> None:
         """Refresh the card display."""

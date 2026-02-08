@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QToolBar, QPushButton, QScrollArea, QGridLayout,
     QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand, QProgressDialog
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QEvent
+from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QPoint, QRect
 from PyQt6.QtGui import QAction, QKeySequence
 from send2trash import send2trash
 
@@ -59,6 +59,12 @@ class MainWindow(QMainWindow):
         self._preview_thumb_size = PDFCard.THUMBNAIL_SIZE
         self._preview_card_ratio = PDFCard.CARD_WIDTH / PDFCard.THUMBNAIL_SIZE
         self._preview_card_width = int(round(self._preview_thumb_size * self._preview_card_ratio))
+
+        # Zoom debounce timer for Ctrl+wheel
+        self._zoom_debounce_timer = QTimer(self)
+        self._zoom_debounce_timer.setSingleShot(True)
+        self._zoom_debounce_timer.setInterval(150)
+        self._zoom_debounce_timer.timeout.connect(self._render_visible_cards_hq)
 
         # Debounce file modified events (path -> single-shot timer)
         self._modified_timers: dict[str, QTimer] = {}
@@ -441,6 +447,24 @@ class MainWindow(QMainWindow):
                     return 0.0
             self._cards.sort(key=get_mtime, reverse=not self._sort_ascending)
 
+    def _get_visible_cards(self) -> list[PDFCard]:
+        """Return cards currently visible in the scroll area viewport."""
+        if not hasattr(self, "_scroll_area") or not self._cards:
+            return []
+        viewport = self._scroll_area.viewport()
+        top_left = self._container.mapFrom(viewport, QPoint(0, 0))
+        bottom_right = self._container.mapFrom(
+            viewport,
+            QPoint(max(0, viewport.width() - 1), max(0, viewport.height() - 1)),
+        )
+        visible_rect = QRect(top_left, bottom_right).normalized()
+        return [card for card in self._cards if card.geometry().intersects(visible_rect)]
+
+    def _render_visible_cards_hq(self) -> None:
+        """Re-render visible cards at full quality after zoom debounce."""
+        for card in self._get_visible_cards():
+            card.render_high_quality()
+
     def _clear_selection(self) -> None:
         """Clear all selections."""
         for card in self._selected_cards:
@@ -455,8 +479,9 @@ class MainWindow(QMainWindow):
         self._preview_thumb_size = size
         self._preview_card_width = int(round(self._preview_thumb_size * self._preview_card_ratio))
         for card in self._cards:
-            card.set_preview_size(self._preview_card_width, self._preview_thumb_size)
+            card.set_preview_size_fast(self._preview_card_width, self._preview_thumb_size)
         self._refresh_grid()
+        self._zoom_debounce_timer.start()
 
     def eventFilter(self, obj, event) -> bool:
         scroll_area = getattr(self, "_scroll_area", None)

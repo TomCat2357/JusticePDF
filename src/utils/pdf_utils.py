@@ -3,12 +3,47 @@ import logging
 import os
 import shutil
 import tempfile
+from collections import OrderedDict
 
 import fitz
 from PyQt6.QtGui import QPixmap, QImage
 
 
 logger = logging.getLogger(__name__)
+
+
+class _PixmapCache:
+    def __init__(self, maxsize: int = 256):
+        self._maxsize = maxsize
+        self._cache: OrderedDict[tuple, QPixmap] = OrderedDict()
+
+    def get(self, key: tuple) -> QPixmap | None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def put(self, key: tuple, pixmap: QPixmap) -> None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self._cache[key] = pixmap
+            return
+        if len(self._cache) >= self._maxsize:
+            self._cache.popitem(last=False)
+        self._cache[key] = pixmap
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+
+_pixmap_cache = _PixmapCache(maxsize=256)
+
+
+def _get_file_mtime(pdf_path: str) -> float:
+    try:
+        return os.path.getmtime(pdf_path)
+    except OSError:
+        return 0.0
 
 
 def _pixmap_to_qpixmap(pix: "fitz.Pixmap") -> QPixmap:
@@ -31,15 +66,22 @@ def _pixmap_to_qpixmap(pix: "fitz.Pixmap") -> QPixmap:
 def get_pdf_card_info(pdf_path: str, size: int = 128) -> tuple[QPixmap, int]:
     """Get (thumbnail, page_count) for main-grid cards with a single PDF open."""
     try:
+        mtime = _get_file_mtime(pdf_path)
         with fitz.open(pdf_path) as doc:
             page_count = len(doc)
             if page_count == 0:
                 return QPixmap(), 0
+            cache_key = (pdf_path, 0, size, None, mtime)
+            cached = _pixmap_cache.get(cache_key)
+            if cached is not None:
+                return cached, page_count
             page = doc[0]
             zoom = size / max(page.rect.width, page.rect.height)
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat)
-            return _pixmap_to_qpixmap(pix), page_count
+            qpix = _pixmap_to_qpixmap(pix)
+            _pixmap_cache.put(cache_key, qpix)
+            return qpix, page_count
     except Exception:
         logger.debug("get_pdf_card_info failed: %s", pdf_path, exc_info=True)
         return QPixmap(), 0
@@ -54,6 +96,11 @@ def _render_page_pixmap(
 ) -> QPixmap:
     """Render a PDF page to a pixmap with either size-based or zoom-based scaling."""
     try:
+        mtime = _get_file_mtime(pdf_path)
+        cache_key = (pdf_path, page_num, size, round(zoom, 4) if zoom is not None else None, mtime)
+        cached = _pixmap_cache.get(cache_key)
+        if cached is not None:
+            return cached
         with fitz.open(pdf_path) as doc:
             if page_num >= len(doc) or page_num < 0:
                 return QPixmap()
@@ -64,7 +111,9 @@ def _render_page_pixmap(
                 scale = zoom or 1.0
             mat = fitz.Matrix(scale, scale)
             pix = page.get_pixmap(matrix=mat)
-        return _pixmap_to_qpixmap(pix)
+        qpix = _pixmap_to_qpixmap(pix)
+        _pixmap_cache.put(cache_key, qpix)
+        return qpix
     except Exception:
         logger.debug(
             "_render_page_pixmap failed: pdf=%s page=%s size=%s zoom=%s",
@@ -112,6 +161,47 @@ def get_page_thumbnail(pdf_path: str, page_num: int, size: int = 128) -> QPixmap
 def get_page_pixmap(pdf_path: str, page_num: int, zoom: float = 1.0) -> QPixmap:
     """Render a page at the given zoom factor."""
     return _render_page_pixmap(pdf_path, page_num, zoom=zoom)
+
+
+def render_page_thumbnails_batch(pdf_path: str, page_nums: list[int], size: int = 128) -> dict[int, QPixmap]:
+    """Batch-render thumbnails for multiple pages, using cache where possible.
+
+    Opens the PDF only once for all cache-missed pages.
+    """
+    mtime = _get_file_mtime(pdf_path)
+    result: dict[int, QPixmap] = {}
+    miss_pages: list[int] = []
+
+    for pn in page_nums:
+        cache_key = (pdf_path, pn, size, None, mtime)
+        cached = _pixmap_cache.get(cache_key)
+        if cached is not None:
+            result[pn] = cached
+        else:
+            miss_pages.append(pn)
+
+    if miss_pages:
+        try:
+            with fitz.open(pdf_path) as doc:
+                for pn in miss_pages:
+                    if pn < 0 or pn >= len(doc):
+                        result[pn] = QPixmap()
+                        continue
+                    page = doc[pn]
+                    scale = size / max(page.rect.width, page.rect.height)
+                    mat = fitz.Matrix(scale, scale)
+                    pix = page.get_pixmap(matrix=mat)
+                    qpix = _pixmap_to_qpixmap(pix)
+                    cache_key = (pdf_path, pn, size, None, mtime)
+                    _pixmap_cache.put(cache_key, qpix)
+                    result[pn] = qpix
+        except Exception:
+            logger.debug("render_page_thumbnails_batch failed: %s", pdf_path, exc_info=True)
+            for pn in miss_pages:
+                if pn not in result:
+                    result[pn] = QPixmap()
+
+    return result
 
 
 def get_page_words(pdf_path: str, page_num: int) -> list[tuple]:
