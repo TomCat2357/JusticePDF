@@ -726,20 +726,23 @@ class PageEditWindow(QMainWindow):
         if not self._thumbnails or not self._grid_scroll:
             return
         visible_rect = self._visible_rect_in_container()
+        visible_pages = []
         for page_num, thumb in enumerate(self._thumbnails):
             if thumb._explicitly_hidden or not thumb.isVisible():
                 continue
             if thumb.geometry().intersects(visible_rect):
-                self._enqueue_thumbnail_render(page_num, priority=True)
+                visible_pages.append(page_num)
+        for page_num in reversed(visible_pages):
+            self._enqueue_thumbnail_render(page_num, priority=True)
         self._schedule_thumbnail_render()
 
     def _enqueue_all_thumbnail_renders(self) -> None:
-        self._enqueue_visible_thumbnail_renders()
         for page_num, thumb in enumerate(self._thumbnails):
             if thumb._explicitly_hidden:
                 continue
             self._enqueue_thumbnail_render(page_num)
         self._schedule_thumbnail_render()
+        QTimer.singleShot(0, self._enqueue_visible_thumbnail_renders)
 
     def _request_thumbnail_refresh(self, page_num: int) -> None:
         if page_num < 0 or page_num >= len(self._thumbnails):
