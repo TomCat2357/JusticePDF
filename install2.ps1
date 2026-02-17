@@ -19,7 +19,7 @@ if (-not $script:ScriptDir -or $script:ScriptDir.Trim() -eq "")
 # Config
 # =========================
 $ProjectName   = "JusticePDF"
-$PythonVersion = "3.13.11"
+$PythonVersion = "3.11"
 $ScoopRoot     = Join-Path $env:USERPROFILE "scoop"
 
 # =========================
@@ -207,55 +207,33 @@ function Ensure-Python([string]$Version)
     Refresh-ProcessPath
     Append-PathOnce $shimDir
 
-    Ensure-ScoopApp "python" "main"
+    # Python 3.11 は versions バケットから python311 としてインストール
+    Ensure-ScoopApp "python311" "versions"
 
-    # Try exact version manifest first (python@3.13.11), if available
-    try
-    {
-        $target = "python@" + $Version
-        $listText = (& scoop list 2>$null | Out-String)
-        if ($listText -notmatch ("(?m)^\s*" + [Regex]::Escape($target) + "\s"))
-        {
-            Write-Info ("Trying to install exact version: " + $target)
-            & scoop install $target | Out-Host
-            Refresh-ProcessPath
-            Append-PathOnce $shimDir
-        }
-    } catch
-    {
-        Write-Warn ("Could not install python@" + $Version + ". Will use installed python.")
-    }
+    # python311 をデフォルトの python shim に設定
+    Write-Info "Setting python311 as default python shim..."
+    & scoop reset python311 2>$null | Out-Host
+    Refresh-ProcessPath
+    Append-PathOnce $shimDir
 
     if (-not (Has-Command "python"))
     {
         throw "python command not found after Scoop install."
     }
 
-    $pythonList = (& scoop list python 2>$null | Out-String)
-    $verMatch = [Regex]::Match($pythonList, "(?m)^\s*python\s+([0-9][^\s]*)\s+")
-    $ver = $null
-    if ($verMatch.Success)
-    {
-        $ver = $verMatch.Groups[1].Value
-    }
+    # バージョン確認
+    $ver = (& python --version 2>&1) | Out-String
+    $ver = $ver.Trim()
+    Write-Info ("Python version: " + $ver)
 
-    if ($null -eq $ver -or $ver.Trim() -eq "")
+    if ($ver -notmatch ("Python\s+" + [Regex]::Escape($Version)))
     {
-        Write-Warn "Could not detect python version from scoop list output."
+        Write-Warn ("Python version is not " + $Version + ".x (actual: " + $ver + ")")
     } else
     {
-        Write-Info ("python version (scoop): " + $ver)
-
-        # Optional strict check: enforce 3.13.11 exactly
-        if ($ver -notmatch [Regex]::Escape($Version))
-        {
-            Write-Warn ("Python version is not exactly " + $Version + ". (actual: " + $ver + ")")
-            # 必須にしたいなら次行を有効化:
-            # throw ("Python " + $Version + " is required but got: " + $ver)
-        }
+        Write-Ok ("Python " + $Version + ".x confirmed.")
     }
 
-    # Ensure shims in PATH after PATH refresh.
     Refresh-ProcessPath
     Append-PathOnce $shimDir
 }
