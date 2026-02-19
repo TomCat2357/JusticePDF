@@ -283,6 +283,21 @@ class MainWindow(QMainWindow):
                 widget._pdf_path = new_path
                 widget.setWindowTitle(f"JusticePDF - Edit: {new_name}")
 
+    def _refresh_page_edit_windows_for_paths(self, paths: list[str]) -> None:
+        """指定PDFのPageEditWindowを外部更新として再描画する。"""
+        if not paths:
+            return
+
+        from src.views.page_edit_window import PageEditWindow
+
+        normalized_paths = {self._normalize_path(path) for path in paths}
+        for widget in QApplication.topLevelWidgets():
+            if (
+                isinstance(widget, PageEditWindow)
+                and self._normalize_path(widget._pdf_path) in normalized_paths
+            ):
+                widget._on_external_pdf_rotation()
+
     def _perform_rename(self, old_path: str, new_path: str) -> None:
         old_norm = self._normalize_path(old_path)
         new_norm = self._normalize_path(new_path)
@@ -1200,22 +1215,28 @@ class MainWindow(QMainWindow):
             return
 
         def do_rotate():
+            rotated_paths: list[str] = []
             for pdf_path, indices in rotations:
                 rotate_pages(pdf_path, indices, 90)
+                rotated_paths.append(pdf_path)
                 # Find and refresh the card for this path
                 for card in self._cards:
                     if card.pdf_path == pdf_path:
                         card.refresh()
                         break
+            self._refresh_page_edit_windows_for_paths(rotated_paths)
 
         def undo_rotate():
+            rotated_paths: list[str] = []
             for pdf_path, indices in rotations:
                 rotate_pages(pdf_path, indices, 270)
+                rotated_paths.append(pdf_path)
                 # Find and refresh the card for this path
                 for card in self._cards:
                     if card.pdf_path == pdf_path:
                         card.refresh()
                         break
+            self._refresh_page_edit_windows_for_paths(rotated_paths)
 
         do_rotate()
 

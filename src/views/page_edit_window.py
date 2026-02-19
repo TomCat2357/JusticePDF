@@ -829,6 +829,25 @@ class PageEditWindow(QMainWindow):
         if self._zoom_view and self._zoom_view.isVisible():
             self._render_zoom_page()
 
+    def _on_external_pdf_rotation(self) -> None:
+        """外部（MainWindow等）で回転されたPDFを即時反映する。"""
+        if not os.path.exists(self._pdf_path):
+            return
+
+        page_count = get_page_count(self._pdf_path)
+        if page_count != len(self._thumbnails):
+            self._load_pages()
+            return
+
+        self._zoom_text_cache.clear()
+        self._reset_thumbnail_render_queue()
+        for thumb in self._thumbnails:
+            thumb.invalidate_thumbnail()
+        self._enqueue_all_thumbnail_renders()
+
+        if self._zoom_view and self._zoom_view.isVisible():
+            self._render_zoom_page()
+
     def _grid_available_width(self) -> int:
         """Width source for column calculation (always consistent)."""
         return viewport_width_or_fallback(self._grid_scroll, self.width())
