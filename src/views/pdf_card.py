@@ -18,6 +18,7 @@ class PDFCard(QFrame):
     clicked = pyqtSignal(object)  # Emits self when clicked
     double_clicked = pyqtSignal(object)  # Emits self when double-clicked
     dropped_on = pyqtSignal(object, str)  # Emits (self, source_paths_str) when another card is dropped on this card
+    context_menu_requested = pyqtSignal(object, object)  # Emits (self, global_pos) when context menu is requested
 
     CARD_WIDTH = 150
     THUMBNAIL_SIZE = 120
@@ -265,6 +266,11 @@ class PDFCard(QFrame):
         if event.button() == Qt.MouseButton.LeftButton:
             self.double_clicked.emit(self)
         super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        """Emit the native context-menu request with global coordinates."""
+        self.context_menu_requested.emit(self, event.globalPos())
+        event.accept()
 
     def dropEvent(self, event) -> None:
         """Handle drop event."""

@@ -27,6 +27,7 @@ from src.controllers.folder_watcher import FolderWatcher
 from src.models.undo_manager import UndoManager, UndoAction
 from src.utils.pdf_utils import rotate_pages, get_page_count
 from src.utils.path_utils import ensure_unique_path
+from src.utils.windows_shell import show_native_file_context_menu
 
 logger = logging.getLogger(__name__)
 
@@ -349,16 +350,23 @@ class MainWindow(QMainWindow):
             self.width(),
         )
 
-    def _add_card(self, pdf_path: str, insert_index: int | None = None) -> PDFCard:
-        """Add a new card for a PDF file."""
-        card = PDFCard(
-            pdf_path,
-            card_width=self._preview_card_width,
-            thumb_size=self._preview_thumb_size,
-        )
+    def _connect_card_signals(self, card: PDFCard) -> PDFCard:
+        """Connect all card-level signals used by the main window."""
         card.clicked.connect(self._on_card_clicked)
         card.double_clicked.connect(self._on_card_double_clicked)
         card.dropped_on.connect(self._on_card_merge)
+        card.context_menu_requested.connect(self._on_card_context_menu_requested)
+        return card
+
+    def _add_card(self, pdf_path: str, insert_index: int | None = None) -> PDFCard:
+        """Add a new card for a PDF file."""
+        card = self._connect_card_signals(
+            PDFCard(
+                pdf_path,
+                card_width=self._preview_card_width,
+                thumb_size=self._preview_thumb_size,
+            )
+        )
         if insert_index is None or insert_index >= len(self._cards):
             self._cards.append(card)
         else:
@@ -381,14 +389,13 @@ class MainWindow(QMainWindow):
         # Create new cards for existing files
         for path in paths:
             if os.path.exists(path):
-                card = PDFCard(
-                    path,
-                    card_width=self._preview_card_width,
-                    thumb_size=self._preview_thumb_size,
+                card = self._connect_card_signals(
+                    PDFCard(
+                        path,
+                        card_width=self._preview_card_width,
+                        thumb_size=self._preview_thumb_size,
+                    )
                 )
-                card.clicked.connect(self._on_card_clicked)
-                card.double_clicked.connect(self._on_card_double_clicked)
-                card.dropped_on.connect(self._on_card_merge)
                 self._cards.append(card)
 
     def _remove_card(self, pdf_path: str) -> None:
@@ -467,6 +474,10 @@ class MainWindow(QMainWindow):
         """Clear all selections."""
         clear_selection(self._selected_cards)
         self._update_button_states()
+
+    def _selected_card_paths_in_grid_order(self) -> list[str]:
+        """Return selected card paths ordered by the visible card grid."""
+        return [card.pdf_path for card in self._cards if card in self._selected_cards]
 
     def _set_preview_thumb_size(self, size: int) -> None:
         size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
@@ -565,6 +576,20 @@ class MainWindow(QMainWindow):
                 self._selected_cards.append(card)
 
         self._update_button_states()
+
+    def _on_card_context_menu_requested(self, card: PDFCard, global_pos: QPoint) -> None:
+        """Handle Explorer-style right-click selection and menu opening."""
+        if card not in self._selected_cards:
+            self._clear_selection()
+            card.set_selected(True)
+            self._selected_cards.append(card)
+            self._update_button_states()
+
+        show_native_file_context_menu(
+            int(self.winId()),
+            self._selected_card_paths_in_grid_order(),
+            global_pos,
+        )
 
     def _on_card_double_clicked(self, card: PDFCard) -> None:
         """Handle card double-click - open page edit window."""
@@ -1144,10 +1169,12 @@ class MainWindow(QMainWindow):
     def _convert_via_libreoffice(self, src_path: str, dest_pdf_path: Path, soffice: str) -> None:
         """Convert Office file to PDF using LibreOffice headless."""
         with tempfile.TemporaryDirectory() as tmpdir:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             result = subprocess.run(
                 [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, src_path],
                 capture_output=True,
                 timeout=120,
+                creationflags=creationflags,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"soffice failed: {result.stderr.decode(errors='replace')}")
@@ -1596,14 +1623,13 @@ class MainWindow(QMainWindow):
             
             # Add cards for copied files
             for i, new_path in enumerate(copied_paths):
-                card = PDFCard(
-                    new_path,
-                    card_width=self._preview_card_width,
-                    thumb_size=self._preview_thumb_size,
+                card = self._connect_card_signals(
+                    PDFCard(
+                        new_path,
+                        card_width=self._preview_card_width,
+                        thumb_size=self._preview_thumb_size,
+                    )
                 )
-                card.clicked.connect(self._on_card_clicked)
-                card.double_clicked.connect(self._on_card_double_clicked)
-                card.dropped_on.connect(self._on_card_merge)
                 
                 insert_idx = target_idx + i
                 if insert_idx >= len(self._cards):
