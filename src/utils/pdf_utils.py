@@ -1,15 +1,37 @@
 """PDF utility functions using PyMuPDF."""
+import html
+import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import fitz
 from PyQt6.QtGui import QPixmap, QImage
 
 
 logger = logging.getLogger(__name__)
+JUSTICEPDF_FREETEXT_SUBJECT_PREFIX = "JusticePDF-FreeText:"
+
+
+@dataclass(slots=True)
+class FreeTextAnnotData:
+    page_num: int
+    xref: int
+    rect: tuple[float, float, float, float]
+    content: str
+    fontsize: float
+    text_color: tuple[float, float, float]
+    fill_color: tuple[float, float, float] | None
+    border_color: tuple[float, float, float] | None
+    border_width: float
+    opacity: float
+    fontname: str = "Helv"
+    annotation_id: str = ""
+    subject: str = ""
 
 
 class _PixmapCache:
@@ -37,6 +59,314 @@ class _PixmapCache:
 
 
 _pixmap_cache = _PixmapCache(maxsize=256)
+
+_FLOAT_RE = r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)"
+_DA_COLOR_RE = re.compile(rf"({_FLOAT_RE})\s+({_FLOAT_RE})\s+({_FLOAT_RE})\s+rg")
+_DA_FONT_RE = re.compile(rf"/([^\s/]+)\s+({_FLOAT_RE})\s+Tf")
+_CSS_DECL_RE = re.compile(r"\s*([^:]+)\s*:\s*([^;]+)\s*")
+_CSS_BORDER_RE = re.compile(
+    rf"({_FLOAT_RE})(?:px|pt)?\s+\w+\s+(#[0-9a-fA-F]{{6}}|rgb\([^)]+\))"
+)
+
+
+def _save_document_in_place(doc: fitz.Document, pdf_path: str) -> None:
+    """Persist a modified document, falling back when incremental save fails."""
+    try:
+        doc.saveIncr()
+    except Exception:
+        tmp_path: str | None = None
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            doc.save(tmp_path)
+        except Exception:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+        shutil.move(tmp_path, pdf_path)
+    _pixmap_cache.clear()
+
+
+def _parse_float_array(value: str) -> list[float]:
+    return [float(item) for item in re.findall(_FLOAT_RE, value or "")]
+
+
+def _normalize_color(
+    values: list[float] | tuple[float, ...] | None,
+    fallback: tuple[float, float, float] | None = None,
+) -> tuple[float, float, float] | None:
+    if not values or len(values) < 3:
+        return fallback
+    return (float(values[0]), float(values[1]), float(values[2]))
+
+
+def _parse_css_declarations(style: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for part in (style or "").split(";"):
+        match = _CSS_DECL_RE.fullmatch(part.strip())
+        if not match:
+            continue
+        key, value = match.groups()
+        result[key.lower()] = value.strip()
+    return result
+
+
+def _css_color_to_rgb(value: str | None) -> tuple[float, float, float] | None:
+    if not value:
+        return None
+    value = value.strip()
+    if value.lower() == "transparent":
+        return None
+    if value.startswith("#") and len(value) == 7:
+        return (
+            int(value[1:3], 16) / 255.0,
+            int(value[3:5], 16) / 255.0,
+            int(value[5:7], 16) / 255.0,
+        )
+    if value.lower().startswith("rgb(") and value.endswith(")"):
+        parts = [p.strip() for p in value[4:-1].split(",")]
+        if len(parts) == 3:
+            try:
+                return (
+                    float(parts[0]) / 255.0,
+                    float(parts[1]) / 255.0,
+                    float(parts[2]) / 255.0,
+                )
+            except ValueError:
+                return None
+    return None
+
+
+def _color_to_css(color: tuple[float, float, float] | None) -> str:
+    if color is None:
+        return "transparent"
+    r = max(0, min(255, round(color[0] * 255)))
+    g = max(0, min(255, round(color[1] * 255)))
+    b = max(0, min(255, round(color[2] * 255)))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _parse_da(da_value: str) -> tuple[str, float, tuple[float, float, float]]:
+    fontname = "Helv"
+    fontsize = 11.0
+    text_color = (0.0, 0.0, 0.0)
+
+    font_match = _DA_FONT_RE.search(da_value or "")
+    if font_match:
+        fontname = font_match.group(1)
+        fontsize = float(font_match.group(2))
+
+    color_match = _DA_COLOR_RE.search(da_value or "")
+    if color_match:
+        text_color = (
+            float(color_match.group(1)),
+            float(color_match.group(2)),
+            float(color_match.group(3)),
+        )
+    return fontname, fontsize, text_color
+
+
+def _pdf_font_to_css(fontname: str) -> str:
+    name = (fontname or "Helv").lower()
+    if "cour" in name:
+        return "Courier"
+    if "tiro" in name or "times" in name:
+        return "Times New Roman"
+    return "Helvetica"
+
+
+def _css_font_to_pdf(fontname: str | None) -> str:
+    name = (fontname or "").lower()
+    if "cour" in name:
+        return "Cour"
+    if "times" in name or "serif" in name:
+        return "TiRo"
+    return "Helv"
+
+
+def _extract_text_from_rc(rc_value: str) -> str:
+    if not rc_value:
+        return ""
+    text = re.sub(r"<[^>]+>", "", rc_value)
+    return html.unescape(text).strip()
+
+
+def _decode_subject_metadata(subject: str) -> dict[str, object] | None:
+    if not subject or not subject.startswith(JUSTICEPDF_FREETEXT_SUBJECT_PREFIX):
+        return None
+    raw = subject[len(JUSTICEPDF_FREETEXT_SUBJECT_PREFIX):]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _encode_subject_metadata(data: FreeTextAnnotData) -> str:
+    payload = {
+        "text_color": list(data.text_color),
+        "fill_color": list(data.fill_color) if data.fill_color is not None else None,
+        "border_color": list(data.border_color) if data.border_color is not None else None,
+        "border_width": float(data.border_width),
+        "fontsize": float(data.fontsize),
+        "fontname": data.fontname,
+    }
+    return JUSTICEPDF_FREETEXT_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
+
+
+def _build_richtext_style(data: FreeTextAnnotData) -> str:
+    parts = [
+        f"font-size:{max(1.0, float(data.fontsize)):g}pt",
+        f"font-family:{_pdf_font_to_css(data.fontname)}",
+        f"color:{_color_to_css(data.text_color)}",
+    ]
+    if data.fill_color is not None:
+        parts.append(f"background-color:{_color_to_css(data.fill_color)}")
+    if data.border_width > 0 and data.border_color is not None:
+        parts.append(f"border:{max(0.0, float(data.border_width)):g}px solid {_color_to_css(data.border_color)}")
+    else:
+        parts.append("border:0px solid transparent")
+    return "; ".join(parts) + ";"
+
+
+def _extract_freetext_data(
+    doc: fitz.Document,
+    page_num: int,
+    annot: fitz.Annot,
+) -> FreeTextAnnotData:
+    xref = annot.xref
+    info = annot.info
+    subject = info.get("subject", "")
+    metadata = _decode_subject_metadata(subject) or {}
+
+    _, da_value = doc.xref_get_key(xref, "DA")
+    fontname, fontsize, text_color = _parse_da(da_value)
+
+    rect = tuple(annot.rect)
+
+    _, fill_value = doc.xref_get_key(xref, "C")
+    fill_color = _normalize_color(_parse_float_array(fill_value))
+
+    _, bs_value = doc.xref_get_key(xref, "BS")
+    bs_widths = _parse_float_array(bs_value)
+    border_width = float(bs_widths[0]) if bs_widths else float(annot.border.get("width", 0.0))
+    border_color: tuple[float, float, float] | None = None
+
+    _, ds_value = doc.xref_get_key(xref, "DS")
+    css = _parse_css_declarations(ds_value if ds_value != "null" else "")
+    if "font-size" in css:
+        try:
+            fontsize = float(re.findall(_FLOAT_RE, css["font-size"])[0])
+        except (IndexError, ValueError):
+            pass
+    if "font-family" in css:
+        fontname = _css_font_to_pdf(css["font-family"])
+    css_text_color = _css_color_to_rgb(css.get("color"))
+    if css_text_color is not None:
+        text_color = css_text_color
+    css_fill_color = _css_color_to_rgb(css.get("background-color"))
+    if css_fill_color is not None:
+        fill_color = css_fill_color
+    css_border_color = _css_color_to_rgb(css.get("border-color"))
+    if css_border_color is None and "border" in css:
+        border_match = _CSS_BORDER_RE.search(css["border"])
+        if border_match:
+            border_width = float(border_match.group(1))
+            css_border_color = _css_color_to_rgb(border_match.group(2))
+    if "border-width" in css:
+        try:
+            border_width = float(re.findall(_FLOAT_RE, css["border-width"])[0])
+        except (IndexError, ValueError):
+            pass
+    if css_border_color is not None:
+        border_color = css_border_color
+
+    if isinstance(metadata.get("fontsize"), (int, float)):
+        fontsize = float(metadata["fontsize"])
+    if isinstance(metadata.get("fontname"), str):
+        fontname = str(metadata["fontname"])
+    metadata_text_color = metadata.get("text_color")
+    if isinstance(metadata_text_color, list):
+        parsed = _normalize_color(metadata_text_color)
+        if parsed is not None:
+            text_color = parsed
+    metadata_fill_color = metadata.get("fill_color")
+    if isinstance(metadata_fill_color, list):
+        fill_color = _normalize_color(metadata_fill_color)
+    elif metadata_fill_color is None and "fill_color" in metadata:
+        fill_color = None
+    metadata_border_color = metadata.get("border_color")
+    if isinstance(metadata_border_color, list):
+        border_color = _normalize_color(metadata_border_color)
+    elif metadata_border_color is None and "border_color" in metadata:
+        border_color = None
+    if isinstance(metadata.get("border_width"), (int, float)):
+        border_width = float(metadata["border_width"])
+
+    if border_width <= 0:
+        border_color = None
+        border_width = 0.0
+    elif border_color is None:
+        border_color = (0.0, 0.0, 0.0)
+
+    _, contents_value = doc.xref_get_key(xref, "Contents")
+    content = info.get("content") or (contents_value if contents_value != "null" else "")
+    if not content:
+        _, rc_value = doc.xref_get_key(xref, "RC")
+        if rc_value != "null":
+            content = _extract_text_from_rc(rc_value)
+
+    _, ca_value = doc.xref_get_key(xref, "CA")
+    if ca_value == "null":
+        opacity = 1.0
+    else:
+        try:
+            opacity = float(ca_value)
+        except ValueError:
+            opacity = float(annot.opacity or 1.0)
+
+    _, name_value = doc.xref_get_key(xref, "NM")
+    annotation_id = info.get("id") or (name_value if name_value != "null" else "")
+
+    return FreeTextAnnotData(
+        page_num=page_num,
+        xref=xref,
+        rect=(float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])),
+        content=content or "",
+        fontsize=float(fontsize),
+        text_color=text_color,
+        fill_color=fill_color,
+        border_color=border_color,
+        border_width=float(border_width),
+        opacity=max(0.0, min(1.0, float(opacity))),
+        fontname=fontname or "Helv",
+        annotation_id=annotation_id,
+        subject=subject,
+    )
+
+
+def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fitz.Annot:
+    rect = fitz.Rect(*data.rect)
+    if data.border_width > 0:
+        inset = float(data.border_width) / 2.0
+        if rect.width > inset * 2 and rect.height > inset * 2:
+            rect = fitz.Rect(rect.x0 + inset, rect.y0 + inset, rect.x1 - inset, rect.y1 - inset)
+    annot = page.add_freetext_annot(
+        rect,
+        data.content,
+        fontsize=max(1.0, float(data.fontsize)),
+        fontname=data.fontname or "Helv",
+        text_color=data.text_color,
+        fill_color=None,
+        border_width=max(0.0, float(data.border_width)),
+        opacity=max(0.0, min(1.0, float(data.opacity))),
+        richtext=True,
+        style=_build_richtext_style(data),
+    )
+    annot.set_info(content=data.content, subject=_encode_subject_metadata(data))
+    return annot
 
 
 def _get_file_mtime(pdf_path: str) -> float:
@@ -251,6 +581,86 @@ def get_page_links(pdf_path: str, page_num: int) -> list[dict]:
             exc_info=True,
         )
         return []
+
+
+def list_freetext_annots(pdf_path: str, page_num: int | None = None) -> list[FreeTextAnnotData]:
+    """Return normalized FreeText annotations for one page or the whole document."""
+    results: list[FreeTextAnnotData] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            page_numbers: range | list[int]
+            if page_num is None:
+                page_numbers = range(len(doc))
+            elif 0 <= page_num < len(doc):
+                page_numbers = [page_num]
+            else:
+                return []
+
+            for pn in page_numbers:
+                page = doc[pn]
+                annots = page.annots(types=[fitz.PDF_ANNOT_FREE_TEXT])
+                if annots is None:
+                    continue
+                for annot in annots:
+                    results.append(_extract_freetext_data(doc, pn, annot))
+    except Exception:
+        logger.debug("list_freetext_annots failed: %s", pdf_path, exc_info=True)
+    return results
+
+
+def create_freetext_annot(pdf_path: str, data: FreeTextAnnotData) -> FreeTextAnnotData:
+    """Create a new FreeText annotation and return the normalized saved form."""
+    doc = fitz.open(pdf_path)
+    try:
+        if data.page_num < 0 or data.page_num >= len(doc):
+            raise IndexError(f"page out of range: {data.page_num}")
+        page = doc[data.page_num]
+        annot = _add_freetext_annot_to_page(page, data)
+        saved = _extract_freetext_data(doc, data.page_num, annot)
+        _save_document_in_place(doc, pdf_path)
+        return saved
+    finally:
+        doc.close()
+
+
+def delete_freetext_annot(pdf_path: str, page_num: int, xref: int) -> bool:
+    """Delete a FreeText annotation by page number and xref."""
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            return False
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is None or annot.type[0] != fitz.PDF_ANNOT_FREE_TEXT:
+            return False
+        page.delete_annot(annot)
+        _save_document_in_place(doc, pdf_path)
+        return True
+    finally:
+        doc.close()
+
+
+def replace_freetext_annot(
+    pdf_path: str,
+    page_num: int,
+    xref: int,
+    data: FreeTextAnnotData,
+) -> FreeTextAnnotData:
+    """Replace an existing FreeText annotation and return the saved replacement."""
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            raise IndexError(f"page out of range: {page_num}")
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is not None:
+            page.delete_annot(annot)
+        replacement = _add_freetext_annot_to_page(page, data)
+        saved = _extract_freetext_data(doc, page_num, replacement)
+        _save_document_in_place(doc, pdf_path)
+        return saved
+    finally:
+        doc.close()
 
 
 def merge_pdfs(output_path: str, pdf_paths: list[str]) -> None:
