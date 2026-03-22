@@ -214,6 +214,7 @@ class PageThumbnail(QFrame):
 class AnnotationTextEdit(QPlainTextEdit):
     commit_requested = pyqtSignal(str)
     cancel_requested = pyqtSignal()
+    delete_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -244,6 +245,13 @@ class AnnotationTextEdit(QPlainTextEdit):
             event.accept()
             return
         if (
+            event.key() == Qt.Key.Key_Delete
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        ):
+            self.delete_requested.emit()
+            event.accept()
+            return
+        if (
             event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
             and event.modifiers() & Qt.KeyboardModifier.ControlModifier
         ):
@@ -262,6 +270,7 @@ class ZoomPageWidget(QWidget):
     annotation_edit_requested = pyqtSignal(object)
     annotation_text_committed = pyqtSignal(object, str)
     annotation_text_edit_cancelled = pyqtSignal()
+    annotation_delete_requested = pyqtSignal()
 
     HANDLE_SIZE = 10
     MIN_ANNOT_SIZE = 24.0
@@ -325,8 +334,12 @@ class ZoomPageWidget(QWidget):
         editor.setPlainText(annotation.content)
         editor.commit_requested.connect(lambda text, annot=annotation: self._commit_inline_editor(annot, text))
         editor.cancel_requested.connect(self.cancel_annotation_text_edit)
+        editor.delete_requested.connect(self.annotation_delete_requested)
         editor.setStyleSheet(self._inline_editor_stylesheet(annotation))
         editor.setFrameStyle(QFrame.Shape.NoFrame)
+        editor.setContentsMargins(0, 0, 0, 0)
+        editor.setViewportMargins(0, 0, 0, 0)
+        editor.document().setDocumentMargin(0)
         font = editor.font()
         font.setPixelSize(max(10, round(annotation.fontsize * self._zoom_factor)))
         editor.setFont(font)
@@ -374,17 +387,16 @@ class ZoomPageWidget(QWidget):
 
     def _inline_editor_stylesheet(self, annotation: FreeTextAnnotData) -> str:
         fill = annotation.fill_color or (1.0, 1.0, 1.0)
-        border = annotation.border_color or annotation.text_color
         opacity = max(0.0, min(1.0, annotation.opacity))
         fill_rgba = f"rgba({round(fill[0] * 255)}, {round(fill[1] * 255)}, {round(fill[2] * 255)}, {round(opacity * 255)})"
-        border_rgba = f"rgba({round(border[0] * 255)}, {round(border[1] * 255)}, {round(border[2] * 255)}, {round(opacity * 255)})"
         text_rgb = f"rgb({round(annotation.text_color[0] * 255)}, {round(annotation.text_color[1] * 255)}, {round(annotation.text_color[2] * 255)})"
         return (
             "QPlainTextEdit {"
             f"background-color: {fill_rgba};"
             f"color: {text_rgb};"
-            f"border: {max(0, round(annotation.border_width))}px solid {border_rgba};"
-            "padding: 2px;"
+            "border: 0px solid transparent;"
+            "padding: 0px;"
+            "margin: 0px;"
             "}"
         )
 
@@ -844,6 +856,14 @@ class ZoomPageWidget(QWidget):
                 QApplication.clipboard().setText(text)
                 event.accept()
                 return
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and self._selected_annotation_xref is not None
+        ):
+            self.annotation_delete_requested.emit()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def resizeEvent(self, event) -> None:
@@ -1010,6 +1030,7 @@ class PageEditWindow(QMainWindow):
         self._zoom_label.annotation_edit_requested.connect(self._on_zoom_annotation_edit_requested)
         self._zoom_label.annotation_text_committed.connect(self._on_zoom_annotation_text_committed)
         self._zoom_label.annotation_text_edit_cancelled.connect(self._on_zoom_annotation_text_edit_cancelled)
+        self._zoom_label.annotation_delete_requested.connect(self._delete_selected_zoom_annotation)
         self._zoom_scroll.setWidget(self._zoom_label)
 
         nav_button_style = (
@@ -2102,6 +2123,9 @@ class PageEditWindow(QMainWindow):
     def _on_delete(self) -> None:
         # ズームビュー表示中の場合
         if self._zoom_view and self._zoom_view.isVisible():
+            if self._selected_zoom_annotation is not None:
+                self._delete_selected_zoom_annotation()
+                return
             self._delete_zoom_page()
             return
 

@@ -112,3 +112,69 @@ def test_list_freetext_annots_reads_existing_richtext(tmp_path):
     _assert_color_close(annot.text_color, (0x11 / 255.0, 0x22 / 255.0, 0x33 / 255.0))
     _assert_color_close(annot.fill_color, (1.0, 0xEE / 255.0, 0xAA / 255.0))
     _assert_color_close(annot.border_color, (0x44 / 255.0, 0x55 / 255.0, 0x66 / 255.0))
+
+
+def test_freetext_create_and_replace_keep_richtext_appearance_data(tmp_path):
+    pdf_path = tmp_path / "richtext-appearance.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(30, 40, 180, 120),
+            content="colorful",
+            fontsize=16,
+            text_color=(1.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.6),
+            border_color=(0.0, 0.0, 1.0),
+            border_width=2,
+            opacity=1.0,
+        ),
+    )
+
+    with fitz.open(str(pdf_path)) as doc:
+        richtext_kind, richtext_value = doc.xref_get_key(created.xref, "RC")
+        fill_kind, fill_value = doc.xref_get_key(created.xref, "C")
+        subject_kind, subject_value = doc.xref_get_key(created.xref, "Subj")
+        style_kind, style_value = doc.xref_get_key(created.xref, "DS")
+    assert richtext_kind == "string"
+    assert "colorful" in richtext_value
+    assert fill_kind == "array"
+    assert fill_value != "null"
+    assert subject_kind == "string"
+    assert "JusticePDF-FreeText:" in subject_value
+    assert style_kind == "string"
+    assert "margin:0" in style_value
+    assert "padding:0" in style_value
+    assert "border:0px solid transparent" in style_value
+
+    replaced = replace_freetext_annot(
+        str(pdf_path),
+        0,
+        created.xref,
+        FreeTextAnnotData(
+            page_num=0,
+            xref=created.xref,
+            rect=(50, 60, 210, 150),
+            content="updated",
+            fontsize=18,
+            text_color=(0.0, 0.4, 0.0),
+            fill_color=(0.9, 1.0, 0.9),
+            border_color=(0.2, 0.2, 0.2),
+            border_width=3,
+            opacity=0.9,
+        ),
+    )
+
+    with fitz.open(str(pdf_path)) as doc:
+        richtext_kind, richtext_value = doc.xref_get_key(replaced.xref, "RC")
+        fill_kind, fill_value = doc.xref_get_key(replaced.xref, "C")
+        style_kind, style_value = doc.xref_get_key(replaced.xref, "DS")
+    assert richtext_kind == "string"
+    assert "updated" in richtext_value
+    assert fill_kind == "array"
+    assert fill_value != "null"
+    assert style_kind == "string"
+    assert "border:0px solid transparent" in style_value

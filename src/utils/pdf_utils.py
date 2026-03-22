@@ -221,13 +221,12 @@ def _build_richtext_style(data: FreeTextAnnotData) -> str:
         f"font-size:{max(1.0, float(data.fontsize)):g}pt",
         f"font-family:{_pdf_font_to_css(data.fontname)}",
         f"color:{_color_to_css(data.text_color)}",
+        "margin:0",
+        "padding:0",
     ]
     if data.fill_color is not None:
         parts.append(f"background-color:{_color_to_css(data.fill_color)}")
-    if data.border_width > 0 and data.border_color is not None:
-        parts.append(f"border:{max(0.0, float(data.border_width)):g}px solid {_color_to_css(data.border_color)}")
-    else:
-        parts.append("border:0px solid transparent")
+    parts.append("border:0px solid transparent")
     return "; ".join(parts) + ";"
 
 
@@ -359,13 +358,13 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         fontsize=max(1.0, float(data.fontsize)),
         fontname=data.fontname or "Helv",
         text_color=data.text_color,
-        fill_color=None,
+        fill_color=data.fill_color,
         border_width=max(0.0, float(data.border_width)),
         opacity=max(0.0, min(1.0, float(data.opacity))),
         richtext=True,
         style=_build_richtext_style(data),
     )
-    annot.set_info(content=data.content, subject=_encode_subject_metadata(data))
+    annot.set_info(subject=_encode_subject_metadata(data))
     return annot
 
 

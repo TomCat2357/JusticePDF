@@ -5,7 +5,7 @@ import pytest
 from PyQt6.QtCore import QPoint, Qt
 
 from src.models.undo_manager import UndoManager
-from src.utils.pdf_utils import FreeTextAnnotData, create_freetext_annot, list_freetext_annots
+from src.utils.pdf_utils import FreeTextAnnotData, create_freetext_annot, get_page_count, list_freetext_annots
 from src.views.page_edit_window import PageEditWindow
 
 
@@ -104,6 +104,9 @@ def test_zoom_selects_existing_freetext_and_applies_direct_edit_and_form_changes
     editor = window._zoom_label._inline_editor
     assert editor is not None
     assert editor.toPlainText() == "existing"
+    assert editor.document().documentMargin() == 0
+    assert "border: 0px solid transparent" in editor.styleSheet()
+    assert "padding: 0px" in editor.styleSheet()
 
     editor.selectAll()
     qtbot.keyClicks(editor, "changed")
@@ -189,3 +192,60 @@ def test_zoom_can_move_resize_and_undo_redo_freetext(qtbot, tmp_path):
 
     window._on_redo()
     qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].rect == resized_rect)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_delete_key_removes_selected_freetext_instead_of_page(qtbot, tmp_path):
+    pdf_path = tmp_path / "delete-selected.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 170, 120),
+            content="delete",
+            fontsize=14,
+            text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.6),
+            border_color=(0.0, 0.0, 0.0),
+            border_width=2,
+            opacity=1.0,
+        ),
+    )
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    annot = _annotation_for(window, created.xref)
+    rect = window._zoom_label._annotation_widget_rect(annot)
+    qtbot.mouseClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+    qtbot.waitUntil(lambda: window._selected_zoom_annotation is not None and window._selected_zoom_annotation.xref == created.xref)
+
+    qtbot.keyClick(window._zoom_label, Qt.Key.Key_Delete)
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0) == [])
+
+    assert get_page_count(str(pdf_path)) == 1
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_delete_key_removes_active_freetext_editor_annotation(qtbot, tmp_path):
+    pdf_path = tmp_path / "delete-active-editor.pdf"
+    _make_pdf(pdf_path)
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    qtbot.mouseClick(window._zoom_annotation_toggle_btn, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=_page_click_pos(window, 60, 80))
+    qtbot.waitUntil(lambda: window._zoom_label.has_active_text_editor())
+
+    editor = window._zoom_label._inline_editor
+    assert editor is not None
+    qtbot.keyClicks(editor, "delete me")
+    qtbot.keyClick(editor, Qt.Key.Key_Delete)
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0) == [])
+
+    assert get_page_count(str(pdf_path)) == 1
