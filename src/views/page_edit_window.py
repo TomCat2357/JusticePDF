@@ -533,6 +533,61 @@ class ZoomPageWidget(QWidget):
             rect.height() * self._zoom_factor,
         )
 
+    def _annotation_color(
+        self,
+        color: tuple[float, float, float] | None,
+        *,
+        opacity: float = 1.0,
+    ) -> QColor | None:
+        if color is None:
+            return None
+        return QColor(
+            round(color[0] * 255),
+            round(color[1] * 255),
+            round(color[2] * 255),
+            round(max(0.0, min(1.0, opacity)) * 255),
+        )
+
+    def _paint_annotation(self, painter: QPainter, annot: FreeTextAnnotData, rect: QRectF) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        fill_color = self._annotation_color(annot.fill_color, opacity=annot.opacity)
+        if fill_color is not None:
+            painter.fillRect(rect, fill_color)
+
+        pen_width = max(0.0, float(annot.border_width) * self._zoom_factor)
+        border_color = self._annotation_color(annot.border_color)
+        if border_color is not None and pen_width > 0:
+            border_pen = QPen(border_color)
+            border_pen.setWidthF(pen_width)
+            painter.setPen(border_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            inset = pen_width / 2.0
+            border_rect = rect
+            if rect.width() > pen_width and rect.height() > pen_width:
+                border_rect = rect.adjusted(inset, inset, -inset, -inset)
+            painter.drawRect(border_rect)
+
+        if annot.content:
+            font = painter.font()
+            font.setPixelSize(max(10, round(annot.fontsize * self._zoom_factor)))
+            painter.setFont(font)
+            text_color = self._annotation_color(annot.text_color)
+            if text_color is not None:
+                painter.setPen(text_color)
+            painter.drawText(
+                rect,
+                int(
+                    Qt.AlignmentFlag.AlignLeft
+                    | Qt.AlignmentFlag.AlignTop
+                    | Qt.TextFlag.TextWordWrap
+                ),
+                annot.content,
+            )
+
+        painter.restore()
+
     def _handle_rects(self, rect: QRectF) -> dict[str, QRectF]:
         size = float(self.HANDLE_SIZE)
         half = size / 2.0
@@ -707,6 +762,13 @@ class ZoomPageWidget(QWidget):
                 if annot.xref == self._drag_annotation_xref and self._pending_annotation_rect is not None:
                     preview_rect = self._annotation_widget_rect(annot, self._pending_annotation_rect)
                 annot_rect = preview_rect or self._annotation_widget_rect(annot)
+                is_being_edited = (
+                    annot.xref == self._editing_annotation_xref
+                    and self._inline_editor is not None
+                    and self._inline_editor.isVisible()
+                )
+                if not is_being_edited:
+                    self._paint_annotation(painter, annot, annot_rect)
                 if annot.xref == self._selected_annotation_xref:
                     painter.setPen(QPen(QColor(0, 120, 215), 1))
                     painter.setBrush(QBrush(QColor(255, 255, 255)))
@@ -2071,7 +2133,12 @@ class PageEditWindow(QMainWindow):
             self._exit_zoom_view()
             return
         dpr = self._zoom_label.devicePixelRatioF()
-        pixmap = get_page_pixmap(self._pdf_path, self._zoom_page_num, self._zoom_factor * dpr)
+        pixmap = get_page_pixmap(
+            self._pdf_path,
+            self._zoom_page_num,
+            self._zoom_factor * dpr,
+            annots=False,
+        )
         pixmap.setDevicePixelRatio(dpr)
         words = []
         links = []

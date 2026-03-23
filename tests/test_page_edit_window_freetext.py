@@ -95,6 +95,11 @@ def test_zoom_selects_existing_freetext_and_applies_direct_edit_and_form_changes
     window = _create_window(qtbot, pdf_path)
     _open_zoom(window, qtbot)
 
+    base_pixel = window._zoom_label._pixmap.toImage().pixelColor(110, 90)
+    assert base_pixel.red() > 240
+    assert base_pixel.green() > 240
+    assert base_pixel.blue() > 240
+
     annot = list_freetext_annots(str(pdf_path), 0)[0]
     rect = window._zoom_label._annotation_widget_rect(annot)
     qtbot.mouseDClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())

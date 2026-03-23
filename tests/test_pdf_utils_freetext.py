@@ -6,6 +6,7 @@ from src.utils.pdf_utils import (
     FreeTextAnnotData,
     create_freetext_annot,
     delete_freetext_annot,
+    get_page_pixmap,
     list_freetext_annots,
     replace_freetext_annot,
 )
@@ -178,3 +179,37 @@ def test_freetext_create_and_replace_keep_richtext_appearance_data(tmp_path):
     assert fill_value != "null"
     assert style_kind == "string"
     assert "border:0px solid transparent" in style_value
+
+
+def test_get_page_pixmap_can_exclude_annotation_appearance(tmp_path):
+    pdf_path = tmp_path / "pixmap-annots-flag.pdf"
+    _make_pdf(pdf_path)
+
+    create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 240, 150),
+            content="visible",
+            fontsize=16,
+            text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=(0.0, 0.0, 0.0),
+            border_width=1,
+            opacity=1.0,
+        ),
+    )
+
+    pix_with_annots = get_page_pixmap(str(pdf_path), 0, 1.0, annots=True)
+    pix_without_annots = get_page_pixmap(str(pdf_path), 0, 1.0, annots=False)
+
+    with_annots = pix_with_annots.toImage().pixelColor(200, 130)
+    without_annots = pix_without_annots.toImage().pixelColor(200, 130)
+
+    assert with_annots.red() > 240
+    assert with_annots.green() > 240
+    assert with_annots.blue() < 80
+    assert without_annots.red() > 240
+    assert without_annots.green() > 240
+    assert without_annots.blue() > 240

@@ -422,11 +422,19 @@ def _render_page_pixmap(
     *,
     size: int | None = None,
     zoom: float | None = None,
+    annots: bool = True,
 ) -> QPixmap:
     """Render a PDF page to a pixmap with either size-based or zoom-based scaling."""
     try:
         mtime = _get_file_mtime(pdf_path)
-        cache_key = (pdf_path, page_num, size, round(zoom, 4) if zoom is not None else None, mtime)
+        cache_key = (
+            pdf_path,
+            page_num,
+            size,
+            round(zoom, 4) if zoom is not None else None,
+            bool(annots),
+            mtime,
+        )
         cached = _pixmap_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -439,7 +447,7 @@ def _render_page_pixmap(
             else:
                 scale = zoom or 1.0
             mat = fitz.Matrix(scale, scale)
-            pix = page.get_pixmap(matrix=mat)
+            pix = page.get_pixmap(matrix=mat, annots=annots)
         qpix = _pixmap_to_qpixmap(pix)
         _pixmap_cache.put(cache_key, qpix)
         return qpix
@@ -487,9 +495,9 @@ def get_page_thumbnail(pdf_path: str, page_num: int, size: int = 128) -> QPixmap
     return _render_page_pixmap(pdf_path, page_num, size=size)
 
 
-def get_page_pixmap(pdf_path: str, page_num: int, zoom: float = 1.0) -> QPixmap:
+def get_page_pixmap(pdf_path: str, page_num: int, zoom: float = 1.0, *, annots: bool = True) -> QPixmap:
     """Render a page at the given zoom factor."""
-    return _render_page_pixmap(pdf_path, page_num, zoom=zoom)
+    return _render_page_pixmap(pdf_path, page_num, zoom=zoom, annots=annots)
 
 
 def render_page_thumbnails_batch(pdf_path: str, page_nums: list[int], size: int = 128) -> dict[int, QPixmap]:
