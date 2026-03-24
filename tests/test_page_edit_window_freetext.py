@@ -136,7 +136,7 @@ def test_zoom_selects_existing_freetext_and_applies_direct_edit_and_form_changes
     assert changed.content == "changed"
     assert changed.rect == (50.0, 60.0, 250.0, 170.0)
     assert changed.fontsize == 22.0
-    assert abs(changed.opacity - 0.65) < 0.02
+    assert abs(changed.fill_opacity - 0.65) < 0.02
     assert changed.border_width == 4.0
     assert window._zoom_annotation_opacity_label.text() == "65%"
 
@@ -158,7 +158,7 @@ def test_zoom_can_move_resize_and_undo_redo_freetext(qtbot, tmp_path):
             fill_color=(1.0, 1.0, 0.6),
             border_color=(0.0, 0.0, 0.0),
             border_width=2,
-            opacity=1.0,
+            fill_opacity=1.0,
         ),
     )
 
@@ -211,7 +211,7 @@ def test_zoom_delete_key_removes_selected_freetext_instead_of_page(qtbot, tmp_pa
             fill_color=(1.0, 1.0, 0.6),
             border_color=(0.0, 0.0, 0.0),
             border_width=2,
-            opacity=1.0,
+            fill_opacity=1.0,
         ),
     )
 

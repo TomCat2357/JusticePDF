@@ -387,7 +387,7 @@ class ZoomPageWidget(QWidget):
 
     def _inline_editor_stylesheet(self, annotation: FreeTextAnnotData) -> str:
         fill = annotation.fill_color or (1.0, 1.0, 1.0)
-        opacity = max(0.0, min(1.0, annotation.opacity))
+        opacity = max(0.0, min(1.0, annotation.fill_opacity))
         fill_rgba = f"rgba({round(fill[0] * 255)}, {round(fill[1] * 255)}, {round(fill[2] * 255)}, {round(opacity * 255)})"
         text_rgb = f"rgb({round(annotation.text_color[0] * 255)}, {round(annotation.text_color[1] * 255)}, {round(annotation.text_color[2] * 255)})"
         return (
@@ -1128,18 +1128,6 @@ class PageEditWindow(QMainWindow):
         form.addRow("線幅", self._zoom_annotation_border_width_spin)
         panel_layout.addLayout(form)
 
-        opacity_row = QWidget()
-        opacity_layout = QHBoxLayout(opacity_row)
-        opacity_layout.setContentsMargins(0, 0, 0, 0)
-        opacity_layout.addWidget(QLabel("透明度"))
-        self._zoom_annotation_opacity_slider = QSlider(Qt.Orientation.Horizontal)
-        self._zoom_annotation_opacity_slider.setRange(0, 100)
-        self._zoom_annotation_opacity_slider.valueChanged.connect(self._on_zoom_annotation_opacity_changed)
-        opacity_layout.addWidget(self._zoom_annotation_opacity_slider, 1)
-        self._zoom_annotation_opacity_label = QLabel("0%")
-        opacity_layout.addWidget(self._zoom_annotation_opacity_label)
-        panel_layout.addWidget(opacity_row)
-
         self._zoom_annotation_text_color_btn = QPushButton()
         self._zoom_annotation_text_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("text"))
         panel_layout.addWidget(self._build_labeled_color_row("文字色", self._zoom_annotation_text_color_btn))
@@ -1147,6 +1135,18 @@ class PageEditWindow(QMainWindow):
         self._zoom_annotation_fill_color_btn = QPushButton()
         self._zoom_annotation_fill_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("fill"))
         panel_layout.addWidget(self._build_labeled_color_row("背景色", self._zoom_annotation_fill_color_btn))
+
+        opacity_row = QWidget()
+        opacity_layout = QHBoxLayout(opacity_row)
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_layout.addWidget(QLabel("背景の透明度"))
+        self._zoom_annotation_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_annotation_opacity_slider.setRange(0, 100)
+        self._zoom_annotation_opacity_slider.valueChanged.connect(self._on_zoom_annotation_opacity_changed)
+        opacity_layout.addWidget(self._zoom_annotation_opacity_slider, 1)
+        self._zoom_annotation_opacity_label = QLabel("0%")
+        opacity_layout.addWidget(self._zoom_annotation_opacity_label)
+        panel_layout.addWidget(opacity_row)
 
         self._zoom_annotation_border_color_btn = QPushButton()
         self._zoom_annotation_border_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("border"))
@@ -1276,9 +1276,9 @@ class PageEditWindow(QMainWindow):
                 if self._zoom_annotation_fontsize_spin:
                     self._zoom_annotation_fontsize_spin.setValue(max(6, round(annotation.fontsize)))
                 if self._zoom_annotation_opacity_slider:
-                    self._zoom_annotation_opacity_slider.setValue(round(annotation.opacity * 100))
+                    self._zoom_annotation_opacity_slider.setValue(round(annotation.fill_opacity * 100))
                 if self._zoom_annotation_opacity_label:
-                    self._zoom_annotation_opacity_label.setText(f"{round(annotation.opacity * 100)}%")
+                    self._zoom_annotation_opacity_label.setText(f"{round(annotation.fill_opacity * 100)}%")
                 if self._zoom_annotation_border_width_spin:
                     self._zoom_annotation_border_width_spin.setValue(round(annotation.border_width))
                 self._zoom_annotation_text_color = annotation.text_color
@@ -1348,7 +1348,7 @@ class PageEditWindow(QMainWindow):
             fill_color=self._zoom_annotation_fill_color,
             border_color=border_color,
             border_width=border_width,
-            opacity=(float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else base.opacity,
+            fill_opacity=(float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else base.fill_opacity,
             fontname=base.fontname,
             annotation_id=base.annotation_id,
             subject=base.subject,
@@ -1458,7 +1458,7 @@ class PageEditWindow(QMainWindow):
             fill_color=current.fill_color,
             border_color=current.border_color,
             border_width=current.border_width,
-            opacity=current.opacity,
+            fill_opacity=current.fill_opacity,
             fontname=current.fontname,
             annotation_id=current.annotation_id,
             subject=current.subject,
@@ -1509,7 +1509,7 @@ class PageEditWindow(QMainWindow):
             fill_color=self._zoom_annotation_fill_color,
             border_color=self._zoom_annotation_border_color,
             border_width=1.0,
-            opacity=1.0,
+            fill_opacity=1.0,
         )
         state: dict[str, FreeTextAnnotData | None] = {"created": None}
 
@@ -1585,7 +1585,7 @@ class PageEditWindow(QMainWindow):
             and old_annotation.fill_color == new_annotation.fill_color
             and old_annotation.border_color == new_annotation.border_color
             and abs(old_annotation.border_width - new_annotation.border_width) < 0.01
-            and abs(old_annotation.opacity - new_annotation.opacity) < 0.01
+            and abs(old_annotation.fill_opacity - new_annotation.fill_opacity) < 0.01
         ):
             return
         self._run_zoom_annotation_replace(old_annotation, new_annotation, "Update FreeText")
@@ -1629,7 +1629,7 @@ class PageEditWindow(QMainWindow):
             fill_color=old_annotation.fill_color,
             border_color=old_annotation.border_color,
             border_width=old_annotation.border_width,
-            opacity=old_annotation.opacity,
+            fill_opacity=old_annotation.fill_opacity,
             fontname=old_annotation.fontname,
             annotation_id=old_annotation.annotation_id,
             subject=old_annotation.subject,

@@ -40,7 +40,7 @@ def test_freetext_create_replace_delete_roundtrip(tmp_path):
             fill_color=(1.0, 1.0, 0.0),
             border_color=(1.0, 0.0, 0.0),
             border_width=2,
-            opacity=0.55,
+            fill_opacity=0.55,
         ),
     )
 
@@ -66,7 +66,7 @@ def test_freetext_create_replace_delete_roundtrip(tmp_path):
             fill_color=(0.9, 1.0, 0.9),
             border_color=(0.0, 0.0, 0.0),
             border_width=3,
-            opacity=0.7,
+            fill_opacity=0.7,
         ),
     )
 
@@ -108,7 +108,7 @@ def test_list_freetext_annots_reads_existing_richtext(tmp_path):
     assert annot.rect == (40.0, 50.0, 180.0, 120.0)
     assert annot.fontsize == 16.0
     assert annot.border_width == 3.0
-    assert abs(annot.opacity - 0.8) < 0.02
+    assert abs(annot.fill_opacity - 0.8) < 0.02
     _assert_color_close(annot.text_color, (0x11 / 255.0, 0x22 / 255.0, 0x33 / 255.0))
     _assert_color_close(annot.fill_color, (1.0, 0xEE / 255.0, 0xAA / 255.0))
     _assert_color_close(annot.border_color, (0x44 / 255.0, 0x55 / 255.0, 0x66 / 255.0))
@@ -130,7 +130,7 @@ def test_freetext_create_and_replace_keep_richtext_appearance_data(tmp_path):
             fill_color=(1.0, 1.0, 0.6),
             border_color=(0.0, 0.0, 1.0),
             border_width=2,
-            opacity=1.0,
+            fill_opacity=1.0,
         ),
     )
 
@@ -164,7 +164,7 @@ def test_freetext_create_and_replace_keep_richtext_appearance_data(tmp_path):
             fill_color=(0.9, 1.0, 0.9),
             border_color=(0.2, 0.2, 0.2),
             border_width=3,
-            opacity=0.9,
+            fill_opacity=0.9,
         ),
     )
 

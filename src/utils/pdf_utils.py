@@ -28,7 +28,7 @@ class FreeTextAnnotData:
     fill_color: tuple[float, float, float] | None
     border_color: tuple[float, float, float] | None
     border_width: float
-    opacity: float
+    fill_opacity: float
     fontname: str = "Helv"
     annotation_id: str = ""
     subject: str = ""
@@ -212,6 +212,7 @@ def _encode_subject_metadata(data: FreeTextAnnotData) -> str:
         "border_width": float(data.border_width),
         "fontsize": float(data.fontsize),
         "fontname": data.fontname,
+        "fill_opacity": float(data.fill_opacity),
     }
     return JUSTICEPDF_FREETEXT_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
 
@@ -317,14 +318,21 @@ def _extract_freetext_data(
         if rc_value != "null":
             content = _extract_text_from_rc(rc_value)
 
-    _, ca_value = doc.xref_get_key(xref, "CA")
-    if ca_value == "null":
-        opacity = 1.0
-    else:
+    # Fill opacity: prefer metadata value (new format); fall back to CA attribute (old format).
+    if "fill_opacity" in metadata:
         try:
-            opacity = float(ca_value)
-        except ValueError:
-            opacity = float(annot.opacity or 1.0)
+            fill_opacity = float(metadata["fill_opacity"])
+        except (TypeError, ValueError):
+            fill_opacity = 1.0
+    else:
+        _, ca_value = doc.xref_get_key(xref, "CA")
+        if ca_value == "null":
+            fill_opacity = 1.0
+        else:
+            try:
+                fill_opacity = float(ca_value)
+            except ValueError:
+                fill_opacity = float(annot.opacity or 1.0)
 
     _, name_value = doc.xref_get_key(xref, "NM")
     annotation_id = info.get("id") or (name_value if name_value != "null" else "")
@@ -339,11 +347,67 @@ def _extract_freetext_data(
         fill_color=fill_color,
         border_color=border_color,
         border_width=float(border_width),
-        opacity=max(0.0, min(1.0, float(opacity))),
+        fill_opacity=max(0.0, min(1.0, fill_opacity)),
         fontname=fontname or "Helv",
         annotation_id=annotation_id,
         subject=subject,
     )
+
+
+def _apply_fill_opacity_to_annot(doc: fitz.Document, annot: fitz.Annot, fill_opacity: float) -> None:
+    """Modify the annotation's AP stream to apply opacity only to the fill/background rect."""
+    if fill_opacity >= 1.0 - 1e-6:
+        return
+
+    xref = annot.xref
+    _, n_val = doc.xref_get_key(xref, "AP/N")
+    if not n_val or n_val == "null":
+        return
+
+    parts = n_val.strip().split()
+    if not parts:
+        return
+    try:
+        n_xref = int(parts[0])
+    except ValueError:
+        return
+
+    stream_bytes = doc.xref_stream(n_xref)
+    if not stream_bytes:
+        return
+
+    stream_str = stream_bytes.decode("latin-1")
+
+    # Add an ExtGState with non-stroking (fill) opacity only.
+    doc.xref_set_key(
+        n_xref,
+        "Resources/ExtGState",
+        f"<</GS_bg <</Type /ExtGState /ca {fill_opacity:.6f}>> >>",
+    )
+
+    # Find fill-rect pattern: "R G B rg  X Y W H re  f" and wrap with the GS.
+    num = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+    sp = r"[ \t\r\n]+"
+    fill_pat = re.compile(
+        r"("
+        + num + sp + num + sp + num + sp + r"rg" + sp
+        + num + sp + num + sp + num + sp + num + sp + r"re" + sp
+        + r"f(?=[ \t\r\n]|$)"
+        + r")",
+        re.MULTILINE,
+    )
+
+    match = fill_pat.search(stream_str)
+    if match:
+        start, end = match.span()
+        modified = (
+            stream_str[:start]
+            + "q /GS_bg gs "
+            + match.group(1).strip()
+            + " Q\n"
+            + stream_str[end:]
+        )
+        doc.update_stream(n_xref, modified.encode("latin-1"), new=True)
 
 
 def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fitz.Annot:
@@ -360,11 +424,12 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         text_color=data.text_color,
         fill_color=data.fill_color,
         border_width=max(0.0, float(data.border_width)),
-        opacity=max(0.0, min(1.0, float(data.opacity))),
+        opacity=1.0,
         richtext=True,
         style=_build_richtext_style(data),
     )
     annot.set_info(subject=_encode_subject_metadata(data))
+    _apply_fill_opacity_to_annot(page.parent, annot, data.fill_opacity)
     return annot
 
 
