@@ -3,6 +3,8 @@ from __future__ import annotations
 import fitz
 import pytest
 from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtGui import QCursor
+from PyQt6.QtWidgets import QApplication
 
 from src.models.undo_manager import UndoManager
 from src.utils.pdf_utils import FreeTextAnnotData, create_freetext_annot, get_page_count, list_freetext_annots
@@ -39,6 +41,33 @@ def _page_click_pos(window: PageEditWindow, x: int, y: int) -> QPoint:
     return QPoint(int(offset.x() + x), int(offset.y() + y))
 
 
+def _page_global_pos(window: PageEditWindow, x: int, y: int) -> QPoint:
+    return window._zoom_label.mapToGlobal(_page_click_pos(window, x, y))
+
+
+def _set_cursor_pos(qtbot, pos: QPoint) -> None:
+    QCursor.setPos(pos)
+    QApplication.processEvents()
+    qtbot.waitUntil(
+        lambda: abs(QCursor.pos().x() - pos.x()) <= 1
+        and abs(QCursor.pos().y() - pos.y()) <= 1
+    )
+
+
+def _drag_on_zoom_label(qtbot, window: PageEditWindow, start: tuple[int, int], end: tuple[int, int]) -> None:
+    qtbot.mousePress(
+        window._zoom_label,
+        Qt.MouseButton.LeftButton,
+        pos=_page_click_pos(window, *start),
+    )
+    qtbot.mouseMove(window._zoom_label, _page_click_pos(window, *end))
+    qtbot.mouseRelease(
+        window._zoom_label,
+        Qt.MouseButton.LeftButton,
+        pos=_page_click_pos(window, *end),
+    )
+
+
 def _annotation_for(window: PageEditWindow, xref: int):
     return next(annot for annot in window._zoom_annotations if annot.xref == xref)
 
@@ -60,11 +89,12 @@ def test_zoom_drawer_starts_closed_and_can_create_freetext(qtbot, tmp_path):
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
     assert window._zoom_annotation_new_btn.isChecked() is True
 
-    qtbot.mouseClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=_page_click_pos(window, 60, 80))
+    _drag_on_zoom_label(qtbot, window, (60, 80), (160, 150))
     qtbot.waitUntil(lambda: len(list_freetext_annots(str(pdf_path), 0)) == 1)
 
     annots = list_freetext_annots(str(pdf_path), 0)
     assert len(annots) == 1
+    assert annots[0].rect == (60.0, 80.0, 160.0, 150.0)
     assert window._selected_zoom_annotation is not None
     assert window._selected_zoom_annotation.content == ""
     assert window._zoom_annotation_open is True
@@ -244,7 +274,7 @@ def test_zoom_delete_key_removes_active_freetext_editor_annotation(qtbot, tmp_pa
 
     qtbot.mouseClick(window._zoom_annotation_toggle_btn, Qt.MouseButton.LeftButton)
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
-    qtbot.mouseClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=_page_click_pos(window, 60, 80))
+    _drag_on_zoom_label(qtbot, window, (60, 80), (160, 140))
     qtbot.waitUntil(lambda: window._zoom_label.has_active_text_editor())
 
     editor = window._zoom_label._inline_editor
@@ -254,3 +284,200 @@ def test_zoom_delete_key_removes_active_freetext_editor_annotation(qtbot, tmp_pa
     qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0) == [])
 
     assert get_page_count(str(pdf_path)) == 1
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_can_copy_paste_freetext_and_undo_redo(qtbot, tmp_path):
+    pdf_path = tmp_path / "copy-paste.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 170, 120),
+            content="copied box",
+            fontsize=18,
+            text_color=(0.1, 0.2, 0.3),
+            fill_color=(0.9, 1.0, 0.7),
+            border_color=(0.3, 0.2, 0.1),
+            border_width=3,
+            opacity=0.6,
+            fontname="Helv",
+            subject="copied-subject",
+        ),
+    )
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    source = _annotation_for(window, created.xref)
+    rect = window._zoom_label._annotation_widget_rect(source)
+    qtbot.mouseClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+    qtbot.waitUntil(
+        lambda: window._selected_zoom_annotation is not None
+        and window._selected_zoom_annotation.xref == created.xref
+    )
+
+    qtbot.keyClick(window._zoom_label, Qt.Key.Key_C, modifier=Qt.KeyboardModifier.ControlModifier)
+    assert window._copied_zoom_annotation is not None
+    assert window._copied_zoom_annotation.content == source.content
+    assert window._copied_zoom_annotation.fontsize == source.fontsize
+    assert window._copied_zoom_annotation.text_color == source.text_color
+    assert window._copied_zoom_annotation.fill_color == source.fill_color
+    assert window._copied_zoom_annotation.border_color == source.border_color
+    assert window._copied_zoom_annotation.border_width == source.border_width
+    assert window._copied_zoom_annotation.opacity == source.opacity
+    assert window._copied_zoom_annotation.subject == source.subject
+
+    _set_cursor_pos(qtbot, _page_global_pos(window, 150, 190))
+    page_point = window._zoom_label.page_point_from_global_pos(QCursor.pos())
+    assert page_point is not None
+    expected_rect = window._zoom_label.annotation_rect_for_page_point(source, page_point)
+    assert expected_rect is not None
+    qtbot.keyClick(window._zoom_label, Qt.Key.Key_V, modifier=Qt.KeyboardModifier.ControlModifier)
+    qtbot.waitUntil(lambda: len(list_freetext_annots(str(pdf_path), 0)) == 2)
+    assert window._zoom_label.has_annotation_paste_mode() is False
+
+    annots = list_freetext_annots(str(pdf_path), 0)
+    pasted = next(annot for annot in annots if annot.xref != created.xref)
+    assert pasted.content == source.content
+    assert pasted.fontsize == source.fontsize
+    assert pasted.text_color == source.text_color
+    assert pasted.fill_color == source.fill_color
+    assert pasted.border_color == source.border_color
+    assert pasted.border_width == source.border_width
+    assert pasted.opacity == source.opacity
+    assert pasted.subject == source.subject
+    assert pasted.rect == window._zoom_label._qrectf_to_rect_tuple(expected_rect)
+
+    window._on_undo()
+    qtbot.waitUntil(lambda: len(list_freetext_annots(str(pdf_path), 0)) == 1)
+
+    window._on_redo()
+    qtbot.waitUntil(lambda: len(list_freetext_annots(str(pdf_path), 0)) == 2)
+    pasted_again = max(list_freetext_annots(str(pdf_path), 0), key=lambda annot: annot.xref)
+    assert pasted_again.content == "copied box"
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_paste_ignores_cursor_outside_page(qtbot, tmp_path):
+    pdf_path = tmp_path / "copy-paste-outside.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 170, 120),
+            content="outside",
+            fontsize=18,
+            text_color=(0.1, 0.2, 0.3),
+            fill_color=(0.9, 1.0, 0.7),
+            border_color=(0.3, 0.2, 0.1),
+            border_width=3,
+            opacity=0.6,
+        ),
+    )
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    source = _annotation_for(window, created.xref)
+    rect = window._zoom_label._annotation_widget_rect(source)
+    qtbot.mouseClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+    qtbot.waitUntil(
+        lambda: window._selected_zoom_annotation is not None
+        and window._selected_zoom_annotation.xref == created.xref
+    )
+
+    qtbot.keyClick(window._zoom_label, Qt.Key.Key_C, modifier=Qt.KeyboardModifier.ControlModifier)
+    outside = window._zoom_label.mapToGlobal(
+        QPoint(window._zoom_label.width() + 20, window._zoom_label.height() + 20)
+    )
+    _set_cursor_pos(qtbot, outside)
+
+    qtbot.keyClick(window._zoom_label, Qt.Key.Key_V, modifier=Qt.KeyboardModifier.ControlModifier)
+
+    assert len(list_freetext_annots(str(pdf_path), 0)) == 1
+    assert window._zoom_label.has_annotation_paste_mode() is False
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_editor_ctrl_c_v_prioritize_text_editing(qtbot, tmp_path):
+    pdf_path = tmp_path / "editor-priority.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 170, 120),
+            content="editor copy",
+            fontsize=14,
+            text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.6),
+            border_color=(0.0, 0.0, 0.0),
+            border_width=2,
+            opacity=1.0,
+        ),
+    )
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    annot = _annotation_for(window, created.xref)
+    rect = window._zoom_label._annotation_widget_rect(annot)
+    qtbot.mouseClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+    qtbot.keyClick(window._zoom_label, Qt.Key.Key_C, modifier=Qt.KeyboardModifier.ControlModifier)
+    assert window._copied_zoom_annotation is not None
+
+    qtbot.mouseDClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+    qtbot.waitUntil(lambda: window._zoom_label.has_active_text_editor())
+
+    editor = window._zoom_label._inline_editor
+    assert editor is not None
+
+    clipboard = QApplication.clipboard()
+    editor.selectAll()
+    qtbot.keyClick(editor, Qt.Key.Key_C, modifier=Qt.KeyboardModifier.ControlModifier)
+    qtbot.waitUntil(lambda: clipboard.text() == "editor copy")
+
+    clipboard.setText("replaced via paste")
+    editor.selectAll()
+    qtbot.keyClick(editor, Qt.Key.Key_V, modifier=Qt.KeyboardModifier.ControlModifier)
+    window._zoom_annotation_width_spin.setFocus()
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].content == "replaced via paste")
+
+    assert len(list_freetext_annots(str(pdf_path), 0)) == 1
+    assert window._zoom_label.has_annotation_paste_mode() is False
+    assert window._copied_zoom_annotation is not None
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_copy_without_selected_annotation_still_copies_selected_text(qtbot, tmp_path):
+    pdf_path = tmp_path / "selected-text-copy.pdf"
+    _make_pdf(pdf_path)
+
+    doc = fitz.open(str(pdf_path))
+    page = doc[0]
+    page.insert_text((40, 80), "hello world")
+    doc.saveIncr()
+    doc.close()
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    assert len(window._zoom_label._words) >= 2
+    window._zoom_label._selected_word_indices = list(range(len(window._zoom_label._words)))
+    window._zoom_label.setFocus()
+
+    clipboard = QApplication.clipboard()
+    clipboard.clear()
+    qtbot.keyClick(window._zoom_label, Qt.Key.Key_C, modifier=Qt.KeyboardModifier.ControlModifier)
+    qtbot.waitUntil(lambda: clipboard.text() == "hello world")
+
+    assert window._copied_zoom_annotation is None
