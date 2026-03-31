@@ -226,6 +226,8 @@ def _build_richtext_style(data: FreeTextAnnotData) -> str:
     ]
     if data.fill_color is not None:
         parts.append(f"background-color:{_color_to_css(data.fill_color)}")
+    else:
+        parts.append("background-color:transparent")
     parts.append("border:0px solid transparent")
     return "; ".join(parts) + ";"
 
@@ -292,14 +294,16 @@ def _extract_freetext_data(
         if parsed is not None:
             text_color = parsed
     metadata_fill_color = metadata.get("fill_color")
+    fill_color_explicit_none = metadata_fill_color is None and "fill_color" in metadata
     if isinstance(metadata_fill_color, list):
         fill_color = _normalize_color(metadata_fill_color)
-    elif metadata_fill_color is None and "fill_color" in metadata:
+    elif fill_color_explicit_none:
         fill_color = None
     metadata_border_color = metadata.get("border_color")
+    border_color_explicit_none = metadata_border_color is None and "border_color" in metadata
     if isinstance(metadata_border_color, list):
         border_color = _normalize_color(metadata_border_color)
-    elif metadata_border_color is None and "border_color" in metadata:
+    elif border_color_explicit_none:
         border_color = None
     if isinstance(metadata.get("border_width"), (int, float)):
         border_width = float(metadata["border_width"])
@@ -307,7 +311,7 @@ def _extract_freetext_data(
     if border_width <= 0:
         border_color = None
         border_width = 0.0
-    elif border_color is None:
+    elif border_color is None and not border_color_explicit_none:
         border_color = (0.0, 0.0, 0.0)
 
     _, contents_value = doc.xref_get_key(xref, "Contents")
@@ -348,8 +352,11 @@ def _extract_freetext_data(
 
 def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fitz.Annot:
     rect = fitz.Rect(*data.rect)
-    if data.border_width > 0:
-        inset = float(data.border_width) / 2.0
+    border_width = max(0.0, float(data.border_width))
+    effective_border_width = border_width if border_width > 0 and data.border_color is not None else 0.0
+    opacity = max(0.0, min(1.0, float(data.opacity)))
+    if effective_border_width > 0:
+        inset = effective_border_width / 2.0
         if rect.width > inset * 2 and rect.height > inset * 2:
             rect = fitz.Rect(rect.x0 + inset, rect.y0 + inset, rect.x1 - inset, rect.y1 - inset)
     annot = page.add_freetext_annot(
@@ -359,10 +366,19 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         fontname=data.fontname or "Helv",
         text_color=data.text_color,
         fill_color=data.fill_color,
-        border_width=max(0.0, float(data.border_width)),
-        opacity=max(0.0, min(1.0, float(data.opacity))),
+        border_width=effective_border_width,
+        opacity=opacity,
         richtext=True,
         style=_build_richtext_style(data),
+    )
+    annot.set_border(width=effective_border_width)
+    annot.update(
+        fontsize=max(1.0, float(data.fontsize)),
+        fontname=data.fontname or "Helv",
+        text_color=data.text_color,
+        border_color=data.border_color if effective_border_width > 0 else None,
+        fill_color=data.fill_color,
+        opacity=opacity,
     )
     annot.set_info(subject=_encode_subject_metadata(data))
     return annot

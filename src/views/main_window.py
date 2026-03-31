@@ -183,6 +183,10 @@ class MainWindow(QMainWindow):
         self._export_btn.clicked.connect(self._on_export)
         toolbar.addWidget(self._export_btn)
 
+        self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn.clicked.connect(self._on_refresh)
+        toolbar.addWidget(self._refresh_btn)
+
         toolbar.addSeparator()
 
         self._rotate_btn = QPushButton("Rotate")
@@ -297,7 +301,30 @@ class MainWindow(QMainWindow):
                 isinstance(widget, PageEditWindow)
                 and self._normalize_path(widget._pdf_path) in normalized_paths
             ):
-                widget._on_external_pdf_rotation()
+                widget.refresh_from_disk()
+
+    def _get_open_page_edit_windows(self) -> list[object]:
+        from src.views.page_edit_window import PageEditWindow
+
+        return [
+            widget
+            for widget in QApplication.topLevelWidgets()
+            if isinstance(widget, PageEditWindow)
+        ]
+
+    def _refresh_cards_for_paths(self, paths: list[str]) -> None:
+        normalized_paths = {self._normalize_path(path) for path in paths}
+        for card in self._cards:
+            if self._normalize_path(card.pdf_path) in normalized_paths:
+                card.refresh()
+
+    def _refresh_all_views(self) -> None:
+        card_paths = [card.pdf_path for card in self._cards]
+        if card_paths:
+            self._refresh_cards_for_paths(card_paths)
+            self._refresh_grid()
+        for widget in self._get_open_page_edit_windows():
+            widget.refresh_from_disk()
 
     def _perform_rename(self, old_path: str, new_path: str) -> None:
         old_norm = self._normalize_path(old_path)
@@ -876,6 +903,10 @@ class MainWindow(QMainWindow):
         """Handle redo action."""
         self._undo_manager.redo()
         self._update_button_states()
+
+    def _on_refresh(self) -> None:
+        """Reload cards and open edit windows from disk."""
+        self._refresh_all_views()
 
     def _on_delete(self) -> None:
         """Handle delete action."""

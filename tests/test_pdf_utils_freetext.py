@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fitz
+import pytest
 
 from src.utils.pdf_utils import (
     FreeTextAnnotData,
@@ -10,6 +11,9 @@ from src.utils.pdf_utils import (
     list_freetext_annots,
     replace_freetext_annot,
 )
+
+
+pytestmark = pytest.mark.usefixtures("qapp")
 
 
 def _make_pdf(path, *, width: int = 320, height: int = 420) -> None:
@@ -23,6 +27,13 @@ def _assert_color_close(actual, expected) -> None:
     assert actual is not None
     for left, right in zip(actual, expected):
         assert abs(left - right) < 0.02
+
+
+def _page_rgb(path, x: int, y: int, *, annots: bool = True) -> tuple[int, int, int]:
+    with fitz.open(str(path)) as doc:
+        pix = doc[0].get_pixmap(matrix=fitz.Matrix(1, 1), annots=annots)
+    offset = y * pix.stride + x * pix.n
+    return tuple(pix.samples[offset:offset + 3])
 
 
 def test_freetext_create_replace_delete_roundtrip(tmp_path):
@@ -179,6 +190,120 @@ def test_freetext_create_and_replace_keep_richtext_appearance_data(tmp_path):
     assert fill_value != "null"
     assert style_kind == "string"
     assert "border:0px solid transparent" in style_value
+
+
+def test_freetext_create_with_empty_content_generates_visible_border_appearance(tmp_path):
+    pdf_path = tmp_path / "empty-border-appearance.pdf"
+    _make_pdf(pdf_path, width=300, height=300)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(50, 50, 200, 150),
+            content="",
+            fontsize=14,
+            text_color=(1.0, 0.0, 0.0),
+            fill_color=None,
+            border_color=(1.0, 0.0, 0.0),
+            border_width=2,
+            opacity=1.0,
+        ),
+    )
+
+    with fitz.open(str(pdf_path)) as doc:
+        da_kind, da_value = doc.xref_get_key(created.xref, "DA")
+        ap_kind, ap_value = doc.xref_get_key(created.xref, "AP")
+    assert da_kind == "string"
+    assert "1 0 0 rg" in da_value
+    assert ap_kind == "dict"
+    assert ap_value != "null"
+    assert _page_rgb(pdf_path, 50, 50) == (255, 0, 0)
+    assert _page_rgb(pdf_path, 125, 100) == (255, 255, 255)
+
+
+def test_freetext_replace_updates_empty_border_appearance(tmp_path):
+    pdf_path = tmp_path / "replace-empty-border-appearance.pdf"
+    _make_pdf(pdf_path, width=300, height=300)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 40, 180, 130),
+            content="",
+            fontsize=12,
+            text_color=(0.0, 0.0, 0.0),
+            fill_color=None,
+            border_color=(0.0, 0.0, 0.0),
+            border_width=1,
+            opacity=1.0,
+        ),
+    )
+
+    replaced = replace_freetext_annot(
+        str(pdf_path),
+        0,
+        created.xref,
+        FreeTextAnnotData(
+            page_num=0,
+            xref=created.xref,
+            rect=(60, 60, 220, 170),
+            content="",
+            fontsize=16,
+            text_color=(1.0, 0.0, 0.0),
+            fill_color=None,
+            border_color=(1.0, 0.0, 0.0),
+            border_width=3,
+            opacity=1.0,
+        ),
+    )
+
+    with fitz.open(str(pdf_path)) as doc:
+        da_kind, da_value = doc.xref_get_key(replaced.xref, "DA")
+    assert da_kind == "string"
+    assert "1 0 0 rg" in da_value
+    assert _page_rgb(pdf_path, 60, 60) == (255, 0, 0)
+    assert _page_rgb(pdf_path, 140, 110) == (255, 255, 255)
+
+
+def test_freetext_create_preserves_transparent_fill_and_border_metadata(tmp_path):
+    pdf_path = tmp_path / "transparent-colors.pdf"
+    _make_pdf(pdf_path, width=300, height=300)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 40, 220, 170),
+            content="transparent",
+            fontsize=14,
+            text_color=(1.0, 0.0, 0.0),
+            fill_color=None,
+            border_color=None,
+            border_width=3,
+            opacity=0.6,
+        ),
+    )
+
+    listed = list_freetext_annots(str(pdf_path), 0)
+    assert len(listed) == 1
+    assert listed[0].fill_color is None
+    assert listed[0].border_color is None
+    assert listed[0].border_width == 3.0
+    assert abs(listed[0].opacity - 0.6) < 0.02
+
+    with fitz.open(str(pdf_path)) as doc:
+        style_kind, style_value = doc.xref_get_key(created.xref, "DS")
+        border_kind, border_value = doc.xref_get_key(created.xref, "BS")
+    assert style_kind == "string"
+    assert "background-color:transparent" in style_value
+    assert border_kind == "dict"
+    assert "/W 0" in border_value
+    assert _page_rgb(pdf_path, 60, 60) == (255, 255, 255)
 
 
 def test_get_page_pixmap_can_exclude_annotation_appearance(tmp_path):

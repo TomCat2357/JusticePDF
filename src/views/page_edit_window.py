@@ -426,14 +426,26 @@ class ZoomPageWidget(QWidget):
             self.annotation_text_edit_cancelled.emit()
 
     def _inline_editor_stylesheet(self, annotation: FreeTextAnnotData) -> str:
-        fill = annotation.fill_color or (1.0, 1.0, 1.0)
         opacity = max(0.0, min(1.0, annotation.opacity))
-        fill_rgba = f"rgba({round(fill[0] * 255)}, {round(fill[1] * 255)}, {round(fill[2] * 255)}, {round(opacity * 255)})"
-        text_rgb = f"rgb({round(annotation.text_color[0] * 255)}, {round(annotation.text_color[1] * 255)}, {round(annotation.text_color[2] * 255)})"
+        if annotation.fill_color is None:
+            fill_css = "transparent"
+        else:
+            fill_css = (
+                f"rgba({round(annotation.fill_color[0] * 255)}, "
+                f"{round(annotation.fill_color[1] * 255)}, "
+                f"{round(annotation.fill_color[2] * 255)}, "
+                f"{round(opacity * 255)})"
+            )
+        text_css = (
+            f"rgba({round(annotation.text_color[0] * 255)}, "
+            f"{round(annotation.text_color[1] * 255)}, "
+            f"{round(annotation.text_color[2] * 255)}, "
+            f"{round(opacity * 255)})"
+        )
         return (
             "QPlainTextEdit {"
-            f"background-color: {fill_rgba};"
-            f"color: {text_rgb};"
+            f"background-color: {fill_css};"
+            f"color: {text_css};"
             "border: 0px solid transparent;"
             "padding: 0px;"
             "margin: 0px;"
@@ -607,7 +619,7 @@ class ZoomPageWidget(QWidget):
             painter.fillRect(rect, fill_color)
 
         pen_width = max(0.0, float(annot.border_width) * self._zoom_factor)
-        border_color = self._annotation_color(annot.border_color)
+        border_color = self._annotation_color(annot.border_color, opacity=annot.opacity)
         if border_color is not None and pen_width > 0:
             border_pen = QPen(border_color)
             border_pen.setWidthF(pen_width)
@@ -623,7 +635,7 @@ class ZoomPageWidget(QWidget):
             font = painter.font()
             font.setPixelSize(max(10, round(annot.fontsize * self._zoom_factor)))
             painter.setFont(font)
-            text_color = self._annotation_color(annot.text_color)
+            text_color = self._annotation_color(annot.text_color, opacity=annot.opacity)
             if text_color is not None:
                 painter.setPen(text_color)
             painter.drawText(
@@ -1162,10 +1174,12 @@ class PageEditWindow(QMainWindow):
         self._zoom_annotation_border_width_spin = None
         self._zoom_annotation_text_color_btn = None
         self._zoom_annotation_fill_color_btn = None
+        self._zoom_annotation_fill_color_clear_btn = None
         self._zoom_annotation_border_color_btn = None
+        self._zoom_annotation_border_color_clear_btn = None
         self._zoom_annotation_text_color = (0.0, 0.0, 0.0)
-        self._zoom_annotation_fill_color = (1.0, 1.0, 0.6)
-        self._zoom_annotation_border_color = (0.0, 0.0, 0.0)
+        self._zoom_annotation_fill_color: tuple[float, float, float] | None = (1.0, 1.0, 0.6)
+        self._zoom_annotation_border_color: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
         self._thumb_size = PageThumbnail.THUMBNAIL_SIZE
         self._thumb_render_queue: deque[int] = deque()
         self._thumb_render_queue_set: set[int] = set()
@@ -1394,11 +1408,31 @@ class PageEditWindow(QMainWindow):
 
         self._zoom_annotation_fill_color_btn = QPushButton()
         self._zoom_annotation_fill_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("fill"))
-        panel_layout.addWidget(self._build_labeled_color_row("背景色", self._zoom_annotation_fill_color_btn))
+        self._zoom_annotation_fill_color_clear_btn = QPushButton("透明")
+        self._zoom_annotation_fill_color_clear_btn.clicked.connect(
+            lambda: self._clear_zoom_annotation_color("fill")
+        )
+        panel_layout.addWidget(
+            self._build_labeled_color_row(
+                "背景色",
+                self._zoom_annotation_fill_color_btn,
+                clear_button=self._zoom_annotation_fill_color_clear_btn,
+            )
+        )
 
         self._zoom_annotation_border_color_btn = QPushButton()
         self._zoom_annotation_border_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("border"))
-        panel_layout.addWidget(self._build_labeled_color_row("線色", self._zoom_annotation_border_color_btn))
+        self._zoom_annotation_border_color_clear_btn = QPushButton("透明")
+        self._zoom_annotation_border_color_clear_btn.clicked.connect(
+            lambda: self._clear_zoom_annotation_color("border")
+        )
+        panel_layout.addWidget(
+            self._build_labeled_color_row(
+                "線色",
+                self._zoom_annotation_border_color_btn,
+                clear_button=self._zoom_annotation_border_color_clear_btn,
+            )
+        )
 
         panel_layout.addStretch()
         drawer_layout.addWidget(self._zoom_annotation_panel)
@@ -1410,13 +1444,22 @@ class PageEditWindow(QMainWindow):
         layout.addWidget(self._zoom_view)
         self._zoom_view.hide()
 
-    def _build_labeled_color_row(self, label_text: str, button: QPushButton) -> QWidget:
+    def _build_labeled_color_row(
+        self,
+        label_text: str,
+        button: QPushButton,
+        *,
+        clear_button: QPushButton | None = None,
+    ) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(QLabel(label_text))
         button.setMinimumWidth(120)
         layout.addWidget(button, 1)
+        if clear_button is not None:
+            clear_button.setFixedWidth(56)
+            layout.addWidget(clear_button)
         return row
 
     def _set_color_button_preview(
@@ -1430,7 +1473,7 @@ class PageEditWindow(QMainWindow):
             return
         if color is None and allow_none:
             button.setText("透明")
-            button.setStyleSheet("")
+            button.setStyleSheet("background-color: transparent; color: #000000;")
             return
         qcolor = self._rgb_tuple_to_qcolor(color or (0.0, 0.0, 0.0))
         button.setText(qcolor.name())
@@ -1492,7 +1535,9 @@ class PageEditWindow(QMainWindow):
                 self._zoom_annotation_border_width_spin,
                 self._zoom_annotation_text_color_btn,
                 self._zoom_annotation_fill_color_btn,
+                self._zoom_annotation_fill_color_clear_btn,
                 self._zoom_annotation_border_color_btn,
+                self._zoom_annotation_border_color_clear_btn,
             ]
             has_selection = annotation is not None
             for widget in widgets:
@@ -1532,11 +1577,17 @@ class PageEditWindow(QMainWindow):
                 if self._zoom_annotation_border_width_spin:
                     self._zoom_annotation_border_width_spin.setValue(round(annotation.border_width))
                 self._zoom_annotation_text_color = annotation.text_color
-                self._zoom_annotation_fill_color = annotation.fill_color or (1.0, 1.0, 0.6)
-                self._zoom_annotation_border_color = annotation.border_color or (0.0, 0.0, 0.0)
+                self._zoom_annotation_fill_color = annotation.fill_color
+                self._zoom_annotation_border_color = (
+                    annotation.border_color if annotation.border_width > 0 else None
+                )
 
             self._set_color_button_preview(self._zoom_annotation_text_color_btn, self._zoom_annotation_text_color)
-            self._set_color_button_preview(self._zoom_annotation_fill_color_btn, self._zoom_annotation_fill_color)
+            self._set_color_button_preview(
+                self._zoom_annotation_fill_color_btn,
+                self._zoom_annotation_fill_color,
+                allow_none=True,
+            )
             self._set_color_button_preview(
                 self._zoom_annotation_border_color_btn,
                 None if (annotation is not None and annotation.border_width <= 0) else self._zoom_annotation_border_color,
@@ -1551,9 +1602,9 @@ class PageEditWindow(QMainWindow):
         if kind == "text":
             current = self._zoom_annotation_text_color
         elif kind == "fill":
-            current = self._zoom_annotation_fill_color
+            current = self._zoom_annotation_fill_color or (1.0, 1.0, 0.6)
         else:
-            current = self._zoom_annotation_border_color
+            current = self._zoom_annotation_border_color or (0.0, 0.0, 0.0)
         color = QColorDialog.getColor(self._rgb_tuple_to_qcolor(current), self, "色を選択")
         if not color.isValid():
             return
@@ -1563,10 +1614,23 @@ class PageEditWindow(QMainWindow):
             self._set_color_button_preview(self._zoom_annotation_text_color_btn, rgb)
         elif kind == "fill":
             self._zoom_annotation_fill_color = rgb
-            self._set_color_button_preview(self._zoom_annotation_fill_color_btn, rgb)
+            self._set_color_button_preview(self._zoom_annotation_fill_color_btn, rgb, allow_none=True)
         else:
             self._zoom_annotation_border_color = rgb
             self._set_color_button_preview(self._zoom_annotation_border_color_btn, rgb, allow_none=True)
+        self._apply_zoom_annotation_form()
+
+    def _clear_zoom_annotation_color(self, kind: str) -> None:
+        if self._selected_zoom_annotation is None:
+            return
+        if kind == "fill":
+            self._zoom_annotation_fill_color = None
+            self._set_color_button_preview(self._zoom_annotation_fill_color_btn, None, allow_none=True)
+        elif kind == "border":
+            self._zoom_annotation_border_color = None
+            self._set_color_button_preview(self._zoom_annotation_border_color_btn, None, allow_none=True)
+        else:
+            return
         self._apply_zoom_annotation_form()
 
     def _current_zoom_annotation_page_size(self) -> tuple[float, float]:
@@ -2135,11 +2199,12 @@ class PageEditWindow(QMainWindow):
         if self._zoom_view and self._zoom_view.isVisible():
             self._render_zoom_page()
 
-    def _on_external_pdf_rotation(self) -> None:
-        """外部（MainWindow等）で回転されたPDFを即時反映する。"""
+    def refresh_from_disk(self) -> None:
+        """Reload the current PDF from disk without closing the edit window."""
         if not os.path.exists(self._pdf_path):
             return
 
+        self._commit_inline_annotation_editor()
         page_count = get_page_count(self._pdf_path)
         if page_count != len(self._thumbnails):
             self._load_pages()
@@ -2154,6 +2219,10 @@ class PageEditWindow(QMainWindow):
 
         if self._zoom_view and self._zoom_view.isVisible():
             self._render_zoom_page()
+
+    def _on_external_pdf_rotation(self) -> None:
+        """外部（MainWindow等）で回転されたPDFを即時反映する。"""
+        self.refresh_from_disk()
 
     def _grid_available_width(self) -> int:
         """Width source for column calculation (always consistent)."""

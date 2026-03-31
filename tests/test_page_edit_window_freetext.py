@@ -287,6 +287,53 @@ def test_zoom_delete_key_removes_active_freetext_editor_annotation(qtbot, tmp_pa
 
 
 @pytest.mark.usefixtures("qtbot")
+def test_zoom_can_clear_fill_and_border_colors(qtbot, tmp_path):
+    pdf_path = tmp_path / "clear-transparent-colors.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 170, 120),
+            content="transparent options",
+            fontsize=16,
+            text_color=(0.1, 0.2, 0.3),
+            fill_color=(0.9, 1.0, 0.7),
+            border_color=(0.3, 0.2, 0.1),
+            border_width=3,
+            opacity=0.6,
+        ),
+    )
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    annot = _annotation_for(window, created.xref)
+    rect = window._zoom_label._annotation_widget_rect(annot)
+    qtbot.mouseClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+    qtbot.waitUntil(
+        lambda: window._selected_zoom_annotation is not None
+        and window._selected_zoom_annotation.xref == created.xref
+    )
+
+    qtbot.mouseClick(window._zoom_annotation_fill_color_clear_btn, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].fill_color is None)
+
+    qtbot.mouseClick(window._zoom_annotation_border_color_clear_btn, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].border_color is None)
+
+    changed = list_freetext_annots(str(pdf_path), 0)[0]
+    assert changed.fill_color is None
+    assert changed.border_color is None
+    assert changed.border_width == 3.0
+    assert abs(changed.opacity - 0.6) < 0.02
+    assert window._zoom_annotation_fill_color_btn.text() == "透明"
+    assert window._zoom_annotation_border_color_btn.text() == "透明"
+
+
+@pytest.mark.usefixtures("qtbot")
 def test_zoom_can_copy_paste_freetext_and_undo_redo(qtbot, tmp_path):
     pdf_path = tmp_path / "copy-paste.pdf"
     _make_pdf(pdf_path)

@@ -7,6 +7,7 @@ from PyQt6.QtCore import QObject, QPoint, pyqtSignal
 from PyQt6.QtGui import QPixmap
 
 from src.views import main_window, pdf_card
+from src.views import page_edit_window as page_edit_window_module
 
 
 class FakeWatcher(QObject):
@@ -114,3 +115,35 @@ def test_context_menu_paths_follow_grid_order(window_factory, monkeypatch):
     window._on_card_context_menu_requested(first_card, QPoint(5, 15))
 
     assert captured == [[paths[0], paths[2]]]
+
+
+def test_refresh_button_refreshes_cards_and_open_page_windows(window_factory, monkeypatch):
+    window, paths = window_factory(count=2)
+    card_refreshes: list[str] = []
+
+    monkeypatch.setattr(
+        pdf_card.PDFCard,
+        "refresh",
+        lambda self: card_refreshes.append(self.pdf_path),
+    )
+
+    class FakePageEditWindow:
+        def __init__(self, pdf_path: str):
+            self._pdf_path = pdf_path
+            self.refresh_calls = 0
+
+        def refresh_from_disk(self) -> None:
+            self.refresh_calls += 1
+
+    fake_window = FakePageEditWindow(paths[0])
+    monkeypatch.setattr(page_edit_window_module, "PageEditWindow", FakePageEditWindow)
+    monkeypatch.setattr(
+        main_window.QApplication,
+        "topLevelWidgets",
+        staticmethod(lambda: [fake_window]),
+    )
+
+    window._refresh_btn.click()
+
+    assert card_refreshes == paths
+    assert fake_window.refresh_calls == 1
