@@ -2641,7 +2641,7 @@ class PageEditWindow(QMainWindow):
         old_name = os.path.basename(old_path)
         old_title = get_pdf_metadata_title(old_path) or os.path.splitext(old_name)[0]
         new_title, ok = QInputDialog.getText(
-            self, "Rename PDF Name", "New PDF name:", text=old_title
+            self, "Rename PDF Title", "New PDF title:", text=old_title
         )
 
         if not ok or not new_title or new_title == old_title:
