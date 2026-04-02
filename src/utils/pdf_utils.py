@@ -112,6 +112,18 @@ def update_pdf_metadata_title(pdf_path: str, title: str) -> None:
         logger.debug("Failed to update PDF metadata title: %s", pdf_path, exc_info=True)
 
 
+def get_pdf_metadata_title(pdf_path: str) -> str:
+    """PDFメタデータのTitleプロパティを取得する。"""
+    try:
+        with fitz.open(pdf_path) as doc:
+            meta = doc.metadata or {}
+            title = meta.get("title")
+            return str(title) if isinstance(title, str) else ""
+    except Exception:
+        logger.debug("Failed to read PDF metadata title: %s", pdf_path, exc_info=True)
+        return ""
+
+
 def _parse_float_array(value: str) -> list[float]:
     return [float(item) for item in re.findall(_FLOAT_RE, value or "")]
 

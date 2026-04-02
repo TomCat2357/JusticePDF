@@ -24,7 +24,7 @@ from src.utils.pdf_utils import (
     get_page_count, rotate_pages, remove_pages, reorder_pages, extract_pages,
     insert_pages, render_page_thumbnails_batch, FreeTextAnnotData,
     list_freetext_annots, create_freetext_annot, replace_freetext_annot,
-    delete_freetext_annot, update_pdf_metadata_title,
+    delete_freetext_annot, get_pdf_metadata_title, update_pdf_metadata_title,
     clear_pixmap_cache_for_path
 )
 from src.models.undo_manager import UndoManager, UndoAction
@@ -1713,6 +1713,7 @@ class PageEditWindow(QMainWindow):
                 (QKeySequence.StandardKey.Redo, self._on_redo),
                 (QKeySequence.StandardKey.Delete, self._on_delete),
                 (QKeySequence(Qt.Key.Key_F2), self._on_rename),
+                (QKeySequence("Shift+F2"), self._on_rename_pdf_title),
                 (QKeySequence.StandardKey.SelectAll, self._on_select_all),
                 (QKeySequence(Qt.Key.Key_R), self._on_rotate),
             ),
@@ -2582,6 +2583,10 @@ class PageEditWindow(QMainWindow):
         ))
 
     def _on_rename(self) -> None:
+        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self._on_rename_pdf_title()
+            return
+
         old_path = self._pdf_path
         old_name = os.path.basename(old_path)
         new_name, ok = QInputDialog.getText(
@@ -2610,7 +2615,6 @@ class PageEditWindow(QMainWindow):
                     main_window._perform_rename(old_path, new_path)
                 else:
                     os.rename(old_path, new_path)
-                    update_pdf_metadata_title(new_path, os.path.splitext(new_name)[0])
                     self._pdf_path = new_path
                     self.setWindowTitle(f"JusticePDF - Edit: {new_name}")
 
@@ -2620,7 +2624,6 @@ class PageEditWindow(QMainWindow):
                     main_window._perform_rename(new_path, old_path)
                 else:
                     os.rename(new_path, old_path)
-                    update_pdf_metadata_title(old_path, os.path.splitext(old_name)[0])
                     self._pdf_path = old_path
                     self.setWindowTitle(f"JusticePDF - Edit: {old_name}")
 
@@ -2630,6 +2633,32 @@ class PageEditWindow(QMainWindow):
                 undo_func=undo_rename,
                 redo_func=do_rename
             ))
+
+    def _on_rename_pdf_title(self) -> None:
+        old_path = self._pdf_path
+        old_name = os.path.basename(old_path)
+        old_title = get_pdf_metadata_title(old_path) or os.path.splitext(old_name)[0]
+        new_title, ok = QInputDialog.getText(
+            self, "Rename PDF Name", "New PDF name:", text=old_title
+        )
+
+        if not ok or not new_title or new_title == old_title:
+            return
+
+        def do_rename_pdf_title() -> None:
+            update_pdf_metadata_title(old_path, new_title)
+            self.refresh_from_disk()
+
+        def undo_rename_pdf_title() -> None:
+            update_pdf_metadata_title(old_path, old_title)
+            self.refresh_from_disk()
+
+        do_rename_pdf_title()
+        self._undo_manager.add_action(UndoAction(
+            description="Rename PDF Name",
+            undo_func=undo_rename_pdf_title,
+            redo_func=do_rename_pdf_title
+        ))
 
     def _on_rotate(self) -> None:
         # ズームビュー表示中の場合

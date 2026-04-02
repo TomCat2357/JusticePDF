@@ -26,7 +26,7 @@ from src.views.view_helpers import (
 from src.controllers.folder_watcher import FolderWatcher
 from src.models.undo_manager import UndoManager, UndoAction
 from src.utils.pdf_utils import (
-    rotate_pages, get_page_count, update_pdf_metadata_title,
+    rotate_pages, get_page_count, get_pdf_metadata_title, update_pdf_metadata_title,
     clear_pixmap_cache, clear_pixmap_cache_for_path
 )
 from src.utils.path_utils import ensure_unique_path
@@ -219,6 +219,7 @@ class MainWindow(QMainWindow):
                 (QKeySequence.StandardKey.Redo, self._on_redo),
                 (QKeySequence.StandardKey.Delete, self._on_delete),
                 (QKeySequence(Qt.Key.Key_F2), self._on_rename),
+                (QKeySequence("Shift+F2"), self._on_rename_pdf_title),
                 (QKeySequence.StandardKey.SelectAll, self._on_select_all),
                 (QKeySequence("Ctrl+E"), self._on_export),
             ),
@@ -349,9 +350,6 @@ class MainWindow(QMainWindow):
             self._internal_removes.discard(old_norm)
             self._internal_adds.discard(new_norm)
             raise
-
-        new_title = os.path.splitext(os.path.basename(new_path))[0]
-        update_pdf_metadata_title(new_path, new_title)
 
         card = self._get_card_by_path(old_path)
         if card:
@@ -970,6 +968,10 @@ class MainWindow(QMainWindow):
 
     def _on_rename(self) -> None:
         """Handle rename action."""
+        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self._on_rename_pdf_title()
+            return
+
         if len(self._selected_cards) != 1:
             return
 
@@ -1007,6 +1009,38 @@ class MainWindow(QMainWindow):
                 undo_func=undo_rename,
                 redo_func=do_rename
             ))
+
+    def _on_rename_pdf_title(self) -> None:
+        """Handle PDF metadata title rename action."""
+        if len(self._selected_cards) != 1:
+            return
+
+        card = self._selected_cards[0]
+        old_path = card.pdf_path
+        old_title = get_pdf_metadata_title(old_path) or os.path.splitext(card.filename)[0]
+        new_title, ok = QInputDialog.getText(
+            self, "Rename PDF Name", "New PDF name:", text=old_title
+        )
+
+        if not ok or not new_title or new_title == old_title:
+            return
+
+        def do_rename_pdf_title() -> None:
+            update_pdf_metadata_title(old_path, new_title)
+            self._refresh_cards_for_paths([old_path])
+            self._refresh_grid()
+
+        def undo_rename_pdf_title() -> None:
+            update_pdf_metadata_title(old_path, old_title)
+            self._refresh_cards_for_paths([old_path])
+            self._refresh_grid()
+
+        do_rename_pdf_title()
+        self._undo_manager.add_action(UndoAction(
+            description="Rename PDF Name",
+            undo_func=undo_rename_pdf_title,
+            redo_func=do_rename_pdf_title
+        ))
 
     def _on_import(self) -> None:
         """Handle import action."""
