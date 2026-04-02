@@ -1210,6 +1210,7 @@ class PageEditWindow(QMainWindow):
         self.setWindowTitle(f"JusticePDF - Edit: {os.path.basename(self._pdf_path)}")
         self.resize(800, 600)
         self.setAcceptDrops(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         central = QWidget()
         self.setCentralWidget(central)

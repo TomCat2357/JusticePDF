@@ -256,7 +256,7 @@ class MainWindow(QMainWindow):
 
     def _normalize_path(self, path: str) -> str:
         """Normalize paths for internal tracking."""
-        return os.path.abspath(path)
+        return os.path.normcase(os.path.abspath(path))
 
     def _register_internal_add(self, paths: list[str]) -> None:
         """Mark paths as internally added to avoid clearing undo history."""
@@ -629,7 +629,11 @@ class MainWindow(QMainWindow):
         from src.views.page_edit_window import PageEditWindow
         # If a window for this file is already open, bring it to front.
         for widget in QApplication.topLevelWidgets():
-            if isinstance(widget, PageEditWindow) and widget._pdf_path == card.pdf_path:
+            if (
+                isinstance(widget, PageEditWindow)
+                and widget._pdf_path == card.pdf_path
+                and widget.isVisible()
+            ):
                 if widget.isMinimized():
                     widget.setWindowState(
                         (widget.windowState() & ~Qt.WindowState.WindowMinimized)
@@ -805,7 +809,9 @@ class MainWindow(QMainWindow):
 
     def _on_file_added(self, path: str) -> None:
         """Handle new file added to folder."""
+        clear_pixmap_cache_for_path(path)
         normalized = self._normalize_path(path)
+        self._modified_last_mtime.pop(normalized, None)
         if normalized in self._pending_rename_new_to_old:
             self._internal_adds.discard(normalized)
             self._pending_rename_added.add(normalized)
@@ -814,7 +820,12 @@ class MainWindow(QMainWindow):
                 self._finalize_pending_rename(old_norm, normalized)
             return
         for card in self._cards:
-            if card.pdf_path == path:
+            if self._normalize_path(card.pdf_path) == normalized:
+                # The path was reused for a different file before the old card was removed.
+                # Refresh in place rather than treating this as a duplicate add.
+                card.refresh()
+                self._refresh_page_edit_windows_for_paths([path])
+                self._refresh_grid()
                 return
         if normalized in self._internal_adds:
             self._internal_adds.discard(normalized)
@@ -835,6 +846,10 @@ class MainWindow(QMainWindow):
             new_norm = self._pending_rename_old_to_new.get(normalized)
             if new_norm:
                 self._finalize_pending_rename(normalized, new_norm)
+            return
+        if os.path.exists(path):
+            # Watchdog can deliver a stale remove after the path has already been recreated.
+            self._internal_removes.discard(normalized)
             return
         if normalized in self._internal_removes:
             self._internal_removes.discard(normalized)

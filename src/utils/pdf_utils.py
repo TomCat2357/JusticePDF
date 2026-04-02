@@ -409,11 +409,17 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
     return annot
 
 
-def _get_file_mtime(pdf_path: str) -> float:
+def _get_file_cache_token(pdf_path: str) -> tuple[int, int, int]:
+    """Return a filesystem-based token that changes when the file instance changes."""
     try:
-        return os.path.getmtime(pdf_path)
+        stat_result = os.stat(pdf_path)
     except OSError:
-        return 0.0
+        return (0, 0, 0)
+    return (
+        int(getattr(stat_result, "st_mtime_ns", 0)),
+        int(stat_result.st_size),
+        int(getattr(stat_result, "st_ctime_ns", 0)),
+    )
 
 
 def _pixmap_to_qpixmap(pix: "fitz.Pixmap") -> QPixmap:
@@ -436,12 +442,12 @@ def _pixmap_to_qpixmap(pix: "fitz.Pixmap") -> QPixmap:
 def get_pdf_card_info(pdf_path: str, size: int = 128) -> tuple[QPixmap, int]:
     """Get (thumbnail, page_count) for main-grid cards with a single PDF open."""
     try:
-        mtime = _get_file_mtime(pdf_path)
+        cache_token = _get_file_cache_token(pdf_path)
         with fitz.open(pdf_path) as doc:
             page_count = len(doc)
             if page_count == 0:
                 return QPixmap(), 0
-            cache_key = (pdf_path, 0, size, None, mtime)
+            cache_key = (pdf_path, 0, size, None, True, cache_token)
             cached = _pixmap_cache.get(cache_key)
             if cached is not None:
                 return cached, page_count
@@ -467,14 +473,14 @@ def _render_page_pixmap(
 ) -> QPixmap:
     """Render a PDF page to a pixmap with either size-based or zoom-based scaling."""
     try:
-        mtime = _get_file_mtime(pdf_path)
+        cache_token = _get_file_cache_token(pdf_path)
         cache_key = (
             pdf_path,
             page_num,
             size,
             round(zoom, 4) if zoom is not None else None,
             bool(annots),
-            mtime,
+            cache_token,
         )
         cached = _pixmap_cache.get(cache_key)
         if cached is not None:
@@ -546,12 +552,12 @@ def render_page_thumbnails_batch(pdf_path: str, page_nums: list[int], size: int 
 
     Opens the PDF only once for all cache-missed pages.
     """
-    mtime = _get_file_mtime(pdf_path)
+    cache_token = _get_file_cache_token(pdf_path)
     result: dict[int, QPixmap] = {}
     miss_pages: list[int] = []
 
     for pn in page_nums:
-        cache_key = (pdf_path, pn, size, None, mtime)
+        cache_key = (pdf_path, pn, size, None, True, cache_token)
         cached = _pixmap_cache.get(cache_key)
         if cached is not None:
             result[pn] = cached
@@ -570,7 +576,7 @@ def render_page_thumbnails_batch(pdf_path: str, page_nums: list[int], size: int 
                     mat = fitz.Matrix(scale, scale)
                     pix = page.get_pixmap(matrix=mat)
                     qpix = _pixmap_to_qpixmap(pix)
-                    cache_key = (pdf_path, pn, size, None, mtime)
+                    cache_key = (pdf_path, pn, size, None, True, cache_token)
                     _pixmap_cache.put(cache_key, qpix)
                     result[pn] = qpix
         except Exception:
