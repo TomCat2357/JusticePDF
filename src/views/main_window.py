@@ -176,6 +176,10 @@ class MainWindow(QMainWindow):
         self._rename_btn.clicked.connect(self._on_rename)
         toolbar.addWidget(self._rename_btn)
 
+        self._title_btn = QPushButton("Title")
+        self._title_btn.clicked.connect(self._on_rename_pdf_title)
+        toolbar.addWidget(self._title_btn)
+
         toolbar.addSeparator()
 
         self._import_btn = QPushButton("Import")
@@ -231,6 +235,7 @@ class MainWindow(QMainWindow):
         has_any = len(self._cards) > 0
         self._delete_btn.setEnabled(has_selection)
         self._rename_btn.setEnabled(len(self._selected_cards) == 1)
+        self._title_btn.setEnabled(len(self._selected_cards) == 1)
         self._rotate_btn.setEnabled(has_selection)
         self._undo_btn.setEnabled(self._undo_manager.can_undo())
         self._redo_btn.setEnabled(self._undo_manager.can_redo())
@@ -968,10 +973,6 @@ class MainWindow(QMainWindow):
 
     def _on_rename(self) -> None:
         """Handle rename action."""
-        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
-            self._on_rename_pdf_title()
-            return
-
         if len(self._selected_cards) != 1:
             return
 
