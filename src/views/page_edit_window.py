@@ -1693,6 +1693,10 @@ class PageEditWindow(QMainWindow):
         self._rename_btn.clicked.connect(self._on_rename)
         toolbar.addWidget(self._rename_btn)
 
+        self._title_btn = QPushButton("Title")
+        self._title_btn.clicked.connect(self._on_rename_pdf_title)
+        toolbar.addWidget(self._title_btn)
+
         toolbar.addSeparator()
 
         self._rotate_btn = QPushButton("Rotate")
@@ -2050,6 +2054,8 @@ class PageEditWindow(QMainWindow):
         )
         can_edit_pages = has_selection or zoom_active
         self._delete_btn.setEnabled(can_edit_pages)
+        self._rename_btn.setEnabled(True)
+        self._title_btn.setEnabled(True)
         self._rotate_btn.setEnabled(can_edit_pages)
         self._undo_btn.setEnabled(self._undo_manager.can_undo())
         self._redo_btn.setEnabled(self._undo_manager.can_redo())
@@ -2583,10 +2589,6 @@ class PageEditWindow(QMainWindow):
         ))
 
     def _on_rename(self) -> None:
-        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
-            self._on_rename_pdf_title()
-            return
-
         old_path = self._pdf_path
         old_name = os.path.basename(old_path)
         new_name, ok = QInputDialog.getText(
