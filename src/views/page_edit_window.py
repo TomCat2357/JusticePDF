@@ -24,7 +24,8 @@ from src.utils.pdf_utils import (
     get_page_count, rotate_pages, remove_pages, reorder_pages, extract_pages,
     insert_pages, render_page_thumbnails_batch, FreeTextAnnotData,
     list_freetext_annots, create_freetext_annot, replace_freetext_annot,
-    delete_freetext_annot
+    delete_freetext_annot, update_pdf_metadata_title,
+    clear_pixmap_cache_for_path
 )
 from src.models.undo_manager import UndoManager, UndoAction
 from src.views.view_helpers import (
@@ -2205,6 +2206,7 @@ class PageEditWindow(QMainWindow):
             return
 
         self._commit_inline_annotation_editor()
+        clear_pixmap_cache_for_path(self._pdf_path)
         page_count = get_page_count(self._pdf_path)
         if page_count != len(self._thumbnails):
             self._load_pages()
@@ -2607,6 +2609,7 @@ class PageEditWindow(QMainWindow):
                     main_window._perform_rename(old_path, new_path)
                 else:
                     os.rename(old_path, new_path)
+                    update_pdf_metadata_title(new_path, os.path.splitext(new_name)[0])
                     self._pdf_path = new_path
                     self.setWindowTitle(f"JusticePDF - Edit: {new_name}")
 
@@ -2616,6 +2619,7 @@ class PageEditWindow(QMainWindow):
                     main_window._perform_rename(new_path, old_path)
                 else:
                     os.rename(new_path, old_path)
+                    update_pdf_metadata_title(old_path, os.path.splitext(old_name)[0])
                     self._pdf_path = old_path
                     self.setWindowTitle(f"JusticePDF - Edit: {old_name}")
 

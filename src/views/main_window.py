@@ -25,7 +25,10 @@ from src.views.view_helpers import (
 )
 from src.controllers.folder_watcher import FolderWatcher
 from src.models.undo_manager import UndoManager, UndoAction
-from src.utils.pdf_utils import rotate_pages, get_page_count
+from src.utils.pdf_utils import (
+    rotate_pages, get_page_count, update_pdf_metadata_title,
+    clear_pixmap_cache, clear_pixmap_cache_for_path
+)
 from src.utils.path_utils import ensure_unique_path
 from src.utils.windows_shell import show_native_file_context_menu
 
@@ -346,6 +349,9 @@ class MainWindow(QMainWindow):
             self._internal_removes.discard(old_norm)
             self._internal_adds.discard(new_norm)
             raise
+
+        new_title = os.path.splitext(os.path.basename(new_path))[0]
+        update_pdf_metadata_title(new_path, new_title)
 
         card = self._get_card_by_path(old_path)
         if card:
@@ -821,6 +827,7 @@ class MainWindow(QMainWindow):
         """Handle file removed from folder."""
         # If a save is in progress, there may be a pending debounced refresh.
         self._cancel_debounced_modified(path)
+        clear_pixmap_cache_for_path(path)
         normalized = self._normalize_path(path)
         if normalized in self._pending_rename_old_to_new:
             self._internal_removes.discard(normalized)
@@ -906,6 +913,7 @@ class MainWindow(QMainWindow):
 
     def _on_refresh(self) -> None:
         """Reload cards and open edit windows from disk."""
+        clear_pixmap_cache()
         self._refresh_all_views()
 
     def _on_delete(self) -> None:
@@ -1109,6 +1117,7 @@ class MainWindow(QMainWindow):
         except Exception:
             self._internal_adds.discard(self._normalize_path(dest_str))
             raise
+        clear_pixmap_cache_for_path(dest_str)
         return dest_str
 
     def _convert_office_to_pdf_into_workdir(self, src_path: str) -> str:

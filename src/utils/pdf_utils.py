@@ -57,8 +57,21 @@ class _PixmapCache:
     def clear(self) -> None:
         self._cache.clear()
 
+    def clear_for_path(self, pdf_path: str) -> None:
+        keys_to_remove = [k for k in self._cache if k[0] == pdf_path]
+        for k in keys_to_remove:
+            del self._cache[k]
+
 
 _pixmap_cache = _PixmapCache(maxsize=256)
+
+
+def clear_pixmap_cache_for_path(pdf_path: str) -> None:
+    _pixmap_cache.clear_for_path(pdf_path)
+
+
+def clear_pixmap_cache() -> None:
+    _pixmap_cache.clear()
 
 _FLOAT_RE = r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)"
 _DA_COLOR_RE = re.compile(rf"({_FLOAT_RE})\s+({_FLOAT_RE})\s+({_FLOAT_RE})\s+rg")
@@ -85,6 +98,18 @@ def _save_document_in_place(doc: fitz.Document, pdf_path: str) -> None:
             raise
         shutil.move(tmp_path, pdf_path)
     _pixmap_cache.clear()
+
+
+def update_pdf_metadata_title(pdf_path: str, title: str) -> None:
+    """PDFメタデータのTitleプロパティを更新する。"""
+    try:
+        with fitz.open(pdf_path) as doc:
+            meta = doc.metadata
+            meta['title'] = title
+            doc.set_metadata(meta)
+            _save_document_in_place(doc, pdf_path)
+    except Exception:
+        logger.debug("Failed to update PDF metadata title: %s", pdf_path, exc_info=True)
 
 
 def _parse_float_array(value: str) -> list[float]:
