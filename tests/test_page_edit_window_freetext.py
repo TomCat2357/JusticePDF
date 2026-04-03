@@ -265,8 +265,8 @@ def test_zoom_delete_key_removes_selected_freetext_instead_of_page(qtbot, tmp_pa
 
 
 @pytest.mark.usefixtures("qtbot")
-def test_zoom_delete_key_removes_active_freetext_editor_annotation(qtbot, tmp_path):
-    pdf_path = tmp_path / "delete-active-editor.pdf"
+def test_zoom_delete_key_in_editor_deletes_char_not_annotation(qtbot, tmp_path):
+    pdf_path = tmp_path / "delete-char-in-editor.pdf"
     _make_pdf(pdf_path)
 
     window = _create_window(qtbot, pdf_path)
@@ -279,11 +279,15 @@ def test_zoom_delete_key_removes_active_freetext_editor_annotation(qtbot, tmp_pa
 
     editor = window._zoom_label._inline_editor
     assert editor is not None
-    qtbot.keyClicks(editor, "delete me")
+    qtbot.keyClicks(editor, "abc")
+    # Move cursor to beginning so DELETE removes the first character
+    qtbot.keyClick(editor, Qt.Key.Key_Home)
     qtbot.keyClick(editor, Qt.Key.Key_Delete)
-    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0) == [])
-
-    assert get_page_count(str(pdf_path)) == 1
+    assert editor.toPlainText() == "bc"
+    # The annotation must still exist (not deleted by DELETE key during editing)
+    qtbot.keyClick(editor, Qt.Key.Key_Escape)
+    qtbot.waitUntil(lambda: not window._zoom_label.has_active_text_editor())
+    assert list_freetext_annots(str(pdf_path), 0) != []
 
 
 @pytest.mark.usefixtures("qtbot")

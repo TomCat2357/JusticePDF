@@ -246,13 +246,6 @@ class AnnotationTextEdit(QPlainTextEdit):
             event.accept()
             return
         if (
-            event.key() == Qt.Key.Key_Delete
-            and event.modifiers() == Qt.KeyboardModifier.NoModifier
-        ):
-            self.delete_requested.emit()
-            event.accept()
-            return
-        if (
             event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
             and event.modifiers() & Qt.KeyboardModifier.ControlModifier
         ):
@@ -379,7 +372,9 @@ class ZoomPageWidget(QWidget):
         editor.setStyleSheet(self._inline_editor_stylesheet(annotation))
         editor.setFrameStyle(QFrame.Shape.NoFrame)
         editor.setContentsMargins(0, 0, 0, 0)
-        editor.setViewportMargins(0, 0, 0, 0)
+        effective_border_width = annotation.border_width if annotation.border_color is not None else 0.0
+        text_inset_px = max(0, round(effective_border_width * 2.0 * self._zoom_factor))
+        editor.setViewportMargins(text_inset_px, text_inset_px, text_inset_px, 0)
         editor.document().setDocumentMargin(0)
         font = editor.font()
         font.setPixelSize(max(10, round(annotation.fontsize * self._zoom_factor)))
@@ -639,8 +634,11 @@ class ZoomPageWidget(QWidget):
             text_color = self._annotation_color(annot.text_color, opacity=annot.opacity)
             if text_color is not None:
                 painter.setPen(text_color)
+            effective_border_width = annot.border_width if annot.border_color is not None else 0.0
+            text_inset = effective_border_width * 2.0 * self._zoom_factor
+            text_rect = rect.adjusted(text_inset, text_inset, -text_inset, 0) if text_inset > 0 else rect
             painter.drawText(
-                rect,
+                text_rect,
                 int(
                     Qt.AlignmentFlag.AlignLeft
                     | Qt.AlignmentFlag.AlignTop
