@@ -26,6 +26,7 @@ from src.views.view_helpers import (
 from src.controllers.folder_watcher import FolderWatcher
 from src.models.undo_manager import UndoManager, UndoAction
 from src.utils.pdf_utils import (
+    PdfWritePermissionError,
     rotate_pages, get_page_count, get_pdf_metadata_title, update_pdf_metadata_title,
     clear_pixmap_cache, clear_pixmap_cache_for_path
 )
@@ -796,6 +797,13 @@ class MainWindow(QMainWindow):
 
         try:
             do_merge()
+        except PdfWritePermissionError as error:
+            try:
+                undo_merge()
+            except Exception:
+                pass
+            self._handle_pdf_write_permission_denied(error)
+            return
         except Exception:
             # Best-effort rollback
             try:
@@ -922,18 +930,50 @@ class MainWindow(QMainWindow):
 
     def _on_undo(self) -> None:
         """Handle undo action."""
-        self._undo_manager.undo()
+        try:
+            self._undo_manager.undo()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
         self._update_button_states()
 
     def _on_redo(self) -> None:
         """Handle redo action."""
-        self._undo_manager.redo()
+        try:
+            self._undo_manager.redo()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
         self._update_button_states()
+
+    def _handle_pdf_write_permission_denied(self, error: PdfWritePermissionError) -> None:
+        logger.warning("PDF write blocked in main window for %s", error.pdf_path)
+        logger.debug("PDF write blocked in main window for %s", error.pdf_path, exc_info=True)
+        pdf_name = os.path.basename(error.pdf_path)
+        QMessageBox.warning(
+            self,
+            "PDFを編集できません",
+            (
+                "このPDFは他のアプリで使用中のため保存できません。\n\n"
+                f"{pdf_name}\n\n"
+                "Acrobat などで閉じてから、もう一度お試しください。"
+            ),
+        )
 
     def _on_refresh(self) -> None:
         """Reload cards and open edit windows from disk."""
         clear_pixmap_cache()
         self._refresh_all_views()
+
+    def _handle_file_operation_error(self, error: Exception, pdf_path: str, action: str) -> None:
+        logger.warning("%s failed for %s", action, pdf_path)
+        logger.debug("%s failed for %s", action, pdf_path, exc_info=True)
+        pdf_name = os.path.basename(pdf_path)
+        QMessageBox.warning(
+            self,
+            f"{action}できません",
+            f"{action}に失敗しました。\n\n{pdf_name}\n\n{error}",
+        )
 
     def _on_delete(self) -> None:
         """Handle delete action."""
@@ -1029,7 +1069,11 @@ class MainWindow(QMainWindow):
             def undo_rename() -> None:
                 self._perform_rename(new_path, old_path)
 
-            do_rename()
+            try:
+                do_rename()
+            except OSError as error:
+                self._handle_file_operation_error(error, old_path, "名前変更")
+                return
             self._undo_manager.add_action(UndoAction(
                 description="Rename PDF",
                 undo_func=undo_rename,
@@ -1061,7 +1105,14 @@ class MainWindow(QMainWindow):
             self._refresh_cards_for_paths([old_path])
             self._refresh_grid()
 
-        do_rename_pdf_title()
+        try:
+            do_rename_pdf_title()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        except Exception as error:
+            self._handle_file_operation_error(error, old_path, "PDFタイトル変更")
+            return
         self._undo_manager.add_action(UndoAction(
             description="Rename PDF Name",
             undo_func=undo_rename_pdf_title,
@@ -1380,7 +1431,11 @@ class MainWindow(QMainWindow):
                         break
             self._refresh_page_edit_windows_for_paths(rotated_paths)
 
-        do_rotate()
+        try:
+            do_rotate()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
 
         self._undo_manager.add_action(UndoAction(
             description=f"Rotate {len(rotations)} PDF(s)",
@@ -1855,6 +1910,10 @@ class MainWindow(QMainWindow):
                 redo_func=redo_copy_merge
             ))
             
+        except PdfWritePermissionError as error:
+            shutil.copy2(backup_path, target_path)
+            self._handle_pdf_write_permission_denied(error)
+            return
         except Exception:
             # Rollback on error
             shutil.copy2(backup_path, target_path)
@@ -2087,7 +2146,11 @@ class MainWindow(QMainWindow):
         def redo_extraction() -> None:
             do_extraction()
 
-        if not do_extraction():
+        try:
+            if not do_extraction():
+                return
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
             return
 
         action = "Copy" if is_copy else "Move"

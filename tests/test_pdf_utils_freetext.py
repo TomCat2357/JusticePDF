@@ -5,12 +5,15 @@ import pytest
 
 from src.utils.pdf_utils import (
     FreeTextAnnotData,
+    PdfWritePermissionError,
     create_freetext_annot,
     delete_freetext_annot,
     get_page_pixmap,
     list_freetext_annots,
+    rotate_pages,
     replace_freetext_annot,
 )
+from src.utils import pdf_utils
 
 
 pytestmark = pytest.mark.usefixtures("qapp")
@@ -338,3 +341,73 @@ def test_get_page_pixmap_can_exclude_annotation_appearance(tmp_path):
     assert without_annots.red() > 240
     assert without_annots.green() > 240
     assert without_annots.blue() > 240
+
+
+def test_replace_freetext_annot_raises_permission_error_when_destination_is_locked(tmp_path, monkeypatch):
+    pdf_path = tmp_path / "locked-replace.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(24, 36, 164, 106),
+            content="first",
+            fontsize=15,
+            text_color=(0.1, 0.2, 0.3),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=(1.0, 0.0, 0.0),
+            border_width=2,
+            opacity=0.55,
+        ),
+    )
+
+    monkeypatch.setattr(
+        fitz.Document,
+        "saveIncr",
+        lambda self: (_ for _ in ()).throw(RuntimeError("permission denied")),
+    )
+    monkeypatch.setattr(
+        pdf_utils.shutil,
+        "move",
+        lambda src, dst: (_ for _ in ()).throw(PermissionError(13, "Permission denied", dst)),
+    )
+
+    with pytest.raises(PdfWritePermissionError):
+        replace_freetext_annot(
+            str(pdf_path),
+            0,
+            created.xref,
+            FreeTextAnnotData(
+                page_num=0,
+                xref=created.xref,
+                rect=(40, 50, 220, 150),
+                content="second",
+                fontsize=18,
+                text_color=(0.0, 0.0, 1.0),
+                fill_color=(0.9, 1.0, 0.9),
+                border_color=(0.0, 0.0, 0.0),
+                border_width=3,
+                opacity=0.7,
+            ),
+        )
+
+
+def test_rotate_pages_raises_permission_error_when_destination_is_locked(tmp_path, monkeypatch):
+    pdf_path = tmp_path / "locked-rotate.pdf"
+    _make_pdf(pdf_path)
+
+    monkeypatch.setattr(
+        fitz.Document,
+        "saveIncr",
+        lambda self: (_ for _ in ()).throw(RuntimeError("permission denied")),
+    )
+    monkeypatch.setattr(
+        pdf_utils.shutil,
+        "move",
+        lambda src, dst: (_ for _ in ()).throw(PermissionError(13, "Permission denied", dst)),
+    )
+
+    with pytest.raises(PdfWritePermissionError):
+        rotate_pages(str(pdf_path), [0], 90)

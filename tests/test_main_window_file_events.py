@@ -184,3 +184,71 @@ def test_delete_shows_warning_when_file_is_in_use(window_factory, monkeypatch, t
     assert pdf_path.exists()
     assert window._get_card_by_path(str(pdf_path)) is card
     assert window._undo_manager.undo_count() == 0
+
+
+def test_rename_shows_warning_when_file_is_in_use(window_factory, monkeypatch, tmp_path):
+    window, _state = window_factory()
+    pdf_path = tmp_path / "locked-rename.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    card = window._add_card(str(pdf_path))
+    card.set_selected(True)
+    window._selected_cards.append(card)
+
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        main_window.QInputDialog,
+        "getText",
+        staticmethod(lambda *_args, **_kwargs: ("renamed.pdf", True)),
+    )
+    monkeypatch.setattr(
+        main_window.MainWindow,
+        "_perform_rename",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError(13, "Permission denied", str(pdf_path))),
+    )
+    monkeypatch.setattr(
+        main_window.QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, title, text: captured.update(title=title, text=text)),
+    )
+
+    window._on_rename()
+
+    assert captured["title"] == "名前変更できません"
+    assert "locked-rename.pdf" in captured["text"]
+    assert window._undo_manager.undo_count() == 0
+
+
+def test_rename_pdf_title_shows_warning_when_file_is_in_use(window_factory, monkeypatch, tmp_path):
+    window, _state = window_factory()
+    pdf_path = tmp_path / "locked-title.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    card = window._add_card(str(pdf_path))
+    card.set_selected(True)
+    window._selected_cards.append(card)
+
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        main_window.QInputDialog,
+        "getText",
+        staticmethod(lambda *_args, **_kwargs: ("new title", True)),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "update_pdf_metadata_title",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(main_window.PdfWritePermissionError(str(pdf_path))),
+    )
+    monkeypatch.setattr(
+        main_window.QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, title, text: captured.update(title=title, text=text)),
+    )
+
+    window._on_rename_pdf_title()
+
+    assert captured["title"] == "PDFを編集できません"
+    assert "locked-title.pdf" in captured["text"]
+    assert window._undo_manager.undo_count() == 0

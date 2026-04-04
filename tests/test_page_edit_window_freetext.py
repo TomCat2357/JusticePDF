@@ -7,7 +7,14 @@ from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication
 
 from src.models.undo_manager import UndoManager
-from src.utils.pdf_utils import FreeTextAnnotData, create_freetext_annot, get_page_count, list_freetext_annots
+from src.utils.pdf_utils import (
+    FreeTextAnnotData,
+    PdfWritePermissionError,
+    create_freetext_annot,
+    get_page_count,
+    list_freetext_annots,
+)
+from src.views import page_edit_window as page_edit_window_module
 from src.views.page_edit_window import PageEditWindow
 
 
@@ -506,6 +513,151 @@ def test_zoom_editor_ctrl_c_v_prioritize_text_editing(qtbot, tmp_path):
     assert len(list_freetext_annots(str(pdf_path), 0)) == 1
     assert window._zoom_label.has_annotation_paste_mode() is False
     assert window._copied_zoom_annotation is not None
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_text_edit_shows_warning_and_exits_editor_when_pdf_is_locked(qtbot, tmp_path, monkeypatch):
+    pdf_path = tmp_path / "locked-edit.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 170, 120),
+            content="locked",
+            fontsize=14,
+            text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.6),
+            border_color=(0.0, 0.0, 0.0),
+            border_width=2,
+            opacity=1.0,
+        ),
+    )
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    annot = _annotation_for(window, created.xref)
+    rect = window._zoom_label._annotation_widget_rect(annot)
+    qtbot.mouseDClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+    qtbot.waitUntil(lambda: window._zoom_label.has_active_text_editor())
+
+    captured: dict[str, str] = {}
+
+    def _raise_locked(*_args, **_kwargs):
+        raise PdfWritePermissionError(str(pdf_path))
+
+    monkeypatch.setattr(page_edit_window_module, "replace_freetext_annot", _raise_locked)
+    monkeypatch.setattr(
+        page_edit_window_module.QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, title, text: captured.update(title=title, text=text)),
+    )
+
+    editor = window._zoom_label._inline_editor
+    assert editor is not None
+    editor.selectAll()
+    qtbot.keyClicks(editor, "changed")
+    window._zoom_annotation_width_spin.setFocus()
+
+    qtbot.waitUntil(lambda: captured.get("title") == "PDFを編集できません")
+    assert not window._zoom_label.has_active_text_editor()
+    assert list_freetext_annots(str(pdf_path), 0)[0].content == "locked"
+    assert window._selected_zoom_annotation is not None
+    assert window._selected_zoom_annotation.xref == created.xref
+    assert "locked-edit.pdf" in captured["text"]
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_rotate_shows_warning_when_pdf_is_locked(qtbot, tmp_path, monkeypatch):
+    pdf_path = tmp_path / "locked-rotate.pdf"
+    _make_pdf(pdf_path)
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    captured: dict[str, str] = {}
+
+    def _raise_locked(*_args, **_kwargs):
+        raise PdfWritePermissionError(str(pdf_path))
+
+    monkeypatch.setattr(page_edit_window_module, "rotate_pages", _raise_locked)
+    monkeypatch.setattr(
+        page_edit_window_module.QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, title, text: captured.update(title=title, text=text)),
+    )
+
+    window._on_rotate()
+
+    assert captured["title"] == "PDFを編集できません"
+    assert "locked-rotate.pdf" in captured["text"]
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_page_edit_rename_shows_warning_when_pdf_is_locked(qtbot, tmp_path, monkeypatch):
+    pdf_path = tmp_path / "locked-rename.pdf"
+    _make_pdf(pdf_path)
+
+    window = _create_window(qtbot, pdf_path)
+
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        page_edit_window_module.QInputDialog,
+        "getText",
+        staticmethod(lambda *_args, **_kwargs: ("renamed.pdf", True)),
+    )
+    monkeypatch.setattr(
+        page_edit_window_module.os,
+        "rename",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError(13, "Permission denied", str(pdf_path))),
+    )
+    monkeypatch.setattr(
+        page_edit_window_module.QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, title, text: captured.update(title=title, text=text)),
+    )
+
+    window._on_rename()
+
+    assert captured["title"] == "名前変更できません"
+    assert "locked-rename.pdf" in captured["text"]
+    assert window._undo_manager.undo_count() == 0
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_page_edit_title_rename_shows_warning_when_pdf_is_locked(qtbot, tmp_path, monkeypatch):
+    pdf_path = tmp_path / "locked-title.pdf"
+    _make_pdf(pdf_path)
+
+    window = _create_window(qtbot, pdf_path)
+
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        page_edit_window_module.QInputDialog,
+        "getText",
+        staticmethod(lambda *_args, **_kwargs: ("new title", True)),
+    )
+    monkeypatch.setattr(
+        page_edit_window_module,
+        "update_pdf_metadata_title",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PdfWritePermissionError(str(pdf_path))),
+    )
+    monkeypatch.setattr(
+        page_edit_window_module.QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, title, text: captured.update(title=title, text=text)),
+    )
+
+    window._on_rename_pdf_title()
+
+    assert captured["title"] == "PDFを編集できません"
+    assert "locked-title.pdf" in captured["text"]
+    assert window._undo_manager.undo_count() == 0
 
 
 @pytest.mark.usefixtures("qtbot")

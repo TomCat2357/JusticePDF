@@ -25,6 +25,7 @@ from src.utils.pdf_utils import (
     insert_pages, render_page_thumbnails_batch, FreeTextAnnotData,
     list_freetext_annots, create_freetext_annot, replace_freetext_annot,
     delete_freetext_annot, get_pdf_metadata_title, update_pdf_metadata_title,
+    PdfWritePermissionError,
     clear_pixmap_cache_for_path
 )
 from src.models.undo_manager import UndoManager, UndoAction
@@ -1814,6 +1815,40 @@ class PageEditWindow(QMainWindow):
     def _on_zoom_annotation_text_edit_cancelled(self) -> None:
         pass
 
+    def _handle_pdf_write_permission_denied(
+        self,
+        error: PdfWritePermissionError,
+        *,
+        selected_annotation: FreeTextAnnotData | None = None,
+    ) -> None:
+        logger.warning("PDF write blocked while editing %s", error.pdf_path)
+        logger.debug("PDF write blocked while editing %s", error.pdf_path, exc_info=True)
+        if selected_annotation is not None:
+            self._selected_zoom_annotation = selected_annotation
+        self._refresh_current_zoom_page(
+            open_drawer=selected_annotation is not None and self._zoom_annotation_open
+        )
+        pdf_name = os.path.basename(error.pdf_path or self._pdf_path)
+        QMessageBox.warning(
+            self,
+            "PDFを編集できません",
+            (
+                "このPDFは他のアプリで使用中のため保存できません。\n\n"
+                f"{pdf_name}\n\n"
+                "Acrobat などで閉じてから、もう一度お試しください。"
+            ),
+        )
+
+    def _handle_file_operation_error(self, error: Exception, pdf_path: str, action: str) -> None:
+        logger.warning("%s failed for %s", action, pdf_path)
+        logger.debug("%s failed for %s", action, pdf_path, exc_info=True)
+        pdf_name = os.path.basename(pdf_path)
+        QMessageBox.warning(
+            self,
+            f"{action}できません",
+            f"{action}に失敗しました。\n\n{pdf_name}\n\n{error}",
+        )
+
     def _on_zoom_annotation_copy_requested(self, annotation: object) -> None:
         if not isinstance(annotation, FreeTextAnnotData):
             return
@@ -1871,7 +1906,11 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        do_paste()
+        try:
+            do_paste()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
         self._undo_manager.add_action(UndoAction(
             description="Paste FreeText",
             undo_func=undo_paste,
@@ -1933,7 +1972,11 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        do_create()
+        try:
+            do_create()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
         self._undo_manager.add_action(UndoAction(
             description="Create FreeText",
             undo_func=undo_create,
@@ -1970,7 +2013,11 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = state["old"]
             self._refresh_current_zoom_page(open_drawer=True)
 
-        do_replace()
+        try:
+            do_replace()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error, selected_annotation=state["old"])
+            return
         self._undo_manager.add_action(UndoAction(
             description=description,
             undo_func=undo_replace,
@@ -2011,7 +2058,11 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = state["old"]
             self._refresh_current_zoom_page(open_drawer=True)
 
-        do_delete()
+        try:
+            do_delete()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error, selected_annotation=state["old"])
+            return
         self._undo_manager.add_action(UndoAction(
             description="Delete FreeText",
             undo_func=undo_delete,
@@ -2528,13 +2579,21 @@ class PageEditWindow(QMainWindow):
 
     def _on_undo(self) -> None:
         self._commit_inline_annotation_editor()
-        self._undo_manager.undo()
+        try:
+            self._undo_manager.undo()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
+            return
         self._load_pages()
         self._update_button_states()
 
     def _on_redo(self) -> None:
         self._commit_inline_annotation_editor()
-        self._undo_manager.redo()
+        try:
+            self._undo_manager.redo()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
+            return
         self._load_pages()
         self._update_button_states()
 
@@ -2579,7 +2638,11 @@ class PageEditWindow(QMainWindow):
             insert_pages(pdf_path, backup_path, sorted_indices)
             self._load_pages()
 
-        do_delete()
+        try:
+            do_delete()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
 
         self._undo_manager.add_action(UndoAction(
             description=f"Delete {len(indices)} page(s)",
@@ -2628,7 +2691,11 @@ class PageEditWindow(QMainWindow):
                     self._pdf_path = old_path
                     self.setWindowTitle(f"JusticePDF - Edit: {old_name}")
 
-            do_rename()
+            try:
+                do_rename()
+            except OSError as error:
+                self._handle_file_operation_error(error, old_path, "名前変更")
+                return
             self._undo_manager.add_action(UndoAction(
                 description="Rename PDF",
                 undo_func=undo_rename,
@@ -2654,7 +2721,14 @@ class PageEditWindow(QMainWindow):
             update_pdf_metadata_title(old_path, old_title)
             self.refresh_from_disk()
 
-        do_rename_pdf_title()
+        try:
+            do_rename_pdf_title()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        except Exception as error:
+            self._handle_file_operation_error(error, old_path, "PDFタイトル変更")
+            return
         self._undo_manager.add_action(UndoAction(
             description="Rename PDF Name",
             undo_func=undo_rename_pdf_title,
@@ -2684,7 +2758,11 @@ class PageEditWindow(QMainWindow):
             for thumb in selected_thumbs:
                 self._request_thumbnail_refresh(thumb.page_num)
 
-        do_rotate()
+        try:
+            do_rotate()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
 
         self._undo_manager.add_action(UndoAction(
             description=f"Rotate {len(indices)} page(s)",
@@ -2751,7 +2829,11 @@ class PageEditWindow(QMainWindow):
                 self._zoom_page_num = deleted_page
                 self._render_zoom_page()
 
-        do_delete()
+        try:
+            do_delete()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
 
         self._undo_manager.add_action(UndoAction(
             description="Delete page from zoom view",
@@ -2785,7 +2867,11 @@ class PageEditWindow(QMainWindow):
             if page_num < len(self._thumbnails):
                 self._request_thumbnail_refresh(page_num)
 
-        do_rotate()
+        try:
+            do_rotate()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
 
         self._undo_manager.add_action(UndoAction(
             description="Rotate page from zoom view",
@@ -3058,7 +3144,11 @@ class PageEditWindow(QMainWindow):
             reorder_pages(pdf_path, inverse)
             self._load_pages()
 
-        do_reorder()
+        try:
+            do_reorder()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
 
         self._undo_manager.add_action(UndoAction(
             description="Reorder page",
@@ -3101,6 +3191,9 @@ class PageEditWindow(QMainWindow):
             insert_at = max(0, min(insert_at, page_count))
             logger.debug(f"Inserting pages at index {insert_at} into {self._pdf_path}")
             insert_pages(self._pdf_path, tmp_path, [insert_at] * len(source_pages))
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 logger.debug(f"Cleaning up tmp_path={tmp_path}")
@@ -3108,7 +3201,7 @@ class PageEditWindow(QMainWindow):
 
         logger.debug("Reloading pages in target window")
         self._load_pages()
-        
+
         # Select inserted pages
         self._clear_selection()
         for i in range(insert_at, insert_at + inserted_count):
@@ -3117,29 +3210,33 @@ class PageEditWindow(QMainWindow):
                 self._selected_thumbnails.append(self._thumbnails[i])
         self._update_button_states()
 
-        if not is_copy:
-            logger.debug(f"Removing pages from source: {source_pdf_path}")
-            file_deleted = remove_pages(source_pdf_path, source_pages)
-            logger.debug(f"file_deleted={file_deleted}")
-            
-            for widget in QApplication.topLevelWidgets():
-                if isinstance(widget, PageEditWindow) and widget._pdf_path == source_pdf_path:
-                    if file_deleted:
-                        logger.debug(f"File deleted, closing PageEditWindow for {source_pdf_path}")
-                        widget.close()
-                    else:
-                        logger.debug(f"Reloading pages in source PageEditWindow for {source_pdf_path}")
-                        widget._load_pages()
-                    break
-            if file_deleted:
-                logger.debug(f"Removing card for {source_pdf_path} from MainWindow")
-                from src.views.main_window import MainWindow
+        try:
+            if not is_copy:
+                logger.debug(f"Removing pages from source: {source_pdf_path}")
+                file_deleted = remove_pages(source_pdf_path, source_pages)
+                logger.debug(f"file_deleted={file_deleted}")
+
                 for widget in QApplication.topLevelWidgets():
-                    if isinstance(widget, MainWindow):
-                        widget._remove_card(source_pdf_path)
-                        widget._refresh_grid()
+                    if isinstance(widget, PageEditWindow) and widget._pdf_path == source_pdf_path:
+                        if file_deleted:
+                            logger.debug(f"File deleted, closing PageEditWindow for {source_pdf_path}")
+                            widget.close()
+                        else:
+                            logger.debug(f"Reloading pages in source PageEditWindow for {source_pdf_path}")
+                            widget._load_pages()
                         break
-        
+                if file_deleted:
+                    logger.debug(f"Removing card for {source_pdf_path} from MainWindow")
+                    from src.views.main_window import MainWindow
+                    for widget in QApplication.topLevelWidgets():
+                        if isinstance(widget, MainWindow):
+                            widget._remove_card(source_pdf_path)
+                            widget._refresh_grid()
+                            break
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+
         logger.debug("_handle_page_insert completed")
 
     def _get_drop_page_index(self, pos) -> int:

@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 JUSTICEPDF_FREETEXT_SUBJECT_PREFIX = "JusticePDF-FreeText:"
 
 
+class PdfWritePermissionError(PermissionError):
+    """Raised when a PDF cannot be overwritten because another app is using it."""
+
+    def __init__(self, pdf_path: str):
+        self.pdf_path = pdf_path
+        super().__init__(13, f"Permission denied: '{pdf_path}'", pdf_path)
+
+
 @dataclass(slots=True)
 class FreeTextAnnotData:
     page_num: int
@@ -82,11 +90,29 @@ _CSS_BORDER_RE = re.compile(
 )
 
 
+def _is_permission_denied_error(error: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, PermissionError):
+            return True
+        if isinstance(current, OSError) and getattr(current, "errno", None) == 13:
+            return True
+        message = str(current).lower()
+        if "permission denied" in message or "access is denied" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _save_document_in_place(doc: fitz.Document, pdf_path: str) -> None:
     """Persist a modified document, falling back when incremental save fails."""
     try:
         doc.saveIncr()
-    except Exception:
+    except Exception as error:
+        if _is_permission_denied_error(error):
+            raise PdfWritePermissionError(pdf_path) from error
         tmp_path: str | None = None
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp_path = tmp.name
@@ -96,20 +122,24 @@ def _save_document_in_place(doc: fitz.Document, pdf_path: str) -> None:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             raise
-        shutil.move(tmp_path, pdf_path)
+        try:
+            shutil.move(tmp_path, pdf_path)
+        except Exception as move_error:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            if _is_permission_denied_error(move_error):
+                raise PdfWritePermissionError(pdf_path) from move_error
+            raise
     _pixmap_cache.clear()
 
 
 def update_pdf_metadata_title(pdf_path: str, title: str) -> None:
     """PDFメタデータのTitleプロパティを更新する。"""
-    try:
-        with fitz.open(pdf_path) as doc:
-            meta = doc.metadata
-            meta['title'] = title
-            doc.set_metadata(meta)
-            _save_document_in_place(doc, pdf_path)
-    except Exception:
-        logger.debug("Failed to update PDF metadata title: %s", pdf_path, exc_info=True)
+    with fitz.open(pdf_path) as doc:
+        meta = doc.metadata
+        meta['title'] = title
+        doc.set_metadata(meta)
+        _save_document_in_place(doc, pdf_path)
 
 
 def get_pdf_metadata_title(pdf_path: str) -> str:
@@ -765,7 +795,6 @@ def merge_pdfs_in_place(
     if not pdf_paths:
         return
 
-    tmp_path: str | None = None
     dest_doc = fitz.open(dest_path)
     try:
         if insert_at is None:
@@ -782,25 +811,9 @@ def merge_pdfs_in_place(
                 with fitz.open(path) as src_doc:
                     dest_doc.insert_pdf(src_doc, start_at=idx)
                     idx += len(src_doc)
-        try:
-            dest_doc.saveIncr()
-            return
-        except Exception:
-            pass
-
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            dest_doc.save(tmp_path)
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            raise
+        _save_document_in_place(dest_doc, dest_path)
     finally:
         dest_doc.close()
-
-    if tmp_path is not None:
-        shutil.move(tmp_path, dest_path)
 
 
 def extract_pages(src_path: str, output_path: str, page_indices: list[int]) -> bool:
@@ -847,28 +860,34 @@ def remove_pages(pdf_path: str, page_indices: list[int]) -> bool:
 
     for idx in sorted(pages_to_remove, reverse=True):
         doc.delete_page(idx)
-    doc.saveIncr()
-    doc.close()
-    return False
+    try:
+        _save_document_in_place(doc, pdf_path)
+        return False
+    finally:
+        doc.close()
 
 
 def rotate_pages(pdf_path: str, page_indices: list[int], angle: int = 90) -> None:
     """Rotate specific pages in a PDF (in place)."""
     doc = fitz.open(pdf_path)
-    for idx in page_indices:
-        if 0 <= idx < len(doc):
-            page = doc[idx]
-            page.set_rotation((page.rotation + angle) % 360)
-    doc.saveIncr()
-    doc.close()
+    try:
+        for idx in page_indices:
+            if 0 <= idx < len(doc):
+                page = doc[idx]
+                page.set_rotation((page.rotation + angle) % 360)
+        _save_document_in_place(doc, pdf_path)
+    finally:
+        doc.close()
 
 
 def reorder_pages(pdf_path: str, new_order: list[int]) -> None:
     """Reorder pages in a PDF (in place)."""
     doc = fitz.open(pdf_path)
-    doc.select(new_order)
-    doc.saveIncr()
-    doc.close()
+    try:
+        doc.select(new_order)
+        _save_document_in_place(doc, pdf_path)
+    finally:
+        doc.close()
 
 
 def insert_pages(dest_path: str, src_path: str, insert_indices: list[int]) -> None:
@@ -881,13 +900,14 @@ def insert_pages(dest_path: str, src_path: str, insert_indices: list[int]) -> No
     """
     dest_doc = fitz.open(dest_path)
     src_doc = fitz.open(src_path)
-    
-    # Insert pages in reverse order to maintain correct indices
-    for i in reversed(range(len(src_doc))):
-        if i < len(insert_indices):
-            insert_at = insert_indices[i]
-            dest_doc.insert_pdf(src_doc, from_page=i, to_page=i, start_at=insert_at)
-    
-    dest_doc.saveIncr()
-    dest_doc.close()
-    src_doc.close()
+    try:
+        # Insert pages in reverse order to maintain correct indices
+        for i in reversed(range(len(src_doc))):
+            if i < len(insert_indices):
+                insert_at = insert_indices[i]
+                dest_doc.insert_pdf(src_doc, from_page=i, to_page=i, start_at=insert_at)
+
+        _save_document_in_place(dest_doc, dest_path)
+    finally:
+        dest_doc.close()
+        src_doc.close()
