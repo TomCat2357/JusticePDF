@@ -387,6 +387,16 @@ def _extract_freetext_data(
     )
 
 
+def _fix_rc_leading_whitespace(doc: fitz.Document, xref: int) -> None:
+    """Remove leading whitespace after <body> tag in RC to fix Acrobat display."""
+    kind, rc = doc.xref_get_key(xref, "RC")
+    if kind != "string" or not rc:
+        return
+    fixed = re.sub(r"(<body[^>]*>)\s+", r"\1", rc)
+    if fixed != rc:
+        doc.xref_set_key(xref, "RC", fitz.get_pdf_str(fixed))
+
+
 def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fitz.Annot:
     rect = fitz.Rect(*data.rect)
     border_width = max(0.0, float(data.border_width))
@@ -409,6 +419,7 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         style=_build_richtext_style(data),
     )
     annot.set_border(width=effective_border_width)
+    _fix_rc_leading_whitespace(page.parent, annot.xref)
     annot.update(
         fontsize=max(1.0, float(data.fontsize)),
         fontname=data.fontname or "Helv",

@@ -153,3 +153,34 @@ def test_page_edit_window_deletes_on_close(qtbot, tmp_path):
     window.show()
 
     assert window.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose) is True
+
+
+def test_delete_shows_warning_when_file_is_in_use(window_factory, monkeypatch, tmp_path):
+    window, _state = window_factory()
+    pdf_path = tmp_path / "locked.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    card = window._add_card(str(pdf_path))
+    card.set_selected(True)
+    window._selected_cards.append(card)
+
+    captured: dict[str, str] = {}
+
+    def _raise_locked(path: str) -> None:
+        raise OSError(None, "OLE error 0x80270027", path, -2144927705)
+
+    monkeypatch.setattr(main_window, "send2trash", _raise_locked)
+    monkeypatch.setattr(
+        main_window.QMessageBox,
+        "warning",
+        staticmethod(lambda _parent, title, text: captured.update(title=title, text=text)),
+    )
+
+    window._on_delete()
+
+    assert captured["title"] == "削除できません"
+    assert "使用中" in captured["text"]
+    assert "locked.pdf" in captured["text"]
+    assert pdf_path.exists()
+    assert window._get_card_by_path(str(pdf_path)) is card
+    assert window._undo_manager.undo_count() == 0

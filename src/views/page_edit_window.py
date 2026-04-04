@@ -6,7 +6,7 @@ from collections import deque
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
-    QInputDialog, QLabel, QFrame, QApplication, QRubberBand,
+    QInputDialog, QLabel, QFrame, QApplication, QRubberBand, QMessageBox,
     QToolButton, QSizePolicy, QPlainTextEdit, QFormLayout,
     QSpinBox, QColorDialog, QSlider
 )
@@ -34,6 +34,7 @@ from src.views.view_helpers import (
     register_shortcuts,
     viewport_width_or_fallback,
 )
+from src.utils.trash_utils import build_trash_failure_message
 
 PAGETHUMBNAIL_MIME_TYPE = "application/x-pdfas-page"
 PDFCARD_MIME_TYPE = "application/x-pdfas-card"
@@ -2812,13 +2813,23 @@ class PageEditWindow(QMainWindow):
 
         def do_delete():
             main_window = _get_main_window()
+            removed_card = False
             if main_window:
                 main_window._register_internal_remove([pdf_path])
                 main_window._remove_card(pdf_path)
                 main_window._refresh_grid()
+                removed_card = True
             # ファイルをゴミ箱へ
-            if os.path.exists(pdf_path):
-                send2trash(pdf_path)
+            try:
+                if os.path.exists(pdf_path):
+                    send2trash(pdf_path)
+            except OSError:
+                if main_window:
+                    main_window._internal_removes.discard(main_window._normalize_path(pdf_path))
+                    if removed_card and main_window._get_card_by_path(pdf_path) is None:
+                        main_window._add_card(pdf_path)
+                        main_window._refresh_grid()
+                raise
             # このPDFのPageEditWindowをすべて閉じる
             _close_edit_windows()
 
@@ -2837,7 +2848,15 @@ class PageEditWindow(QMainWindow):
                 # 復元後は編集画面を再度開く
                 main_window._on_card_double_clicked(restored_card)
 
-        do_delete()
+        try:
+            do_delete()
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                "削除できません",
+                build_trash_failure_message(pdf_path, error),
+            )
+            return
 
         self._undo_manager.add_action(UndoAction(
             description="Delete all pages (file to trash)",

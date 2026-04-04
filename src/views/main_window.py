@@ -30,6 +30,7 @@ from src.utils.pdf_utils import (
     clear_pixmap_cache, clear_pixmap_cache_for_path
 )
 from src.utils.path_utils import ensure_unique_path
+from src.utils.trash_utils import build_trash_failure_message
 from src.utils.windows_shell import show_native_file_context_menu
 
 logger = logging.getLogger(__name__)
@@ -952,10 +953,26 @@ class MainWindow(QMainWindow):
             shutil.copy2(path, backup_path)
             backups[path] = str(backup_path)
 
+        failed_path: str | None = None
+
         def do_delete():
-            self._register_internal_remove(paths)
+            nonlocal failed_path
+            deleted_paths: list[str] = []
             for path in paths:
-                send2trash(path)
+                failed_path = path
+                self._register_internal_remove([path])
+                try:
+                    send2trash(path)
+                except OSError:
+                    for restored_path in deleted_paths:
+                        backup_path = backups.get(restored_path)
+                        if backup_path and os.path.exists(backup_path):
+                            self._register_internal_add([restored_path])
+                            shutil.copy2(backup_path, restored_path)
+                    for pending_path in paths[len(deleted_paths):]:
+                        self._internal_removes.discard(self._normalize_path(pending_path))
+                    raise
+                deleted_paths.append(path)
             self._clear_selection()
 
         def undo_delete():
@@ -963,7 +980,15 @@ class MainWindow(QMainWindow):
             for original_path, backup_path in backups.items():
                 shutil.copy2(backup_path, original_path)
 
-        do_delete()
+        try:
+            do_delete()
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                "削除できません",
+                build_trash_failure_message(failed_path or paths[0], error),
+            )
+            return
 
         self._undo_manager.add_action(UndoAction(
             description=f"Delete {len(paths)} PDF(s)",
