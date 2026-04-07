@@ -107,29 +107,26 @@ def _is_permission_denied_error(error: BaseException) -> bool:
 
 
 def _save_document_in_place(doc: fitz.Document, pdf_path: str) -> None:
-    """Persist a modified document, falling back when incremental save fails."""
+    """Persist a modified document with garbage collection to prevent file growth."""
+    tmp_path: str | None = None
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp_path = tmp.name
     try:
-        doc.saveIncr()
+        doc.save(tmp_path, garbage=1, deflate=True)
     except Exception as error:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
         if _is_permission_denied_error(error):
             raise PdfWritePermissionError(pdf_path) from error
-        tmp_path: str | None = None
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            doc.save(tmp_path)
-        except Exception:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            raise
-        try:
-            shutil.move(tmp_path, pdf_path)
-        except Exception as move_error:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            if _is_permission_denied_error(move_error):
-                raise PdfWritePermissionError(pdf_path) from move_error
-            raise
+        raise
+    try:
+        shutil.move(tmp_path, pdf_path)
+    except Exception as move_error:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        if _is_permission_denied_error(move_error):
+            raise PdfWritePermissionError(pdf_path) from move_error
+        raise
     _pixmap_cache.clear()
 
 
