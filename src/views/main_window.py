@@ -28,7 +28,7 @@ from src.models.undo_manager import UndoManager, UndoAction
 from src.utils.pdf_utils import (
     PdfWritePermissionError,
     rotate_pages, get_page_count, get_pdf_metadata_title, update_pdf_metadata_title,
-    clear_pixmap_cache, clear_pixmap_cache_for_path
+    clear_pixmap_cache, clear_pixmap_cache_for_path, print_pdfs,
 )
 from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
@@ -192,6 +192,10 @@ class MainWindow(QMainWindow):
         self._export_btn.clicked.connect(self._on_export)
         toolbar.addWidget(self._export_btn)
 
+        self._print_btn = QPushButton("Print")
+        self._print_btn.clicked.connect(self._on_print)
+        toolbar.addWidget(self._print_btn)
+
         self._refresh_btn = QPushButton("Refresh")
         self._refresh_btn.clicked.connect(self._on_refresh)
         toolbar.addWidget(self._refresh_btn)
@@ -228,6 +232,7 @@ class MainWindow(QMainWindow):
                 (QKeySequence("Shift+F2"), self._on_rename_pdf_title),
                 (QKeySequence.StandardKey.SelectAll, self._on_select_all),
                 (QKeySequence("Ctrl+E"), self._on_export),
+                (QKeySequence.StandardKey.Print, self._on_print),
             ),
         )
 
@@ -1392,6 +1397,18 @@ class MainWindow(QMainWindow):
             )
         else:
             QMessageBox.information(self, "エクスポート結果", f"{ok} 件コピーしました。")
+
+    def _on_print(self) -> None:
+        """Print selected PDFs (or all PDFs if none selected)."""
+        targets = (
+            [c.pdf_path for c in self._selected_cards]
+            if self._selected_cards
+            else [c.pdf_path for c in self._cards]
+        )
+        if not targets:
+            QMessageBox.information(self, "Print", "印刷対象のPDFがありません。")
+            return
+        print_pdfs(targets, self)
 
     def _on_rotate(self) -> None:
         """Handle rotate action."""

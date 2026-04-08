@@ -10,7 +10,10 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 import fitz
-from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPainter, QPixmap, QImage
+from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
+from PyQt6.QtWidgets import QWidget
 
 
 logger = logging.getLogger(__name__)
@@ -908,3 +911,48 @@ def insert_pages(dest_path: str, src_path: str, insert_indices: list[int]) -> No
     finally:
         dest_doc.close()
         src_doc.close()
+
+
+def print_pdfs(pdf_paths: list[str], parent: QWidget | None = None) -> None:
+    """Print one or more PDF files via the system print dialog."""
+    printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+    dialog = QPrintDialog(printer, parent)
+    if dialog.exec() != QPrintDialog.DialogCode.Accepted:
+        return
+
+    painter = QPainter()
+    if not painter.begin(printer):
+        return
+
+    try:
+        first_page = True
+        for pdf_path in pdf_paths:
+            doc = fitz.open(pdf_path)
+            try:
+                for page_num in range(len(doc)):
+                    if not first_page:
+                        printer.newPage()
+                    first_page = False
+
+                    page = doc[page_num]
+                    dpi = printer.resolution()
+                    scale = dpi / 72.0
+                    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+                    img = QImage(
+                        pix.samples, pix.width, pix.height, pix.stride,
+                        QImage.Format.Format_RGB888,
+                    )
+
+                    page_rect = painter.viewport()
+                    img_scaled = img.scaled(
+                        page_rect.size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    x = (page_rect.width() - img_scaled.width()) // 2
+                    y = (page_rect.height() - img_scaled.height()) // 2
+                    painter.drawImage(x, y, img_scaled)
+            finally:
+                doc.close()
+    finally:
+        painter.end()
