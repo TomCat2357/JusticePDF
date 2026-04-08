@@ -26,7 +26,7 @@ from src.utils.pdf_utils import (
     list_freetext_annots, create_freetext_annot, replace_freetext_annot,
     delete_freetext_annot, get_pdf_metadata_title, update_pdf_metadata_title,
     PdfWritePermissionError,
-    clear_pixmap_cache_for_path
+    clear_pixmap_cache_for_path, print_pdfs,
 )
 from src.models.undo_manager import UndoManager, UndoAction
 from src.views.view_helpers import (
@@ -1697,6 +1697,10 @@ class PageEditWindow(QMainWindow):
         self._title_btn.clicked.connect(self._on_rename_pdf_title)
         toolbar.addWidget(self._title_btn)
 
+        self._print_btn = QPushButton("Print")
+        self._print_btn.clicked.connect(self._on_print)
+        toolbar.addWidget(self._print_btn)
+
         toolbar.addSeparator()
 
         self._rotate_btn = QPushButton("Rotate")
@@ -1720,6 +1724,7 @@ class PageEditWindow(QMainWindow):
                 (QKeySequence("Shift+F2"), self._on_rename_pdf_title),
                 (QKeySequence.StandardKey.SelectAll, self._on_select_all),
                 (QKeySequence(Qt.Key.Key_R), self._on_rotate),
+                (QKeySequence.StandardKey.Print, self._on_print),
             ),
         )
 
@@ -2734,6 +2739,10 @@ class PageEditWindow(QMainWindow):
             undo_func=undo_rename_pdf_title,
             redo_func=do_rename_pdf_title
         ))
+
+    def _on_print(self) -> None:
+        """Print the current PDF."""
+        print_pdfs([self._pdf_path], self)
 
     def _on_rotate(self) -> None:
         # ズームビュー表示中の場合
