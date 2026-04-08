@@ -29,6 +29,7 @@ from src.utils.pdf_utils import (
     PdfWritePermissionError,
     rotate_pages, get_page_count, get_pdf_metadata_title, update_pdf_metadata_title,
     clear_pixmap_cache, clear_pixmap_cache_for_path, print_pdfs,
+    export_pages_as_images, images_to_pdf,
 )
 from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
@@ -41,7 +42,10 @@ _OFFICE_EXTS = {
     ".xls", ".xlsx", ".xlsm",
     ".ppt", ".pptx",
 }
-_IMPORT_EXTS = {".pdf"} | _OFFICE_EXTS
+_IMAGE_EXTS = {
+    ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif",
+}
+_IMPORT_EXTS = {".pdf"} | _OFFICE_EXTS | _IMAGE_EXTS
 
 
 class MainWindow(QMainWindow):
@@ -1187,6 +1191,8 @@ class MainWindow(QMainWindow):
                             office_index += 1
                             progress.setValue(office_index)
                             QApplication.processEvents()
+                elif ext in _IMAGE_EXTS:
+                    dest_path = self._convert_image_to_pdf_into_workdir(src_path)
                 else:
                     failed.append((src_path, "未対応の拡張子です"))
                 if dest_path:
@@ -1245,6 +1251,20 @@ class MainWindow(QMainWindow):
         self._register_internal_add([dest_str])
         try:
             shutil.copy2(src_path, dest_path)
+        except Exception:
+            self._internal_adds.discard(self._normalize_path(dest_str))
+            raise
+        clear_pixmap_cache_for_path(dest_str)
+        return dest_str
+
+    def _convert_image_to_pdf_into_workdir(self, src_path: str) -> str:
+        """Convert an image file to a single-page PDF in the work directory."""
+        base_name = os.path.splitext(os.path.basename(src_path))[0]
+        dest_path = ensure_unique_path(self._work_dir, f"{base_name}.pdf", pattern="{stem}({i}){ext}")
+        dest_str = str(dest_path)
+        self._register_internal_add([dest_str])
+        try:
+            images_to_pdf([src_path], dest_str)
         except Exception:
             self._internal_adds.discard(self._normalize_path(dest_str))
             raise
@@ -1358,18 +1378,45 @@ class MainWindow(QMainWindow):
 
             shutil.move(generated, dest_pdf_path)
 
+    _EXPORT_FORMATS = ["PDF (*.pdf)", "PNG (*.png)", "JPEG (*.jpg)"]
+
     def _on_export(self) -> None:
-        """Export selected PDFs (or all PDFs if none selected) to a chosen folder."""
+        """Export selected PDFs (or all PDFs if none selected) to a chosen folder.
+
+        The user picks an output format via the name filter dropdown in the
+        directory dialog.  When an image format is chosen, every page of each
+        target PDF is exported as an individual image file.
+        """
         targets = [c.pdf_path for c in self._selected_cards] if self._selected_cards else [c.pdf_path for c in self._cards]
 
         if not targets:
             QMessageBox.information(self, "Export", "エクスポート対象のPDFがありません。")
             return
 
+        fmt, accepted = QInputDialog.getItem(
+            self,
+            "エクスポート形式",
+            "出力形式を選択してください:",
+            self._EXPORT_FORMATS,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+
         dst_dir = QFileDialog.getExistingDirectory(self, "エクスポート先フォルダを選択")
         if not dst_dir:
             return
 
+        if "*.png" in fmt:
+            self._export_as_images(targets, dst_dir, "png")
+        elif "*.jpg" in fmt:
+            self._export_as_images(targets, dst_dir, "jpeg")
+        else:
+            self._export_as_pdf(targets, dst_dir)
+
+    def _export_as_pdf(self, targets: list[str], dst_dir: str) -> None:
+        """Copy PDF files to the destination directory."""
         ok = 0
         failed: list[tuple[str, str]] = []
 
@@ -1386,6 +1433,32 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 failed.append((src, str(e)))
 
+        self._show_export_result(ok, failed)
+
+    def _export_as_images(self, targets: list[str], dst_dir: str, fmt: str) -> None:
+        """Export all pages of each target PDF as images."""
+        ok = 0
+        failed: list[tuple[str, str]] = []
+
+        for src in targets:
+            try:
+                if not os.path.exists(src):
+                    failed.append((src, "元ファイルが見つかりません"))
+                    continue
+                created = export_pages_as_images(src, dst_dir, fmt=fmt)
+                ok += len(created)
+            except Exception as e:
+                failed.append((src, str(e)))
+
+        label = "ページ" if fmt != "pdf" else "件"
+        self._show_export_result(ok, failed, label=label)
+
+    def _show_export_result(
+        self,
+        ok: int,
+        failed: list[tuple[str, str]],
+        label: str = "件",
+    ) -> None:
         if failed:
             details = "\n".join([f"- {os.path.basename(s)}: {r}" for s, r in failed[:20]])
             if len(failed) > 20:
@@ -1393,10 +1466,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "エクスポート結果",
-                f"{ok} 件コピーしました。\n失敗: {len(failed)} 件\n\n{details}",
+                f"{ok} {label}エクスポートしました。\n失敗: {len(failed)} 件\n\n{details}",
             )
         else:
-            QMessageBox.information(self, "エクスポート結果", f"{ok} 件コピーしました。")
+            QMessageBox.information(self, "エクスポート結果", f"{ok} {label}エクスポートしました。")
 
     def _on_print(self) -> None:
         """Print selected PDFs (or all PDFs if none selected)."""
