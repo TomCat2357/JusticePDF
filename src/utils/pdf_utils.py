@@ -913,6 +913,68 @@ def insert_pages(dest_path: str, src_path: str, insert_indices: list[int]) -> No
         src_doc.close()
 
 
+def export_pages_as_images(
+    pdf_path: str,
+    output_dir: str,
+    fmt: str = "png",
+    dpi: int = 150,
+    page_indices: list[int] | None = None,
+) -> list[str]:
+    """Export PDF pages as image files.
+
+    Args:
+        pdf_path: Source PDF file path.
+        output_dir: Directory to save images.
+        fmt: Image format ("png" or "jpeg").
+        dpi: Resolution in DPI.
+        page_indices: Pages to export (0-based). None means all pages.
+
+    Returns:
+        List of created image file paths.
+    """
+    scale = dpi / 72.0
+    ext = ".jpg" if fmt.lower() in ("jpeg", "jpg") else ".png"
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    created: list[str] = []
+
+    doc = fitz.open(pdf_path)
+    try:
+        indices = page_indices if page_indices is not None else list(range(len(doc)))
+        for page_num in indices:
+            page = doc[page_num]
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+            filename = f"{base}_p{page_num + 1}{ext}"
+            out_path = os.path.join(output_dir, filename)
+            pix.save(out_path)
+            created.append(out_path)
+    finally:
+        doc.close()
+
+    return created
+
+
+def images_to_pdf(image_paths: list[str], output_path: str) -> None:
+    """Create a PDF from image files. Each image becomes one page.
+
+    Args:
+        image_paths: List of image file paths.
+        output_path: Destination PDF path.
+    """
+    doc = fitz.open()
+    try:
+        for img_path in image_paths:
+            img_doc = fitz.open(img_path)
+            # fitz.open on an image creates a 1-page PDF-like document
+            pdf_bytes = img_doc.convert_to_pdf()
+            img_doc.close()
+            img_pdf = fitz.open("pdf", pdf_bytes)
+            doc.insert_pdf(img_pdf)
+            img_pdf.close()
+        doc.save(output_path, garbage=1, deflate=True)
+    finally:
+        doc.close()
+
+
 def print_pdfs(pdf_paths: list[str], parent: QWidget | None = None) -> None:
     """Print one or more PDF files via the system print dialog."""
     printer = QPrinter(QPrinter.PrinterMode.HighResolution)
