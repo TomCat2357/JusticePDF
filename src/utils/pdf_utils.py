@@ -43,6 +43,7 @@ class FreeTextAnnotData:
     fontname: str = "Helv"
     annotation_id: str = ""
     subject: str = ""
+    text_rotation: int = 0
 
 
 class _PixmapCache:
@@ -271,7 +272,7 @@ def _decode_subject_metadata(subject: str) -> dict[str, object] | None:
     return None
 
 
-def _encode_subject_metadata(data: FreeTextAnnotData) -> str:
+def _encode_subject_metadata(data: FreeTextAnnotData, *, page_rotation: int = 0) -> str:
     payload = {
         "text_color": list(data.text_color),
         "fill_color": list(data.fill_color) if data.fill_color is not None else None,
@@ -279,6 +280,7 @@ def _encode_subject_metadata(data: FreeTextAnnotData) -> str:
         "border_width": float(data.border_width),
         "fontsize": float(data.fontsize),
         "fontname": data.fontname,
+        "page_rotation": int(page_rotation),
     }
     return JUSTICEPDF_FREETEXT_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
 
@@ -313,6 +315,9 @@ def _extract_freetext_data(
     fontname, fontsize, text_color = _parse_da(da_value)
 
     rect = tuple(annot.rect)
+    page = doc[page_num]
+    if page.rotation != 0:
+        rect = tuple(fitz.Rect(rect) * page.rotation_matrix)
 
     _, fill_value = doc.xref_get_key(xref, "C")
     fill_color = _normalize_color(_parse_float_array(fill_value))
@@ -400,6 +405,9 @@ def _extract_freetext_data(
     _, name_value = doc.xref_get_key(xref, "NM")
     annotation_id = info.get("id") or (name_value if name_value != "null" else "")
 
+    creation_rotation = int(metadata.get("page_rotation", 0))
+    text_rotation = (page.rotation - creation_rotation) % 360
+
     return FreeTextAnnotData(
         page_num=page_num,
         xref=xref,
@@ -414,6 +422,7 @@ def _extract_freetext_data(
         fontname=fontname or "Helv",
         annotation_id=annotation_id,
         subject=subject,
+        text_rotation=text_rotation,
     )
 
 
@@ -436,6 +445,15 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         inset = effective_border_width / 2.0
         if rect.width > inset * 2 and rect.height > inset * 2:
             rect = fitz.Rect(rect.x0 + inset, rect.y0 + inset, rect.x1 - inset, rect.y1 - inset)
+    if page.rotation != 0:
+        rect = rect * page.derotation_matrix
+    # Determine the creation page rotation: use existing metadata (undo/restore)
+    # or current page rotation (new/edit where subject is cleared).
+    existing_metadata = _decode_subject_metadata(data.subject)
+    if existing_metadata is not None and "page_rotation" in existing_metadata:
+        creation_page_rotation = int(existing_metadata["page_rotation"])
+    else:
+        creation_page_rotation = page.rotation
     annot = page.add_freetext_annot(
         rect,
         data.content,
@@ -445,6 +463,7 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         fill_color=data.fill_color,
         border_width=effective_border_width,
         opacity=opacity,
+        rotate=creation_page_rotation,
         richtext=True,
         style=_build_richtext_style(data),
     )
@@ -456,9 +475,10 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         text_color=data.text_color,
         border_color=data.border_color if effective_border_width > 0 else None,
         fill_color=data.fill_color,
+        rotate=creation_page_rotation,
         opacity=opacity,
     )
-    annot.set_info(subject=_encode_subject_metadata(data))
+    annot.set_info(subject=_encode_subject_metadata(data, page_rotation=creation_page_rotation))
     return annot
 
 

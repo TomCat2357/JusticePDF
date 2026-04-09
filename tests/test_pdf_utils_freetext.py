@@ -394,6 +394,237 @@ def test_replace_freetext_annot_raises_permission_error_when_destination_is_lock
         )
 
 
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_freetext_annot_renders_at_correct_position_on_rotated_page(tmp_path, rotation):
+    """Annotations created on rotated pages must render at the visual position."""
+    pdf_path = tmp_path / f"rotated-{rotation}.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=320, height=420)
+    page.set_rotation(rotation)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    # Create annotation at visual top-left area (50,50)-(200,100)
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(50, 50, 200, 100),
+            content="rotated",
+            fontsize=12,
+            text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=None,
+            border_width=0,
+            opacity=1.0,
+        ),
+    )
+
+    # Roundtrip: read back should return the same visual coordinates
+    listed = list_freetext_annots(str(pdf_path), 0)
+    assert len(listed) == 1
+    r = listed[0].rect
+    assert abs(r[0] - 50) < 1 and abs(r[1] - 50) < 1
+    assert abs(r[2] - 200) < 1 and abs(r[3] - 100) < 1
+
+    # Render with annotations and verify yellow pixel at visual (100, 75)
+    with fitz.open(str(pdf_path)) as doc:
+        pix = doc[0].get_pixmap(matrix=fitz.Matrix(1, 1), annots=True)
+    offset = 75 * pix.stride + 100 * pix.n
+    r_val, g_val, b_val = pix.samples[offset], pix.samples[offset + 1], pix.samples[offset + 2]
+    assert r_val > 200 and g_val > 200 and b_val < 80, (
+        f"Expected yellow at (100,75) but got ({r_val},{g_val},{b_val})"
+    )
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_freetext_annot_has_correct_rotate_key_on_rotated_page(tmp_path, rotation):
+    """Annotation /Rotate must match page rotation so text appears upright."""
+    pdf_path = tmp_path / f"rotate-key-{rotation}.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=320, height=420)
+    page.set_rotation(rotation)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0, xref=0,
+            rect=(50, 50, 200, 100), content="test",
+            fontsize=12, text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=None, border_width=0, opacity=1.0,
+        ),
+    )
+
+    with fitz.open(str(pdf_path)) as doc:
+        _, rotate_val = doc.xref_get_key(created.xref, "Rotate")
+        assert int(rotate_val) == rotation
+
+
+def test_freetext_text_rotation_after_page_rotation(tmp_path):
+    """text_rotation must reflect delta between current and creation rotation."""
+    pdf_path = tmp_path / "text-rot.pdf"
+    _make_pdf(pdf_path)
+
+    create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0, xref=0,
+            rect=(50, 50, 200, 100), content="hello",
+            fontsize=12, text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=None, border_width=0, opacity=1.0,
+        ),
+    )
+
+    # Before rotation: text_rotation should be 0
+    listed = list_freetext_annots(str(pdf_path), 0)
+    assert listed[0].text_rotation == 0
+
+    # Rotate page to 90
+    rotate_pages(str(pdf_path), [0], 90)
+    listed = list_freetext_annots(str(pdf_path), 0)
+    assert listed[0].text_rotation == 90
+
+
+def test_freetext_edit_resets_rotation_on_rotated_page(tmp_path):
+    """Replacing with subject='' resets page_rotation to current page rotation."""
+    pdf_path = tmp_path / "edit-reset.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0, xref=0,
+            rect=(50, 50, 200, 100), content="original",
+            fontsize=12, text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=None, border_width=0, opacity=1.0,
+        ),
+    )
+
+    # Rotate page to 90
+    rotate_pages(str(pdf_path), [0], 90)
+    listed = list_freetext_annots(str(pdf_path), 0)
+    assert listed[0].text_rotation == 90
+
+    # Replace with subject="" (simulates edit)
+    edited = replace_freetext_annot(
+        str(pdf_path), 0, listed[0].xref,
+        FreeTextAnnotData(
+            page_num=0, xref=listed[0].xref,
+            rect=listed[0].rect, content="edited",
+            fontsize=12, text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=None, border_width=0, opacity=1.0,
+            subject="",
+        ),
+    )
+
+    # After edit: text_rotation should be 0 (reset to upright)
+    listed2 = list_freetext_annots(str(pdf_path), 0)
+    assert listed2[0].text_rotation == 0
+    assert listed2[0].content == "edited"
+
+    # /Rotate in PDF should match current page rotation (90)
+    with fitz.open(str(pdf_path)) as doc:
+        _, rotate_val = doc.xref_get_key(listed2[0].xref, "Rotate")
+        assert int(rotate_val) == 90
+
+
+def test_freetext_undo_restores_original_rotation(tmp_path):
+    """Restoring old annotation data (with subject metadata) preserves original rotation."""
+    pdf_path = tmp_path / "undo-rot.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0, xref=0,
+            rect=(50, 50, 200, 100), content="original",
+            fontsize=12, text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=None, border_width=0, opacity=1.0,
+        ),
+    )
+
+    # Rotate page to 90
+    rotate_pages(str(pdf_path), [0], 90)
+
+    # Read the annotation (has text_rotation=90, subject with page_rotation=0)
+    old_data = list_freetext_annots(str(pdf_path), 0)[0]
+    assert old_data.text_rotation == 90
+
+    # Edit (subject="") to reset rotation
+    edited = replace_freetext_annot(
+        str(pdf_path), 0, old_data.xref,
+        FreeTextAnnotData(
+            page_num=0, xref=old_data.xref,
+            rect=old_data.rect, content="edited",
+            fontsize=12, text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=None, border_width=0, opacity=1.0,
+            subject="",
+        ),
+    )
+    assert list_freetext_annots(str(pdf_path), 0)[0].text_rotation == 0
+
+    # Undo: restore old_data (which has subject with page_rotation=0)
+    restored = replace_freetext_annot(
+        str(pdf_path), 0, edited.xref, old_data,
+    )
+
+    # text_rotation should be back to 90
+    listed = list_freetext_annots(str(pdf_path), 0)
+    assert listed[0].text_rotation == 90
+    assert listed[0].content == "original"
+
+    # /Rotate in PDF should be 0 (original creation rotation)
+    with fitz.open(str(pdf_path)) as doc:
+        _, rotate_val = doc.xref_get_key(listed[0].xref, "Rotate")
+        assert int(rotate_val) == 0
+
+
+def test_freetext_move_preserves_rotation(tmp_path):
+    """Move (with subject preserved) should keep original rotation."""
+    pdf_path = tmp_path / "move-rot.pdf"
+    _make_pdf(pdf_path)
+
+    create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0, xref=0,
+            rect=(50, 50, 200, 100), content="moveme",
+            fontsize=12, text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=None, border_width=0, opacity=1.0,
+        ),
+    )
+
+    rotate_pages(str(pdf_path), [0], 90)
+    old_data = list_freetext_annots(str(pdf_path), 0)[0]
+    assert old_data.text_rotation == 90
+
+    # Move: replace with old subject preserved (simulates move)
+    moved = replace_freetext_annot(
+        str(pdf_path), 0, old_data.xref,
+        FreeTextAnnotData(
+            page_num=0, xref=old_data.xref,
+            rect=(60, 60, 210, 110), content="moveme",
+            fontsize=12, text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.0),
+            border_color=None, border_width=0, opacity=1.0,
+            subject=old_data.subject,
+        ),
+    )
+
+    listed = list_freetext_annots(str(pdf_path), 0)
+    assert listed[0].text_rotation == 90
+
+
 def test_rotate_pages_raises_permission_error_when_destination_is_locked(tmp_path, monkeypatch):
     pdf_path = tmp_path / "locked-rotate.pdf"
     _make_pdf(pdf_path)

@@ -612,9 +612,23 @@ class ZoomPageWidget(QWidget):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
+        text_rot = annot.text_rotation % 360
+        if text_rot:
+            center = rect.center()
+            painter.translate(center)
+            painter.rotate(text_rot)
+            # Use swapped dimensions for 90/270 so text wrapping matches native rendering
+            if text_rot in (90, 270):
+                w, h = rect.height(), rect.width()
+            else:
+                w, h = rect.width(), rect.height()
+            paint_rect = QRectF(-w / 2, -h / 2, w, h)
+        else:
+            paint_rect = rect
+
         fill_color = self._annotation_color(annot.fill_color, opacity=annot.opacity)
         if fill_color is not None:
-            painter.fillRect(rect, fill_color)
+            painter.fillRect(paint_rect, fill_color)
 
         pen_width = max(0.0, float(annot.border_width) * self._zoom_factor)
         border_color = self._annotation_color(annot.border_color, opacity=annot.opacity)
@@ -624,9 +638,9 @@ class ZoomPageWidget(QWidget):
             painter.setPen(border_pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             inset = pen_width / 2.0
-            border_rect = rect
-            if rect.width() > pen_width and rect.height() > pen_width:
-                border_rect = rect.adjusted(inset, inset, -inset, -inset)
+            border_rect = paint_rect
+            if paint_rect.width() > pen_width and paint_rect.height() > pen_width:
+                border_rect = paint_rect.adjusted(inset, inset, -inset, -inset)
             painter.drawRect(border_rect)
 
         if annot.content:
@@ -638,7 +652,7 @@ class ZoomPageWidget(QWidget):
                 painter.setPen(text_color)
             effective_border_width = annot.border_width if annot.border_color is not None else 0.0
             text_inset = effective_border_width * 2.0 * self._zoom_factor
-            text_rect = rect.adjusted(text_inset, text_inset, -text_inset, 0) if text_inset > 0 else rect
+            text_rect = paint_rect.adjusted(text_inset, text_inset, -text_inset, 0) if text_inset > 0 else paint_rect
             painter.drawText(
                 text_rect,
                 int(
@@ -1667,7 +1681,7 @@ class PageEditWindow(QMainWindow):
             opacity=(float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else base.opacity,
             fontname=base.fontname,
             annotation_id=base.annotation_id,
-            subject=base.subject,
+            subject="",
         )
 
     def _setup_toolbar(self) -> None:
@@ -1809,7 +1823,7 @@ class PageEditWindow(QMainWindow):
             opacity=current.opacity,
             fontname=current.fontname,
             annotation_id=current.annotation_id,
-            subject=current.subject,
+            subject="",
         )
         self._zoom_annotation_text_commit_in_progress = True
         try:
@@ -1895,7 +1909,7 @@ class PageEditWindow(QMainWindow):
             opacity=self._copied_zoom_annotation.opacity,
             fontname=self._copied_zoom_annotation.fontname,
             annotation_id="",
-            subject=self._copied_zoom_annotation.subject,
+            subject="",
         )
         state: dict[str, FreeTextAnnotData | None] = {"created": None}
 
@@ -2093,7 +2107,7 @@ class PageEditWindow(QMainWindow):
             opacity=old_annotation.opacity,
             fontname=old_annotation.fontname,
             annotation_id=old_annotation.annotation_id,
-            subject=old_annotation.subject,
+            subject=old_annotation.subject if mode == "move" else "",
         )
         if old_annotation.rect == new_annotation.rect:
             return
