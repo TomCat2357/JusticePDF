@@ -88,6 +88,12 @@ class MainWindow(QMainWindow):
         self._modified_last_mtime: dict[str, float] = {}
         self._modified_debounce_ms = 250
 
+        # Debounce grid refresh for rapid file-removal events (watchdog)
+        self._grid_refresh_timer = QTimer(self)
+        self._grid_refresh_timer.setSingleShot(True)
+        self._grid_refresh_timer.setInterval(50)
+        self._grid_refresh_timer.timeout.connect(self._on_deferred_grid_refresh)
+
         # Setup working directory
         self._work_dir = Path.home() / "Documents" / "PDFs"
         self._work_dir.mkdir(parents=True, exist_ok=True)
@@ -421,21 +427,23 @@ class MainWindow(QMainWindow):
         return card
 
     def _rebuild_cards_from_paths(self, paths: list[str]) -> None:
-        """Rebuild PDFCards from a list of paths.
-        
-        This method safely disposes of all existing cards and creates
-        new ones from the given paths. Used by undo/redo operations
-        to avoid holding Widget references in closures.
+        """Rebuild PDFCards from a list of paths, reusing existing cards where possible.
+
+        Cards whose paths appear in *paths* are kept as-is (no thumbnail
+        re-render).  Only genuinely new paths cause a PDFCard to be created.
+        Cards not present in *paths* are disposed of.
         """
-        # Safely dispose of existing cards
-        for card in self._cards:
-            card.deleteLater()
-        self._cards.clear()
-        self._selected_cards.clear()
-        
-        # Create new cards for existing files
+        existing: dict[str, PDFCard] = {card.pdf_path: card for card in self._cards}
+        new_cards: list[PDFCard] = []
+        reused_paths: set[str] = set()
+
         for path in paths:
-            if os.path.exists(path):
+            if not os.path.exists(path):
+                continue
+            if path in existing and path not in reused_paths:
+                new_cards.append(existing[path])
+                reused_paths.add(path)
+            else:
                 card = self._connect_card_signals(
                     PDFCard(
                         path,
@@ -443,7 +451,14 @@ class MainWindow(QMainWindow):
                         thumb_size=self._preview_thumb_size,
                     )
                 )
-                self._cards.append(card)
+                new_cards.append(card)
+
+        for card in self._cards:
+            if card.pdf_path not in reused_paths:
+                card.deleteLater()
+
+        self._cards = new_cards
+        self._selected_cards = [c for c in self._selected_cards if c in new_cards]
 
     def _remove_card(self, pdf_path: str) -> None:
         """Remove a card for a PDF file."""
@@ -486,6 +501,10 @@ class MainWindow(QMainWindow):
             row = i // cols
             col = i % cols
             self._grid_layout.addWidget(card, row, col)
+
+    def _on_deferred_grid_refresh(self) -> None:
+        """Callback for the debounced grid refresh timer."""
+        self._refresh_grid()
 
     def _sort_cards(self) -> None:
         """Sort cards based on current sort order."""
@@ -846,14 +865,14 @@ class MainWindow(QMainWindow):
                 # Refresh in place rather than treating this as a duplicate add.
                 card.refresh()
                 self._refresh_page_edit_windows_for_paths([path])
-                self._refresh_grid()
+                self._grid_refresh_timer.start()
                 return
         if normalized in self._internal_adds:
             self._internal_adds.discard(normalized)
         else:
             self._clear_undo_history()
         new_card = self._add_card(path, insert_index=None)
-        self._refresh_grid()
+        self._grid_refresh_timer.start()
 
     def _on_file_removed(self, path: str) -> None:
         """Handle file removed from folder."""
@@ -877,7 +896,7 @@ class MainWindow(QMainWindow):
         else:
             self._clear_undo_history()
         self._remove_card(path)
-        self._refresh_grid()
+        self._grid_refresh_timer.start()
         self._update_button_states()
 
     def _on_file_modified(self, path: str) -> None:

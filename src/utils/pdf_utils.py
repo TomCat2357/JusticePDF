@@ -110,8 +110,26 @@ def _is_permission_denied_error(error: BaseException) -> bool:
     return False
 
 
-def _save_document_in_place(doc: fitz.Document, pdf_path: str) -> None:
-    """Persist a modified document with garbage collection to prevent file growth."""
+def _save_document_in_place(
+    doc: fitz.Document, pdf_path: str, *, incremental: bool = False
+) -> None:
+    """Persist a modified document.
+
+    When *incremental* is True, tries ``saveIncr()`` first for speed
+    (append-only, no rewrite).  Falls back to full save on failure.
+    When False (default), uses full save with garbage collection to
+    prevent file growth from repeated annotation edits.
+    """
+    if incremental:
+        try:
+            doc.saveIncr()
+            _pixmap_cache.clear_for_path(pdf_path)
+            return
+        except Exception as error:
+            if _is_permission_denied_error(error):
+                raise PdfWritePermissionError(pdf_path) from error
+            # Fall through to full save
+
     tmp_path: str | None = None
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp_path = tmp.name
@@ -131,7 +149,7 @@ def _save_document_in_place(doc: fitz.Document, pdf_path: str) -> None:
         if _is_permission_denied_error(move_error):
             raise PdfWritePermissionError(pdf_path) from move_error
         raise
-    _pixmap_cache.clear()
+    _pixmap_cache.clear_for_path(pdf_path)
 
 
 def update_pdf_metadata_title(pdf_path: str, title: str) -> None:
@@ -831,7 +849,7 @@ def merge_pdfs_in_place(
                 with fitz.open(path) as src_doc:
                     dest_doc.insert_pdf(src_doc, start_at=idx)
                     idx += len(src_doc)
-        _save_document_in_place(dest_doc, dest_path)
+        _save_document_in_place(dest_doc, dest_path, incremental=True)
     finally:
         dest_doc.close()
 
@@ -881,7 +899,7 @@ def remove_pages(pdf_path: str, page_indices: list[int]) -> bool:
     for idx in sorted(pages_to_remove, reverse=True):
         doc.delete_page(idx)
     try:
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True)
         return False
     finally:
         doc.close()
@@ -895,7 +913,7 @@ def rotate_pages(pdf_path: str, page_indices: list[int], angle: int = 90) -> Non
             if 0 <= idx < len(doc):
                 page = doc[idx]
                 page.set_rotation((page.rotation + angle) % 360)
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True)
     finally:
         doc.close()
 
@@ -905,7 +923,7 @@ def reorder_pages(pdf_path: str, new_order: list[int]) -> None:
     doc = fitz.open(pdf_path)
     try:
         doc.select(new_order)
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True)
     finally:
         doc.close()
 
@@ -927,7 +945,7 @@ def insert_pages(dest_path: str, src_path: str, insert_indices: list[int]) -> No
                 insert_at = insert_indices[i]
                 dest_doc.insert_pdf(src_doc, from_page=i, to_page=i, start_at=insert_at)
 
-        _save_document_in_place(dest_doc, dest_path)
+        _save_document_in_place(dest_doc, dest_path, incremental=True)
     finally:
         dest_doc.close()
         src_doc.close()
