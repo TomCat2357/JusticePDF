@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
+from PyQt6.QtWidgets import QApplication
 
 from src.views import main_window, pdf_card
 from src.views import page_edit_window as page_edit_window_module
@@ -178,11 +179,17 @@ def test_delete_shows_warning_when_file_is_in_use(window_factory, monkeypatch, t
 
     window._on_delete()
 
+    # _on_delete is now async — wait for the background worker to finish
+    if window._active_worker is not None:
+        window._active_worker.wait()
+        QApplication.processEvents()
+
     assert captured["title"] == "削除できません"
     assert "使用中" in captured["text"]
     assert "locked.pdf" in captured["text"]
     assert pdf_path.exists()
-    assert window._get_card_by_path(str(pdf_path)) is card
+    # After async rollback, card is recreated (not the same object)
+    assert window._get_card_by_path(str(pdf_path)) is not None
     assert window._undo_manager.undo_count() == 0
 
 

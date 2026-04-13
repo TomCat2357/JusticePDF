@@ -35,6 +35,7 @@ from src.utils.pdf_utils import (
 from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
 from src.utils.windows_shell import show_native_file_context_menu
+from src.workers.file_worker import FileOperationWorker
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,10 @@ class MainWindow(QMainWindow):
 
         # Undo manager
         self._undo_manager = UndoManager(max_size=20)
+
+        # Async file operation state
+        self._operation_in_progress: bool = False
+        self._active_worker: FileOperationWorker | None = None
 
         # Drop indicator
         self._drop_indicator = None
@@ -249,15 +254,29 @@ class MainWindow(QMainWindow):
 
     def _update_button_states(self) -> None:
         """Update toolbar button enabled states."""
+        busy = self._operation_in_progress
         has_selection = len(self._selected_cards) > 0
         has_any = len(self._cards) > 0
-        self._delete_btn.setEnabled(has_selection)
-        self._rename_btn.setEnabled(len(self._selected_cards) == 1)
-        self._title_btn.setEnabled(len(self._selected_cards) == 1)
-        self._rotate_btn.setEnabled(has_selection)
-        self._undo_btn.setEnabled(self._undo_manager.can_undo())
-        self._redo_btn.setEnabled(self._undo_manager.can_redo())
+        self._delete_btn.setEnabled(has_selection and not busy)
+        self._rename_btn.setEnabled(len(self._selected_cards) == 1 and not busy)
+        self._title_btn.setEnabled(len(self._selected_cards) == 1 and not busy)
+        self._rotate_btn.setEnabled(has_selection and not busy)
+        self._undo_btn.setEnabled(self._undo_manager.can_undo() and not busy)
+        self._redo_btn.setEnabled(self._undo_manager.can_redo() and not busy)
         self._export_btn.setEnabled(has_any)
+
+    def _begin_async_operation(self) -> None:
+        """Mark start of a background file operation."""
+        self._operation_in_progress = True
+        self._update_button_states()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+    def _end_async_operation(self) -> None:
+        """Mark end of a background file operation."""
+        self._operation_in_progress = False
+        self._active_worker = None
+        QApplication.restoreOverrideCursor()
+        self._update_button_states()
 
     def _debug_undo_state(self, reason: str) -> None:
         log_undo_state(
@@ -713,6 +732,8 @@ class MainWindow(QMainWindow):
     def _on_card_merge(self, target_card: PDFCard, source_paths_str: str) -> None:
         """Handle card merge (drop cards on another card) with undo support.
 
+        Async — UI updates instantly, heavy I/O runs in background thread.
+
         Supports multiple selected cards - merges all into target.
         Order: earlier cards (in grid) appear first in merged PDF (sources first, then target).
 
@@ -730,6 +751,9 @@ class MainWindow(QMainWindow):
         from src.utils.pdf_utils import merge_pdfs_in_place
         import tempfile
         from pathlib import Path
+
+        if self._operation_in_progress:
+            return
 
         # Snapshot grid order and selection before mutation
         old_paths = [c.pdf_path for c in self._cards]
@@ -765,88 +789,108 @@ class MainWindow(QMainWindow):
             elif p not in source_paths:
                 new_paths.append(p)  # Keep non-source paths
 
-        # Backup involved PDFs (target + sources) so undo/redo is byte-stable
-        backup_dir = tempfile.mkdtemp(prefix="justicepdf_merge_backup_")
-        backups: dict[str, str] = {}
-        for p in [*source_paths, target_path]:
-            src = Path(p)
-            dst = Path(backup_dir) / f"{src.stem}__{abs(hash(p))}{src.suffix}"
-            shutil.copy2(p, dst)
-            backups[p] = str(dst)
+        # --- Phase A: immediate UI update (main thread) ---
+        trash_paths = [target_path] + source_paths[1:]
+        self._register_internal_remove(trash_paths)
+        self._rebuild_cards_from_paths(new_paths)
+        self._sort_order = "manual"
+        self._refresh_grid()
 
-        def _select_paths(paths: list[str]) -> None:
+        # Select merge destination immediately
+        self._clear_selection()
+        dest_card = self._get_card_by_path(merge_dest_path)
+        if dest_card:
+            dest_card.set_selected(True)
+            self._selected_cards.append(dest_card)
+        self._update_button_states()
+
+        self._begin_async_operation()
+
+        # --- Phase B: heavy I/O in background ---
+        def _do_io() -> dict[str, str]:
+            # Backup involved PDFs (target + sources) so undo/redo is byte-stable
+            backup_dir = tempfile.mkdtemp(prefix="justicepdf_merge_backup_")
+            backups: dict[str, str] = {}
+            for p in [*source_paths, target_path]:
+                src = Path(p)
+                dst = Path(backup_dir) / f"{src.stem}__{abs(hash(p))}{src.suffix}"
+                shutil.copy2(p, dst)
+                backups[p] = str(dst)
+
+            # Merge PDFs
+            merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path])
+
+            # Trash merged-away files (batch)
+            send2trash(trash_paths)
+
+            return backups
+
+        # --- Phase C: completion on main thread ---
+        def _select_paths(paths_to_select: list[str]) -> None:
             self._clear_selection()
             for card in self._cards:
-                if card.pdf_path in paths:
+                if card.pdf_path in paths_to_select:
                     card.set_selected(True)
                     self._selected_cards.append(card)
             self._update_button_states()
 
-        # Post-selection is captured after do_merge runs once
-        post_selected_paths: list[str] = []
+        def _on_success(backups: object) -> None:
+            backups_dict: dict[str, str] = backups  # type: ignore[assignment]
 
-        def do_merge() -> None:
-            nonlocal post_selected_paths
-            merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path])
-
-            # Trash the target and other source PDFs (keep first source as merge destination)
-            self._register_internal_remove([target_path] + source_paths[1:])
-            send2trash(target_path)
-            for p in source_paths[1:]:
-                send2trash(p)
-
-            # Rebuild cards from paths (avoid stale QWidget references)
-            self._rebuild_cards_from_paths(new_paths)
-            self._sort_order = "manual"
-            self._refresh_grid()
-
-            # Select merge destination (first source), and remember it for redo
-            _select_paths([merge_dest_path])
-            post_selected_paths = [merge_dest_path]
-
+            # Refresh merged card thumbnail (file content changed)
             card = self._get_card_by_path(merge_dest_path)
             if card:
                 card.refresh()
 
-        def undo_merge() -> None:
-            self._register_internal_add(list(backups.keys()))
-            # Restore file bytes
-            for original_path, backup_path in backups.items():
-                shutil.copy2(backup_path, original_path)
+            def do_merge_sync() -> None:
+                merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path])
+                self._register_internal_remove(trash_paths)
+                send2trash(trash_paths)
+                self._rebuild_cards_from_paths(new_paths)
+                self._sort_order = "manual"
+                self._refresh_grid()
+                _select_paths([merge_dest_path])
+                card = self._get_card_by_path(merge_dest_path)
+                if card:
+                    card.refresh()
 
+            def undo_merge() -> None:
+                self._register_internal_add(list(backups_dict.keys()))
+                for original_path, backup_path in backups_dict.items():
+                    shutil.copy2(backup_path, original_path)
+                self._rebuild_cards_from_paths(old_paths)
+                self._refresh_grid()
+                _select_paths(pre_selected_paths)
+
+            def redo_merge() -> None:
+                do_merge_sync()
+
+            self._undo_manager.add_action(UndoAction(
+                description=f"Merge {len(source_paths)} file(s)",
+                undo_func=undo_merge,
+                redo_func=redo_merge,
+            ))
+            self._end_async_operation()
+
+        def _on_error(exc: Exception) -> None:
+            # Rollback: restore original card layout
+            self._register_internal_add(trash_paths)
             self._rebuild_cards_from_paths(old_paths)
             self._refresh_grid()
             _select_paths(pre_selected_paths)
+            self._end_async_operation()
+            if isinstance(exc, PdfWritePermissionError):
+                self._handle_pdf_write_permission_denied(exc)
+            else:
+                self._handle_file_operation_error(exc, merge_dest_path, "マージ")
 
-        def redo_merge() -> None:
-            do_merge()
-            # Ensure redo selection matches the post-merge selection
-            if post_selected_paths:
-                _select_paths(post_selected_paths)
-
-        try:
-            do_merge()
-        except PdfWritePermissionError as error:
-            try:
-                undo_merge()
-            except Exception:
-                pass
-            self._handle_pdf_write_permission_denied(error)
-            return
-        except Exception:
-            # Best-effort rollback
-            try:
-                undo_merge()
-            except Exception:
-                pass
-            raise
-
-        # Register undo action
-        self._undo_manager.add_action(UndoAction(
-            description=f"Merge {len(source_paths)} file(s)",
-            undo_func=undo_merge,
-            redo_func=redo_merge,
-        ))
+        worker = FileOperationWorker(_do_io, parent=self)
+        worker.finished.connect(_on_success)
+        worker.error.connect(_on_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        self._active_worker = worker
+        worker.start()
 
     def _on_file_added(self, path: str) -> None:
         """Handle new file added to folder."""
@@ -1005,65 +1049,89 @@ class MainWindow(QMainWindow):
         )
 
     def _on_delete(self) -> None:
-        """Handle delete action."""
-        if not self._selected_cards:
+        """Handle delete action (async — UI updates instantly)."""
+        if not self._selected_cards or self._operation_in_progress:
             return
 
         import tempfile
-        import shutil
         from pathlib import Path
 
         paths = [card.pdf_path for card in self._selected_cards]
+        old_paths = [c.pdf_path for c in self._cards]
 
-        backup_dir = tempfile.mkdtemp(prefix="pdfas_backup_")
-        backups = {}
-        for path in paths:
-            backup_path = Path(backup_dir) / Path(path).name
-            shutil.copy2(path, backup_path)
-            backups[path] = str(backup_path)
+        # --- Phase A: immediate UI update (main thread) ---
+        self._register_internal_remove(paths)
+        for card in self._selected_cards[:]:
+            if card in self._cards:
+                self._cards.remove(card)
+            card.deleteLater()
+        self._selected_cards.clear()
+        self._refresh_grid()
+        self._begin_async_operation()
 
-        failed_path: str | None = None
-
-        def do_delete():
-            nonlocal failed_path
-            deleted_paths: list[str] = []
+        # --- Phase B: heavy I/O in background ---
+        def _do_io() -> dict[str, str]:
+            backup_dir = tempfile.mkdtemp(prefix="pdfas_backup_")
+            backups: dict[str, str] = {}
             for path in paths:
-                failed_path = path
-                self._register_internal_remove([path])
-                try:
+                backup_path = Path(backup_dir) / Path(path).name
+                shutil.copy2(path, backup_path)
+                backups[path] = str(backup_path)
+
+            deleted_paths: list[str] = []
+            try:
+                for path in paths:
                     send2trash(path)
-                except OSError:
-                    for restored_path in deleted_paths:
-                        backup_path = backups.get(restored_path)
-                        if backup_path and os.path.exists(backup_path):
-                            self._register_internal_add([restored_path])
-                            shutil.copy2(backup_path, restored_path)
-                    for pending_path in paths[len(deleted_paths):]:
-                        self._internal_removes.discard(self._normalize_path(pending_path))
-                    raise
-                deleted_paths.append(path)
-            self._clear_selection()
+                    deleted_paths.append(path)
+            except OSError:
+                # Rollback already-deleted files from backup
+                for restored in deleted_paths:
+                    bp = backups.get(restored)
+                    if bp and os.path.exists(bp):
+                        shutil.copy2(bp, restored)
+                raise
+            return backups
 
-        def undo_delete():
-            self._register_internal_add(list(backups.keys()))
-            for original_path, backup_path in backups.items():
-                shutil.copy2(backup_path, original_path)
+        def _on_success(backups: object) -> None:
+            backups_dict: dict[str, str] = backups  # type: ignore[assignment]
 
-        try:
-            do_delete()
-        except OSError as error:
-            QMessageBox.warning(
-                self,
-                "削除できません",
-                build_trash_failure_message(failed_path or paths[0], error),
-            )
-            return
+            def undo_delete() -> None:
+                self._register_internal_add(list(backups_dict.keys()))
+                for original_path, backup_path in backups_dict.items():
+                    shutil.copy2(backup_path, original_path)
 
-        self._undo_manager.add_action(UndoAction(
-            description=f"Delete {len(paths)} PDF(s)",
-            undo_func=undo_delete,
-            redo_func=do_delete
-        ))
+            def redo_delete() -> None:
+                self._register_internal_remove(list(backups_dict.keys()))
+                for path in backups_dict:
+                    send2trash(path)
+
+            self._undo_manager.add_action(UndoAction(
+                description=f"Delete {len(paths)} PDF(s)",
+                undo_func=undo_delete,
+                redo_func=redo_delete,
+            ))
+            self._end_async_operation()
+
+        def _on_error(exc: Exception) -> None:
+            # Rollback: restore cards
+            self._register_internal_add(paths)
+            self._rebuild_cards_from_paths(old_paths)
+            self._refresh_grid()
+            self._end_async_operation()
+            if isinstance(exc, OSError):
+                QMessageBox.warning(
+                    self,
+                    "削除できません",
+                    build_trash_failure_message(paths[0], exc),
+                )
+
+        worker = FileOperationWorker(_do_io, parent=self)
+        worker.finished.connect(_on_success)
+        worker.error.connect(_on_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        self._active_worker = worker
+        worker.start()
 
     def _on_rename(self) -> None:
         """Handle rename action."""
