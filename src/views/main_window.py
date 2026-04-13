@@ -10,7 +10,8 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
-    QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand, QProgressDialog
+    QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand, QProgressDialog,
+    QCheckBox, QDialog, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QPoint, QRect
 from PyQt6.QtGui import QKeySequence
@@ -29,7 +30,7 @@ from src.utils.pdf_utils import (
     PdfWritePermissionError,
     rotate_pages, get_page_count, get_pdf_metadata_title, update_pdf_metadata_title,
     clear_pixmap_cache, clear_pixmap_cache_for_path, print_pdfs,
-    export_pages_as_images, images_to_pdf,
+    export_pages_as_images, images_to_pdf, rasterize_pdf,
 )
 from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
@@ -1423,6 +1424,12 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
 
+        rasterize = False
+        if "*.pdf" in fmt:
+            rasterize = self._ask_rasterize_option()
+            if rasterize is None:
+                return
+
         dst_dir = QFileDialog.getExistingDirectory(self, "エクスポート先フォルダを選択")
         if not dst_dir:
             return
@@ -1432,10 +1439,31 @@ class MainWindow(QMainWindow):
         elif "*.jpg" in fmt:
             self._export_as_images(targets, dst_dir, "jpeg")
         else:
-            self._export_as_pdf(targets, dst_dir)
+            self._export_as_pdf(targets, dst_dir, rasterize=rasterize)
 
-    def _export_as_pdf(self, targets: list[str], dst_dir: str) -> None:
-        """Copy PDF files to the destination directory."""
+    def _ask_rasterize_option(self) -> bool | None:
+        """Show a dialog asking whether to rasterize the PDF export.
+
+        Returns True if rasterize is checked, False if unchecked,
+        or None if the user cancelled.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("PDFエクスポート設定")
+        layout = QVBoxLayout(dlg)
+        checkbox = QCheckBox("テキストデータを削除（画像のみ）")
+        layout.addWidget(checkbox)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return checkbox.isChecked()
+
+    def _export_as_pdf(self, targets: list[str], dst_dir: str, *, rasterize: bool = False) -> None:
+        """Copy (or rasterize) PDF files to the destination directory."""
         ok = 0
         failed: list[tuple[str, str]] = []
 
@@ -1447,7 +1475,10 @@ class MainWindow(QMainWindow):
 
                 filename = os.path.basename(src)
                 dst_path = ensure_unique_path(dst_dir, filename, pattern="{stem}({i}){ext}")
-                shutil.copy2(src, dst_path)
+                if rasterize:
+                    rasterize_pdf(src, str(dst_path))
+                else:
+                    shutil.copy2(src, dst_path)
                 ok += 1
             except Exception as e:
                 failed.append((src, str(e)))

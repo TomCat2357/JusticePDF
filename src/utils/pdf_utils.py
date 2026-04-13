@@ -1013,6 +1013,38 @@ def images_to_pdf(image_paths: list[str], output_path: str) -> None:
         doc.close()
 
 
+def rasterize_pdf(src_path: str, output_path: str, dpi: int = 150) -> None:
+    """Create a rasterized (image-only) copy of a PDF.
+
+    Each page is rendered to a PNG at the given DPI, then reassembled
+    into a new PDF.  The result looks identical but contains no
+    selectable text or vector data.
+
+    Args:
+        src_path: Source PDF file path.
+        output_path: Destination PDF path.
+        dpi: Resolution for rasterization.
+    """
+    scale = dpi / 72.0
+    src_doc = fitz.open(src_path)
+    out_doc = fitz.open()
+    try:
+        for page_num in range(len(src_doc)):
+            page = src_doc[page_num]
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+            img_data = pix.tobytes("png")
+            img_doc = fitz.open("png", img_data)
+            pdf_bytes = img_doc.convert_to_pdf()
+            img_doc.close()
+            img_pdf = fitz.open("pdf", pdf_bytes)
+            out_doc.insert_pdf(img_pdf)
+            img_pdf.close()
+        out_doc.save(output_path, garbage=1, deflate=True)
+    finally:
+        src_doc.close()
+        out_doc.close()
+
+
 def print_pdfs(pdf_paths: list[str], parent: QWidget | None = None) -> None:
     """Print one or more PDF files via the system print dialog."""
     printer = QPrinter(QPrinter.PrinterMode.HighResolution)
