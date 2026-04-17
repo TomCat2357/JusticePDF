@@ -2,12 +2,15 @@
 import html
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import tempfile
+import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 
 import fitz
 from PyQt6.QtCore import Qt
@@ -18,6 +21,7 @@ from PyQt6.QtWidgets import QWidget
 
 logger = logging.getLogger(__name__)
 JUSTICEPDF_FREETEXT_SUBJECT_PREFIX = "JusticePDF-FreeText:"
+JUSTICEPDF_SHAPE_SUBJECT_PREFIX = "JusticePDF-Shape:"
 
 
 class PdfWritePermissionError(PermissionError):
@@ -44,6 +48,41 @@ class FreeTextAnnotData:
     annotation_id: str = ""
     subject: str = ""
     text_rotation: int = 0
+
+
+class ShapeType(str, Enum):
+    LINE = "line"
+    RECTANGLE = "rectangle"
+    ELLIPSE = "ellipse"
+    TRIANGLE = "triangle"
+    BRACKET = "bracket"
+
+
+@dataclass(slots=True)
+class ShapeAnnotData:
+    page_num: int
+    xref: int
+    rect: tuple[float, float, float, float]
+    shape_type: ShapeType
+    stroke_color: tuple[float, float, float] | None
+    fill_color: tuple[float, float, float] | None
+    stroke_width: float
+    opacity: float
+    rotation: float = 0.0
+    arrow_start: bool = False
+    arrow_end: bool = False
+    bracket_style: str = "square"
+    bracket_size: str = "medium"
+    bracket_both_sides: bool = False
+    bracket_side: str = "left"
+    group_id: str = ""
+    vertices: tuple[tuple[float, float], ...] = ()
+    triangle_apex: tuple[float, float] = (0.5, 0.0)
+    annotation_id: str = ""
+    subject: str = ""
+
+
+AnyAnnotData = FreeTextAnnotData | ShapeAnnotData
 
 
 class _PixmapCache:
@@ -498,6 +537,537 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
     )
     annot.set_info(subject=_encode_subject_metadata(data, page_rotation=creation_page_rotation))
     return annot
+
+
+# ---------------------------------------------------------------------------
+# Shape annotation helpers
+# ---------------------------------------------------------------------------
+
+_SHAPE_ANNOT_TYPES = [
+    fitz.PDF_ANNOT_LINE,
+    fitz.PDF_ANNOT_SQUARE,
+    fitz.PDF_ANNOT_CIRCLE,
+    fitz.PDF_ANNOT_POLYGON,
+    fitz.PDF_ANNOT_POLY_LINE,
+]
+
+
+def _rotate_point(x: float, y: float, cx: float, cy: float, angle_deg: float) -> tuple[float, float]:
+    rad = math.radians(angle_deg)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
+    dx, dy = x - cx, y - cy
+    return (cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a)
+
+
+def _rotate_vertices(
+    vertices: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+    cx: float,
+    cy: float,
+    angle_deg: float,
+) -> list[tuple[float, float]]:
+    if angle_deg == 0.0:
+        return list(vertices)
+    return [_rotate_point(x, y, cx, cy, angle_deg) for x, y in vertices]
+
+
+def _bounding_rect_of_vertices(vertices: list[tuple[float, float]]) -> tuple[float, float, float, float]:
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _ellipse_vertices(cx: float, cy: float, rx: float, ry: float, n: int = 32) -> list[tuple[float, float]]:
+    return [
+        (cx + rx * math.cos(2 * math.pi * i / n), cy + ry * math.sin(2 * math.pi * i / n))
+        for i in range(n)
+    ]
+
+
+def _triangle_vertices(
+    rect: tuple[float, float, float, float],
+    apex: tuple[float, float] = (0.5, 0.0),
+) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = rect
+    ax = min(1.0, max(0.0, float(apex[0])))
+    ay = min(1.0, max(0.0, float(apex[1])))
+    apex_x = x0 + ax * (x1 - x0)
+    apex_y = y0 + ay * (y1 - y0)
+    return [(apex_x, apex_y), (x1, y1), (x0, y1)]
+
+
+def _rectangle_vertices(rect: tuple[float, float, float, float]) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = rect
+    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+
+def _bracket_vertices_square(
+    rect: tuple[float, float, float, float],
+    side: str = "left",
+) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = rect
+    w = x1 - x0
+    hook = min(w * 0.4, 8.0)
+    if side == "left":
+        return [(x0 + hook, y0), (x0, y0), (x0, y1), (x0 + hook, y1)]
+    else:
+        return [(x1 - hook, y0), (x1, y0), (x1, y1), (x1 - hook, y1)]
+
+
+def _bracket_vertices_round(
+    rect: tuple[float, float, float, float],
+    side: str = "left",
+    n: int = 16,
+) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = rect
+    h = y1 - y0
+    w = x1 - x0
+    depth = min(w * 0.4, 12.0)
+    pts: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        t = i / n
+        angle = math.pi * t - math.pi / 2
+        dx = depth * (1.0 - math.cos(angle)) / 2.0
+        dy = y0 + t * h
+        if side == "left":
+            pts.append((x0 + depth - dx, dy))
+        else:
+            pts.append((x1 - depth + dx, dy))
+    return pts
+
+
+def _bracket_vertices_curly(
+    rect: tuple[float, float, float, float],
+    side: str = "left",
+    n: int = 20,
+) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = rect
+    h = y1 - y0
+    w = x1 - x0
+    depth = min(w * 0.4, 14.0)
+    mid_y = (y0 + y1) / 2
+    pts: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        t = i / n
+        y = y0 + t * h
+        if t <= 0.5:
+            s = t / 0.5
+            dx = depth * (1.0 - math.cos(math.pi * s)) / 2.0
+        else:
+            s = (t - 0.5) / 0.5
+            dx = depth * (1.0 + math.cos(math.pi * s)) / 2.0
+        if side == "left":
+            pts.append((x0 + depth - dx, y))
+        else:
+            pts.append((x1 - depth + dx, y))
+    return pts
+
+
+def _compute_bracket_vertices(
+    rect: tuple[float, float, float, float],
+    style: str = "square",
+    side: str = "left",
+) -> list[tuple[float, float]]:
+    if style == "round":
+        return _bracket_vertices_round(rect, side)
+    elif style == "curly":
+        return _bracket_vertices_curly(rect, side)
+    else:
+        return _bracket_vertices_square(rect, side)
+
+
+def _line_endpoints_from_data(data: ShapeAnnotData) -> tuple[tuple[float, float], tuple[float, float]]:
+    rect = data.rect
+    width = rect[2] - rect[0]
+    height = rect[3] - rect[1]
+    if data.vertices and len(data.vertices) >= 2:
+        rx1, ry1 = data.vertices[0]
+        rx2, ry2 = data.vertices[1]
+    else:
+        rx1, ry1 = (0.0, 0.5)
+        rx2, ry2 = (1.0, 0.5)
+    p1 = (rect[0] + rx1 * width, rect[1] + ry1 * height)
+    p2 = (rect[0] + rx2 * width, rect[1] + ry2 * height)
+    return p1, p2
+
+
+def _compute_shape_vertices(data: ShapeAnnotData) -> list[tuple[float, float]]:
+    rect = data.rect
+    cx = (rect[0] + rect[2]) / 2
+    cy = (rect[1] + rect[3]) / 2
+
+    if data.shape_type == ShapeType.LINE:
+        p1, p2 = _line_endpoints_from_data(data)
+        pts = [p1, p2]
+    elif data.shape_type == ShapeType.RECTANGLE:
+        pts = _rectangle_vertices(rect)
+    elif data.shape_type == ShapeType.ELLIPSE:
+        rx = (rect[2] - rect[0]) / 2
+        ry = (rect[3] - rect[1]) / 2
+        pts = _ellipse_vertices(cx, cy, rx, ry)
+    elif data.shape_type == ShapeType.TRIANGLE:
+        pts = _triangle_vertices(rect, data.triangle_apex)
+    elif data.shape_type == ShapeType.BRACKET:
+        pts = _compute_bracket_vertices(rect, data.bracket_style, data.bracket_side)
+    else:
+        pts = _rectangle_vertices(rect)
+
+    if data.rotation != 0.0:
+        pts = _rotate_vertices(pts, cx, cy, data.rotation)
+    return pts
+
+
+def _encode_shape_metadata(data: ShapeAnnotData, *, page_rotation: int = 0) -> str:
+    payload: dict = {
+        "shape_type": data.shape_type.value,
+        "stroke_color": list(data.stroke_color) if data.stroke_color is not None else None,
+        "fill_color": list(data.fill_color) if data.fill_color is not None else None,
+        "stroke_width": float(data.stroke_width),
+        "rotation": float(data.rotation),
+        "original_rect": list(data.rect),
+        "page_rotation": int(page_rotation),
+    }
+    if data.shape_type == ShapeType.LINE:
+        payload["arrow_start"] = data.arrow_start
+        payload["arrow_end"] = data.arrow_end
+        if data.vertices and len(data.vertices) >= 2:
+            payload["vertices"] = [[float(v[0]), float(v[1])] for v in data.vertices[:2]]
+    if data.shape_type == ShapeType.BRACKET:
+        payload["bracket_style"] = data.bracket_style
+        payload["bracket_size"] = data.bracket_size
+        payload["bracket_both_sides"] = data.bracket_both_sides
+        payload["bracket_side"] = data.bracket_side
+        if data.group_id:
+            payload["group_id"] = data.group_id
+    if data.shape_type == ShapeType.TRIANGLE:
+        payload["triangle_apex"] = [float(data.triangle_apex[0]), float(data.triangle_apex[1])]
+    return JUSTICEPDF_SHAPE_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
+
+
+def _decode_shape_metadata(subject: str) -> dict | None:
+    if not subject or not subject.startswith(JUSTICEPDF_SHAPE_SUBJECT_PREFIX):
+        return None
+    raw = subject[len(JUSTICEPDF_SHAPE_SUBJECT_PREFIX):]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _line_ending_code(arrow: bool) -> int:
+    return fitz.PDF_ANNOT_LE_OPEN_ARROW if arrow else fitz.PDF_ANNOT_LE_NONE
+
+
+def _add_shape_annot_to_page(page: fitz.Page, data: ShapeAnnotData) -> fitz.Annot:
+    opacity = max(0.0, min(1.0, float(data.opacity)))
+    stroke_width = max(0.0, float(data.stroke_width))
+    stroke = list(data.stroke_color) if data.stroke_color is not None else None
+    fill = list(data.fill_color) if data.fill_color is not None else None
+    rect = data.rect
+    cx = (rect[0] + rect[2]) / 2
+    cy = (rect[1] + rect[3]) / 2
+    rotation = data.rotation
+    has_rotation = rotation != 0.0
+
+    existing_metadata = _decode_shape_metadata(data.subject)
+    if existing_metadata is not None and "page_rotation" in existing_metadata:
+        creation_page_rotation = int(existing_metadata["page_rotation"])
+    else:
+        creation_page_rotation = page.rotation
+
+    annot: fitz.Annot
+
+    if data.shape_type == ShapeType.LINE:
+        p1, p2 = _line_endpoints_from_data(data)
+        if has_rotation:
+            p1 = _rotate_point(*p1, cx, cy, rotation)
+            p2 = _rotate_point(*p2, cx, cy, rotation)
+        if page.rotation != 0:
+            m = page.derotation_matrix
+            p1 = tuple(fitz.Point(p1) * m)
+            p2 = tuple(fitz.Point(p2) * m)
+        annot = page.add_line_annot(fitz.Point(p1), fitz.Point(p2))
+        annot.set_line_ends(_line_ending_code(data.arrow_start), _line_ending_code(data.arrow_end))
+
+    elif data.shape_type == ShapeType.RECTANGLE and not has_rotation:
+        r = fitz.Rect(*rect)
+        if page.rotation != 0:
+            r = r * page.derotation_matrix
+        annot = page.add_rect_annot(r)
+
+    elif data.shape_type == ShapeType.ELLIPSE and not has_rotation:
+        r = fitz.Rect(*rect)
+        if page.rotation != 0:
+            r = r * page.derotation_matrix
+        annot = page.add_circle_annot(r)
+
+    elif data.shape_type in (ShapeType.RECTANGLE, ShapeType.ELLIPSE, ShapeType.TRIANGLE):
+        verts = _compute_shape_vertices(data)
+        if page.rotation != 0:
+            m = page.derotation_matrix
+            verts = [tuple(fitz.Point(v) * m) for v in verts]
+        points = [fitz.Point(v) for v in verts]
+        annot = page.add_polygon_annot(points)
+
+    elif data.shape_type == ShapeType.BRACKET:
+        verts = _compute_shape_vertices(data)
+        if page.rotation != 0:
+            m = page.derotation_matrix
+            verts = [tuple(fitz.Point(v) * m) for v in verts]
+        points = [fitz.Point(v) for v in verts]
+        annot = page.add_polyline_annot(points)
+
+    else:
+        verts = _compute_shape_vertices(data)
+        if page.rotation != 0:
+            m = page.derotation_matrix
+            verts = [tuple(fitz.Point(v) * m) for v in verts]
+        points = [fitz.Point(v) for v in verts]
+        annot = page.add_polygon_annot(points)
+
+    annot.set_colors(stroke=stroke, fill=fill)
+    annot.set_border(width=stroke_width)
+    annot.set_opacity(opacity)
+    annot.update()
+    annot.set_info(subject=_encode_shape_metadata(data, page_rotation=creation_page_rotation))
+    return annot
+
+
+def _extract_shape_data(
+    doc: fitz.Document,
+    page_num: int,
+    annot: fitz.Annot,
+) -> ShapeAnnotData | None:
+    xref = annot.xref
+    info = annot.info
+    subject = info.get("subject", "")
+    metadata = _decode_shape_metadata(subject)
+    if metadata is None:
+        return None
+
+    try:
+        shape_type = ShapeType(metadata["shape_type"])
+    except (KeyError, ValueError):
+        return None
+
+    original_rect = metadata.get("original_rect")
+    if isinstance(original_rect, list) and len(original_rect) == 4:
+        rect = tuple(float(v) for v in original_rect)
+    else:
+        r = annot.rect
+        page = doc[page_num]
+        if page.rotation != 0:
+            r = fitz.Rect(r) * page.rotation_matrix
+        rect = (float(r.x0), float(r.y0), float(r.x1), float(r.y1))
+
+    rotation = float(metadata.get("rotation", 0.0))
+    stroke_color = _normalize_color(metadata.get("stroke_color"))
+    fill_color = _normalize_color(metadata.get("fill_color"))
+    stroke_width = float(metadata.get("stroke_width", 1.0))
+
+    _, ca_value = doc.xref_get_key(xref, "CA")
+    if ca_value == "null":
+        opacity = 1.0
+    else:
+        try:
+            opacity = float(ca_value)
+        except ValueError:
+            opacity = float(annot.opacity or 1.0)
+
+    _, name_value = doc.xref_get_key(xref, "NM")
+    annotation_id = info.get("id") or (name_value if name_value != "null" else "")
+
+    arrow_start = bool(metadata.get("arrow_start", False))
+    arrow_end = bool(metadata.get("arrow_end", False))
+    vertices_raw = metadata.get("vertices")
+    vertices: tuple[tuple[float, float], ...] = ()
+    if isinstance(vertices_raw, list):
+        parsed: list[tuple[float, float]] = []
+        for v in vertices_raw:
+            if isinstance(v, list) and len(v) >= 2:
+                parsed.append((float(v[0]), float(v[1])))
+        vertices = tuple(parsed)
+    bracket_style = str(metadata.get("bracket_style", "square"))
+    bracket_size = str(metadata.get("bracket_size", "medium"))
+    bracket_both_sides = bool(metadata.get("bracket_both_sides", False))
+    bracket_side = str(metadata.get("bracket_side", "left"))
+    group_id = str(metadata.get("group_id", ""))
+    triangle_apex_raw = metadata.get("triangle_apex")
+    triangle_apex: tuple[float, float] = (0.5, 0.0)
+    if isinstance(triangle_apex_raw, list) and len(triangle_apex_raw) >= 2:
+        try:
+            ax = min(1.0, max(0.0, float(triangle_apex_raw[0])))
+            ay = min(1.0, max(0.0, float(triangle_apex_raw[1])))
+            triangle_apex = (ax, ay)
+        except (TypeError, ValueError):
+            triangle_apex = (0.5, 0.0)
+
+    return ShapeAnnotData(
+        page_num=page_num,
+        xref=xref,
+        rect=rect,
+        shape_type=shape_type,
+        stroke_color=stroke_color,
+        fill_color=fill_color,
+        stroke_width=stroke_width,
+        opacity=max(0.0, min(1.0, float(opacity))),
+        rotation=rotation,
+        arrow_start=arrow_start,
+        arrow_end=arrow_end,
+        bracket_style=bracket_style,
+        bracket_size=bracket_size,
+        bracket_both_sides=bracket_both_sides,
+        bracket_side=bracket_side,
+        group_id=group_id,
+        vertices=vertices,
+        triangle_apex=triangle_apex,
+        annotation_id=annotation_id,
+        subject=subject,
+    )
+
+
+def list_shape_annots(pdf_path: str, page_num: int | None = None) -> list[ShapeAnnotData]:
+    results: list[ShapeAnnotData] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            page_numbers: range | list[int]
+            if page_num is None:
+                page_numbers = range(len(doc))
+            elif 0 <= page_num < len(doc):
+                page_numbers = [page_num]
+            else:
+                return []
+
+            for pn in page_numbers:
+                page = doc[pn]
+                annots = page.annots(types=_SHAPE_ANNOT_TYPES)
+                if annots is None:
+                    continue
+                for annot in annots:
+                    shape_data = _extract_shape_data(doc, pn, annot)
+                    if shape_data is not None:
+                        results.append(shape_data)
+    except Exception:
+        logger.debug("list_shape_annots failed: %s", pdf_path, exc_info=True)
+    return results
+
+
+def create_shape_annot(pdf_path: str, data: ShapeAnnotData) -> ShapeAnnotData:
+    doc = fitz.open(pdf_path)
+    try:
+        if data.page_num < 0 or data.page_num >= len(doc):
+            raise IndexError(f"page out of range: {data.page_num}")
+        page = doc[data.page_num]
+        annot = _add_shape_annot_to_page(page, data)
+        saved = _extract_shape_data(doc, data.page_num, annot)
+        _save_document_in_place(doc, pdf_path)
+        if saved is None:
+            raise RuntimeError("Failed to extract saved shape annotation")
+        return saved
+    finally:
+        doc.close()
+
+
+def delete_shape_annot(pdf_path: str, page_num: int, xref: int) -> bool:
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            return False
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is None:
+            return False
+        if annot.type[0] not in _SHAPE_ANNOT_TYPES:
+            return False
+        page.delete_annot(annot)
+        _save_document_in_place(doc, pdf_path)
+        return True
+    finally:
+        doc.close()
+
+
+def replace_shape_annot(
+    pdf_path: str,
+    page_num: int,
+    xref: int,
+    data: ShapeAnnotData,
+) -> ShapeAnnotData:
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            raise IndexError(f"page out of range: {page_num}")
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is not None:
+            page.delete_annot(annot)
+        replacement = _add_shape_annot_to_page(page, data)
+        saved = _extract_shape_data(doc, page_num, replacement)
+        _save_document_in_place(doc, pdf_path)
+        if saved is None:
+            raise RuntimeError("Failed to extract saved shape annotation")
+        return saved
+    finally:
+        doc.close()
+
+
+def create_bracket_pair(
+    pdf_path: str,
+    rect: tuple[float, float, float, float],
+    page_num: int,
+    *,
+    bracket_style: str = "square",
+    bracket_size: str = "medium",
+    stroke_color: tuple[float, float, float] | None = (0.0, 0.0, 0.0),
+    stroke_width: float = 1.0,
+    opacity: float = 1.0,
+    rotation: float = 0.0,
+) -> tuple[ShapeAnnotData, ShapeAnnotData]:
+    gid = uuid.uuid4().hex[:12]
+    x0, y0, x1, y1 = rect
+    w = x1 - x0
+    bracket_w = max(8.0, w * 0.15)
+
+    left_rect = (x0, y0, x0 + bracket_w, y1)
+    right_rect = (x1 - bracket_w, y0, x1, y1)
+
+    left_data = ShapeAnnotData(
+        page_num=page_num, xref=0, rect=left_rect,
+        shape_type=ShapeType.BRACKET,
+        stroke_color=stroke_color, fill_color=None,
+        stroke_width=stroke_width, opacity=opacity, rotation=rotation,
+        bracket_style=bracket_style, bracket_size=bracket_size,
+        bracket_both_sides=True, bracket_side="left", group_id=gid,
+    )
+    right_data = ShapeAnnotData(
+        page_num=page_num, xref=0, rect=right_rect,
+        shape_type=ShapeType.BRACKET,
+        stroke_color=stroke_color, fill_color=None,
+        stroke_width=stroke_width, opacity=opacity, rotation=rotation,
+        bracket_style=bracket_style, bracket_size=bracket_size,
+        bracket_both_sides=True, bracket_side="right", group_id=gid,
+    )
+
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            raise IndexError(f"page out of range: {page_num}")
+        page = doc[page_num]
+
+        left_annot = _add_shape_annot_to_page(page, left_data)
+        left_saved = _extract_shape_data(doc, page_num, left_annot)
+
+        right_annot = _add_shape_annot_to_page(page, right_data)
+        right_saved = _extract_shape_data(doc, page_num, right_annot)
+
+        _save_document_in_place(doc, pdf_path)
+        if left_saved is None or right_saved is None:
+            raise RuntimeError("Failed to extract saved bracket annotations")
+        return left_saved, right_saved
+    finally:
+        doc.close()
 
 
 def _get_file_cache_token(pdf_path: str) -> tuple[int, int, int]:
@@ -956,6 +1526,7 @@ def export_pages_as_images(
     output_dir: str,
     fmt: str = "png",
     dpi: int = 150,
+    quality: int = 85,
     page_indices: list[int] | None = None,
 ) -> list[str]:
     """Export PDF pages as image files.
@@ -965,13 +1536,15 @@ def export_pages_as_images(
         output_dir: Directory to save images.
         fmt: Image format ("png" or "jpeg").
         dpi: Resolution in DPI.
+        quality: JPEG quality (1-100). Ignored for PNG.
         page_indices: Pages to export (0-based). None means all pages.
 
     Returns:
         List of created image file paths.
     """
     scale = dpi / 72.0
-    ext = ".jpg" if fmt.lower() in ("jpeg", "jpg") else ".png"
+    is_jpeg = fmt.lower() in ("jpeg", "jpg")
+    ext = ".jpg" if is_jpeg else ".png"
     base = os.path.splitext(os.path.basename(pdf_path))[0]
     created: list[str] = []
 
@@ -983,7 +1556,10 @@ def export_pages_as_images(
             pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
             filename = f"{base}_p{page_num + 1}{ext}"
             out_path = os.path.join(output_dir, filename)
-            pix.save(out_path)
+            if is_jpeg:
+                pix.save(out_path, jpg_quality=quality)
+            else:
+                pix.save(out_path)
             created.append(out_path)
     finally:
         doc.close()
@@ -1009,6 +1585,152 @@ def images_to_pdf(image_paths: list[str], output_path: str) -> None:
             doc.insert_pdf(img_pdf)
             img_pdf.close()
         doc.save(output_path, garbage=1, deflate=True)
+    finally:
+        doc.close()
+
+
+def _downsample_images(
+    doc: fitz.Document,
+    max_dpi: int = 150,
+    jpeg_quality: int = 75,
+) -> None:
+    """Re-compress images in *doc* in-place.
+
+    Each image whose effective resolution exceeds *max_dpi* is
+    down-scaled and re-encoded as JPEG at the given quality.
+    Images already at or below the target resolution are still
+    re-encoded if the JPEG result is smaller.
+    """
+    seen_xrefs: set[int] = set()
+
+    # Suppress MuPDF C-library stderr noise (e.g. "Not a JPEG file")
+    fitz.TOOLS.mupdf_display_errors(False)
+    try:
+        _downsample_images_inner(doc, max_dpi, jpeg_quality, seen_xrefs)
+    finally:
+        fitz.TOOLS.mupdf_display_errors(True)
+        fitz.TOOLS.mupdf_warnings(reset=True)
+
+
+def _downsample_images_inner(
+    doc: fitz.Document,
+    max_dpi: int,
+    jpeg_quality: int,
+    seen_xrefs: set[int],
+) -> None:
+    for page in doc:
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+
+            # Decode image via xref (handles all PDF filter types)
+            try:
+                pix = fitz.Pixmap(doc, xref)
+            except Exception:
+                continue
+
+            orig_w = pix.width
+            orig_h = pix.height
+
+            # Get original compressed size for comparison
+            try:
+                raw_stream = doc.xref_stream_raw(xref)
+                orig_size = len(raw_stream) if raw_stream else 0
+            except Exception:
+                orig_size = 0
+
+            # Determine the effective DPI from page placement
+            try:
+                img_rects = page.get_image_rects(xref)
+            except Exception:
+                img_rects = []
+            if img_rects:
+                r = img_rects[0]
+                eff_dpi_x = orig_w / (r.width / 72) if r.width else 9999
+                eff_dpi_y = orig_h / (r.height / 72) if r.height else 9999
+                eff_dpi = max(eff_dpi_x, eff_dpi_y)
+            else:
+                eff_dpi = 9999
+
+            scale = min(1.0, max_dpi / eff_dpi) if eff_dpi > max_dpi else 1.0
+            new_w = max(1, int(orig_w * scale))
+            new_h = max(1, int(orig_h * scale))
+
+            # Ensure RGB without alpha for JPEG encoding
+            if pix.alpha:
+                pix = fitz.Pixmap(pix, 0)  # drop alpha channel
+            if pix.colorspace != fitz.csRGB:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+
+            # Resize via Pixmap if dimensions changed
+            if new_w != orig_w or new_h != orig_h:
+                # Build a scaled pixmap using a temporary single-page PDF
+                tmp_doc = fitz.open()
+                tmp_page = tmp_doc.new_page(width=new_w, height=new_h)
+                tmp_page.insert_image(
+                    fitz.Rect(0, 0, new_w, new_h),
+                    pixmap=pix,
+                )
+                pix = tmp_page.get_pixmap(
+                    matrix=fitz.Identity,
+                    clip=fitz.Rect(0, 0, new_w, new_h),
+                )
+                tmp_doc.close()
+
+            jpeg_bytes = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
+
+            # Only replace if the result is actually smaller
+            if orig_size == 0 or len(jpeg_bytes) < orig_size:
+                doc.update_stream(xref, jpeg_bytes, compress=False)
+                doc.xref_set_key(xref, "Filter", "/DCTDecode")
+                doc.xref_set_key(xref, "DecodeParms", "null")
+                doc.xref_set_key(xref, "Width", str(new_w))
+                doc.xref_set_key(xref, "Height", str(new_h))
+                doc.xref_set_key(xref, "ColorSpace", "/DeviceRGB")
+                doc.xref_set_key(xref, "BitsPerComponent", "8")
+                doc.xref_set_key(xref, "Length", str(len(jpeg_bytes)))
+
+    fitz.TOOLS.mupdf_warnings(reset=True)  # discard MuPDF stderr noise
+
+
+def export_pdf_compressed(
+    src_path: str,
+    dst_path: str,
+    optimize_level: int = 0,
+    *,
+    image_dpi: int = 150,
+    image_quality: int = 75,
+) -> None:
+    """Export a PDF with optimization.
+
+    Args:
+        src_path: Source PDF file path.
+        dst_path: Destination PDF file path.
+        optimize_level: Optimization level 0-5.
+            0 = no optimization (plain save),
+            1 = cleanup only (garbage collection + deflate),
+            2 = standard image recompression (200 dpi / 85%),
+            3 = high image recompression (150 dpi / 50%),
+            4 = maximum image recompression (72 dpi / 10%),
+            5 = custom (uses *image_dpi* / *image_quality*).
+        image_dpi: Target max DPI for image recompression (used at level 5).
+        image_quality: JPEG quality (1-100) for image recompression (used at level 5).
+    """
+    doc = fitz.open(src_path)
+    try:
+        if optimize_level >= 2:
+            _downsample_images(doc, max_dpi=image_dpi, jpeg_quality=image_quality)
+
+        save_opts: dict = {}
+        if optimize_level >= 1:
+            save_opts["garbage"] = 4
+            save_opts["deflate"] = True
+            save_opts["deflate_images"] = optimize_level < 2
+            save_opts["deflate_fonts"] = True
+            save_opts["clean"] = True
+        doc.save(dst_path, **save_opts)
     finally:
         doc.close()
 

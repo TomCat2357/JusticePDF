@@ -10,8 +10,8 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
-    QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand, QProgressDialog,
-    QCheckBox, QDialog, QDialogButtonBox,
+    QDialog, QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand,
+    QProgressDialog,
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QPoint, QRect
 from PyQt6.QtGui import QKeySequence
@@ -30,8 +30,9 @@ from src.utils.pdf_utils import (
     PdfWritePermissionError,
     rotate_pages, get_page_count, get_pdf_metadata_title, update_pdf_metadata_title,
     clear_pixmap_cache, clear_pixmap_cache_for_path, print_pdfs,
-    export_pages_as_images, images_to_pdf, rasterize_pdf,
+    export_pages_as_images, export_pdf_compressed, images_to_pdf, rasterize_pdf,
 )
+from src.views.export_dialog import ExportOptionsDialog
 from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
 from src.utils.windows_shell import show_native_file_context_menu
@@ -1466,14 +1467,11 @@ class MainWindow(QMainWindow):
 
             shutil.move(generated, dest_pdf_path)
 
-    _EXPORT_FORMATS = ["PDF (*.pdf)", "PNG (*.png)", "JPEG (*.jpg)"]
-
     def _on_export(self) -> None:
         """Export selected PDFs (or all PDFs if none selected) to a chosen folder.
 
-        The user picks an output format via the name filter dropdown in the
-        directory dialog.  When an image format is chosen, every page of each
-        target PDF is exported as an individual image file.
+        A dialog lets the user pick format, DPI, quality, and compression
+        settings before choosing the output directory.
         """
         targets = [c.pdf_path for c in self._selected_cards] if self._selected_cards else [c.pdf_path for c in self._cards]
 
@@ -1481,57 +1479,41 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export", "エクスポート対象のPDFがありません。")
             return
 
-        fmt, accepted = QInputDialog.getItem(
-            self,
-            "エクスポート形式",
-            "出力形式を選択してください:",
-            self._EXPORT_FORMATS,
-            0,
-            False,
-        )
-        if not accepted:
+        dialog = ExportOptionsDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-
-        rasterize = False
-        if "*.pdf" in fmt:
-            rasterize = self._ask_rasterize_option()
-            if rasterize is None:
-                return
+        options = dialog.get_options()
 
         dst_dir = QFileDialog.getExistingDirectory(self, "エクスポート先フォルダを選択")
         if not dst_dir:
             return
 
-        if "*.png" in fmt:
-            self._export_as_images(targets, dst_dir, "png")
-        elif "*.jpg" in fmt:
-            self._export_as_images(targets, dst_dir, "jpeg")
+        fmt = options["format"]
+        if fmt == "pdf":
+            self._export_as_pdf(
+                targets, dst_dir,
+                optimize_level=options["pdf_optimize_level"],
+                image_dpi=options["pdf_image_dpi"],
+                image_quality=options["pdf_image_quality"],
+                rasterize=options["rasterize"],
+            )
         else:
-            self._export_as_pdf(targets, dst_dir, rasterize=rasterize)
+            self._export_as_images(
+                targets, dst_dir, fmt,
+                dpi=options["dpi"], quality=options["jpeg_quality"],
+            )
 
-    def _ask_rasterize_option(self) -> bool | None:
-        """Show a dialog asking whether to rasterize the PDF export.
-
-        Returns True if rasterize is checked, False if unchecked,
-        or None if the user cancelled.
-        """
-        dlg = QDialog(self)
-        dlg.setWindowTitle("PDFエクスポート設定")
-        layout = QVBoxLayout(dlg)
-        checkbox = QCheckBox("テキストデータを削除（画像のみ）")
-        layout.addWidget(checkbox)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return None
-        return checkbox.isChecked()
-
-    def _export_as_pdf(self, targets: list[str], dst_dir: str, *, rasterize: bool = False) -> None:
-        """Copy (or rasterize) PDF files to the destination directory."""
+    def _export_as_pdf(
+        self,
+        targets: list[str],
+        dst_dir: str,
+        *,
+        optimize_level: int = 0,
+        image_dpi: int = 150,
+        image_quality: int = 75,
+        rasterize: bool = False,
+    ) -> None:
+        """Copy, optimize-export, or rasterize PDF files to the destination directory."""
         ok = 0
         failed: list[tuple[str, str]] = []
 
@@ -1545,6 +1527,13 @@ class MainWindow(QMainWindow):
                 dst_path = ensure_unique_path(dst_dir, filename, pattern="{stem}({i}){ext}")
                 if rasterize:
                     rasterize_pdf(src, str(dst_path))
+                elif optimize_level > 0:
+                    export_pdf_compressed(
+                        src, str(dst_path),
+                        optimize_level=optimize_level,
+                        image_dpi=image_dpi,
+                        image_quality=image_quality,
+                    )
                 else:
                     shutil.copy2(src, dst_path)
                 ok += 1
@@ -1553,7 +1542,15 @@ class MainWindow(QMainWindow):
 
         self._show_export_result(ok, failed)
 
-    def _export_as_images(self, targets: list[str], dst_dir: str, fmt: str) -> None:
+    def _export_as_images(
+        self,
+        targets: list[str],
+        dst_dir: str,
+        fmt: str,
+        *,
+        dpi: int = 150,
+        quality: int = 85,
+    ) -> None:
         """Export all pages of each target PDF as images."""
         ok = 0
         failed: list[tuple[str, str]] = []
@@ -1563,7 +1560,9 @@ class MainWindow(QMainWindow):
                 if not os.path.exists(src):
                     failed.append((src, "元ファイルが見つかりません"))
                     continue
-                created = export_pages_as_images(src, dst_dir, fmt=fmt)
+                created = export_pages_as_images(
+                    src, dst_dir, fmt=fmt, dpi=dpi, quality=quality,
+                )
                 ok += len(created)
             except Exception as e:
                 failed.append((src, str(e)))
