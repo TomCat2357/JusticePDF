@@ -16,7 +16,7 @@ class PDFCard(QFrame):
     """
 
     clicked = pyqtSignal(object)  # Emits self when clicked
-    double_clicked = pyqtSignal(object)  # Emits self when double-clicked
+    double_clicked = pyqtSignal(object, bool)  # Emits (self, alt_pressed) when double-clicked
     dropped_on = pyqtSignal(object, str)  # Emits (self, source_paths_str) when another card is dropped on this card
     context_menu_requested = pyqtSignal(object, object)  # Emits (self, global_pos) when context menu is requested
 
@@ -258,13 +258,18 @@ class PDFCard(QFrame):
         drag.setPixmap(pixmap)
         drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
 
-        # Export drag should always be copy (external drop).
-        drag.exec(Qt.DropAction.CopyAction)
+        # Allow both move (internal/cross-window) and copy (external/Ctrl).
+        drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
 
     def mouseDoubleClickEvent(self, event) -> None:
-        """Handle double-click events."""
+        """Handle double-click events.
+
+        When Alt is held, the receiver should open the page edit window
+        directly in enlarged (zoom) mode.
+        """
         if event.button() == Qt.MouseButton.LeftButton:
-            self.double_clicked.emit(self)
+            alt = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier)
+            self.double_clicked.emit(self, alt)
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event) -> None:
