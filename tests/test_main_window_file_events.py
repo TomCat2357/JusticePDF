@@ -16,6 +16,8 @@ class FakeWatcher(QObject):
     file_added = pyqtSignal(str)
     file_removed = pyqtSignal(str)
     file_modified = pyqtSignal(str)
+    folder_added = pyqtSignal(str)
+    folder_removed = pyqtSignal(str)
 
     def __init__(self, folder_path: str):
         super().__init__()
@@ -26,6 +28,9 @@ class FakeWatcher(QObject):
 
     def stop(self) -> None:
         pass
+
+    def get_subfolders(self) -> list[str]:
+        return []
 
 
 @pytest.fixture

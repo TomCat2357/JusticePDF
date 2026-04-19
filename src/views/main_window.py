@@ -18,6 +18,7 @@ from PyQt6.QtGui import QKeySequence
 from send2trash import send2trash
 
 from src.views.pdf_card import PDFCard, PDFCARD_MIME_TYPE
+from src.views.folder_card import FolderCard, FOLDERCARD_MIME_TYPE
 from src.views.view_helpers import (
     clear_selection,
     log_undo_state,
@@ -37,6 +38,7 @@ from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
 from src.utils.windows_shell import show_native_file_context_menu
 from src.workers.file_worker import FileOperationWorker
+from src.workers.import_worker import ImportWorker, find_soffice
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,9 @@ _IMAGE_EXTS = {
 }
 _IMPORT_EXTS = {".pdf"} | _OFFICE_EXTS | _IMAGE_EXTS
 
+# If conversion-required files exceed this count the user is warned first.
+IMPORT_OFFICE_WARN_THRESHOLD = 5
+
 
 class MainWindow(QMainWindow):
     """Main application window.
@@ -61,10 +66,16 @@ class MainWindow(QMainWindow):
     PREVIEW_THUMB_MAX = 400
     PREVIEW_THUMB_STEP = 20
 
-    def __init__(self):
+    # Registry of live MainWindow instances for cross-window DnD.
+    _instances: list["MainWindow"] = []
+
+    def __init__(self, folder_path: str | None = None):
         super().__init__()
         self._cards: list[PDFCard] = []
+        self._folder_cards: list[FolderCard] = []
+        self._selected_folder_cards: list[FolderCard] = []
         self._selected_cards: list[PDFCard] = []
+        self._child_windows: list[QMainWindow] = []
         self._sort_order = "manual"  # "name", "date", or "manual"
         self._sort_ascending = True
         # Ensure initial layout uses the same logic as subsequent resizes
@@ -98,7 +109,8 @@ class MainWindow(QMainWindow):
         self._grid_refresh_timer.timeout.connect(self._on_deferred_grid_refresh)
 
         # Setup working directory
-        self._work_dir = Path.home() / "Documents" / "PDFs"
+        self._work_dir = Path(folder_path) if folder_path else Path.home() / "Documents" / "PDFs"
+        self._is_root_window = folder_path is None
         self._work_dir.mkdir(parents=True, exist_ok=True)
 
         # Undo manager
@@ -107,6 +119,8 @@ class MainWindow(QMainWindow):
         # Async file operation state
         self._operation_in_progress: bool = False
         self._active_worker: FileOperationWorker | None = None
+        self._active_import_worker: ImportWorker | None = None
+        self._active_import_progress: QProgressDialog | None = None
 
         # Drop indicator
         self._drop_indicator = None
@@ -127,7 +141,16 @@ class MainWindow(QMainWindow):
         self._watcher.file_added.connect(self._on_file_added)
         self._watcher.file_removed.connect(self._on_file_removed)
         self._watcher.file_modified.connect(self._on_file_modified)
+        self._watcher.folder_added.connect(self._on_folder_added)
+        self._watcher.folder_removed.connect(self._on_folder_removed)
         self._watcher.start()
+
+        # Register this window in the cross-window registry
+        MainWindow._instances.append(self)
+
+        # Update title for non-root windows
+        if folder_path is not None:
+            self.setWindowTitle(f"JusticePDF - {self._work_dir.name}")
 
         # Load existing files
         self._load_existing_files()
@@ -204,6 +227,14 @@ class MainWindow(QMainWindow):
         self._import_btn = QPushButton("Import")
         self._import_btn.clicked.connect(self._on_import)
         toolbar.addWidget(self._import_btn)
+
+        self._import_folder_btn = QPushButton("Import Folder")
+        self._import_folder_btn.clicked.connect(self._on_import_folder)
+        toolbar.addWidget(self._import_folder_btn)
+
+        self._new_folder_btn = QPushButton("New Folder")
+        self._new_folder_btn.clicked.connect(self._on_new_folder)
+        toolbar.addWidget(self._new_folder_btn)
 
         self._export_btn = QPushButton("Export")
         self._export_btn.clicked.connect(self._on_export)
@@ -403,7 +434,9 @@ class MainWindow(QMainWindow):
         self._update_button_states()
 
     def _load_existing_files(self) -> None:
-        """Load existing PDF files from the work directory."""
+        """Load existing subfolders and PDF files from the work directory."""
+        for folder_path in sorted(self._watcher.get_subfolders(), key=lambda p: os.path.basename(p).lower()):
+            self._add_folder_card(folder_path)
         for pdf_path in self._watcher.get_pdf_files():
             self._add_card(pdf_path)
         # Do not refresh here: at this point viewport width is often 0 and causes "initial-only" layout.
@@ -432,6 +465,13 @@ class MainWindow(QMainWindow):
         card.context_menu_requested.connect(self._on_card_context_menu_requested)
         return card
 
+    def _connect_folder_card_signals(self, fc: FolderCard) -> FolderCard:
+        fc.clicked.connect(self._on_folder_card_clicked)
+        fc.double_clicked.connect(self._on_folder_card_double_clicked)
+        fc.dropped_on.connect(self._on_folder_card_dropped_on)
+        fc.context_menu_requested.connect(self._on_folder_card_context_menu_requested)
+        return fc
+
     def _add_card(self, pdf_path: str, insert_index: int | None = None) -> PDFCard:
         """Add a new card for a PDF file."""
         card = self._connect_card_signals(
@@ -446,6 +486,36 @@ class MainWindow(QMainWindow):
         else:
             self._cards.insert(max(0, insert_index), card)
         return card
+
+    def _add_folder_card(self, folder_path: str, insert_index: int | None = None) -> FolderCard:
+        fc = self._connect_folder_card_signals(
+            FolderCard(
+                folder_path,
+                card_width=self._preview_card_width,
+                thumb_size=self._preview_thumb_size,
+            )
+        )
+        if insert_index is None or insert_index >= len(self._folder_cards):
+            self._folder_cards.append(fc)
+        else:
+            self._folder_cards.insert(max(0, insert_index), fc)
+        return fc
+
+    def _get_folder_card_by_path(self, folder_path: str) -> FolderCard | None:
+        normalized = self._normalize_path(folder_path)
+        for fc in self._folder_cards:
+            if self._normalize_path(fc.folder_path) == normalized:
+                return fc
+        return None
+
+    def _remove_folder_card(self, folder_path: str) -> None:
+        fc = self._get_folder_card_by_path(folder_path)
+        if fc is None:
+            return
+        if fc in self._selected_folder_cards:
+            self._selected_folder_cards.remove(fc)
+        self._folder_cards.remove(fc)
+        fc.deleteLater()
 
     def _rebuild_cards_from_paths(self, paths: list[str]) -> None:
         """Rebuild PDFCards from a list of paths, reusing existing cards where possible.
@@ -517,11 +587,12 @@ class MainWindow(QMainWindow):
         # n*W + (n-1)*S <= usable  => cols = floor((usable + S) / (W + S))
         w = int(self._preview_card_width)
         cols = max(1, int((usable + spacing) // (w + spacing)))
-        
-        for i, card in enumerate(self._cards):
+
+        all_items: list[QWidget] = list(self._folder_cards) + list(self._cards)
+        for i, item in enumerate(all_items):
             row = i // cols
             col = i % cols
-            self._grid_layout.addWidget(card, row, col)
+            self._grid_layout.addWidget(item, row, col)
 
     def _on_deferred_grid_refresh(self) -> None:
         """Callback for the debounced grid refresh timer."""
@@ -678,8 +749,12 @@ class MainWindow(QMainWindow):
             global_pos,
         )
 
-    def _on_card_double_clicked(self, card: PDFCard) -> None:
-        """Handle card double-click - open page edit window."""
+    def _on_card_double_clicked(self, card: PDFCard, open_zoom: bool = False) -> None:
+        """Handle card double-click - open page edit window.
+
+        When ``open_zoom`` is True (Alt+double-click), the window is
+        immediately switched into enlarged single-page mode on page 0.
+        """
         from src.views.page_edit_window import PageEditWindow
         # If a window for this file is already open, bring it to front.
         for widget in QApplication.topLevelWidgets():
@@ -698,6 +773,11 @@ class MainWindow(QMainWindow):
                 widget.activateWindow()
                 # Ensure the card is locked while the window is visible.
                 self.lock_card(card.pdf_path)
+                if open_zoom:
+                    try:
+                        widget._open_zoom_view(0)
+                    except Exception:
+                        logger.debug("_open_zoom_view failed", exc_info=True)
                 return
 
         # Lock the card before opening the edit window
@@ -729,6 +809,10 @@ class MainWindow(QMainWindow):
 
         window.move(new_x, new_y)
         window.show()
+
+        if open_zoom:
+            # Defer slightly so the window's initial layout finishes first.
+            QTimer.singleShot(0, lambda w=window: w._open_zoom_view(0))
 
     def _on_card_merge(self, target_card: PDFCard, source_paths_str: str) -> None:
         """Handle card merge (drop cards on another card) with undo support.
@@ -892,6 +976,362 @@ class MainWindow(QMainWindow):
         worker.error.connect(worker.deleteLater)
         self._active_worker = worker
         worker.start()
+
+    def _on_folder_added(self, path: str) -> None:
+        """Handle subfolder created on disk."""
+        normalized = self._normalize_path(path)
+        for fc in self._folder_cards:
+            if self._normalize_path(fc.folder_path) == normalized:
+                fc.refresh()
+                self._grid_refresh_timer.start()
+                return
+        self._add_folder_card(path)
+        self._grid_refresh_timer.start()
+
+    def _on_folder_removed(self, path: str) -> None:
+        """Handle subfolder removed from disk."""
+        self._remove_folder_card(path)
+        self._grid_refresh_timer.start()
+
+    def _on_folder_card_clicked(self, fc: FolderCard) -> None:
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            if fc in self._selected_folder_cards:
+                fc.set_selected(False)
+                self._selected_folder_cards.remove(fc)
+            else:
+                fc.set_selected(True)
+                self._selected_folder_cards.append(fc)
+        else:
+            if fc not in self._selected_folder_cards:
+                self._clear_selection()
+                fc.set_selected(True)
+                self._selected_folder_cards.append(fc)
+        self._update_button_states()
+
+    def _on_folder_card_double_clicked(self, fc: FolderCard, alt_pressed: bool = False) -> None:
+        """Open a new MainWindow scoped to the clicked subfolder."""
+        if not os.path.isdir(fc.folder_path):
+            return
+        # If already open, bring that window to front.
+        for w in MainWindow._instances:
+            if w is self:
+                continue
+            try:
+                if self._normalize_path(str(w._work_dir)) == self._normalize_path(fc.folder_path):
+                    if w.isMinimized():
+                        w.setWindowState(
+                            (w.windowState() & ~Qt.WindowState.WindowMinimized)
+                            | Qt.WindowState.WindowActive
+                        )
+                    w.show()
+                    w.raise_()
+                    w.activateWindow()
+                    return
+            except RuntimeError:
+                continue
+
+        new_window = MainWindow(fc.folder_path)
+
+        existing_count = sum(
+            1 for w in MainWindow._instances
+            if w is not new_window and w.isVisible()
+        )
+        main_geo = self.geometry()
+        screen = self.screen().availableGeometry()
+        cascade_offset = 40
+        new_x = main_geo.right() + 10
+        if new_x + new_window.width() > screen.right():
+            new_x = max(screen.left(), screen.right() - new_window.width())
+        max_y = screen.bottom() - new_window.height() // 2
+        cycles_fit = max(1, (max_y - main_geo.top()) // cascade_offset + 1)
+        new_y = main_geo.top() + ((existing_count % cycles_fit) * cascade_offset)
+        new_window.move(new_x, new_y)
+        new_window.show()
+
+        # Hold a reference so Qt doesn't GC the new top-level window.
+        self._child_windows.append(new_window)
+
+    def _on_folder_card_dropped_on(
+        self,
+        fc: FolderCard,
+        mime_type: str,
+        payload: str,
+    ) -> None:
+        """Handle drops onto a folder card (move/copy into that folder)."""
+        dest_dir = Path(fc.folder_path)
+        if not dest_dir.exists():
+            return
+        modifiers = QApplication.keyboardModifiers()
+        is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+
+        if mime_type == PDFCARD_MIME_TYPE:
+            paths = [p for p in payload.split('|') if p]
+            if paths:
+                self._move_or_copy_files_into_dir(paths, dest_dir, is_copy=is_copy)
+            return
+        if mime_type == FOLDERCARD_MIME_TYPE:
+            src = payload.strip()
+            if src and os.path.isdir(src):
+                if self._normalize_path(src) == self._normalize_path(str(dest_dir)):
+                    return
+                self._move_or_copy_folder_into_dir(src, dest_dir, is_copy=is_copy)
+            return
+        if mime_type == "application/x-pdfas-page":
+            self._handle_page_extraction(payload, drop_pos=None, dest_dir=dest_dir)
+            return
+        if mime_type == "text/uri-list":
+            urls = [p for p in payload.split('|') if p]
+            if urls:
+                self._import_paths(urls, dest_root=dest_dir)
+
+    def _on_folder_card_context_menu_requested(
+        self,
+        fc: FolderCard,
+        global_pos: QPoint,
+    ) -> None:
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        rename_action = menu.addAction("Rename")
+        delete_action = menu.addAction("Delete")
+        chosen = menu.exec(global_pos)
+        if chosen is rename_action:
+            self._rename_folder(fc)
+        elif chosen is delete_action:
+            self._delete_folder(fc)
+
+    def _rename_folder(self, fc: FolderCard) -> None:
+        old_path = fc.folder_path
+        old_name = os.path.basename(old_path)
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Folder", "New folder name:", text=old_name
+        )
+        if not ok or not new_name or new_name == old_name:
+            return
+        parent_dir = os.path.dirname(old_path)
+        new_path = os.path.join(parent_dir, new_name)
+        if os.path.exists(new_path):
+            QMessageBox.warning(self, "Rename Folder", f"'{new_name}' は既に存在します。")
+            return
+        try:
+            os.rename(old_path, new_path)
+        except OSError as e:
+            QMessageBox.warning(self, "Rename Folder", f"リネームに失敗しました: {e}")
+            return
+
+        def do_rename() -> None:
+            if os.path.exists(old_path):
+                os.rename(old_path, new_path)
+
+        def undo_rename() -> None:
+            if os.path.exists(new_path):
+                os.rename(new_path, old_path)
+
+        self._undo_manager.add_action(UndoAction(
+            description=f"Rename folder {old_name}",
+            undo_func=undo_rename,
+            redo_func=do_rename,
+        ))
+
+    def _delete_folder(self, fc: FolderCard) -> None:
+        path = fc.folder_path
+        name = os.path.basename(path)
+        result = QMessageBox.question(
+            self,
+            "Delete Folder",
+            f"フォルダ '{name}' をゴミ箱に移動します。よろしいですか?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            send2trash(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Delete Folder", f"削除に失敗しました: {e}")
+            return
+        self._clear_undo_history()
+
+    def _on_new_folder(self) -> None:
+        name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
+        if not ok or not name:
+            return
+        dest = self._work_dir / name
+        if dest.exists():
+            QMessageBox.warning(self, "New Folder", f"'{name}' は既に存在します。")
+            return
+        try:
+            dest.mkdir(parents=True, exist_ok=False)
+        except OSError as e:
+            QMessageBox.warning(self, "New Folder", f"作成に失敗しました: {e}")
+            return
+
+        def undo_create() -> None:
+            if dest.exists():
+                try:
+                    send2trash(str(dest))
+                except Exception:
+                    pass
+
+        def redo_create() -> None:
+            if not dest.exists():
+                dest.mkdir(parents=True, exist_ok=False)
+
+        self._undo_manager.add_action(UndoAction(
+            description=f"Create folder {name}",
+            undo_func=undo_create,
+            redo_func=redo_create,
+        ))
+
+    def _move_or_copy_files_into_dir(
+        self,
+        source_paths: list[str],
+        dest_dir: Path,
+        *,
+        is_copy: bool,
+    ) -> None:
+        """Move or copy PDF files into another directory."""
+        if not source_paths:
+            return
+        dest_str = str(dest_dir)
+        if self._normalize_path(dest_str) == self._normalize_path(str(self._work_dir)):
+            # Same folder — nothing to move.  Let the existing reorder path handle it.
+            return
+
+        source_win = self._find_window_by_path(source_paths[0])
+        dest_paths: list[str] = []
+        actually_copied: list[tuple[str, str]] = []
+
+        for src in source_paths:
+            if not os.path.exists(src):
+                continue
+            new_path = str(
+                ensure_unique_path(
+                    dest_dir,
+                    os.path.basename(src),
+                    pattern="{stem}({i}){ext}",
+                )
+            )
+            try:
+                if source_win is not None:
+                    source_win._register_internal_remove([src])
+                # Register internal add on the window that actually owns dest_dir.
+                dest_win = self._find_window_by_workdir(str(dest_dir))
+                if dest_win is not None:
+                    dest_win._register_internal_add([new_path])
+                shutil.copy2(src, new_path)
+                if not is_copy:
+                    send2trash(src)
+                actually_copied.append((src, new_path))
+                dest_paths.append(new_path)
+            except Exception as e:
+                logger.debug("Move/copy failed for %s -> %s: %s", src, new_path, e)
+
+        if not actually_copied:
+            return
+
+        def undo_move() -> None:
+            for src, dest in actually_copied:
+                try:
+                    if is_copy:
+                        if os.path.exists(dest):
+                            send2trash(dest)
+                    else:
+                        if os.path.exists(dest) and not os.path.exists(src):
+                            shutil.copy2(dest, src)
+                            send2trash(dest)
+                except Exception:
+                    logger.debug("undo_move failed for %s -> %s", src, dest, exc_info=True)
+
+        def redo_move() -> None:
+            for src, dest in actually_copied:
+                try:
+                    if is_copy:
+                        if not os.path.exists(dest) and os.path.exists(src):
+                            shutil.copy2(src, dest)
+                    else:
+                        if not os.path.exists(dest) and os.path.exists(src):
+                            shutil.copy2(src, dest)
+                            send2trash(src)
+                except Exception:
+                    logger.debug("redo_move failed for %s -> %s", src, dest, exc_info=True)
+
+        action = "Copy" if is_copy else "Move"
+        self._undo_manager.add_action(UndoAction(
+            description=f"{action} {len(actually_copied)} file(s)",
+            undo_func=undo_move,
+            redo_func=redo_move,
+        ))
+
+    def _move_or_copy_folder_into_dir(
+        self,
+        source: str,
+        dest_dir: Path,
+        *,
+        is_copy: bool,
+    ) -> None:
+        if not os.path.isdir(source):
+            return
+        src_norm = self._normalize_path(source)
+        dest_norm = self._normalize_path(str(dest_dir))
+        # Refuse if moving folder into itself or its own descendant.
+        if dest_norm == src_norm or dest_norm.startswith(src_norm + os.sep):
+            QMessageBox.warning(self, "Move Folder", "フォルダを自身の中に移動できません。")
+            return
+        base_name = os.path.basename(source.rstrip(os.sep)) or "folder"
+        target = dest_dir / base_name
+        if target.exists():
+            target = Path(str(ensure_unique_path(dest_dir, base_name, pattern="{stem}({i}){ext}")))
+        try:
+            if is_copy:
+                shutil.copytree(source, target)
+            else:
+                shutil.move(source, target)
+        except Exception as e:
+            QMessageBox.warning(self, "Move Folder", f"フォルダの移動に失敗しました: {e}")
+
+    def _find_window_by_path(self, path: str) -> "MainWindow | None":
+        """Find the MainWindow whose work directory contains the given file path."""
+        path_norm = self._normalize_path(path)
+        best: "MainWindow | None" = None
+        best_len = -1
+        for w in list(MainWindow._instances):
+            try:
+                wd = self._normalize_path(str(w._work_dir))
+                if path_norm == wd or path_norm.startswith(wd + os.sep):
+                    if len(wd) > best_len:
+                        best = w
+                        best_len = len(wd)
+            except RuntimeError:
+                continue
+        return best
+
+    def _find_window_by_workdir(self, workdir: str) -> "MainWindow | None":
+        norm = self._normalize_path(workdir)
+        for w in list(MainWindow._instances):
+            try:
+                if self._normalize_path(str(w._work_dir)) == norm:
+                    return w
+            except RuntimeError:
+                continue
+        return None
+
+    def closeEvent(self, event) -> None:
+        try:
+            if self._active_import_worker is not None:
+                self._active_import_worker.request_cancel()
+                self._active_import_worker.wait(2000)
+        except Exception:
+            pass
+        try:
+            self._watcher.stop()
+        except Exception:
+            pass
+        try:
+            MainWindow._instances.remove(self)
+        except ValueError:
+            pass
+        super().closeEvent(event)
 
     def _on_file_added(self, path: str) -> None:
         """Handle new file added to folder."""
@@ -1218,7 +1658,7 @@ class MainWindow(QMainWindow):
         ))
 
     def _on_import(self) -> None:
-        """Handle import action."""
+        """Handle import action (files)."""
         ext_list = " ".join(f"*{e}" for e in sorted(_IMPORT_EXTS))
         dialog = QFileDialog(self, "Import")
         dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
@@ -1228,76 +1668,205 @@ class MainWindow(QMainWindow):
             if paths:
                 self._import_paths(paths)
 
-    # ─────────────────────────────────────────────────────────────────
-    # Office Import helpers
-    # ─────────────────────────────────────────────────────────────────
-
-    def _import_paths(self, paths: list[str]) -> None:
-        """Import PDF or Office files into the work directory."""
-        failed: list[tuple[str, str]] = []
-        imported_paths: list[str] = []
-        office_total = sum(
-            1 for p in paths if os.path.splitext(p)[1].lower() in _OFFICE_EXTS
+    def _on_import_folder(self) -> None:
+        """Handle import action for a folder (preserves nested structure)."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Import Folder", str(Path.home())
         )
-        office_index = 0
-        progress = None
-        cursor_set = False
-        if office_total:
-            progress = QProgressDialog(
-                "OfficeファイルをPDFに変換中...",
-                None,
-                0,
-                office_total,
+        if folder:
+            self._import_paths([folder])
+
+    # ─────────────────────────────────────────────────────────────────
+    # Import helpers — asynchronous with cancellation
+    # ─────────────────────────────────────────────────────────────────
+
+    def _build_import_tree(
+        self,
+        paths: list[str],
+        dest_root: Path,
+    ) -> list[tuple[str, str]]:
+        """Build a flat list of (src, dest) pairs for the importer.
+
+        Directories are walked recursively; the nested structure is preserved
+        relative to the dropped-root under ``dest_root``.  Leaf collisions are
+        resolved via ``ensure_unique_path`` so neither the real work dir nor
+        any new subfolder ever sees a clobber.  Office/image sources are given
+        ``.pdf`` destinations.
+        """
+        used_dest: set[str] = set()
+
+        def _alloc_dest(parent: Path, filename: str) -> Path:
+            parent.mkdir(parents=True, exist_ok=True)
+            dest = ensure_unique_path(parent, filename, pattern="{stem}({i}){ext}")
+            # If multiple sources resolve to the same destination during this
+            # build pass (before the files are created) we bump further.
+            while str(dest) in used_dest:
+                dest = ensure_unique_path(parent, filename, pattern="{stem}({i}){ext}", use_original=False)
+            used_dest.add(str(dest))
+            return dest
+
+        def _normalize_dest_name(src_name: str) -> str:
+            base, ext = os.path.splitext(src_name)
+            lower = ext.lower()
+            if lower in _OFFICE_EXTS or lower in _IMAGE_EXTS:
+                return f"{base}.pdf"
+            return src_name
+
+        tree: list[tuple[str, str]] = []
+        for p in paths:
+            if not p:
+                continue
+            if os.path.isdir(p):
+                folder_name = os.path.basename(os.path.abspath(p).rstrip(os.sep)) or "folder"
+                # Ensure the top-level import folder gets a unique name at dest_root.
+                target_root = dest_root / folder_name
+                if target_root.exists():
+                    target_root = Path(
+                        str(ensure_unique_path(dest_root, folder_name, pattern="{stem}({i}){ext}", use_original=False))
+                    )
+                target_root.mkdir(parents=True, exist_ok=True)
+                for root, _dirs, files in os.walk(p):
+                    rel = os.path.relpath(root, p)
+                    dest_parent = target_root if rel == "." else (target_root / rel)
+                    dest_parent.mkdir(parents=True, exist_ok=True)
+                    for fname in files:
+                        src_full = os.path.join(root, fname)
+                        ext = os.path.splitext(fname)[1].lower()
+                        if ext not in _IMPORT_EXTS:
+                            continue
+                        dest_name = _normalize_dest_name(fname)
+                        dest_full = _alloc_dest(dest_parent, dest_name)
+                        tree.append((src_full, str(dest_full)))
+            elif os.path.isfile(p):
+                ext = os.path.splitext(p)[1].lower()
+                if ext not in _IMPORT_EXTS:
+                    continue
+                dest_name = _normalize_dest_name(os.path.basename(p))
+                dest_full = _alloc_dest(dest_root, dest_name)
+                tree.append((p, str(dest_full)))
+        return tree
+
+    def _count_office_files(self, tree: list[tuple[str, str]]) -> int:
+        return sum(
+            1 for src, _ in tree
+            if os.path.splitext(src)[1].lower() in _OFFICE_EXTS
+        )
+
+    def _import_paths(
+        self,
+        paths: list[str],
+        *,
+        dest_root: Path | None = None,
+    ) -> None:
+        """Import PDF / Office / image files and folders into the work tree.
+
+        This is the main entry for both the Import button, the Import Folder
+        button, drag-and-drop onto the main window, and drops onto a
+        FolderCard (via ``dest_root``).  Runs asynchronously in an
+        ``ImportWorker`` thread; the user may cancel mid-batch.
+        """
+        if self._operation_in_progress or self._active_import_worker is not None:
+            QMessageBox.information(self, "Import", "別のインポートが進行中です。完了までお待ちください。")
+            return
+
+        root = Path(dest_root) if dest_root else Path(self._work_dir)
+        tree = self._build_import_tree(paths, root)
+        if not tree:
+            return
+
+        office_count = self._count_office_files(tree)
+        if office_count > IMPORT_OFFICE_WARN_THRESHOLD:
+            result = QMessageBox.question(
                 self,
+                "インポート確認",
+                (
+                    f"変換が必要なファイルが {office_count} 件あります。\n"
+                    "変換には時間がかかります。続行しますか?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
-            progress.setWindowTitle("変換中")
-            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-            progress.setCancelButton(None)
-            progress.setMinimumDuration(0)
-            progress.setValue(0)
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            cursor_set = True
-            QApplication.processEvents()
+            if result != QMessageBox.StandardButton.Yes:
+                return
 
-        for src_path in paths:
-            ext = os.path.splitext(src_path)[1].lower()
-            if progress and ext in _OFFICE_EXTS:
+        self._start_import_worker(tree)
+
+    def _start_import_worker(self, tree: list[tuple[str, str]]) -> None:
+        total = len(tree)
+        if total == 0:
+            return
+
+        # Pre-register expected destinations so FolderWatcher events don't
+        # clobber undo history on either the current or target window.
+        for _, dest in tree:
+            dest_win = self._find_window_by_workdir(os.path.dirname(dest))
+            if dest_win is not None:
+                dest_win._register_internal_add([dest])
+
+        progress = QProgressDialog(
+            "インポート中...",
+            "キャンセル",
+            0,
+            total,
+            self,
+        )
+        progress.setWindowTitle("インポート")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        worker = ImportWorker(tree, find_soffice(), parent=self)
+
+        def _on_progress(current: int, total_: int, filename: str) -> None:
+            progress.setMaximum(max(1, total_))
+            progress.setValue(current)
+            if filename:
                 progress.setLabelText(
-                    f"変換中 ({office_index + 1}/{office_total}): "
-                    f"{os.path.basename(src_path)}"
+                    f"({current + 1}/{total_}) {filename}"
                 )
-                progress.setValue(office_index)
-                QApplication.processEvents()
-            try:
-                dest_path = None
-                if ext == ".pdf":
-                    dest_path = self._copy_pdf_into_workdir(src_path)
-                elif ext in _OFFICE_EXTS:
-                    try:
-                        dest_path = self._convert_office_to_pdf_into_workdir(src_path)
-                    finally:
-                        if progress:
-                            office_index += 1
-                            progress.setValue(office_index)
-                            QApplication.processEvents()
-                elif ext in _IMAGE_EXTS:
-                    dest_path = self._convert_image_to_pdf_into_workdir(src_path)
-                else:
-                    failed.append((src_path, "未対応の拡張子です"))
-                if dest_path:
-                    imported_paths.append(dest_path)
-            except Exception as e:
-                failed.append((src_path, str(e)))
 
-        if progress:
+        def _on_finished(imported: list, failed: list, cancelled: bool) -> None:
             progress.close()
-        if cursor_set:
-            QApplication.restoreOverrideCursor()
+            self._active_import_worker = None
+            self._active_import_progress = None
+            self._end_async_operation()
+            self._on_import_finished(imported, failed, cancelled, tree)
+            worker.deleteLater()
 
-        if imported_paths:
+        worker.progress_updated.connect(_on_progress)
+        worker.finished_all.connect(_on_finished)
+        progress.canceled.connect(worker.request_cancel)
+
+        self._active_import_worker = worker
+        self._active_import_progress = progress
+        self._begin_async_operation()
+        worker.start()
+
+    def _on_import_finished(
+        self,
+        imported: list[str],
+        failed: list[tuple[str, str]],
+        cancelled: bool,
+        tree: list[tuple[str, str]],
+    ) -> None:
+        # Drop any pre-registered adds that never happened.
+        imported_norm = {self._normalize_path(p) for p in imported}
+        for _, dest in tree:
+            norm = self._normalize_path(dest)
+            if norm not in imported_norm:
+                for w in list(MainWindow._instances):
+                    try:
+                        w._internal_adds.discard(norm)
+                    except Exception:
+                        pass
+
+        for dest in imported:
+            clear_pixmap_cache_for_path(dest)
+
+        if imported:
             backup_dir = tempfile.mkdtemp(prefix="pdfas_import_")
             backups: dict[str, str] = {}
-            for dest_path in imported_paths:
+            for dest_path in imported:
                 backup_path = str(
                     ensure_unique_path(
                         backup_dir,
@@ -1305,25 +1874,34 @@ class MainWindow(QMainWindow):
                         pattern="{stem}({i}){ext}",
                     )
                 )
-                shutil.copy2(dest_path, backup_path)
+                try:
+                    shutil.copy2(dest_path, backup_path)
+                except Exception:
+                    logger.debug("Failed to backup %s for undo", dest_path, exc_info=True)
+                    continue
                 backups[dest_path] = backup_path
 
             def undo_import() -> None:
-                self._register_internal_remove(list(backups.keys()))
-                for dest_path in backups.keys():
+                for dest_path in list(backups.keys()):
+                    win = self._find_window_by_path(dest_path) or self
+                    win._register_internal_remove([dest_path])
                     if os.path.exists(dest_path):
-                        send2trash(dest_path)
+                        try:
+                            send2trash(dest_path)
+                        except Exception:
+                            logger.debug("send2trash failed for %s", dest_path, exc_info=True)
 
             def redo_import() -> None:
                 for dest_path, backup_path in backups.items():
                     if os.path.exists(backup_path) and not os.path.exists(dest_path):
-                        self._register_internal_add([dest_path])
+                        win = self._find_window_by_path(dest_path) or self
+                        win._register_internal_add([dest_path])
                         shutil.copy2(backup_path, dest_path)
 
             self._undo_manager.add_action(UndoAction(
-                description=f"Import {len(imported_paths)} file(s)",
+                description=f"Import {len(imported)} file(s)",
                 undo_func=undo_import,
-                redo_func=redo_import
+                redo_func=redo_import,
             ))
 
         if failed:
@@ -1332,140 +1910,12 @@ class MainWindow(QMainWindow):
                 details += f"\n...（他 {len(failed) - 20} 件）"
             QMessageBox.warning(self, "インポート結果", f"失敗: {len(failed)} 件\n\n{details}")
 
-    def _copy_pdf_into_workdir(self, src_path: str) -> str:
-        """Copy a PDF into the work directory with unique name."""
-        filename = os.path.basename(src_path)
-        dest_path = ensure_unique_path(self._work_dir, filename, pattern="{stem}({i}){ext}")
-        dest_str = str(dest_path)
-        self._register_internal_add([dest_str])
-        try:
-            shutil.copy2(src_path, dest_path)
-        except Exception:
-            self._internal_adds.discard(self._normalize_path(dest_str))
-            raise
-        clear_pixmap_cache_for_path(dest_str)
-        return dest_str
-
-    def _convert_image_to_pdf_into_workdir(self, src_path: str) -> str:
-        """Convert an image file to a single-page PDF in the work directory."""
-        base_name = os.path.splitext(os.path.basename(src_path))[0]
-        dest_path = ensure_unique_path(self._work_dir, f"{base_name}.pdf", pattern="{stem}({i}){ext}")
-        dest_str = str(dest_path)
-        self._register_internal_add([dest_str])
-        try:
-            images_to_pdf([src_path], dest_str)
-        except Exception:
-            self._internal_adds.discard(self._normalize_path(dest_str))
-            raise
-        clear_pixmap_cache_for_path(dest_str)
-        return dest_str
-
-    def _convert_office_to_pdf_into_workdir(self, src_path: str) -> str:
-        """Convert Office document to PDF and place it in work directory."""
-        base_name = os.path.splitext(os.path.basename(src_path))[0]
-        dest_path = ensure_unique_path(self._work_dir, f"{base_name}.pdf", pattern="{stem}({i}){ext}")
-        dest_str = str(dest_path)
-        self._register_internal_add([dest_str])
-
-        # Try Microsoft Office COM first (Windows only)
-        if sys.platform == "win32":
-            try:
-                self._convert_via_office_com(src_path, dest_path)
-                return dest_str
-            except Exception as e:
-                logger.debug(f"Office COM conversion failed: {e}")
-
-        # Fallback to LibreOffice
-        soffice = self._find_soffice()
-        if soffice:
-            try:
-                self._convert_via_libreoffice(src_path, dest_path, soffice)
-                return dest_str
-            except Exception as e:
-                logger.debug(f"LibreOffice conversion failed: {e}")
-
-        self._internal_adds.discard(self._normalize_path(dest_str))
-        raise RuntimeError("Office変換に必要なソフトウェアが見つかりません (MS Office または LibreOffice)")
-
-    def _convert_via_office_com(self, src_path: str, dest_pdf_path: Path) -> None:
-        """Convert Office file to PDF using COM automation (Windows + MS Office)."""
-        import win32com.client  # type: ignore
-
-        ext = os.path.splitext(src_path)[1].lower()
-        abs_src = os.path.abspath(src_path)
-        abs_dest = str(dest_pdf_path.resolve())
-
-        if ext in {".doc", ".docx", ".docm"}:
-            word = win32com.client.Dispatch("Word.Application")
-            word.Visible = False
-            try:
-                doc = word.Documents.Open(abs_src)
-                doc.SaveAs(abs_dest, FileFormat=17)  # wdFormatPDF
-                doc.Close(False)
-            finally:
-                word.Quit()
-
-        elif ext in {".xls", ".xlsx", ".xlsm"}:
-            excel = win32com.client.Dispatch("Excel.Application")
-            excel.Visible = False
-            try:
-                wb = excel.Workbooks.Open(abs_src)
-                wb.ExportAsFixedFormat(0, abs_dest)  # xlTypePDF
-                wb.Close(False)
-            finally:
-                excel.Quit()
-
-        elif ext in {".ppt", ".pptx"}:
-            ppt = win32com.client.Dispatch("PowerPoint.Application")
-            # PowerPoint may need to be visible briefly
-            try:
-                presentation = ppt.Presentations.Open(abs_src, WithWindow=False)
-                presentation.SaveAs(abs_dest, 32)  # ppSaveAsPDF
-                presentation.Close()
-            finally:
-                ppt.Quit()
-
-        else:
-            raise ValueError(f"Unsupported Office extension: {ext}")
-
-    def _find_soffice(self) -> str | None:
-        """Find LibreOffice soffice executable."""
-        candidates = []
-        if sys.platform == "win32":
-            for pf in [os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")]:
-                if pf:
-                    candidates.append(os.path.join(pf, "LibreOffice", "program", "soffice.exe"))
-        else:
-            candidates = ["/usr/bin/soffice", "/usr/local/bin/soffice", "/opt/libreoffice/program/soffice"]
-
-        for path in candidates:
-            if path and os.path.isfile(path):
-                return path
-
-        # Try PATH
-        import shutil as sh
-        return sh.which("soffice")
-
-    def _convert_via_libreoffice(self, src_path: str, dest_pdf_path: Path, soffice: str) -> None:
-        """Convert Office file to PDF using LibreOffice headless."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            result = subprocess.run(
-                [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, src_path],
-                capture_output=True,
-                timeout=120,
-                creationflags=creationflags,
+        if cancelled and not failed:
+            QMessageBox.information(
+                self,
+                "インポート",
+                f"インポートはキャンセルされました ({len(imported)} 件は既に処理済み)。",
             )
-            if result.returncode != 0:
-                raise RuntimeError(f"soffice failed: {result.stderr.decode(errors='replace')}")
-
-            # Find generated PDF
-            base_name = os.path.splitext(os.path.basename(src_path))[0]
-            generated = os.path.join(tmpdir, f"{base_name}.pdf")
-            if not os.path.exists(generated):
-                raise RuntimeError("LibreOffice did not produce a PDF")
-
-            shutil.move(generated, dest_pdf_path)
 
     def _on_export(self) -> None:
         """Export selected PDFs (or all PDFs if none selected) to a chosen folder.
@@ -1707,13 +2157,22 @@ class MainWindow(QMainWindow):
         """Handle drag enter event."""
         from src.views.page_edit_window import PAGETHUMBNAIL_MIME_TYPE
 
-        if event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
+        md = event.mimeData()
+        if md.hasFormat(PDFCARD_MIME_TYPE):
             event.acceptProposedAction()
-        elif event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
+        elif md.hasFormat(PAGETHUMBNAIL_MIME_TYPE):
             event.acceptProposedAction()
-        elif event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                ext = os.path.splitext(url.toLocalFile())[1].lower()
+        elif md.hasFormat(FOLDERCARD_MIME_TYPE):
+            event.acceptProposedAction()
+        elif md.hasUrls():
+            for url in md.urls():
+                local = url.toLocalFile()
+                if not local:
+                    continue
+                if os.path.isdir(local):
+                    event.acceptProposedAction()
+                    return
+                ext = os.path.splitext(local)[1].lower()
                 if ext in _IMPORT_EXTS:
                     event.acceptProposedAction()
                     return
@@ -1789,6 +2248,14 @@ class MainWindow(QMainWindow):
 
             # Show insert indicator
             self._show_drop_indicator(drop_pos)
+        elif event.mimeData().hasFormat(FOLDERCARD_MIME_TYPE):
+            modifiers = QApplication.keyboardModifiers()
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
+                event.setDropAction(Qt.DropAction.CopyAction)
+            else:
+                event.setDropAction(Qt.DropAction.MoveAction)
+            event.acceptProposedAction()
+            self._hide_drop_indicator()
         elif event.mimeData().hasUrls():
             event.acceptProposedAction()
             self._hide_drop_indicator()
@@ -1857,13 +2324,23 @@ class MainWindow(QMainWindow):
             source_path = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')
             drop_pos = self._container.mapFrom(self, event.position().toPoint())
             logger.debug(f"PDFCARD drop: source_path={source_path}, drop_pos={drop_pos}")
-            
+
             # Check if Ctrl key is pressed for copy operation
             modifiers = QApplication.keyboardModifiers()
             is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
             logger.debug(f"is_copy={is_copy}, _drop_indicator_index={self._drop_indicator_index}")
-            
-            if drop_mode == -2:  # Overlay mode (merge)
+
+            # Detect cross-window drop: any source path outside this work dir.
+            source_paths = [p for p in source_path.split('|') if p]
+            wd_norm = self._normalize_path(str(self._work_dir))
+            is_cross_window = any(
+                not self._normalize_path(os.path.dirname(p)) == wd_norm
+                for p in source_paths
+            )
+
+            if is_cross_window:
+                self._handle_cross_window_card_drop(source_paths, drop_pos, is_copy=is_copy)
+            elif drop_mode == -2:  # Overlay mode (merge)
                 target_card = self._get_card_at_pos(drop_pos)
                 if target_card:
                     if is_copy:
@@ -1882,12 +2359,121 @@ class MainWindow(QMainWindow):
             logger.debug(f"PAGETHUMBNAIL drop: data={data}, drop_pos={drop_pos}")
             self._handle_page_extraction(data, drop_pos)
             event.acceptProposedAction()
+        elif event.mimeData().hasFormat(FOLDERCARD_MIME_TYPE):
+            src = bytes(event.mimeData().data(FOLDERCARD_MIME_TYPE)).decode("utf-8", errors="replace")
+            modifiers = QApplication.keyboardModifiers()
+            is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+            if src and os.path.isdir(src):
+                self._move_or_copy_folder_into_dir(src, Path(self._work_dir), is_copy=is_copy)
+            event.acceptProposedAction()
         elif event.mimeData().hasUrls():
             logger.debug(f"URL drop: {event.mimeData().urls()}")
             self._handle_external_file_drop(event.mimeData().urls())
             event.acceptProposedAction()
         else:
             logger.debug("Unknown drop format, ignoring")
+
+    def _handle_cross_window_card_drop(
+        self,
+        source_paths: list[str],
+        drop_pos,
+        *,
+        is_copy: bool,
+    ) -> None:
+        """Move or copy PDFs from another MainWindow into this window."""
+        dest_dir = Path(self._work_dir)
+        valid = [p for p in source_paths if p and os.path.exists(p)]
+        if not valid:
+            return
+
+        # Avoid trying to move into the same directory.
+        dest_norm = self._normalize_path(str(dest_dir))
+        valid = [
+            p for p in valid
+            if self._normalize_path(os.path.dirname(p)) != dest_norm
+        ]
+        if not valid:
+            return
+
+        insert_index = self._get_drop_index(drop_pos)
+        if insert_index is None or insert_index < 0:
+            insert_index = len(self._cards)
+
+        actually_copied: list[tuple[str, str]] = []
+        for src in valid:
+            source_win = self._find_window_by_path(src)
+            new_path = str(
+                ensure_unique_path(
+                    dest_dir,
+                    os.path.basename(src),
+                    pattern="{stem}({i}){ext}",
+                )
+            )
+            try:
+                self._register_internal_add([new_path])
+                if source_win is not None and not is_copy:
+                    source_win._register_internal_remove([src])
+                shutil.copy2(src, new_path)
+                if not is_copy:
+                    try:
+                        send2trash(src)
+                    except Exception:
+                        logger.debug("send2trash failed for %s", src, exc_info=True)
+                actually_copied.append((src, new_path))
+            except Exception as e:
+                logger.debug("Cross-window copy failed %s -> %s: %s", src, new_path, e)
+
+        if not actually_copied:
+            return
+
+        # Insert cards at drop position in this window; update source window.
+        for offset, (_src, dest) in enumerate(actually_copied):
+            self._add_card(dest, insert_index=insert_index + offset)
+        self._sort_order = "manual"
+        self._refresh_grid()
+
+        def undo_move() -> None:
+            for src, dest in actually_copied:
+                try:
+                    if is_copy:
+                        if os.path.exists(dest):
+                            self._register_internal_remove([dest])
+                            send2trash(dest)
+                    else:
+                        if not os.path.exists(src) and os.path.exists(dest):
+                            source_win2 = self._find_window_by_workdir(os.path.dirname(src))
+                            if source_win2 is not None:
+                                source_win2._register_internal_add([src])
+                            shutil.copy2(dest, src)
+                            self._register_internal_remove([dest])
+                            send2trash(dest)
+                except Exception:
+                    logger.debug("undo cross-window failed for %s -> %s", src, dest, exc_info=True)
+
+        def redo_move() -> None:
+            for src, dest in actually_copied:
+                try:
+                    if is_copy:
+                        if not os.path.exists(dest) and os.path.exists(src):
+                            self._register_internal_add([dest])
+                            shutil.copy2(src, dest)
+                    else:
+                        if not os.path.exists(dest) and os.path.exists(src):
+                            self._register_internal_add([dest])
+                            source_win2 = self._find_window_by_path(src)
+                            if source_win2 is not None:
+                                source_win2._register_internal_remove([src])
+                            shutil.copy2(src, dest)
+                            send2trash(src)
+                except Exception:
+                    logger.debug("redo cross-window failed for %s -> %s", src, dest, exc_info=True)
+
+        action = "Copy" if is_copy else "Move"
+        self._undo_manager.add_action(UndoAction(
+            description=f"{action} {len(actually_copied)} file(s)",
+            undo_func=undo_move,
+            redo_func=redo_move,
+        ))
 
     def _handle_card_drop(self, source_paths_str: str, drop_pos) -> None:
         """Handle internal card drop for reordering.
@@ -2177,18 +2763,38 @@ class MainWindow(QMainWindow):
         return 0
 
     def _handle_external_file_drop(self, urls) -> None:
-        """Handle external file drop (import)."""
-        paths = []
+        """Handle external file drop (import).
+
+        Accepts both files with importable extensions and whole directories
+        (which are walked recursively while preserving structure).
+        """
+        paths: list[str] = []
         for url in urls:
             local = url.toLocalFile()
-            ext = os.path.splitext(local)[1].lower()
-            if ext in _IMPORT_EXTS:
+            if not local:
+                continue
+            if os.path.isdir(local):
                 paths.append(local)
+            else:
+                ext = os.path.splitext(local)[1].lower()
+                if ext in _IMPORT_EXTS:
+                    paths.append(local)
         if paths:
             self._import_paths(paths)
 
-    def _handle_page_extraction(self, data: str, drop_pos=None) -> None:
-        """Handle page extraction from page edit window."""
+    def _handle_page_extraction(
+        self,
+        data: str,
+        drop_pos=None,
+        *,
+        dest_dir: Path | None = None,
+    ) -> None:
+        """Handle page extraction from page edit window.
+
+        When ``dest_dir`` is provided (folder-card drop), the extracted page
+        is always saved to that directory as a new PDF — regardless of
+        drop position — and no existing card is merged into.
+        """
         import tempfile
         import shutil
         from src.utils.pdf_utils import extract_pages, remove_pages, insert_pages
@@ -2200,16 +2806,21 @@ class MainWindow(QMainWindow):
         pdf_path, page_nums_str = data.split('|')
         page_nums = sorted(set(int(n) for n in page_nums_str.split(',') if n))
         logger.debug(f"Parsed pdf_path={pdf_path}, page_nums={page_nums}")
-        
+
         if not page_nums:
             logger.debug("No page_nums, returning early")
             return
 
-        if drop_pos is None:
-            logger.debug("No drop_pos, ignoring")
+        if drop_pos is None and dest_dir is None:
+            logger.debug("No drop_pos and no dest_dir, ignoring")
             return
 
-        target_card = self._get_card_at_pos(drop_pos)
+        effective_work_dir = Path(dest_dir) if dest_dir is not None else Path(self._work_dir)
+
+        if dest_dir is not None:
+            target_card = None
+        else:
+            target_card = self._get_card_at_pos(drop_pos) if drop_pos is not None else None
         logger.debug(f"target_card at drop_pos: {target_card}")
         is_new_target = target_card is None
         if not is_new_target:
@@ -2224,13 +2835,17 @@ class MainWindow(QMainWindow):
         else:
             target_path = str(
                 ensure_unique_path(
-                    self._work_dir,
+                    effective_work_dir,
                     Path(pdf_path).name,
                     pattern="{stem}({i}){ext}",
                     use_original=False,
                 )
             )
-            insert_index = self._get_drop_index(drop_pos)
+            insert_index = (
+                self._get_drop_index(drop_pos)
+                if (drop_pos is not None and dest_dir is None)
+                else None
+            )
             logger.debug(f"No target card, creating new PDF at {target_path} (insert_index={insert_index})")
 
         modifiers = QApplication.keyboardModifiers()
@@ -2296,13 +2911,20 @@ class MainWindow(QMainWindow):
                     return False
 
                 if is_new_target:
-                    self._register_internal_add([target_path])
+                    # Register internal add on whatever window owns the target dir.
+                    dest_win_for_add = self._find_window_by_workdir(os.path.dirname(target_path)) or self
+                    dest_win_for_add._register_internal_add([target_path])
                     shutil.move(tmp_path, target_path)
                     tmp_path = None
-                    self._add_card(target_path, insert_index=insert_index)
-                    self._sort_order = "manual"
-                    self._refresh_grid()
-                    _select_single_card(target_path)
+                    if dest_win_for_add is self:
+                        self._add_card(target_path, insert_index=insert_index)
+                        self._sort_order = "manual"
+                        self._refresh_grid()
+                        _select_single_card(target_path)
+                    else:
+                        dest_win_for_add._add_card(target_path, insert_index=None)
+                        dest_win_for_add._sort_order = "manual"
+                        dest_win_for_add._refresh_grid()
                 else:
                     logger.debug(f"Appending pages to target_card: {target_path}")
                     insert_pages(target_path, tmp_path, [0] * len(page_nums))
