@@ -1069,6 +1069,7 @@ class MainWindow(QMainWindow):
             paths = [p for p in payload.split('|') if p]
             if paths:
                 self._move_or_copy_files_into_dir(paths, dest_dir, is_copy=is_copy)
+                fc.refresh()
             return
         if mime_type == FOLDERCARD_MIME_TYPE:
             src = payload.strip()
@@ -1076,14 +1077,17 @@ class MainWindow(QMainWindow):
                 if self._normalize_path(src) == self._normalize_path(str(dest_dir)):
                     return
                 self._move_or_copy_folder_into_dir(src, dest_dir, is_copy=is_copy)
+                fc.refresh()
             return
         if mime_type == "application/x-pdfas-page":
             self._handle_page_extraction(payload, drop_pos=None, dest_dir=dest_dir)
+            fc.refresh()
             return
         if mime_type == "text/uri-list":
             urls = [p for p in payload.split('|') if p]
             if urls:
                 self._import_paths(urls, dest_root=dest_dir)
+                fc.refresh()
 
     def _on_folder_card_context_menu_requested(
         self,
@@ -1862,6 +1866,13 @@ class MainWindow(QMainWindow):
 
         for dest in imported:
             clear_pixmap_cache_for_path(dest)
+
+        if imported and self._folder_cards:
+            imported_norm_paths = [self._normalize_path(p) for p in imported]
+            for fc in self._folder_cards:
+                fc_norm = self._normalize_path(fc.folder_path) + os.sep
+                if any(p.startswith(fc_norm) for p in imported_norm_paths):
+                    fc.refresh()
 
         if imported:
             backup_dir = tempfile.mkdtemp(prefix="pdfas_import_")

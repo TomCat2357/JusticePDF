@@ -3,7 +3,7 @@ import os
 from PyQt6.QtWidgets import (
     QFrame, QVBoxLayout, QLabel, QApplication, QWidget, QStyle,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QUrl
+from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QUrl, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import QDrag, QPixmap
 
 from src.views.pdf_card import PDFCARD_MIME_TYPE
@@ -46,6 +46,18 @@ class FolderCard(QFrame):
 
         self._setup_ui()
         self._load_folder_info()
+
+        self._refresh_debounce = QTimer(self)
+        self._refresh_debounce.setSingleShot(True)
+        self._refresh_debounce.setInterval(120)
+        self._refresh_debounce.timeout.connect(self._load_folder_info)
+
+        self._fs_watcher = QFileSystemWatcher(self)
+        if os.path.isdir(self._folder_path):
+            self._fs_watcher.addPath(self._folder_path)
+        self._fs_watcher.directoryChanged.connect(
+            lambda _path: self._refresh_debounce.start()
+        )
 
     def _setup_ui(self) -> None:
         self.setFixedWidth(self._card_width)
