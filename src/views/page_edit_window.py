@@ -121,10 +121,9 @@ class PageThumbnail(QFrame):
 
     def _update_style(self) -> None:
         """Update style based on selection."""
-        if self._is_selected:
-            self.setStyleSheet("PageThumbnail { background-color: #cce5ff; border: 2px solid #007bff; }")
-        else:
-            self.setStyleSheet("PageThumbnail { background-color: white; border: 1px solid #ccc; }")
+        self.setProperty("state", "selected" if self._is_selected else "normal")
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     @property
     def page_num(self) -> int:
@@ -1410,7 +1409,7 @@ class PageEditWindow(QMainWindow):
         # Drop indicator line
         self._drop_indicator = QFrame(self._container)
         self._drop_indicator.setFrameShape(QFrame.Shape.VLine)
-        self._drop_indicator.setStyleSheet("background-color: #007bff;")
+        self._drop_indicator.setStyleSheet("background-color: #4f46e5;")
         self._drop_indicator.setFixedWidth(3)
         self._drop_indicator.hide()
 

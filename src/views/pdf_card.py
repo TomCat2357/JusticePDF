@@ -104,20 +104,18 @@ class PDFCard(QFrame):
     def _update_style(self) -> None:
         """Update the card style based on selection and locked state."""
         from PyQt6.QtWidgets import QGraphicsOpacityEffect
-        
+
         if self._is_locked:
-            # Locked state: grayed out
-            self.setStyleSheet("PDFCard { background-color: #d0d0d0; border: 1px solid #999; }")
+            state = "locked"
             effect = QGraphicsOpacityEffect()
             effect.setOpacity(0.5)
             self.setGraphicsEffect(effect)
         else:
-            # Remove opacity effect
             self.setGraphicsEffect(None)
-            if self._is_selected:
-                self.setStyleSheet("PDFCard { background-color: #cce5ff; border: 2px solid #007bff; }")
-            else:
-                self.setStyleSheet("PDFCard { background-color: white; border: 1px solid #ccc; }")
+            state = "selected" if self._is_selected else "normal"
+        self.setProperty("state", state)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     @property
     def pdf_path(self) -> str:
@@ -216,6 +214,7 @@ class PDFCard(QFrame):
         # Get selected cards from parent window
         parent_window = self.window()
         selected_paths = [self._pdf_path]
+        selected_folder_paths: list[str] = []
         if hasattr(parent_window, '_selected_cards'):
             selected = parent_window._selected_cards
             if self in selected and len(selected) > 1:
@@ -223,13 +222,20 @@ class PDFCard(QFrame):
                 available_selected = [c for c in selected if not c.is_locked]
                 if self in available_selected and len(available_selected) > 1:
                     selected_paths = [c.pdf_path for c in parent_window._cards if c in available_selected]
+            if self in selected:
+                selected_folders = getattr(parent_window, '_selected_folder_cards', None)
+                if selected_folders:
+                    selected_folder_paths = [fc.folder_path for fc in selected_folders]
 
         # Start drag
         drag = QDrag(self)
         mime_data = QMimeData()
         data = '|'.join(selected_paths).encode('utf-8')
         mime_data.setData(PDFCARD_MIME_TYPE, data)
-        urls = [QUrl.fromLocalFile(p) for p in selected_paths if os.path.exists(p)]
+        if selected_folder_paths:
+            from src.views.folder_card import FOLDERCARD_MIME_TYPE
+            mime_data.setData(FOLDERCARD_MIME_TYPE, '|'.join(selected_folder_paths).encode('utf-8'))
+        urls = [QUrl.fromLocalFile(p) for p in selected_paths + selected_folder_paths if os.path.exists(p)]
         if urls:
             mime_data.setUrls(urls)
         drag.setMimeData(mime_data)

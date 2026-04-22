@@ -21,7 +21,7 @@ class FolderCard(QFrame):
 
     clicked = pyqtSignal(object)
     double_clicked = pyqtSignal(object, bool)  # self, alt_pressed
-    dropped_on = pyqtSignal(object, str, object)  # self, mime_type, payload_bytes
+    dropped_on = pyqtSignal(object, object)  # self, payloads dict {mime_type: payload_str}
     context_menu_requested = pyqtSignal(object, object)
 
     CARD_WIDTH = 150
@@ -74,7 +74,7 @@ class FolderCard(QFrame):
         self._icon_label = QLabel(self._thumbnail_container)
         self._icon_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._icon_label.setStyleSheet("background-color: #fff8dc; border: 1px solid #d4a017;")
+        self._icon_label.setStyleSheet("background-color: transparent; border: none;")
         self._icon_label.move(0, 0)
         self._render_folder_icon()
 
@@ -127,10 +127,9 @@ class FolderCard(QFrame):
         self._name_label.setText(os.path.basename(self._folder_path) or self._folder_path)
 
     def _update_style(self) -> None:
-        if self._is_selected:
-            self.setStyleSheet("FolderCard { background-color: #cce5ff; border: 2px solid #007bff; }")
-        else:
-            self.setStyleSheet("FolderCard { background-color: white; border: 1px solid #ccc; }")
+        self.setProperty("state", "selected" if self._is_selected else "normal")
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     @property
     def folder_path(self) -> str:
@@ -186,11 +185,25 @@ class FolderCard(QFrame):
         if (event.pos() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
             return
 
+        parent_window = self.window()
+        folder_paths = [self._folder_path]
+        pdf_paths: list[str] = []
+        selected_folders = getattr(parent_window, "_selected_folder_cards", None)
+        if selected_folders and self in selected_folders and len(selected_folders) > 1:
+            folder_paths = [fc.folder_path for fc in selected_folders]
+        if selected_folders and self in selected_folders:
+            selected_cards = getattr(parent_window, "_selected_cards", None)
+            if selected_cards:
+                pdf_paths = [c.pdf_path for c in selected_cards if not c.is_locked]
+
         drag = QDrag(self)
         mime_data = QMimeData()
-        mime_data.setData(FOLDERCARD_MIME_TYPE, self._folder_path.encode("utf-8"))
-        if os.path.isdir(self._folder_path):
-            mime_data.setUrls([QUrl.fromLocalFile(self._folder_path)])
+        mime_data.setData(FOLDERCARD_MIME_TYPE, "|".join(folder_paths).encode("utf-8"))
+        if pdf_paths:
+            mime_data.setData(PDFCARD_MIME_TYPE, "|".join(pdf_paths).encode("utf-8"))
+        urls = [QUrl.fromLocalFile(p) for p in folder_paths + pdf_paths if os.path.exists(p)]
+        if urls:
+            mime_data.setUrls(urls)
         drag.setMimeData(mime_data)
 
         pixmap = self.grab()
@@ -220,7 +233,9 @@ class FolderCard(QFrame):
             return
         if md.hasFormat(FOLDERCARD_MIME_TYPE):
             src = bytes(md.data(FOLDERCARD_MIME_TYPE)).decode("utf-8", errors="replace")
-            if src and os.path.normpath(src) != os.path.normpath(self._folder_path):
+            target_norm = os.path.normpath(self._folder_path)
+            sources = [p for p in src.split("|") if p]
+            if any(os.path.normpath(s) != target_norm for s in sources):
                 event.acceptProposedAction()
                 return
         if md.hasUrls():
@@ -231,9 +246,9 @@ class FolderCard(QFrame):
         event.ignore()
 
     def dragMoveEvent(self, event) -> None:
-        self.setStyleSheet(
-            "FolderCard { background-color: #d4f8d4; border: 2px solid #228B22; }"
-        )
+        self.setProperty("state", "droptarget")
+        self.style().unpolish(self)
+        self.style().polish(self)
         event.acceptProposedAction()
 
     def dragLeaveEvent(self, event) -> None:
@@ -243,16 +258,16 @@ class FolderCard(QFrame):
     def dropEvent(self, event) -> None:
         md = event.mimeData()
         self._update_style()
+        payloads: dict[str, str] = {}
         for mime in (PDFCARD_MIME_TYPE, PAGETHUMBNAIL_MIME_TYPE, FOLDERCARD_MIME_TYPE):
             if md.hasFormat(mime):
-                payload = bytes(md.data(mime)).decode("utf-8", errors="replace")
-                self.dropped_on.emit(self, mime, payload)
-                event.acceptProposedAction()
-                return
-        if md.hasUrls():
+                payloads[mime] = bytes(md.data(mime)).decode("utf-8", errors="replace")
+        if not payloads and md.hasUrls():
             urls = [u.toLocalFile() for u in md.urls() if u.toLocalFile()]
             if urls:
-                self.dropped_on.emit(self, "text/uri-list", "|".join(urls))
-                event.acceptProposedAction()
-                return
+                payloads["text/uri-list"] = "|".join(urls)
+        if payloads:
+            self.dropped_on.emit(self, payloads)
+            event.acceptProposedAction()
+            return
         event.ignore()

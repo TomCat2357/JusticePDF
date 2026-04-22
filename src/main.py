@@ -2,6 +2,7 @@
 import sys
 import argparse
 import logging
+from pathlib import Path
 from PyQt6.QtWidgets import QApplication
 from src.views.main_window import MainWindow
 
@@ -29,6 +30,10 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("JusticePDF")
     app.setApplicationDisplayName("JusticePDF")
+
+    qss_path = Path(__file__).parent / "views" / "style.qss"
+    if qss_path.exists():
+        app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
 
     window = MainWindow()
     window.show()

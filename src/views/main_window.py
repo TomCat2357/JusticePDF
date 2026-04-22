@@ -186,7 +186,7 @@ class MainWindow(QMainWindow):
         # Drop indicator line
         self._drop_indicator = QFrame(self._container)
         self._drop_indicator.setFrameShape(QFrame.Shape.VLine)
-        self._drop_indicator.setStyleSheet("background-color: #007bff;")
+        self._drop_indicator.setStyleSheet("background-color: #4f46e5;")
         self._drop_indicator.setFixedWidth(3)
         self._drop_indicator.hide()
 
@@ -211,6 +211,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setObjectName("danger")
         self._delete_btn.clicked.connect(self._on_delete)
         toolbar.addWidget(self._delete_btn)
 
@@ -237,6 +238,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._new_folder_btn)
 
         self._export_btn = QPushButton("Export")
+        self._export_btn.setObjectName("primary")
         self._export_btn.clicked.connect(self._on_export)
         toolbar.addWidget(self._export_btn)
 
@@ -288,8 +290,9 @@ class MainWindow(QMainWindow):
         """Update toolbar button enabled states."""
         busy = self._operation_in_progress
         has_selection = len(self._selected_cards) > 0
+        has_deletable = has_selection or len(self._selected_folder_cards) > 0
         has_any = len(self._cards) > 0
-        self._delete_btn.setEnabled(has_selection and not busy)
+        self._delete_btn.setEnabled(has_deletable and not busy)
         self._rename_btn.setEnabled(len(self._selected_cards) == 1 and not busy)
         self._title_btn.setEnabled(len(self._selected_cards) == 1 and not busy)
         self._rotate_btn.setEnabled(has_selection and not busy)
@@ -629,13 +632,18 @@ class MainWindow(QMainWindow):
             card.render_high_quality()
 
     def _clear_selection(self) -> None:
-        """Clear all selections."""
+        """Clear all selections (PDF cards and folder cards)."""
         clear_selection(self._selected_cards)
+        clear_selection(self._selected_folder_cards)
         self._update_button_states()
 
     def _selected_card_paths_in_grid_order(self) -> list[str]:
         """Return selected card paths ordered by the visible card grid."""
         return [card.pdf_path for card in self._cards if card in self._selected_cards]
+
+    def _selected_folder_paths_in_grid_order(self) -> list[str]:
+        """Return selected folder paths ordered by the visible folder grid."""
+        return [fc.folder_path for fc in self._folder_cards if fc in self._selected_folder_cards]
 
     def _set_preview_thumb_size(self, size: int) -> None:
         size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
@@ -665,7 +673,7 @@ class MainWindow(QMainWindow):
         if event.button() == Qt.MouseButton.LeftButton:
             child = self.childAt(event.pos())
             while child is not None:
-                if isinstance(child, PDFCard):
+                if isinstance(child, (PDFCard, FolderCard)):
                     super().mousePressEvent(event)
                     return
                 child = child.parent()
@@ -984,12 +992,21 @@ class MainWindow(QMainWindow):
             if self._normalize_path(fc.folder_path) == normalized:
                 fc.refresh()
                 self._grid_refresh_timer.start()
+                self._internal_adds.discard(normalized)
                 return
+        if normalized in self._internal_adds:
+            self._internal_adds.discard(normalized)
+            return
         self._add_folder_card(path)
         self._grid_refresh_timer.start()
 
     def _on_folder_removed(self, path: str) -> None:
         """Handle subfolder removed from disk."""
+        normalized = self._normalize_path(path)
+        if normalized in self._internal_removes:
+            self._internal_removes.discard(normalized)
+            if self._get_folder_card_by_path(path) is None:
+                return
         self._remove_folder_card(path)
         self._grid_refresh_timer.start()
 
@@ -1055,45 +1072,73 @@ class MainWindow(QMainWindow):
     def _on_folder_card_dropped_on(
         self,
         fc: FolderCard,
-        mime_type: str,
-        payload: str,
+        payloads: dict,
     ) -> None:
-        """Handle drops onto a folder card (move/copy into that folder)."""
+        """Handle drops onto a folder card (move/copy into that folder).
+
+        Processes folder and PDF payloads together so a multi-selection
+        (folders + PDFs) is moved/copied in one gesture.
+        """
         dest_dir = Path(fc.folder_path)
         if not dest_dir.exists():
             return
         modifiers = QApplication.keyboardModifiers()
         is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        dest_norm = self._normalize_path(str(dest_dir))
 
-        if mime_type == PDFCARD_MIME_TYPE:
-            paths = [p for p in payload.split('|') if p]
+        folder_payload = payloads.get(FOLDERCARD_MIME_TYPE)
+        pdf_payload = payloads.get(PDFCARD_MIME_TYPE)
+        page_payload = payloads.get("application/x-pdfas-page")
+        url_payload = payloads.get("text/uri-list")
+
+        handled = False
+
+        if folder_payload:
+            src_folders = [
+                p for p in folder_payload.split('|')
+                if p and os.path.isdir(p) and self._normalize_path(p) != dest_norm
+            ]
+            for src in src_folders:
+                self._move_or_copy_folder_into_dir(src, dest_dir, is_copy=is_copy)
+            if src_folders:
+                handled = True
+
+        if pdf_payload:
+            paths = [p for p in pdf_payload.split('|') if p]
             if paths:
                 self._move_or_copy_files_into_dir(paths, dest_dir, is_copy=is_copy)
-                fc.refresh()
-            return
-        if mime_type == FOLDERCARD_MIME_TYPE:
-            src = payload.strip()
-            if src and os.path.isdir(src):
-                if self._normalize_path(src) == self._normalize_path(str(dest_dir)):
-                    return
-                self._move_or_copy_folder_into_dir(src, dest_dir, is_copy=is_copy)
-                fc.refresh()
-            return
-        if mime_type == "application/x-pdfas-page":
-            self._handle_page_extraction(payload, drop_pos=None, dest_dir=dest_dir)
-            fc.refresh()
-            return
-        if mime_type == "text/uri-list":
-            urls = [p for p in payload.split('|') if p]
+                handled = True
+
+        if page_payload:
+            self._handle_page_extraction(page_payload, drop_pos=None, dest_dir=dest_dir)
+            handled = True
+
+        if not handled and url_payload:
+            urls = [p for p in url_payload.split('|') if p]
             if urls:
                 self._import_paths(urls, dest_root=dest_dir)
-                fc.refresh()
+                handled = True
+
+        if handled:
+            fc.refresh()
 
     def _on_folder_card_context_menu_requested(
         self,
         fc: FolderCard,
         global_pos: QPoint,
     ) -> None:
+        """Handle Explorer-style right-click selection and menu opening."""
+        if fc not in self._selected_folder_cards:
+            self._clear_selection()
+            fc.set_selected(True)
+            self._selected_folder_cards.append(fc)
+            self._update_button_states()
+
+        paths = self._selected_folder_paths_in_grid_order()
+        if show_native_file_context_menu(int(self.winId()), paths, global_pos):
+            return
+
+        # Fallback for non-Windows or when the native menu cannot be shown.
         from PyQt6.QtWidgets import QMenu
         menu = QMenu(self)
         rename_action = menu.addAction("Rename")
@@ -1138,23 +1183,146 @@ class MainWindow(QMainWindow):
         ))
 
     def _delete_folder(self, fc: FolderCard) -> None:
-        path = fc.folder_path
-        name = os.path.basename(path)
-        result = QMessageBox.question(
-            self,
-            "Delete Folder",
-            f"フォルダ '{name}' をゴミ箱に移動します。よろしいですか?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if result != QMessageBox.StandardButton.Yes:
+        """Delete a single folder using the same pipeline as the toolbar action."""
+        if fc not in self._selected_folder_cards:
+            self._clear_selection()
+            fc.set_selected(True)
+            self._selected_folder_cards.append(fc)
+            self._update_button_states()
+        self._delete_selected_folders()
+
+    def _delete_selected_folders(self, *, also_pdfs: bool = False) -> None:
+        """Delete selected folders (and optionally selected PDFs) to trash.
+
+        Backups are taken in a temp directory so the operation can be undone.
+        """
+        if self._operation_in_progress:
             return
-        try:
-            send2trash(path)
-        except Exception as e:
-            QMessageBox.warning(self, "Delete Folder", f"削除に失敗しました: {e}")
+
+        folder_paths = [fc.folder_path for fc in self._selected_folder_cards]
+        pdf_cards = list(self._selected_cards) if also_pdfs else []
+        pdf_paths = [c.pdf_path for c in pdf_cards]
+        if not folder_paths and not pdf_paths:
             return
-        self._clear_undo_history()
+
+        all_paths = folder_paths + pdf_paths
+        title = "Delete Folder" if folder_paths else "Delete"
+
+        # Phase A: immediate UI update
+        self._register_internal_remove(all_paths)
+        for path in folder_paths:
+            self._remove_folder_card(path)
+        for card in pdf_cards:
+            if card in self._cards:
+                self._cards.remove(card)
+            card.deleteLater()
+        self._selected_folder_cards.clear()
+        self._selected_cards.clear()
+        self._refresh_grid()
+        self._begin_async_operation()
+
+        # Phase B: heavy I/O in background — backup, then send2trash
+        def _do_io() -> dict[str, dict[str, str]]:
+            backup_dir = tempfile.mkdtemp(prefix="pdfas_backup_")
+            folder_backups: dict[str, str] = {}
+            pdf_backups: dict[str, str] = {}
+            for path in folder_paths:
+                backup_path = Path(backup_dir) / Path(path).name
+                shutil.copytree(path, backup_path)
+                folder_backups[path] = str(backup_path)
+            for path in pdf_paths:
+                backup_path = Path(backup_dir) / Path(path).name
+                shutil.copy2(path, backup_path)
+                pdf_backups[path] = str(backup_path)
+
+            deleted: list[str] = []
+            try:
+                for path in all_paths:
+                    send2trash(path)
+                    deleted.append(path)
+            except OSError:
+                # Restore anything we already trashed before the failure.
+                for restored in deleted:
+                    bp = folder_backups.get(restored) or pdf_backups.get(restored)
+                    if not bp or not os.path.exists(bp):
+                        continue
+                    if restored in folder_backups:
+                        shutil.copytree(bp, restored)
+                    else:
+                        shutil.copy2(bp, restored)
+                raise
+            return {"folders": folder_backups, "pdfs": pdf_backups}
+
+        def _on_success(result: object) -> None:
+            backups: dict[str, dict[str, str]] = result  # type: ignore[assignment]
+            folder_backups = backups["folders"]
+            pdf_backups = backups["pdfs"]
+            backup_paths = list(folder_backups.keys()) + list(pdf_backups.keys())
+
+            def undo_delete() -> None:
+                self._register_internal_add(backup_paths)
+                for original, backup in folder_backups.items():
+                    if not os.path.exists(original):
+                        shutil.copytree(backup, original)
+                    # The folder watcher does not auto-create cards when
+                    # _internal_adds is set, so add the card explicitly.
+                    if self._get_folder_card_by_path(original) is None:
+                        self._add_folder_card(original)
+                for original, backup in pdf_backups.items():
+                    if not os.path.exists(original):
+                        shutil.copy2(backup, original)
+                self._refresh_grid()
+
+            def redo_delete() -> None:
+                self._register_internal_remove(backup_paths)
+                for path in backup_paths:
+                    if os.path.exists(path):
+                        send2trash(path)
+
+            n_folders = len(folder_backups)
+            n_pdfs = len(pdf_backups)
+            if n_folders and n_pdfs:
+                desc = f"Delete {n_folders} folder(s) and {n_pdfs} PDF(s)"
+            elif n_folders:
+                desc = f"Delete {n_folders} folder(s)"
+            else:
+                desc = f"Delete {n_pdfs} PDF(s)"
+            self._undo_manager.add_action(UndoAction(
+                description=desc,
+                undo_func=undo_delete,
+                redo_func=redo_delete,
+            ))
+            self._end_async_operation()
+
+        def _on_error(exc: Exception) -> None:
+            for path in folder_paths:
+                if os.path.exists(path):
+                    self._internal_removes.discard(self._normalize_path(path))
+                    self._add_folder_card(path)
+            existing = {c.pdf_path for c in self._cards}
+            for path in pdf_paths:
+                if os.path.exists(path) and path not in existing:
+                    self._internal_removes.discard(self._normalize_path(path))
+                    self._add_card(path)
+            self._refresh_grid()
+            self._end_async_operation()
+            first = all_paths[0] if all_paths else ""
+            if isinstance(exc, OSError) and first:
+                QMessageBox.warning(
+                    self,
+                    "削除できません",
+                    build_trash_failure_message(first, exc),
+                )
+            else:
+                QMessageBox.warning(self, title, f"削除に失敗しました: {exc}")
+
+        worker = FileOperationWorker(_do_io, parent=self)
+        worker.finished.connect(_on_success)
+        worker.error.connect(_on_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        self._active_worker = worker
+        worker.start()
 
     def _on_new_folder(self) -> None:
         name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
@@ -1273,26 +1441,52 @@ class MainWindow(QMainWindow):
         dest_dir: Path,
         *,
         is_copy: bool,
-    ) -> None:
+    ) -> str | None:
         if not os.path.isdir(source):
-            return
+            return None
         src_norm = self._normalize_path(source)
         dest_norm = self._normalize_path(str(dest_dir))
         # Refuse if moving folder into itself or its own descendant.
         if dest_norm == src_norm or dest_norm.startswith(src_norm + os.sep):
             QMessageBox.warning(self, "Move Folder", "フォルダを自身の中に移動できません。")
-            return
+            return None
         base_name = os.path.basename(source.rstrip(os.sep)) or "folder"
         target = dest_dir / base_name
         if target.exists():
             target = Path(str(ensure_unique_path(dest_dir, base_name, pattern="{stem}({i}){ext}")))
+
+        source_parent = os.path.dirname(source.rstrip(os.sep))
+        source_parent_win = self._find_window_by_workdir(source_parent) if source_parent else None
+        dest_parent_win = self._find_window_by_workdir(str(dest_dir))
+
+        if not is_copy and source_parent_win is not None:
+            source_parent_win._register_internal_remove([source])
+        if dest_parent_win is not None:
+            dest_parent_win._register_internal_add([str(target)])
+
         try:
             if is_copy:
                 shutil.copytree(source, target)
             else:
                 shutil.move(source, target)
         except Exception as e:
+            if not is_copy and source_parent_win is not None:
+                source_parent_win._internal_removes.discard(src_norm)
+            if dest_parent_win is not None:
+                dest_parent_win._internal_adds.discard(self._normalize_path(str(target)))
             QMessageBox.warning(self, "Move Folder", f"フォルダの移動に失敗しました: {e}")
+            return None
+
+        if not is_copy and source_parent_win is not None:
+            source_parent_win._remove_folder_card(source)
+            source_parent_win._grid_refresh_timer.start()
+
+        if dest_parent_win is not None:
+            if dest_parent_win._get_folder_card_by_path(str(target)) is None:
+                dest_parent_win._add_folder_card(str(target))
+            dest_parent_win._grid_refresh_timer.start()
+
+        return str(target)
 
     def _find_window_by_path(self, path: str) -> "MainWindow | None":
         """Find the MainWindow whose work directory contains the given file path."""
@@ -1495,7 +1689,15 @@ class MainWindow(QMainWindow):
 
     def _on_delete(self) -> None:
         """Handle delete action (async — UI updates instantly)."""
-        if not self._selected_cards or self._operation_in_progress:
+        if self._operation_in_progress:
+            return
+        has_pdfs = bool(self._selected_cards)
+        has_folders = bool(self._selected_folder_cards)
+        if not has_pdfs and not has_folders:
+            return
+        if has_folders:
+            # Folders involved → no undo (backup is impractical for large trees)
+            self._delete_selected_folders(also_pdfs=has_pdfs)
             return
 
         import tempfile
@@ -2112,8 +2314,11 @@ class MainWindow(QMainWindow):
         ))
 
     def _on_select_all(self) -> None:
-        """Handle select all action."""
+        """Handle select all action (includes folder cards)."""
         self._clear_selection()
+        for fc in self._folder_cards:
+            fc.set_selected(True)
+            self._selected_folder_cards.append(fc)
         for card in self._cards:
             card.set_selected(True)
             self._selected_cards.append(card)
@@ -2363,6 +2568,15 @@ class MainWindow(QMainWindow):
                     self._handle_card_copy(source_path, drop_pos)
                 else:
                     self._handle_card_drop(source_path, drop_pos)
+
+            # Also move/copy any sibling folders from the same multi-selection drag.
+            if event.mimeData().hasFormat(FOLDERCARD_MIME_TYPE):
+                raw = bytes(event.mimeData().data(FOLDERCARD_MIME_TYPE)).decode("utf-8", errors="replace")
+                dest_dir = Path(self._work_dir)
+                dest_norm = self._normalize_path(str(dest_dir))
+                for src in (p for p in raw.split('|') if p):
+                    if os.path.isdir(src) and self._normalize_path(src) != dest_norm:
+                        self._move_or_copy_folder_into_dir(src, dest_dir, is_copy=is_copy)
             event.acceptProposedAction()
         elif event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
             data = event.mimeData().data(PAGETHUMBNAIL_MIME_TYPE).data().decode('utf-8')
@@ -2371,11 +2585,14 @@ class MainWindow(QMainWindow):
             self._handle_page_extraction(data, drop_pos)
             event.acceptProposedAction()
         elif event.mimeData().hasFormat(FOLDERCARD_MIME_TYPE):
-            src = bytes(event.mimeData().data(FOLDERCARD_MIME_TYPE)).decode("utf-8", errors="replace")
+            raw = bytes(event.mimeData().data(FOLDERCARD_MIME_TYPE)).decode("utf-8", errors="replace")
             modifiers = QApplication.keyboardModifiers()
             is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
-            if src and os.path.isdir(src):
-                self._move_or_copy_folder_into_dir(src, Path(self._work_dir), is_copy=is_copy)
+            dest_dir = Path(self._work_dir)
+            dest_norm = self._normalize_path(str(dest_dir))
+            for src in (p for p in raw.split('|') if p):
+                if os.path.isdir(src) and self._normalize_path(src) != dest_norm:
+                    self._move_or_copy_folder_into_dir(src, dest_dir, is_copy=is_copy)
             event.acceptProposedAction()
         elif event.mimeData().hasUrls():
             logger.debug(f"URL drop: {event.mimeData().urls()}")
