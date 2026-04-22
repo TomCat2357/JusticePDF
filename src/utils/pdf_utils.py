@@ -1070,6 +1070,82 @@ def create_bracket_pair(
         doc.close()
 
 
+def _get_page_annot_xref_order(doc: fitz.Document, page_num: int) -> list[int]:
+    page = doc[page_num]
+    kind, value = doc.xref_get_key(page.xref, "Annots")
+    if kind != "array" or not value:
+        return []
+    return [int(m.group(1)) for m in re.finditer(r"(\d+)\s+\d+\s+R", value)]
+
+
+def _set_page_annot_xref_order(doc: fitz.Document, page_num: int, order: list[int]) -> None:
+    page = doc[page_num]
+    new_array = "[" + " ".join(f"{x} 0 R" for x in order) + "]"
+    doc.xref_set_key(page.xref, "Annots", new_array)
+
+
+def get_annot_xref_order(pdf_path: str, page_num: int) -> list[int]:
+    try:
+        with fitz.open(pdf_path) as doc:
+            if page_num < 0 or page_num >= len(doc):
+                return []
+            return _get_page_annot_xref_order(doc, page_num)
+    except Exception:
+        logger.debug("get_annot_xref_order failed: %s", pdf_path, exc_info=True)
+        return []
+
+
+def set_annot_xref_order(pdf_path: str, page_num: int, order: list[int]) -> bool:
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            return False
+        current = _get_page_annot_xref_order(doc, page_num)
+        if sorted(current) != sorted(order):
+            return False
+        if current == order:
+            return True
+        _set_page_annot_xref_order(doc, page_num, order)
+        _save_document_in_place(doc, pdf_path)
+        return True
+    finally:
+        doc.close()
+
+
+def reorder_annot_on_page(pdf_path: str, page_num: int, xref: int, mode: str) -> bool:
+    if mode not in ("front", "back", "forward", "backward"):
+        return False
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            return False
+        order = _get_page_annot_xref_order(doc, page_num)
+        if xref not in order:
+            return False
+        idx = order.index(xref)
+        if mode == "front":
+            if idx == len(order) - 1:
+                return False
+            order.append(order.pop(idx))
+        elif mode == "back":
+            if idx == 0:
+                return False
+            order.insert(0, order.pop(idx))
+        elif mode == "forward":
+            if idx >= len(order) - 1:
+                return False
+            order[idx], order[idx + 1] = order[idx + 1], order[idx]
+        else:
+            if idx <= 0:
+                return False
+            order[idx], order[idx - 1] = order[idx - 1], order[idx]
+        _set_page_annot_xref_order(doc, page_num, order)
+        _save_document_in_place(doc, pdf_path)
+        return True
+    finally:
+        doc.close()
+
+
 def _get_file_cache_token(pdf_path: str) -> tuple[int, int, int]:
     """Return a filesystem-based token that changes when the file instance changes."""
     try:
