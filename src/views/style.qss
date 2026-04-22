@@ -79,6 +79,24 @@ QToolBar QPushButton#danger           { color: #b91c1c; }
 QToolBar QPushButton#danger:hover     { background-color: #fdecec; }
 QToolBar QPushButton#danger:disabled  { color: #d9b3b3; }
 
+/* Side-panel toggle buttons (e.g. 図形 shape selector) */
+QToolButton {
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 4px 8px;
+    min-height: 18px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #18181b;
+}
+QToolButton:hover            { background-color: #f1f1ee; }
+QToolButton:pressed          { background-color: #d9d9d4; }
+QToolButton:checked          { background-color: #d9d9d4; border: 1px solid #b8b8b0; }
+QToolButton:checked:hover    { background-color: #cfcfc9; }
+QToolButton:disabled         { color: #9ca3af; }
+QToolButton:focus            { outline: none; }
+
 /* ---------- Scroll area (PDF card grid) --------------------------------- */
 
 QScrollArea {
@@ -217,6 +235,39 @@ QDoubleSpinBox {
 QComboBox:focus,
 QSpinBox:focus,
 QDoubleSpinBox:focus { border: 1px solid #4f46e5; }
+
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 18px;
+    border: none;
+    background: transparent;
+}
+QSpinBox::up-button,   QDoubleSpinBox::up-button   { subcontrol-position: top right; }
+QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-position: bottom right; }
+QSpinBox::up-button:hover,   QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover   { background: #f1f1ee; }
+QSpinBox::up-button:pressed,   QDoubleSpinBox::up-button:pressed,
+QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed { background: #e6e6e2; }
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: none;
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid #6b7280;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: none;
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #6b7280;
+}
+QSpinBox::up-arrow:disabled,   QDoubleSpinBox::up-arrow:disabled,
+QSpinBox::up-arrow:off,        QDoubleSpinBox::up-arrow:off        { border-bottom-color: #d9d9d4; }
+QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled,
+QSpinBox::down-arrow:off,      QDoubleSpinBox::down-arrow:off      { border-top-color: #d9d9d4; }
 
 QComboBox::drop-down {
     border: none;

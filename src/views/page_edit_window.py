@@ -1,4 +1,5 @@
 """Page edit window for editing PDF pages."""
+import math
 import os
 import shutil
 import logging
@@ -16,7 +17,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices, QPixmap,
-    QBrush, QCursor, QPolygonF
+    QBrush, QCursor, QPolygonF, QGuiApplication
 )
 
 from src.utils.pdf_utils import (
@@ -31,6 +32,39 @@ from src.utils.pdf_utils import (
     list_shape_annots, create_shape_annot, replace_shape_annot,
     delete_shape_annot, create_bracket_pair,
 )
+def _pixel_size_to_pointf(pixel_size: int) -> float:
+    # Convert pixel size to a point size so QFont.pointSize() stays positive.
+    # setPixelSize() invalidates pointSize (-1), which triggers a Qt warning
+    # if anything downstream re-applies setPointSize on the font.
+    dpi = 96.0
+    screen = QGuiApplication.primaryScreen()
+    if screen is not None:
+        dpi = screen.logicalDotsPerInch() or 96.0
+    return max(1.0, pixel_size * 72.0 / dpi)
+
+
+def _line_endpoints_from_shape(
+    shape: "ShapeAnnotData",
+    rect_override: tuple[float, float, float, float] | None = None,
+    vertices_override: tuple[tuple[float, float], ...] | None = None,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    # LINE 注釈の rect (bbox) と正規化頂点から、ページ座標の (start, end) を再構築する。
+    rect = rect_override if rect_override is not None else shape.rect
+    width = rect[2] - rect[0]
+    height = rect[3] - rect[1]
+    verts = vertices_override if vertices_override is not None else shape.vertices
+    if verts and len(verts) >= 2:
+        rx1, ry1 = verts[0]
+        rx2, ry2 = verts[1]
+    else:
+        rx1, ry1 = (0.0, 0.5)
+        rx2, ry2 = (1.0, 0.5)
+    return (
+        (rect[0] + rx1 * width, rect[1] + ry1 * height),
+        (rect[0] + rx2 * width, rect[1] + ry2 * height),
+    )
+
+
 from src.models.undo_manager import UndoManager, UndoAction
 from src.views.view_helpers import (
     clear_selection,
@@ -264,6 +298,8 @@ class ZoomPageWidget(QWidget):
     link_clicked = pyqtSignal(dict)
     annotation_selected = pyqtSignal(object)
     annotation_geometry_changed = pyqtSignal(object, object, str)
+    # LINE 端点ドラッグ専用：(annotation, new_rect_tuple, new_vertices, mode)
+    shape_geometry_changed_with_vertices = pyqtSignal(object, object, object, str)
     annotation_create_requested = pyqtSignal(object)
     shape_create_requested = pyqtSignal(object, object, object)  # (ShapeType, start_pt_tuple, end_pt_tuple)
     annotation_edit_requested = pyqtSignal(object)
@@ -275,7 +311,13 @@ class ZoomPageWidget(QWidget):
     annotation_paste_placement_requested = pyqtSignal(object)
 
     HANDLE_SIZE = 10
-    MIN_ANNOT_SIZE = 24.0
+
+    @staticmethod
+    def _min_dims_for_annotation(annot) -> tuple[float, float, float]:
+        # (min_w, min_h, min_span). min_span enforces max(w, h) for lines.
+        if isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
+            return (0.0, 0.0, 1.0)
+        return (1.0, 1.0, 0.0)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -304,6 +346,8 @@ class ZoomPageWidget(QWidget):
         self._drag_origin_page: QPointF | None = None
         self._drag_base_rect: QRectF | None = None
         self._pending_annotation_rect: QRectF | None = None
+        self._drag_base_vertices: tuple[tuple[float, float], ...] | None = None
+        self._pending_line_vertices: tuple[tuple[float, float], ...] | None = None
         self._drag_moved = False
         self._inline_editor: AnnotationTextEdit | None = None
         self._editing_annotation_xref: int | None = None
@@ -378,7 +422,8 @@ class ZoomPageWidget(QWidget):
         editor.commit_requested.connect(lambda text, annot=annotation: self._commit_inline_editor(annot, text))
         editor.cancel_requested.connect(self.cancel_annotation_text_edit)
         editor.delete_requested.connect(self.annotation_delete_requested)
-        editor.setStyleSheet(self._inline_editor_stylesheet(annotation))
+        pixel_size = max(10, round(annotation.fontsize * self._zoom_factor))
+        editor.setStyleSheet(self._inline_editor_stylesheet(annotation, pixel_size))
         editor.setFrameStyle(QFrame.Shape.NoFrame)
         editor.setContentsMargins(0, 0, 0, 0)
         effective_border_width = annotation.border_width if annotation.border_color is not None else 0.0
@@ -386,7 +431,7 @@ class ZoomPageWidget(QWidget):
         editor.setViewportMargins(text_inset_px, text_inset_px, text_inset_px, 0)
         editor.document().setDocumentMargin(0)
         font = editor.font()
-        font.setPixelSize(max(10, round(annotation.fontsize * self._zoom_factor)))
+        font.setPointSizeF(_pixel_size_to_pointf(pixel_size))
         editor.setFont(font)
         self._inline_editor = editor
         self._editing_annotation_xref = annotation.xref
@@ -430,7 +475,7 @@ class ZoomPageWidget(QWidget):
         else:
             self.annotation_text_edit_cancelled.emit()
 
-    def _inline_editor_stylesheet(self, annotation: FreeTextAnnotData) -> str:
+    def _inline_editor_stylesheet(self, annotation: FreeTextAnnotData, pixel_size: int) -> str:
         opacity = max(0.0, min(1.0, annotation.opacity))
         if annotation.fill_color is None:
             fill_css = "transparent"
@@ -451,6 +496,7 @@ class ZoomPageWidget(QWidget):
             "QPlainTextEdit {"
             f"background-color: {fill_css};"
             f"color: {text_css};"
+            f"font-size: {max(1, int(pixel_size))}px;"
             "border: 0px solid transparent;"
             "padding: 0px;"
             "margin: 0px;"
@@ -507,6 +553,8 @@ class ZoomPageWidget(QWidget):
         self._drag_origin_page = None
         self._drag_base_rect = None
         self._pending_annotation_rect = None
+        self._drag_base_vertices = None
+        self._pending_line_vertices = None
         self._drag_moved = False
         self._clear_annotation_create_drag()
         self._paste_preview_rect = None
@@ -576,6 +624,35 @@ class ZoomPageWidget(QWidget):
 
     def page_point_from_global_pos(self, global_pos: QPoint) -> QPointF | None:
         return self._page_point_from_widget_pos(self.mapFromGlobal(global_pos))
+
+    def _apply_shape_shift_constraint(
+        self,
+        shape_type: "ShapeType | None",
+        origin: QPointF | None,
+        end: QPointF,
+    ) -> QPointF:
+        # Word-style: Shift 押下中は線を 0/45/90/135° にスナップ、他図形は bbox を正方形化。
+        if origin is None or shape_type is None:
+            return end
+        dx = end.x() - origin.x()
+        dy = end.y() - origin.y()
+        if shape_type == ShapeType.LINE:
+            length = math.hypot(dx, dy)
+            if length <= 0.0:
+                return end
+            angle = math.atan2(dy, dx)
+            step = math.pi / 4.0
+            snapped = round(angle / step) * step
+            return QPointF(
+                origin.x() + math.cos(snapped) * length,
+                origin.y() + math.sin(snapped) * length,
+            )
+        if shape_type in (ShapeType.RECTANGLE, ShapeType.ELLIPSE, ShapeType.TRIANGLE):
+            side = min(abs(dx), abs(dy))
+            sx = 1.0 if dx >= 0 else -1.0
+            sy = 1.0 if dy >= 0 else -1.0
+            return QPointF(origin.x() + sx * side, origin.y() + sy * side)
+        return end
 
     def _link_at(self, pos: QPoint) -> dict | None:
         pix_pos = self._point_in_pixmap(pos)
@@ -659,7 +736,8 @@ class ZoomPageWidget(QWidget):
 
         if annot.content:
             font = painter.font()
-            font.setPixelSize(max(10, round(annot.fontsize * self._zoom_factor)))
+            pixel_size = max(10, round(annot.fontsize * self._zoom_factor))
+            font.setPointSizeF(_pixel_size_to_pointf(pixel_size))
             painter.setFont(font)
             text_color = self._annotation_color(annot.text_color, opacity=annot.opacity)
             if text_color is not None:
@@ -679,7 +757,14 @@ class ZoomPageWidget(QWidget):
 
         painter.restore()
 
-    def _paint_shape_annotation(self, painter: QPainter, shape: ShapeAnnotData, rect: QRectF) -> None:
+    def _paint_shape_annotation(
+        self,
+        painter: QPainter,
+        shape: ShapeAnnotData,
+        rect: QRectF,
+        *,
+        vertices_override: tuple[tuple[float, float], ...] | None = None,
+    ) -> None:
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
@@ -710,9 +795,10 @@ class ZoomPageWidget(QWidget):
             paint_rect = rect
 
         if shape.shape_type == ShapeType.LINE:
-            if shape.vertices and len(shape.vertices) >= 2:
-                rx1, ry1 = shape.vertices[0]
-                rx2, ry2 = shape.vertices[1]
+            verts = vertices_override if vertices_override is not None else shape.vertices
+            if verts and len(verts) >= 2:
+                rx1, ry1 = verts[0]
+                rx2, ry2 = verts[1]
             else:
                 rx1, ry1 = (0.0, 0.5)
                 rx2, ry2 = (1.0, 0.5)
@@ -823,15 +909,95 @@ class ZoomPageWidget(QWidget):
             for name, point in positions.items()
         }
 
+    def _line_endpoints_in_widget(
+        self,
+        shape: ShapeAnnotData,
+        rect_override: QRectF | None = None,
+        vertices_override: tuple[tuple[float, float], ...] | None = None,
+    ) -> tuple[QPointF, QPointF]:
+        widget_rect = self._annotation_widget_rect(shape, rect_override)
+        verts = vertices_override if vertices_override is not None else shape.vertices
+        if verts and len(verts) >= 2:
+            rx1, ry1 = verts[0]
+            rx2, ry2 = verts[1]
+        else:
+            rx1, ry1 = (0.0, 0.5)
+            rx2, ry2 = (1.0, 0.5)
+        p1 = QPointF(
+            widget_rect.left() + rx1 * widget_rect.width(),
+            widget_rect.top() + ry1 * widget_rect.height(),
+        )
+        p2 = QPointF(
+            widget_rect.left() + rx2 * widget_rect.width(),
+            widget_rect.top() + ry2 * widget_rect.height(),
+        )
+        rotation = float(shape.rotation or 0.0)
+        if rotation:
+            cx = widget_rect.center().x()
+            cy = widget_rect.center().y()
+            rad = math.radians(rotation)
+            cos_r = math.cos(rad)
+            sin_r = math.sin(rad)
+
+            def rot(p: QPointF) -> QPointF:
+                dx = p.x() - cx
+                dy = p.y() - cy
+                return QPointF(cx + dx * cos_r - dy * sin_r, cy + dx * sin_r + dy * cos_r)
+
+            p1 = rot(p1)
+            p2 = rot(p2)
+        return p1, p2
+
+    def _line_handle_rects(
+        self,
+        shape: ShapeAnnotData,
+        rect_override: QRectF | None = None,
+        vertices_override: tuple[tuple[float, float], ...] | None = None,
+    ) -> dict[str, QRectF]:
+        p1, p2 = self._line_endpoints_in_widget(shape, rect_override, vertices_override)
+        size = float(self.HANDLE_SIZE)
+        half = size / 2.0
+        return {
+            "ep_start": QRectF(p1.x() - half, p1.y() - half, size, size),
+            "ep_end": QRectF(p2.x() - half, p2.y() - half, size, size),
+        }
+
+    @staticmethod
+    def _point_to_segment_distance(p: QPointF, a: QPointF, b: QPointF) -> float:
+        dx = b.x() - a.x()
+        dy = b.y() - a.y()
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-9:
+            return math.hypot(p.x() - a.x(), p.y() - a.y())
+        t = ((p.x() - a.x()) * dx + (p.y() - a.y()) * dy) / seg_len_sq
+        t = max(0.0, min(1.0, t))
+        cx = a.x() + t * dx
+        cy = a.y() + t * dy
+        return math.hypot(p.x() - cx, p.y() - cy)
+
+    def _line_hit_test(self, shape: ShapeAnnotData, pos: QPoint) -> bool:
+        p1, p2 = self._line_endpoints_in_widget(shape)
+        pen_width = max(0.0, float(shape.stroke_width) * self._zoom_factor)
+        tolerance = max(6.0, pen_width / 2.0 + 4.0)
+        return self._point_to_segment_distance(QPointF(pos), p1, p2) <= tolerance
+
     def _annotation_hit_test(self, pos: QPoint) -> tuple[FreeTextAnnotData | None, str | None]:
         selected = self._annotation_by_xref(self._selected_annotation_xref)
         if selected is not None:
-            selected_rect = self._annotation_widget_rect(selected)
-            for handle, handle_rect in self._handle_rects(selected_rect).items():
-                if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
-                    return selected, handle
+            if isinstance(selected, ShapeAnnotData) and selected.shape_type == ShapeType.LINE:
+                for handle, handle_rect in self._line_handle_rects(selected).items():
+                    if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
+                        return selected, handle
+            else:
+                selected_rect = self._annotation_widget_rect(selected)
+                for handle, handle_rect in self._handle_rects(selected_rect).items():
+                    if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
+                        return selected, handle
         for annot in reversed(self._annotations):
-            if self._annotation_widget_rect(annot).contains(QPointF(pos)):
+            if isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
+                if self._line_hit_test(annot, pos):
+                    return annot, "move"
+            elif self._annotation_widget_rect(annot).contains(QPointF(pos)):
                 return annot, "move"
         return None, None
 
@@ -879,12 +1045,58 @@ class ZoomPageWidget(QWidget):
             return None
         return self.annotation_rect_for_page_point(self._paste_annotation, page_point)
 
+    def _drag_updated_line(
+        self, current_page: QPointF
+    ) -> tuple[QRectF, tuple[tuple[float, float], tuple[float, float]]] | None:
+        # LINE の端点ハンドル (ep_start / ep_end) ドラッグ時に、新しい bbox と正規化頂点を返す。
+        if (
+            self._drag_mode not in ("ep_start", "ep_end")
+            or self._drag_base_rect is None
+            or self._drag_base_vertices is None
+        ):
+            return None
+        base = self._drag_base_rect
+        verts = self._drag_base_vertices
+        if verts and len(verts) >= 2:
+            rx1, ry1 = verts[0]
+            rx2, ry2 = verts[1]
+        else:
+            rx1, ry1 = (0.0, 0.5)
+            rx2, ry2 = (1.0, 0.5)
+        bw = base.width()
+        bh = base.height()
+        sp_orig = QPointF(base.left() + rx1 * bw, base.top() + ry1 * bh)
+        ep_orig = QPointF(base.left() + rx2 * bw, base.top() + ry2 * bh)
+
+        page_w, page_h = self.page_size_points()
+        clamped = QPointF(
+            min(max(0.0, current_page.x()), page_w if page_w > 0 else current_page.x()),
+            min(max(0.0, current_page.y()), page_h if page_h > 0 else current_page.y()),
+        )
+        if self._drag_mode == "ep_start":
+            new_sp, new_ep = clamped, ep_orig
+        else:
+            new_sp, new_ep = sp_orig, clamped
+
+        x0 = min(new_sp.x(), new_ep.x())
+        x1 = max(new_sp.x(), new_ep.x())
+        y0 = min(new_sp.y(), new_ep.y())
+        y1 = max(new_sp.y(), new_ep.y())
+        if max(x1 - x0, y1 - y0) < 1.0:
+            return None
+        width = x1 - x0
+        height = y1 - y0
+        nrx1 = (new_sp.x() - x0) / width if width > 0 else 0.0
+        nry1 = (new_sp.y() - y0) / height if height > 0 else 0.5
+        nrx2 = (new_ep.x() - x0) / width if width > 0 else 1.0
+        nry2 = (new_ep.y() - y0) / height if height > 0 else 0.5
+        return QRectF(QPointF(x0, y0), QPointF(x1, y1)), ((nrx1, nry1), (nrx2, nry2))
+
     def _drag_updated_rect(self, current_page: QPointF) -> QRectF | None:
         if self._drag_mode is None or self._drag_origin_page is None or self._drag_base_rect is None:
             return None
 
         page_w, page_h = self.page_size_points()
-        min_size = self.MIN_ANNOT_SIZE
         base = self._drag_base_rect
 
         if self._drag_mode == "move":
@@ -896,19 +1108,25 @@ class ZoomPageWidget(QWidget):
             top = min(max(0.0, top), max(0.0, page_h - height))
             return QRectF(left, top, width, height)
 
+        annot = self._annotation_by_xref(self._drag_annotation_xref)
+        min_w, min_h, min_span = self._min_dims_for_annotation(annot)
+
         left = base.left()
         top = base.top()
         right = base.right()
         bottom = base.bottom()
 
         if "w" in self._drag_mode:
-            left = min(max(0.0, current_page.x()), right - min_size)
+            left = min(max(0.0, current_page.x()), right - min_w)
         if "e" in self._drag_mode:
-            right = max(min(page_w, current_page.x()), left + min_size)
+            right = max(min(page_w, current_page.x()), left + min_w)
         if "n" in self._drag_mode:
-            top = min(max(0.0, current_page.y()), bottom - min_size)
+            top = min(max(0.0, current_page.y()), bottom - min_h)
         if "s" in self._drag_mode:
-            bottom = max(min(page_h, current_page.y()), top + min_size)
+            bottom = max(min(page_h, current_page.y()), top + min_h)
+
+        if min_span > 0.0 and max(right - left, bottom - top) < min_span:
+            return None
 
         return QRectF(QPointF(left, top), QPointF(right, bottom))
 
@@ -1003,6 +1221,17 @@ class ZoomPageWidget(QWidget):
                 if annot.xref == self._drag_annotation_xref and self._pending_annotation_rect is not None:
                     preview_rect = self._annotation_widget_rect(annot, self._pending_annotation_rect)
                 annot_rect = preview_rect or self._annotation_widget_rect(annot)
+                is_line_shape = (
+                    isinstance(annot, ShapeAnnotData)
+                    and annot.shape_type == ShapeType.LINE
+                )
+                line_vertices_override: tuple[tuple[float, float], ...] | None = None
+                if (
+                    is_line_shape
+                    and annot.xref == self._drag_annotation_xref
+                    and self._pending_line_vertices is not None
+                ):
+                    line_vertices_override = self._pending_line_vertices
                 is_being_edited = (
                     annot.xref == self._editing_annotation_xref
                     and self._inline_editor is not None
@@ -1010,13 +1239,26 @@ class ZoomPageWidget(QWidget):
                 )
                 if not is_being_edited:
                     if isinstance(annot, ShapeAnnotData):
-                        self._paint_shape_annotation(painter, annot, annot_rect)
+                        self._paint_shape_annotation(
+                            painter,
+                            annot,
+                            annot_rect,
+                            vertices_override=line_vertices_override,
+                        )
                     else:
                         self._paint_annotation(painter, annot, annot_rect)
                 if annot.xref == self._selected_annotation_xref:
                     painter.setPen(QPen(QColor(0, 120, 215), 1))
                     painter.setBrush(QBrush(QColor(255, 255, 255)))
-                    for handle_rect in self._handle_rects(annot_rect).values():
+                    if is_line_shape:
+                        handle_iter = self._line_handle_rects(
+                            annot,
+                            preview_rect,
+                            line_vertices_override,
+                        ).values()
+                    else:
+                        handle_iter = self._handle_rects(annot_rect).values()
+                    for handle_rect in handle_iter:
                         painter.drawRect(handle_rect)
 
         if self._selection_rect is not None:
@@ -1111,6 +1353,13 @@ class ZoomPageWidget(QWidget):
                     self._drag_origin_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
                     self._drag_base_rect = self._rect_tuple_to_qrectf(annot.rect)
                     self._pending_annotation_rect = QRectF(self._drag_base_rect)
+                    if isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
+                        base_verts = tuple(tuple(v) for v in annot.vertices) if annot.vertices else ()
+                        self._drag_base_vertices = base_verts
+                        self._pending_line_vertices = base_verts
+                    else:
+                        self._drag_base_vertices = None
+                        self._pending_line_vertices = None
                     self._drag_moved = False
                     self.update()
                     event.accept()
@@ -1159,6 +1408,12 @@ class ZoomPageWidget(QWidget):
             ):
                 current_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
                 if current_page is not None:
+                    if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                        current_page = self._apply_shape_shift_constraint(
+                            self._annotation_create_shape_type,
+                            self._annotation_create_origin_page,
+                            current_page,
+                        )
                     self._annotation_create_current_page = current_page
                     self._annotation_create_preview_rect = QRectF(
                         self._annotation_create_origin_page,
@@ -1170,11 +1425,22 @@ class ZoomPageWidget(QWidget):
             if event.buttons() & Qt.MouseButton.LeftButton and self._drag_mode is not None:
                 current_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
                 if current_page is not None:
-                    updated = self._drag_updated_rect(current_page)
-                    if updated is not None:
-                        self._pending_annotation_rect = updated
-                        self._drag_moved = not self._annotation_rect_close(updated, self._drag_base_rect)
-                        self.update()
+                    if self._drag_mode in ("ep_start", "ep_end"):
+                        line_updated = self._drag_updated_line(current_page)
+                        if line_updated is not None:
+                            new_rect, new_vertices = line_updated
+                            self._pending_annotation_rect = new_rect
+                            self._pending_line_vertices = new_vertices
+                            rect_changed = not self._annotation_rect_close(new_rect, self._drag_base_rect)
+                            verts_changed = new_vertices != self._drag_base_vertices
+                            self._drag_moved = rect_changed or verts_changed
+                            self.update()
+                    else:
+                        updated = self._drag_updated_rect(current_page)
+                        if updated is not None:
+                            self._pending_annotation_rect = updated
+                            self._drag_moved = not self._annotation_rect_close(updated, self._drag_base_rect)
+                            self.update()
                 event.accept()
                 return
             if event.buttons() & Qt.MouseButton.LeftButton and self._selection_origin is not None:
@@ -1209,6 +1475,12 @@ class ZoomPageWidget(QWidget):
                     origin = self._annotation_create_origin_page
                     end_point = current_page if current_page is not None else self._annotation_create_current_page
                     shape_type = self._annotation_create_shape_type
+                    if (
+                        end_point is not None
+                        and origin is not None
+                        and event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                    ):
+                        end_point = self._apply_shape_shift_constraint(shape_type, origin, end_point)
                     self._clear_annotation_create_drag()
                     self.update()
                     if origin is not None and end_point is not None:
@@ -1227,17 +1499,34 @@ class ZoomPageWidget(QWidget):
                 if self._drag_mode is not None:
                     annot = self._annotation_by_xref(self._drag_annotation_xref)
                     final_rect = self._pending_annotation_rect or self._drag_base_rect
+                    final_vertices = self._pending_line_vertices
+                    drag_mode = self._drag_mode
                     if annot is not None and final_rect is not None and self._drag_moved:
-                        self.annotation_geometry_changed.emit(
-                            annot,
-                            self._qrectf_to_rect_tuple(final_rect),
-                            self._drag_mode,
-                        )
+                        if (
+                            isinstance(annot, ShapeAnnotData)
+                            and annot.shape_type == ShapeType.LINE
+                            and drag_mode in ("ep_start", "ep_end")
+                            and final_vertices is not None
+                        ):
+                            self.shape_geometry_changed_with_vertices.emit(
+                                annot,
+                                self._qrectf_to_rect_tuple(final_rect),
+                                final_vertices,
+                                drag_mode,
+                            )
+                        else:
+                            self.annotation_geometry_changed.emit(
+                                annot,
+                                self._qrectf_to_rect_tuple(final_rect),
+                                drag_mode,
+                            )
                     self._drag_annotation_xref = None
                     self._drag_mode = None
                     self._drag_origin_page = None
                     self._drag_base_rect = None
                     self._pending_annotation_rect = None
+                    self._drag_base_vertices = None
+                    self._pending_line_vertices = None
                     self._drag_moved = False
                     self.update()
                     event.accept()
@@ -1459,6 +1748,9 @@ class PageEditWindow(QMainWindow):
         self._zoom_label.link_clicked.connect(self._on_zoom_link_clicked)
         self._zoom_label.annotation_selected.connect(self._on_zoom_annotation_selected)
         self._zoom_label.annotation_geometry_changed.connect(self._on_zoom_annotation_geometry_changed)
+        self._zoom_label.shape_geometry_changed_with_vertices.connect(
+            self._on_zoom_shape_geometry_changed_with_vertices
+        )
         self._zoom_label.annotation_create_requested.connect(self._on_zoom_annotation_create_requested)
         self._zoom_label.shape_create_requested.connect(self._on_zoom_shape_create_requested)
         self._zoom_label.annotation_edit_requested.connect(self._on_zoom_annotation_edit_requested)
@@ -1568,14 +1860,16 @@ class PageEditWindow(QMainWindow):
 
         form = QFormLayout()
         self._zoom_annotation_width_spin = QSpinBox()
-        self._zoom_annotation_width_spin.setRange(20, 5000)
+        self._zoom_annotation_width_spin.setRange(1, 5000)
         self._zoom_annotation_width_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
-        form.addRow("幅", self._zoom_annotation_width_spin)
+        self._zoom_annotation_width_label = QLabel("幅")
+        form.addRow(self._zoom_annotation_width_label, self._zoom_annotation_width_spin)
 
         self._zoom_annotation_height_spin = QSpinBox()
-        self._zoom_annotation_height_spin.setRange(20, 5000)
+        self._zoom_annotation_height_spin.setRange(1, 5000)
         self._zoom_annotation_height_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
-        form.addRow("高さ", self._zoom_annotation_height_spin)
+        self._zoom_annotation_height_label = QLabel("高さ")
+        form.addRow(self._zoom_annotation_height_label, self._zoom_annotation_height_spin)
 
         self._zoom_annotation_fontsize_spin = QSpinBox()
         self._zoom_annotation_fontsize_spin.setRange(6, 400)
@@ -1654,16 +1948,57 @@ class PageEditWindow(QMainWindow):
         panel_layout.addWidget(self._zoom_shape_rotation_row)
         self._zoom_shape_rotation_row.hide()
 
-        # Line options: arrow checkboxes
+        # Line options: arrow checkboxes + start/end coordinates
         self._zoom_shape_line_options = QWidget()
-        line_opt_layout = QHBoxLayout(self._zoom_shape_line_options)
+        line_opt_layout = QVBoxLayout(self._zoom_shape_line_options)
         line_opt_layout.setContentsMargins(0, 0, 0, 0)
+
+        arrow_row = QWidget()
+        arrow_layout = QHBoxLayout(arrow_row)
+        arrow_layout.setContentsMargins(0, 0, 0, 0)
         self._zoom_shape_arrow_start_cb = QCheckBox("始点矢印")
         self._zoom_shape_arrow_start_cb.stateChanged.connect(self._on_zoom_shape_option_changed)
-        line_opt_layout.addWidget(self._zoom_shape_arrow_start_cb)
+        arrow_layout.addWidget(self._zoom_shape_arrow_start_cb)
         self._zoom_shape_arrow_end_cb = QCheckBox("終点矢印")
         self._zoom_shape_arrow_end_cb.stateChanged.connect(self._on_zoom_shape_option_changed)
-        line_opt_layout.addWidget(self._zoom_shape_arrow_end_cb)
+        arrow_layout.addWidget(self._zoom_shape_arrow_end_cb)
+        line_opt_layout.addWidget(arrow_row)
+
+        endpoint_form = QFormLayout()
+        endpoint_form.setContentsMargins(0, 0, 0, 0)
+
+        self._zoom_shape_line_start_x_spin = QSpinBox()
+        self._zoom_shape_line_start_x_spin.setRange(0, 100000)
+        self._zoom_shape_line_start_x_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        self._zoom_shape_line_start_y_spin = QSpinBox()
+        self._zoom_shape_line_start_y_spin.setRange(0, 100000)
+        self._zoom_shape_line_start_y_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        start_row = QWidget()
+        start_layout = QHBoxLayout(start_row)
+        start_layout.setContentsMargins(0, 0, 0, 0)
+        start_layout.addWidget(QLabel("X"))
+        start_layout.addWidget(self._zoom_shape_line_start_x_spin, 1)
+        start_layout.addWidget(QLabel("Y"))
+        start_layout.addWidget(self._zoom_shape_line_start_y_spin, 1)
+        endpoint_form.addRow("始点", start_row)
+
+        self._zoom_shape_line_end_x_spin = QSpinBox()
+        self._zoom_shape_line_end_x_spin.setRange(0, 100000)
+        self._zoom_shape_line_end_x_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        self._zoom_shape_line_end_y_spin = QSpinBox()
+        self._zoom_shape_line_end_y_spin.setRange(0, 100000)
+        self._zoom_shape_line_end_y_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        end_row = QWidget()
+        end_layout = QHBoxLayout(end_row)
+        end_layout.setContentsMargins(0, 0, 0, 0)
+        end_layout.addWidget(QLabel("X"))
+        end_layout.addWidget(self._zoom_shape_line_end_x_spin, 1)
+        end_layout.addWidget(QLabel("Y"))
+        end_layout.addWidget(self._zoom_shape_line_end_y_spin, 1)
+        endpoint_form.addRow("終点", end_row)
+
+        line_opt_layout.addLayout(endpoint_form)
+
         panel_layout.addWidget(self._zoom_shape_line_options)
         self._zoom_shape_line_options.hide()
 
@@ -1815,9 +2150,19 @@ class PageEditWindow(QMainWindow):
             self._zoom_annotation_fontsize_label.setVisible(not is_shape)
             self._zoom_annotation_text_color_row.setVisible(not is_shape)
             self._zoom_shape_rotation_row.setVisible(is_shape)
-            self._zoom_shape_line_options.setVisible(is_shape and annotation.shape_type == ShapeType.LINE if is_shape else False)
+            is_line_shape = is_shape and annotation.shape_type == ShapeType.LINE
+            self._zoom_shape_line_options.setVisible(is_line_shape)
             self._zoom_shape_bracket_options.setVisible(is_shape and annotation.shape_type == ShapeType.BRACKET if is_shape else False)
             self._zoom_shape_triangle_options.setVisible(is_shape and annotation.shape_type == ShapeType.TRIANGLE if is_shape else False)
+            # LINE は始点/終点で編集するので、Width/Height は隠す
+            for sz_widget in (
+                self._zoom_annotation_width_spin,
+                self._zoom_annotation_width_label,
+                self._zoom_annotation_height_spin,
+                self._zoom_annotation_height_label,
+            ):
+                if sz_widget is not None:
+                    sz_widget.setVisible(not is_line_shape)
 
             widgets = [
                 self._zoom_annotation_width_spin,
@@ -1862,10 +2207,14 @@ class PageEditWindow(QMainWindow):
                 self._zoom_shape_triangle_options.hide()
             elif is_shape:
                 x0, y0, x1, y1 = annotation.rect
+                is_line = annotation.shape_type == ShapeType.LINE
+                size_min = 0 if is_line else 1
                 if self._zoom_annotation_width_spin:
-                    self._zoom_annotation_width_spin.setValue(max(20, round(x1 - x0)))
+                    self._zoom_annotation_width_spin.setRange(size_min, 5000)
+                    self._zoom_annotation_width_spin.setValue(max(size_min, round(x1 - x0)))
                 if self._zoom_annotation_height_spin:
-                    self._zoom_annotation_height_spin.setValue(max(20, round(y1 - y0)))
+                    self._zoom_annotation_height_spin.setRange(size_min, 5000)
+                    self._zoom_annotation_height_spin.setValue(max(size_min, round(y1 - y0)))
                 if self._zoom_annotation_opacity_slider:
                     self._zoom_annotation_opacity_slider.setValue(round(annotation.opacity * 100))
                 if self._zoom_annotation_opacity_label:
@@ -1879,12 +2228,25 @@ class PageEditWindow(QMainWindow):
                     self._zoom_shape_rotation_spin.setValue(round(annotation.rotation))
                 with QSignalBlocker(self._zoom_shape_rotation_slider):
                     self._zoom_shape_rotation_slider.setValue(round(annotation.rotation))
-                # Line arrows
+                # Line arrows + endpoints
                 if annotation.shape_type == ShapeType.LINE:
                     with QSignalBlocker(self._zoom_shape_arrow_start_cb):
                         self._zoom_shape_arrow_start_cb.setChecked(annotation.arrow_start)
                     with QSignalBlocker(self._zoom_shape_arrow_end_cb):
                         self._zoom_shape_arrow_end_cb.setChecked(annotation.arrow_end)
+                    (sx_pt, sy_pt), (ex_pt, ey_pt) = _line_endpoints_from_shape(annotation)
+                    page_w, page_h = self._current_zoom_annotation_page_size()
+                    max_x = max(1, int(round(max(page_w, sx_pt, ex_pt)))) or 100000
+                    max_y = max(1, int(round(max(page_h, sy_pt, ey_pt)))) or 100000
+                    for spin, value, max_val in (
+                        (self._zoom_shape_line_start_x_spin, sx_pt, max_x),
+                        (self._zoom_shape_line_start_y_spin, sy_pt, max_y),
+                        (self._zoom_shape_line_end_x_spin, ex_pt, max_x),
+                        (self._zoom_shape_line_end_y_spin, ey_pt, max_y),
+                    ):
+                        with QSignalBlocker(spin):
+                            spin.setRange(0, max_val)
+                            spin.setValue(int(round(value)))
                 # Bracket options
                 if annotation.shape_type == ShapeType.BRACKET:
                     style_idx = {"square": 0, "round": 1, "curly": 2}.get(annotation.bracket_style, 0)
@@ -1906,9 +2268,11 @@ class PageEditWindow(QMainWindow):
                 # FreeText
                 x0, y0, x1, y1 = annotation.rect
                 if self._zoom_annotation_width_spin:
-                    self._zoom_annotation_width_spin.setValue(max(20, round(x1 - x0)))
+                    self._zoom_annotation_width_spin.setRange(1, 5000)
+                    self._zoom_annotation_width_spin.setValue(max(1, round(x1 - x0)))
                 if self._zoom_annotation_height_spin:
-                    self._zoom_annotation_height_spin.setValue(max(20, round(y1 - y0)))
+                    self._zoom_annotation_height_spin.setRange(1, 5000)
+                    self._zoom_annotation_height_spin.setValue(max(1, round(y1 - y0)))
                 if self._zoom_annotation_fontsize_spin:
                     self._zoom_annotation_fontsize_spin.setValue(max(6, round(annotation.fontsize)))
                 if self._zoom_annotation_opacity_slider:
@@ -2363,17 +2727,10 @@ class PageEditWindow(QMainWindow):
 
         vertices: tuple[tuple[float, float], ...] = ()
         if shape_type == ShapeType.LINE:
-            if abs(ex - sx) < 1e-3 and abs(ey - sy) < 1e-3:
-                return
             x0, x1 = (sx, ex) if sx <= ex else (ex, sx)
             y0, y1 = (sy, ey) if sy <= ey else (ey, sy)
-            min_dim = 4.0
-            if x1 - x0 < min_dim:
-                cx = (x0 + x1) / 2.0
-                x0, x1 = cx - min_dim / 2.0, cx + min_dim / 2.0
-            if y1 - y0 < min_dim:
-                cy = (y0 + y1) / 2.0
-                y0, y1 = cy - min_dim / 2.0, cy + min_dim / 2.0
+            if max(x1 - x0, y1 - y0) < 1.0:
+                return
             width = x1 - x0
             height = y1 - y0
             rx1 = (sx - x0) / width if width > 0 else 0.0
@@ -2385,7 +2742,7 @@ class PageEditWindow(QMainWindow):
         else:
             x0, x1 = (sx, ex) if sx <= ex else (ex, sx)
             y0, y1 = (sy, ey) if sy <= ey else (ey, sy)
-            if x1 - x0 <= 0 or y1 - y0 <= 0:
+            if x1 - x0 < 1.0 or y1 - y0 < 1.0:
                 return
             rect_tuple = (x0, y0, x1, y1)
 
@@ -2530,12 +2887,40 @@ class PageEditWindow(QMainWindow):
         *,
         rect: tuple[float, float, float, float] | None = None,
     ) -> ShapeAnnotData:
-        x0, y0, x1, y1 = rect or base.rect
-        if rect is None and self._zoom_annotation_width_spin and self._zoom_annotation_height_spin:
-            width = float(self._zoom_annotation_width_spin.value())
-            height = float(self._zoom_annotation_height_spin.value())
-            x1 = x0 + width
-            y1 = y0 + height
+        new_vertices = base.vertices
+        if base.shape_type == ShapeType.LINE and rect is None:
+            # LINE はフォームの始点・終点スピナーから幾何を再構築する
+            sx = float(self._zoom_shape_line_start_x_spin.value())
+            sy = float(self._zoom_shape_line_start_y_spin.value())
+            ex = float(self._zoom_shape_line_end_x_spin.value())
+            ey = float(self._zoom_shape_line_end_y_spin.value())
+            x0 = min(sx, ex)
+            x1 = max(sx, ex)
+            y0 = min(sy, ey)
+            y1 = max(sy, ey)
+            if max(x1 - x0, y1 - y0) < 1.0:
+                # 退化したら base のジオメトリを保持
+                x0, y0, x1, y1 = base.rect
+                new_vertices = base.vertices
+            else:
+                width = x1 - x0
+                height = y1 - y0
+                rx1 = (sx - x0) / width if width > 0 else 0.0
+                ry1 = (sy - y0) / height if height > 0 else 0.5
+                rx2 = (ex - x0) / width if width > 0 else 1.0
+                ry2 = (ey - y0) / height if height > 0 else 0.5
+                new_vertices = ((rx1, ry1), (rx2, ry2))
+        else:
+            x0, y0, x1, y1 = rect or base.rect
+            if rect is None and self._zoom_annotation_width_spin and self._zoom_annotation_height_spin:
+                width = float(self._zoom_annotation_width_spin.value())
+                height = float(self._zoom_annotation_height_spin.value())
+                if base.shape_type == ShapeType.LINE and width <= 0 and height <= 0:
+                    # Both-zero line is disallowed — keep previous rect size
+                    width = float(base.rect[2] - base.rect[0])
+                    height = float(base.rect[3] - base.rect[1])
+                x1 = x0 + width
+                y1 = y0 + height
         stroke_width = float(self._zoom_annotation_border_width_spin.value()) if self._zoom_annotation_border_width_spin else base.stroke_width
         stroke_color = self._zoom_annotation_border_color if stroke_width > 0 else base.stroke_color
         rotation = float(self._zoom_shape_rotation_spin.value())
@@ -2564,7 +2949,7 @@ class PageEditWindow(QMainWindow):
             bracket_both_sides=base.bracket_both_sides,
             bracket_side=base.bracket_side,
             group_id=base.group_id,
-            vertices=base.vertices,
+            vertices=new_vertices,
             triangle_apex=triangle_apex,
             annotation_id=base.annotation_id,
             subject="",
@@ -2701,6 +3086,8 @@ class PageEditWindow(QMainWindow):
 
         if isinstance(old_annotation, ShapeAnnotData):
             new_annotation = self._shape_data_from_form(old_annotation)
+            old_verts = tuple(tuple(v) for v in old_annotation.vertices) if old_annotation.vertices else ()
+            new_verts = tuple(tuple(v) for v in new_annotation.vertices) if new_annotation.vertices else ()
             if (
                 old_annotation.rect == new_annotation.rect
                 and old_annotation.stroke_color == new_annotation.stroke_color
@@ -2714,6 +3101,7 @@ class PageEditWindow(QMainWindow):
                 and old_annotation.bracket_size == new_annotation.bracket_size
                 and abs(old_annotation.triangle_apex[0] - new_annotation.triangle_apex[0]) < 1e-4
                 and abs(old_annotation.triangle_apex[1] - new_annotation.triangle_apex[1]) < 1e-4
+                and old_verts == new_verts
             ):
                 return
             self._run_zoom_shape_replace(old_annotation, new_annotation, f"Update {old_annotation.shape_type.value}")
@@ -2844,6 +3232,52 @@ class PageEditWindow(QMainWindow):
             return
         description = "Move FreeText" if mode == "move" else "Resize FreeText"
         self._run_zoom_annotation_replace(old_annotation, new_annotation, description)
+
+    def _on_zoom_shape_geometry_changed_with_vertices(
+        self, annotation: object, rect: object, vertices: object, mode: str
+    ) -> None:
+        if not isinstance(annotation, ShapeAnnotData):
+            return
+        if not isinstance(rect, tuple) or len(rect) != 4:
+            return
+        if not isinstance(vertices, tuple) or len(vertices) != 2:
+            return
+        try:
+            new_rect = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+            new_vertices = (
+                (float(vertices[0][0]), float(vertices[0][1])),
+                (float(vertices[1][0]), float(vertices[1][1])),
+            )
+        except (TypeError, ValueError, IndexError):
+            return
+        old_annotation = self._find_zoom_annotation(annotation.xref) or annotation
+        old_verts = tuple(tuple(v) for v in old_annotation.vertices) if old_annotation.vertices else ()
+        if old_annotation.rect == new_rect and old_verts == new_vertices:
+            return
+        new_annotation = ShapeAnnotData(
+            page_num=old_annotation.page_num,
+            xref=old_annotation.xref,
+            rect=new_rect,
+            shape_type=old_annotation.shape_type,
+            stroke_color=old_annotation.stroke_color,
+            fill_color=old_annotation.fill_color,
+            stroke_width=old_annotation.stroke_width,
+            opacity=old_annotation.opacity,
+            rotation=old_annotation.rotation,
+            arrow_start=old_annotation.arrow_start,
+            arrow_end=old_annotation.arrow_end,
+            bracket_style=old_annotation.bracket_style,
+            bracket_size=old_annotation.bracket_size,
+            bracket_both_sides=old_annotation.bracket_both_sides,
+            bracket_side=old_annotation.bracket_side,
+            group_id=old_annotation.group_id,
+            vertices=new_vertices,
+            triangle_apex=old_annotation.triangle_apex,
+            annotation_id=old_annotation.annotation_id,
+            subject="",
+        )
+        description = f"Move {old_annotation.shape_type.value} endpoint"
+        self._run_zoom_shape_replace(old_annotation, new_annotation, description)
 
     def _update_button_states(self) -> None:
         has_selection = len(self._selected_thumbnails) > 0
