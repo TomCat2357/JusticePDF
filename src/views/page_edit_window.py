@@ -1732,7 +1732,7 @@ class PageEditWindow(QMainWindow):
         self._thumb_render_timer.timeout.connect(self._process_thumbnail_render_queue)
         self._scroll_debounce_timer = QTimer(self)
         self._scroll_debounce_timer.setSingleShot(True)
-        self._scroll_debounce_timer.setInterval(150)
+        self._scroll_debounce_timer.setInterval(60)
         self._scroll_debounce_timer.timeout.connect(self._enqueue_visible_thumbnail_renders)
 
         # Drop indicator
@@ -4517,10 +4517,33 @@ class PageEditWindow(QMainWindow):
             self._drop_indicator.raise_()
             self._drop_indicator.show()
 
+        targets = []
+        if 0 <= idx - 1 < len(self._thumbnails):
+            left = self._thumbnails[idx - 1]
+            if left.isVisible():
+                targets.append(left)
+        if 0 <= idx < len(self._thumbnails):
+            right = self._thumbnails[idx]
+            if right.isVisible():
+                targets.append(right)
+        self._clear_all_drop_targets(except_thumbs=targets)
+        for t in targets:
+            t.set_drop_target(True)
+
+    def _clear_all_drop_targets(self, except_thumbs=()) -> None:
+        """Turn off droptarget highlight on every thumbnail (optionally skipping some)."""
+        skip = set(except_thumbs)
+        for thumb in self._thumbnails:
+            if thumb in skip:
+                continue
+            if thumb.is_drop_target:
+                thumb.set_drop_target(False)
+
     def _hide_drop_indicator(self) -> None:
         """Hide the drop indicator."""
         self._drop_indicator.hide()
         self._drop_indicator_index = -1
+        self._clear_all_drop_targets()
 
     def dropEvent(self, event) -> None:
         """Handle drop event."""

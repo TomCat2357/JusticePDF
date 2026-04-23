@@ -49,7 +49,7 @@ class FolderCard(QFrame):
 
         self._refresh_debounce = QTimer(self)
         self._refresh_debounce.setSingleShot(True)
-        self._refresh_debounce.setInterval(120)
+        self._refresh_debounce.setInterval(80)
         self._refresh_debounce.timeout.connect(self._load_folder_info)
 
         self._fs_watcher = QFileSystemWatcher(self)
