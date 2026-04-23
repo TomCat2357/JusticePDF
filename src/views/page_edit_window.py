@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QColorDialog, QSlider, QCheckBox, QComboBox
 )
 from PyQt6.QtCore import (
-    Qt, QMimeData, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl,
+    Qt, QMimeData, QSize, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl,
     QTimer, QEvent, QSignalBlocker
 )
 from PyQt6.QtGui import (
@@ -86,6 +86,7 @@ class PageThumbnail(QFrame):
 
     clicked = pyqtSignal(object)
     THUMBNAIL_SIZE = 120
+    CARD_PADDING = 30  # total horizontal/vertical padding around the thumbnail
 
     def __init__(self, pdf_path: str, page_num: int, display_num: int = None, parent=None, *, thumb_size: int | None = None):
         super().__init__(parent)
@@ -93,6 +94,7 @@ class PageThumbnail(QFrame):
         self._page_num = page_num
         self._display_num = display_num if display_num is not None else page_num
         self._is_selected = False
+        self._is_drop_target = False
         self._explicitly_hidden = False
         self._drag_start_pos = None
         self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
@@ -101,26 +103,41 @@ class PageThumbnail(QFrame):
         self._setup_ui()
 
     def _setup_ui(self) -> None:
-        """Set up the thumbnail UI."""
-        self.setFixedSize(self._thumb_size + 10, self._thumb_size + 30)
+        """Set up the thumbnail UI in the same style as PDFCard."""
+        self.setFixedSize(self._thumb_size + self.CARD_PADDING, self._thumb_size + self.CARD_PADDING)
         self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
+        self.setLineWidth(1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(2)
+        layout.setSpacing(5)
 
-        self._image_label = QLabel()
+        self._thumbnail_container = QWidget()
+        self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
+
+        self._image_label = QLabel(self._thumbnail_container)
         self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._image_label.setStyleSheet("background-color: #f0f0f0;")
-        layout.addWidget(self._image_label)
+        self._image_label.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
+        self._image_label.move(0, 0)
 
-        self._number_label = QLabel(str(self._display_num + 1))
-        self._number_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self._number_label)
+        # Page-number badge in the top-right, matching PDFCard's page-count badge.
+        self._number_label = QLabel(str(self._display_num + 1), self._thumbnail_container)
+        self._number_label.setStyleSheet(
+            "background-color: rgba(0, 0, 0, 0.7); color: white; padding: 2px 5px; border-radius: 3px; font-size: 11px;"
+        )
+        self._number_label.adjustSize()
+        self._number_label.move(self._thumb_size - self._number_label.width() - 3, 3)
+        self._number_label.raise_()
+
+        layout.addWidget(self._thumbnail_container, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.invalidate_thumbnail()
         self._update_style()
+
+    def _reposition_number_badge(self) -> None:
+        self._number_label.adjustSize()
+        self._number_label.move(self._thumb_size - self._number_label.width() - 3, 3)
 
     @property
     def thumbnail_loaded(self) -> bool:
@@ -155,10 +172,27 @@ class PageThumbnail(QFrame):
             self._thumbnail_loaded = True
 
     def _update_style(self) -> None:
-        """Update style based on selection."""
-        self.setProperty("state", "selected" if self._is_selected else "normal")
+        """Update style based on selection and drop-target state."""
+        if self._is_drop_target:
+            state = "droptarget"
+        elif self._is_selected:
+            state = "selected"
+        else:
+            state = "normal"
+        self.setProperty("state", state)
         self.style().unpolish(self)
         self.style().polish(self)
+
+    @property
+    def is_drop_target(self) -> bool:
+        return self._is_drop_target
+
+    def set_drop_target(self, on: bool) -> None:
+        on = bool(on)
+        if self._is_drop_target == on:
+            return
+        self._is_drop_target = on
+        self._update_style()
 
     @property
     def page_num(self) -> int:
@@ -178,8 +212,10 @@ class PageThumbnail(QFrame):
 
     def set_thumbnail_size(self, size: int) -> None:
         self._thumb_size = int(size)
-        self.setFixedSize(self._thumb_size + 10, self._thumb_size + 30)
+        self.setFixedSize(self._thumb_size + self.CARD_PADDING, self._thumb_size + self.CARD_PADDING)
+        self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
         self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
+        self._reposition_number_badge()
         self.invalidate_thumbnail()
         self.updateGeometry()
 
@@ -1809,31 +1845,22 @@ class PageEditWindow(QMainWindow):
         self._zoom_label.annotation_duplicate_requested.connect(self._on_zoom_annotation_duplicate_requested)
         self._zoom_scroll.setWidget(self._zoom_label)
 
-        nav_button_style = (
-            "QToolButton { background-color: #f2f2f2; border: 2px solid #4c4c4c; "
-            "border-radius: 8px; padding: 4px; }"
-            "QToolButton:hover { background-color: #dbe8ff; }"
-            "QToolButton:pressed { background-color: #bcd4ff; }"
-            "QToolButton:disabled { background-color: #e0e0e0; border-color: #aaaaaa; }"
-            "QToolButton::arrow { width: 18px; height: 18px; }"
-        )
-
         self._zoom_prev_btn = QToolButton()
+        self._zoom_prev_btn.setObjectName("zoomNav")
         self._zoom_prev_btn.setArrowType(Qt.ArrowType.LeftArrow)
         self._zoom_prev_btn.setToolTip("Previous page")
         self._zoom_prev_btn.setAutoRaise(False)
         self._zoom_prev_btn.setFixedWidth(56)
         self._zoom_prev_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self._zoom_prev_btn.setStyleSheet(nav_button_style)
         self._zoom_prev_btn.clicked.connect(self._on_zoom_prev_page)
 
         self._zoom_next_btn = QToolButton()
+        self._zoom_next_btn.setObjectName("zoomNav")
         self._zoom_next_btn.setArrowType(Qt.ArrowType.RightArrow)
         self._zoom_next_btn.setToolTip("Next page")
         self._zoom_next_btn.setAutoRaise(False)
         self._zoom_next_btn.setFixedWidth(56)
         self._zoom_next_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self._zoom_next_btn.setStyleSheet(nav_button_style)
         self._zoom_next_btn.clicked.connect(self._on_zoom_next_page)
 
         nav_container = QWidget()
@@ -1851,8 +1878,8 @@ class PageEditWindow(QMainWindow):
         zoom_content_layout.addWidget(nav_container, 1)
 
         self._zoom_annotation_drawer = QFrame()
+        self._zoom_annotation_drawer.setObjectName("annotationDrawer")
         self._zoom_annotation_drawer.setFrameShape(QFrame.Shape.StyledPanel)
-        self._zoom_annotation_drawer.setStyleSheet("QFrame { background-color: #f5f5f5; }")
         drawer_layout = QHBoxLayout(self._zoom_annotation_drawer)
         drawer_layout.setContentsMargins(0, 0, 0, 0)
         drawer_layout.setSpacing(0)
@@ -2457,6 +2484,7 @@ class PageEditWindow(QMainWindow):
 
     def _setup_toolbar(self) -> None:
         toolbar = QToolBar()
+        toolbar.setIconSize(QSize(24, 24))
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
@@ -2471,6 +2499,7 @@ class PageEditWindow(QMainWindow):
         toolbar.addSeparator()
 
         self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setObjectName("danger")
         self._delete_btn.clicked.connect(self._on_delete)
         toolbar.addWidget(self._delete_btn)
 
@@ -3745,6 +3774,7 @@ class PageEditWindow(QMainWindow):
             thumb._page_num = i
             thumb._display_num = i
             thumb._number_label.setText(str(i + 1))
+            thumb._reposition_number_badge()
 
         # ズームビューのページ番号を調整
         if self._zoom_page_num is not None:

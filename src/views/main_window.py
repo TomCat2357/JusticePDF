@@ -2424,7 +2424,8 @@ class MainWindow(QMainWindow):
                     if drop_pos.x() > card_rect.left() + edge_margin and drop_pos.x() < card_rect.right() - edge_margin:
                         # On card center - merge mode
                         self._hide_drop_indicator()
-                        target_card.setStyleSheet("PDFCard { background-color: #90EE90; border: 2px solid #228B22; }")
+                        self._clear_all_drop_targets(except_card=target_card)
+                        target_card.set_drop_target(True)
                         self._drop_indicator_index = -2  # Special value for merge
                         return
 
@@ -2458,7 +2459,8 @@ class MainWindow(QMainWindow):
                     if drop_pos.x() > card_rect.left() + edge_margin and drop_pos.x() < card_rect.right() - edge_margin:
                         # On card center - merge mode
                         self._hide_drop_indicator()
-                        target_card.setStyleSheet("PDFCard { background-color: #90EE90; border: 2px solid #228B22; }")
+                        self._clear_all_drop_targets(except_card=target_card)
+                        target_card.set_drop_target(True)
                         self._drop_indicator_index = -2
                         return
 
@@ -2472,24 +2474,30 @@ class MainWindow(QMainWindow):
                 event.setDropAction(Qt.DropAction.MoveAction)
             event.acceptProposedAction()
             self._hide_drop_indicator()
+            self._clear_all_drop_targets()
         elif event.mimeData().hasUrls():
             event.acceptProposedAction()
             self._hide_drop_indicator()
+            self._clear_all_drop_targets()
+
+    def _clear_all_drop_targets(self, except_card=None) -> None:
+        """Turn off merge-highlight on every card (optionally skipping one)."""
+        for card in self._cards:
+            if card is except_card:
+                continue
+            if card.is_drop_target:
+                card.set_drop_target(False)
 
     def dragLeaveEvent(self, event) -> None:
         """Handle drag leave event - hide drop indicator."""
         self._hide_drop_indicator()
-        # Reset any card highlighting
-        for card in self._cards:
-            card._update_style()
+        self._clear_all_drop_targets()
         super().dragLeaveEvent(event)
 
     def _show_drop_indicator(self, pos) -> None:
         """Show drop indicator at the appropriate position."""
         # Reset any card merge highlighting
-        for card in self._cards:
-            if not card.is_selected:
-                card._update_style()
+        self._clear_all_drop_targets()
 
         idx = self._get_drop_index(pos)
         if idx == self._drop_indicator_index:
@@ -2532,9 +2540,7 @@ class MainWindow(QMainWindow):
         
         drop_mode = self._drop_indicator_index
         self._hide_drop_indicator()
-        # Reset any card highlighting
-        for card in self._cards:
-            card._update_style()
+        self._clear_all_drop_targets()
 
         if event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
             source_path = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')

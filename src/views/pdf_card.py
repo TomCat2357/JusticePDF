@@ -28,6 +28,7 @@ class PDFCard(QFrame):
         self._pdf_path = pdf_path
         self._is_selected = False
         self._is_locked = False
+        self._is_drop_target = False
         self._page_count = 0
         self._drag_start_pos = None
         self._card_width = int(card_width) if card_width is not None else self.CARD_WIDTH
@@ -102,7 +103,7 @@ class PDFCard(QFrame):
         self._filename_label.setText(os.path.basename(self._pdf_path))
 
     def _update_style(self) -> None:
-        """Update the card style based on selection and locked state."""
+        """Update the card style based on selection, locked, and drop-target state."""
         from PyQt6.QtWidgets import QGraphicsOpacityEffect
 
         if self._is_locked:
@@ -112,7 +113,12 @@ class PDFCard(QFrame):
             self.setGraphicsEffect(effect)
         else:
             self.setGraphicsEffect(None)
-            state = "selected" if self._is_selected else "normal"
+            if self._is_drop_target:
+                state = "droptarget"
+            elif self._is_selected:
+                state = "selected"
+            else:
+                state = "normal"
         self.setProperty("state", state)
         self.style().unpolish(self)
         self.style().polish(self)
@@ -150,6 +156,18 @@ class PDFCard(QFrame):
     def set_locked(self, locked: bool) -> None:
         """Set the locked state."""
         self._is_locked = locked
+        self._update_style()
+
+    @property
+    def is_drop_target(self) -> bool:
+        return self._is_drop_target
+
+    def set_drop_target(self, on: bool) -> None:
+        """Toggle the drop-target highlight (merge candidate)."""
+        on = bool(on)
+        if self._is_drop_target == on:
+            return
+        self._is_drop_target = on
         self._update_style()
 
     def set_preview_size(self, card_width: int, thumb_size: int) -> None:
