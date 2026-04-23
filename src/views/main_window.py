@@ -93,14 +93,14 @@ class MainWindow(QMainWindow):
         # Zoom debounce timer for Ctrl+wheel
         self._zoom_debounce_timer = QTimer(self)
         self._zoom_debounce_timer.setSingleShot(True)
-        self._zoom_debounce_timer.setInterval(150)
+        self._zoom_debounce_timer.setInterval(60)
         self._zoom_debounce_timer.timeout.connect(self._render_visible_cards_hq)
 
         # Debounce file modified events (path -> single-shot timer)
         self._modified_timers: dict[str, QTimer] = {}
         # Track last processed mtime to avoid redundant refreshes
         self._modified_last_mtime: dict[str, float] = {}
-        self._modified_debounce_ms = 250
+        self._modified_debounce_ms = 120
 
         # Debounce grid refresh for rapid file-removal events (watchdog)
         self._grid_refresh_timer = QTimer(self)
