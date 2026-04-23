@@ -1261,9 +1261,12 @@ class ZoomPageWidget(QWidget):
                     painter.setPen(QPen(QColor(0, 120, 215), 1))
                     painter.setBrush(QBrush(QColor(255, 255, 255)))
                     if is_line_shape:
+                        handle_rect_override = (
+                            self._pending_annotation_rect if preview_rect is not None else None
+                        )
                         handle_iter = self._line_handle_rects(
                             annot,
-                            preview_rect,
+                            handle_rect_override,
                             line_vertices_override,
                         ).values()
                     else:
