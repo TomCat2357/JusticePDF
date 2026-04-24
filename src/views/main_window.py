@@ -698,6 +698,10 @@ class MainWindow(QMainWindow):
                 if rect.intersects(card.geometry()):
                     card.set_selected(True)
                     self._selected_cards.append(card)
+            for fc in self._folder_cards:
+                if rect.intersects(fc.geometry()):
+                    fc.set_selected(True)
+                    self._selected_folder_cards.append(fc)
             self._update_button_states()
         super().mouseMoveEvent(event)
 
