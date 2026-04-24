@@ -4109,13 +4109,10 @@ class PageEditWindow(QMainWindow):
                 return
 
             def _get_main_window():
-                from PyQt6.QtWidgets import QApplication
                 from src.views.main_window import MainWindow
 
-                for widget in QApplication.topLevelWidgets():
-                    if isinstance(widget, MainWindow):
-                        return widget
-                return None
+                owner = self.parent()
+                return owner if isinstance(owner, MainWindow) else None
 
             def do_rename() -> None:
                 main_window = _get_main_window()
@@ -4335,10 +4332,8 @@ class PageEditWindow(QMainWindow):
         pdf_path = self._pdf_path
 
         def _get_main_window():
-            for widget in QApplication.topLevelWidgets():
-                if isinstance(widget, MainWindow):
-                    return widget
-            return None
+            owner = self.parent()
+            return owner if isinstance(owner, MainWindow) else None
 
         def _close_edit_windows() -> None:
             for widget in QApplication.topLevelWidgets():
@@ -4699,11 +4694,10 @@ class PageEditWindow(QMainWindow):
                 if file_deleted:
                     logger.debug(f"Removing card for {source_pdf_path} from MainWindow")
                     from src.views.main_window import MainWindow
-                    for widget in QApplication.topLevelWidgets():
-                        if isinstance(widget, MainWindow):
-                            widget._remove_card(source_pdf_path)
-                            widget._refresh_grid()
-                            break
+                    owner = self.parent()
+                    if isinstance(owner, MainWindow):
+                        owner._remove_card(source_pdf_path)
+                        owner._refresh_grid()
         except PdfWritePermissionError as error:
             self._handle_pdf_write_permission_denied(error)
             return
@@ -4726,16 +4720,14 @@ class PageEditWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         """Handle window close - unlock the card in main window."""
-        from PyQt6.QtWidgets import QApplication
         from src.views.main_window import MainWindow
-        
+
         logger.debug(f"PageEditWindow closing for {self._pdf_path}")
 
         self._reset_thumbnail_render_queue()
         self._undo_manager.remove_listener(self._on_undo_manager_changed)
-        
-        for widget in QApplication.topLevelWidgets():
-            if isinstance(widget, MainWindow):
-                widget.unlock_card(self._pdf_path)
-                break
+
+        owner = self.parent()
+        if isinstance(owner, MainWindow):
+            owner.unlock_card(self._pdf_path)
         super().closeEvent(event)
