@@ -3,6 +3,7 @@ import sys
 import argparse
 import logging
 from pathlib import Path
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 from src.views.main_window import MainWindow
 
@@ -37,6 +38,14 @@ def main():
 
     window = MainWindow()
     window.show()
+
+    flags = window.windowFlags()
+    window.setWindowFlags(flags | Qt.WindowType.WindowStaysOnTopHint)
+    window.show()
+    window.setWindowFlags(flags)
+    window.show()
+    window.raise_()
+    window.activateWindow()
 
     sys.exit(app.exec())
 
