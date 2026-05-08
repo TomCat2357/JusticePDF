@@ -200,6 +200,10 @@ PageThumbnail[state="droptarget"] {
     background-color: #ecfdf5;
     border: 1px solid #4f46e5;
 }
+PageThumbnail[state="search_hit"] {
+    background-color: #fff6d6;
+    border: 2px solid #f4b400;
+}
 PageThumbnail QLabel {
     color: #6b7280;
     font-size: 10.5px;

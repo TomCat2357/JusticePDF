@@ -32,6 +32,7 @@ from src.utils.pdf_utils import (
     list_shape_annots, create_shape_annot, replace_shape_annot,
     delete_shape_annot, create_bracket_pair,
     reorder_annot_on_page, get_annot_xref_order, set_annot_xref_order,
+    search_text_in_pdf,
 )
 def _pixel_size_to_pointf(pixel_size: int) -> float:
     # Convert pixel size to a point size so QFont.pointSize() stays positive.
@@ -95,6 +96,7 @@ class PageThumbnail(QFrame):
         self._display_num = display_num if display_num is not None else page_num
         self._is_selected = False
         self._is_drop_target = False
+        self._is_search_hit = False
         self._explicitly_hidden = False
         self._drag_start_pos = None
         self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
@@ -177,11 +179,24 @@ class PageThumbnail(QFrame):
             state = "droptarget"
         elif self._is_selected:
             state = "selected"
+        elif self._is_search_hit:
+            state = "search_hit"
         else:
             state = "normal"
         self.setProperty("state", state)
         self.style().unpolish(self)
         self.style().polish(self)
+
+    @property
+    def is_search_hit(self) -> bool:
+        return self._is_search_hit
+
+    def set_search_hit(self, on: bool) -> None:
+        on = bool(on)
+        if self._is_search_hit == on:
+            return
+        self._is_search_hit = on
+        self._update_style()
 
     @property
     def is_drop_target(self) -> bool:
@@ -396,6 +411,8 @@ class ZoomPageWidget(QWidget):
         self._paste_annotation: FreeTextAnnotData | None = None
         self._paste_preview_rect: QRectF | None = None
         self._paste_drag_active = False
+        self._search_hits_pdf: list[tuple[float, float, float, float]] = []
+        self._search_hit_rects: list[QRectF] = []
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
 
@@ -581,6 +598,11 @@ class ZoomPageWidget(QWidget):
             x0, y0, x1, y1 = annot.rect
             self._annotation_rects.append(QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale))
 
+        self._search_hit_rects = [
+            QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+            for (x0, y0, x1, y1) in self._search_hits_pdf
+        ]
+
         self._selected_word_indices = []
         self._selection_origin = None
         self._selection_rect = None
@@ -606,6 +628,22 @@ class ZoomPageWidget(QWidget):
         self._layout_inline_editor()
         self.updateGeometry()
         self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def set_search_hit_rects(self, pdf_rects) -> None:
+        """Provide PDF-coordinate rects for the current page's search hits.
+
+        Rects are scaled by the current zoom factor for paintEvent.
+        Pass an empty list to clear.
+        """
+        self._search_hits_pdf = [
+            (float(r.x0), float(r.y0), float(r.x1), float(r.y1)) for r in pdf_rects
+        ]
+        scale = self._zoom_factor
+        self._search_hit_rects = [
+            QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+            for (x0, y0, x1, y1) in self._search_hits_pdf
+        ]
         self.update()
 
     def _rect_tuple_to_qrectf(self, rect: tuple[float, float, float, float]) -> QRectF:
@@ -1248,6 +1286,13 @@ class ZoomPageWidget(QWidget):
             offset = self._pixmap_offset()
             painter.drawPixmap(offset, self._pixmap)
 
+            if self._search_hit_rects:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 235, 59, 130))
+                offset_pt = QPointF(offset)
+                for rect in self._search_hit_rects:
+                    painter.drawRect(rect.translated(offset_pt))
+
             if self._selected_word_indices:
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor(0, 120, 215, 80))
@@ -1742,6 +1787,12 @@ class PageEditWindow(QMainWindow):
         # Rubber band selection
         self._rubber_band = None
         self._rubber_band_origin = None
+
+        # Text search (Ctrl+F)
+        self._search_dialog = None
+        self._search_hits: dict[int, list] = {}
+        self._search_hit_pages: list[int] = []
+        self._search_cursor: int = -1
 
         self._setup_ui()
         self._setup_toolbar()
@@ -2539,6 +2590,7 @@ class PageEditWindow(QMainWindow):
                 (QKeySequence.StandardKey.SelectAll, self._on_select_all),
                 (QKeySequence(Qt.Key.Key_R), self._on_rotate),
                 (QKeySequence.StandardKey.Print, self._on_print),
+                (QKeySequence.StandardKey.Find, self._on_open_search),
             ),
         )
 
@@ -3660,6 +3712,8 @@ class PageEditWindow(QMainWindow):
 
     def _load_pages(self) -> None:
         self._reset_thumbnail_render_queue()
+        # ページ構成が変わったので検索結果は破棄する
+        self._invalidate_search_results()
         # 既存のサムネイルをグリッドから先に取り除く
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
@@ -4005,6 +4059,8 @@ class PageEditWindow(QMainWindow):
             self._zoom_factor,
             current_selection.xref if current_selection else None,
         )
+        hit_rects = self._search_hits.get(self._zoom_page_num, [])
+        self._zoom_label.set_search_hit_rects(hit_rects)
         self._set_selected_zoom_annotation(current_selection)
 
     def _on_zoom_link_clicked(self, link: dict) -> None:
@@ -4727,7 +4783,113 @@ class PageEditWindow(QMainWindow):
         self._reset_thumbnail_render_queue()
         self._undo_manager.remove_listener(self._on_undo_manager_changed)
 
+        if self._search_dialog is not None:
+            self._search_dialog.close()
+            self._search_dialog = None
+
         owner = self.parent()
         if isinstance(owner, MainWindow):
             owner.unlock_card(self._pdf_path)
         super().closeEvent(event)
+
+    # --- Text search (Ctrl+F) ---
+
+    def _on_open_search(self) -> None:
+        """Open or focus the modeless search dialog."""
+        from src.views.search_dialog import SearchDialog
+
+        if self._search_dialog is None:
+            self._search_dialog = SearchDialog(self)
+            self._search_dialog.search_requested.connect(self._on_search_execute)
+            self._search_dialog.next_requested.connect(self._on_search_next)
+            self._search_dialog.prev_requested.connect(self._on_search_prev)
+            self._search_dialog.finished.connect(self._on_search_dialog_finished)
+        self._search_dialog.show()
+        self._search_dialog.raise_()
+        self._search_dialog.activateWindow()
+        self._search_dialog.focus_input()
+
+    def _on_search_dialog_finished(self, _result: int) -> None:
+        self._clear_search_highlights()
+
+    def _on_search_execute(self, query: str) -> None:
+        query = (query or "").strip()
+        # まず以前のハイライトをクリア
+        self._clear_search_highlights()
+        if not query:
+            if self._search_dialog is not None:
+                self._search_dialog.set_status(0, 0)
+            return
+        self._search_hits = search_text_in_pdf(self._pdf_path, query)
+        self._search_hit_pages = sorted(self._search_hits.keys())
+        self._apply_search_highlights()
+        if not self._search_hit_pages:
+            self._search_cursor = -1
+            if self._search_dialog is not None:
+                self._search_dialog.set_status(0, 0)
+            return
+        self._search_cursor = 0
+        self._jump_to_search_page(self._search_hit_pages[0])
+        if self._search_dialog is not None:
+            self._search_dialog.set_status(1, len(self._search_hit_pages))
+
+    def _on_search_next(self) -> None:
+        if not self._search_hit_pages:
+            return
+        self._search_cursor = (self._search_cursor + 1) % len(self._search_hit_pages)
+        self._jump_to_search_page(self._search_hit_pages[self._search_cursor])
+        if self._search_dialog is not None:
+            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+
+    def _on_search_prev(self) -> None:
+        if not self._search_hit_pages:
+            return
+        self._search_cursor = (self._search_cursor - 1) % len(self._search_hit_pages)
+        self._jump_to_search_page(self._search_hit_pages[self._search_cursor])
+        if self._search_dialog is not None:
+            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+
+    def _jump_to_search_page(self, page_num: int) -> None:
+        if page_num < 0 or page_num >= len(self._thumbnails):
+            return
+        zoom_visible = bool(self._zoom_view and self._zoom_view.isVisible())
+        if zoom_visible:
+            # ズーム表示中は対応ページに切り替えてヒット矩形を表示
+            self._commit_inline_annotation_editor()
+            self._set_zoom_annotation_create_mode(False)
+            self._selected_zoom_annotation = None
+            self._zoom_page_num = page_num
+            self._render_zoom_page()
+        else:
+            # サムネイルグリッド表示中は選択 + スクロール
+            self._clear_selection()
+            thumb = self._thumbnails[page_num]
+            thumb.set_selected(True)
+            self._selected_thumbnails.append(thumb)
+            if self._grid_scroll:
+                self._grid_scroll.ensureWidgetVisible(thumb)
+            self._update_button_states()
+
+    def _apply_search_highlights(self) -> None:
+        hit_set = set(self._search_hit_pages)
+        for thumb in self._thumbnails:
+            thumb.set_search_hit(thumb.page_num in hit_set)
+
+    def _clear_search_highlights(self) -> None:
+        for thumb in self._thumbnails:
+            thumb.set_search_hit(False)
+        self._search_hits = {}
+        self._search_hit_pages = []
+        self._search_cursor = -1
+        if self._zoom_label is not None:
+            self._zoom_label.set_search_hit_rects([])
+
+    def _invalidate_search_results(self) -> None:
+        """ページ構成が変わったときに呼び、検索状態とダイアログ表示を初期化する。"""
+        self._search_hits = {}
+        self._search_hit_pages = []
+        self._search_cursor = -1
+        if self._zoom_label is not None:
+            self._zoom_label.set_search_hit_rects([])
+        if self._search_dialog is not None:
+            self._search_dialog.clear_status()

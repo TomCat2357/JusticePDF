@@ -1343,6 +1343,34 @@ def get_page_words(pdf_path: str, page_num: int) -> list[tuple]:
         return []
 
 
+def search_text_in_pdf(pdf_path: str, query: str) -> dict[int, list]:
+    """Search query text across all pages.
+
+    Returns {page_num: [fitz.Rect, ...]} for pages with at least one hit.
+    Pages without hits are not included. PyMuPDF's search_for is case-insensitive
+    by default.
+    """
+    if not query:
+        return {}
+    results: dict[int, list] = {}
+    try:
+        with fitz.open(pdf_path) as doc:
+            for i in range(len(doc)):
+                page = doc[i]
+                rects = page.search_for(query)
+                if rects:
+                    results[i] = list(rects)
+    except Exception:
+        logger.debug(
+            "search_text_in_pdf failed: pdf=%s query=%r",
+            pdf_path,
+            query,
+            exc_info=True,
+        )
+        return {}
+    return results
+
+
 def get_page_links(pdf_path: str, page_num: int) -> list[dict]:
     """Extract link annotations with rectangles for a page."""
     try:
