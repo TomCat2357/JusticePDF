@@ -17,7 +17,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices, QPixmap,
-    QBrush, QCursor, QPolygonF, QGuiApplication
+    QBrush, QCursor, QPolygonF, QGuiApplication, QAction
 )
 
 from src.utils.pdf_utils import (
@@ -2593,6 +2593,22 @@ class PageEditWindow(QMainWindow):
                 (QKeySequence.StandardKey.Find, self._on_open_search),
             ),
         )
+        # 拡大モード中だけ有効化するページ送りショートカット。
+        # グリッドモードでは無効化し、PageUp/PageDown/Home/End を
+        # QScrollArea のデフォルトスクロールに譲る。
+        self._zoom_nav_actions: list[QAction] = []
+        for key, handler in (
+            (Qt.Key.Key_PageUp, self._on_zoom_prev_page),
+            (Qt.Key.Key_PageDown, self._on_zoom_next_page),
+            (Qt.Key.Key_Home, self._on_zoom_first_page),
+            (Qt.Key.Key_End, self._on_zoom_last_page),
+        ):
+            action = QAction(self)
+            action.setShortcut(QKeySequence(key))
+            action.triggered.connect(handler)
+            action.setEnabled(False)
+            self.addAction(action)
+            self._zoom_nav_actions.append(action)
 
     def _find_zoom_annotation(self, xref: int | None) -> AnyAnnotData | None:
         if xref is None:
@@ -3928,6 +3944,8 @@ class PageEditWindow(QMainWindow):
             self._grid_scroll.hide()
         if self._zoom_view:
             self._zoom_view.show()
+        for action in getattr(self, "_zoom_nav_actions", ()):
+            action.setEnabled(True)
         self._update_button_states()
 
     def _exit_zoom_view(self) -> None:
@@ -3935,6 +3953,8 @@ class PageEditWindow(QMainWindow):
         last_page = self._zoom_page_num
         self._set_zoom_annotation_create_mode(False)
         self._set_selected_zoom_annotation(None)
+        for action in getattr(self, "_zoom_nav_actions", ()):
+            action.setEnabled(False)
         if self._zoom_view:
             self._zoom_view.hide()
         if self._grid_scroll:
@@ -3995,6 +4015,32 @@ class PageEditWindow(QMainWindow):
         self._set_zoom_annotation_create_mode(False)
         self._selected_zoom_annotation = None
         self._zoom_page_num += 1
+        self._render_zoom_page()
+
+    def _on_zoom_first_page(self) -> None:
+        if self._zoom_page_num is None:
+            return
+        if self._zoom_page_num == 0:
+            return
+        self._commit_inline_annotation_editor()
+        self._set_zoom_annotation_create_mode(False)
+        self._selected_zoom_annotation = None
+        self._zoom_page_num = 0
+        self._render_zoom_page()
+
+    def _on_zoom_last_page(self) -> None:
+        if self._zoom_page_num is None:
+            return
+        page_count = get_page_count(self._pdf_path)
+        if page_count <= 0:
+            return
+        last_index = page_count - 1
+        if self._zoom_page_num == last_index:
+            return
+        self._commit_inline_annotation_editor()
+        self._set_zoom_annotation_create_mode(False)
+        self._selected_zoom_annotation = None
+        self._zoom_page_num = last_index
         self._render_zoom_page()
 
     def _update_zoom_nav_buttons(self, page_count: int | None = None) -> None:
