@@ -108,6 +108,19 @@ class MainWindow(QMainWindow):
         self._grid_refresh_timer.setInterval(50)
         self._grid_refresh_timer.timeout.connect(self._on_deferred_grid_refresh)
 
+        # Debounce reconcile-with-disk calls (window activation fires repeatedly)
+        self._reconcile_timer = QTimer(self)
+        self._reconcile_timer.setSingleShot(True)
+        self._reconcile_timer.setInterval(150)
+        self._reconcile_timer.timeout.connect(self._reconcile_with_disk)
+
+        # Low-frequency backstop poll for missed watchdog events (bulk copies,
+        # cloud-synced folders, AV interference). Runs only while visible.
+        self._reconcile_poll_timer = QTimer(self)
+        self._reconcile_poll_timer.setInterval(4000)
+        self._reconcile_poll_timer.timeout.connect(self._maybe_poll_reconcile)
+        self._reconcile_poll_timer.start()
+
         # Setup working directory
         self._work_dir = Path(folder_path) if folder_path else Path.home() / "Documents" / "PDFs"
         self._is_root_window = folder_path is None
@@ -451,6 +464,12 @@ class MainWindow(QMainWindow):
         if not self._did_initial_grid_layout:
             self._did_initial_grid_layout = True
             QTimer.singleShot(0, self._refresh_grid)
+        self._schedule_reconcile()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self._schedule_reconcile()
 
     def _grid_available_width(self) -> int:
         """Width source for column calculation (always consistent)."""
@@ -519,6 +538,100 @@ class MainWindow(QMainWindow):
             self._selected_folder_cards.remove(fc)
         self._folder_cards.remove(fc)
         fc.deleteLater()
+
+    def _schedule_reconcile(self) -> None:
+        """Debounced trigger for _reconcile_with_disk()."""
+        self._reconcile_timer.start()
+
+    def _maybe_poll_reconcile(self) -> None:
+        """Backstop poll: only scan the directory while the window is visible."""
+        if self.isVisible() and not self.isMinimized():
+            self._schedule_reconcile()
+
+    def _is_file_ready(self, path: str) -> bool:
+        """Best-effort check that a freshly-appeared file is fully written
+        (not still being copied / exclusively locked by another process)."""
+        try:
+            if os.path.getsize(path) <= 0:
+                return False
+            with open(path, "rb"):
+                pass
+            return True
+        except OSError:
+            return False
+
+    def _reconcile_with_disk(self) -> None:
+        """Diff the on-disk contents of the work dir against the displayed
+        cards and add/remove cards so the view matches disk.
+
+        Backstop for missed watchdog events. Does not touch undo history and
+        skips any path that is part of an in-flight internal op / pending rename.
+        """
+        if self._operation_in_progress:
+            return
+
+        work_dir = str(self._work_dir)
+        try:
+            entries = os.listdir(work_dir)
+        except OSError:
+            return
+
+        disk_pdf_norm: dict[str, str] = {}  # norm -> real path
+        disk_dir_norm: dict[str, str] = {}
+        for name in entries:
+            full = os.path.join(work_dir, name)
+            try:
+                if os.path.isdir(full):
+                    disk_dir_norm[self._normalize_path(full)] = full
+                elif name.lower().endswith(".pdf") and os.path.isfile(full):
+                    disk_pdf_norm[self._normalize_path(full)] = full
+            except OSError:
+                continue
+
+        busy = (
+            self._internal_adds
+            | self._internal_removes
+            | set(self._pending_rename_old_to_new.keys())
+            | set(self._pending_rename_new_to_old.keys())
+            | self._pending_rename_removed
+            | self._pending_rename_added
+        )
+
+        changed = False
+
+        # --- PDF cards ---
+        card_norm = {self._normalize_path(c.pdf_path) for c in self._cards}
+        for norm, real in disk_pdf_norm.items():
+            if norm in card_norm or norm in busy:
+                continue
+            if not self._is_file_ready(real):  # still being copied; pick it up next pass
+                continue
+            self._add_card(real, insert_index=None)
+            changed = True
+        for card in self._cards[:]:
+            norm = self._normalize_path(card.pdf_path)
+            if norm in disk_pdf_norm or norm in busy:
+                continue
+            self._remove_card(card.pdf_path)
+            changed = True
+
+        # --- folder cards ---
+        fc_norm = {self._normalize_path(fc.folder_path) for fc in self._folder_cards}
+        for norm, real in disk_dir_norm.items():
+            if norm in fc_norm or norm in busy:
+                continue
+            self._add_folder_card(real)
+            changed = True
+        for fc in self._folder_cards[:]:
+            norm = self._normalize_path(fc.folder_path)
+            if norm in disk_dir_norm or norm in busy:
+                continue
+            self._remove_folder_card(fc.folder_path)
+            changed = True
+
+        if changed:
+            self._update_button_states()
+            self._grid_refresh_timer.start()
 
     def _rebuild_cards_from_paths(self, paths: list[str]) -> None:
         """Rebuild PDFCards from a list of paths, reusing existing cards where possible.
@@ -1526,6 +1639,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
+            self._reconcile_poll_timer.stop()
+        except Exception:
+            pass
+        try:
             self._watcher.stop()
         except Exception:
             pass
@@ -1679,7 +1796,8 @@ class MainWindow(QMainWindow):
     def _on_refresh(self) -> None:
         """Reload cards and open edit windows from disk."""
         clear_pixmap_cache()
-        self._refresh_all_views()
+        self._reconcile_with_disk()  # pick up files/folders added or removed externally
+        self._refresh_all_views()    # re-render thumbnails of the (now-current) cards
 
     def _handle_file_operation_error(self, error: Exception, pdf_path: str, action: str) -> None:
         logger.warning("%s failed for %s", action, pdf_path)
