@@ -5,6 +5,8 @@ env/
 .serena/
 *.zip
 *.lnk
+*.doc*
+*.png
 
 # Python cache
 __pycache__/
