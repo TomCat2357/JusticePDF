@@ -42,15 +42,20 @@ from src.workers.import_worker import ImportWorker, find_soffice
 
 logger = logging.getLogger(__name__)
 
-_OFFICE_EXTS = {
-    ".doc", ".docx", ".docm",
-    ".xls", ".xlsx", ".xlsm",
-    ".ppt", ".pptx",
-}
+_WORD_EXTS = {".doc", ".docx", ".docm"}
+_EXCEL_EXTS = {".xls", ".xlsx", ".xlsm"}
+_PPT_EXTS = {".ppt", ".pptx"}
+_OFFICE_EXTS = _WORD_EXTS | _EXCEL_EXTS | _PPT_EXTS
 _IMAGE_EXTS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif",
 }
 _IMPORT_EXTS = {".pdf"} | _OFFICE_EXTS | _IMAGE_EXTS
+
+
+def _exts_to_filter(label: str, exts: set[str]) -> str:
+    """Build a QFileDialog name-filter string like ``"Word (*.doc *.docx)"``."""
+    pattern = " ".join(f"*{e}" for e in sorted(exts))
+    return f"{label} ({pattern})"
 
 # If conversion-required files exceed this count the user is warned first.
 IMPORT_OFFICE_WARN_THRESHOLD = 5
@@ -1987,10 +1992,20 @@ class MainWindow(QMainWindow):
 
     def _on_import(self) -> None:
         """Handle import action (files)."""
-        ext_list = " ".join(f"*{e}" for e in sorted(_IMPORT_EXTS))
+        all_filter = _exts_to_filter("All importable files", _IMPORT_EXTS)
+        filters = [
+            all_filter,
+            _exts_to_filter("PDF", {".pdf"}),
+            _exts_to_filter("Word", _WORD_EXTS),
+            _exts_to_filter("Excel", _EXCEL_EXTS),
+            _exts_to_filter("PowerPoint", _PPT_EXTS),
+            _exts_to_filter("Images", _IMAGE_EXTS),
+            "All files (*)",
+        ]
         dialog = QFileDialog(self, "Import")
         dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
-        dialog.setNameFilter(f"Importable Files ({ext_list})")
+        dialog.setNameFilters(filters)
+        dialog.selectNameFilter(all_filter)
         if dialog.exec():
             paths = dialog.selectedFiles()
             if paths:
