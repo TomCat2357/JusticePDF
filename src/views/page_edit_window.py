@@ -1,0 +1,4941 @@
+"""Page edit window for editing PDF pages."""
+import math
+import os
+import shutil
+import logging
+from collections import deque
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QToolBar, QPushButton, QScrollArea, QGridLayout,
+    QInputDialog, QLabel, QFrame, QApplication, QRubberBand, QMessageBox,
+    QToolButton, QSizePolicy, QPlainTextEdit, QFormLayout,
+    QSpinBox, QDoubleSpinBox, QColorDialog, QSlider, QCheckBox, QComboBox
+)
+from PyQt6.QtCore import (
+    Qt, QMimeData, QSize, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl,
+    QTimer, QEvent, QSignalBlocker
+)
+from PyQt6.QtGui import (
+    QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices, QPixmap,
+    QBrush, QCursor, QPolygonF, QGuiApplication, QAction
+)
+
+from src.utils.pdf_utils import (
+    get_page_thumbnail, get_page_pixmap, get_page_words, get_page_links,
+    get_page_count, rotate_pages, remove_pages, reorder_pages, extract_pages,
+    insert_pages, render_page_thumbnails_batch, FreeTextAnnotData,
+    list_freetext_annots, create_freetext_annot, replace_freetext_annot,
+    delete_freetext_annot, get_pdf_metadata_title, update_pdf_metadata_title,
+    PdfWritePermissionError,
+    clear_pixmap_cache_for_path, print_pdfs,
+    ShapeType, ShapeAnnotData, AnyAnnotData,
+    list_shape_annots, create_shape_annot, replace_shape_annot,
+    delete_shape_annot, create_bracket_pair,
+    reorder_annot_on_page, get_annot_xref_order, set_annot_xref_order,
+    search_text_in_pdf,
+)
+def _pixel_size_to_pointf(pixel_size: int) -> float:
+    # Convert pixel size to a point size so QFont.pointSize() stays positive.
+    # setPixelSize() invalidates pointSize (-1), which triggers a Qt warning
+    # if anything downstream re-applies setPointSize on the font.
+    dpi = 96.0
+    screen = QGuiApplication.primaryScreen()
+    if screen is not None:
+        dpi = screen.logicalDotsPerInch() or 96.0
+    return max(1.0, pixel_size * 72.0 / dpi)
+
+
+def _line_endpoints_from_shape(
+    shape: "ShapeAnnotData",
+    rect_override: tuple[float, float, float, float] | None = None,
+    vertices_override: tuple[tuple[float, float], ...] | None = None,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    # LINE 注釈の rect (bbox) と正規化頂点から、ページ座標の (start, end) を再構築する。
+    rect = rect_override if rect_override is not None else shape.rect
+    width = rect[2] - rect[0]
+    height = rect[3] - rect[1]
+    verts = vertices_override if vertices_override is not None else shape.vertices
+    if verts and len(verts) >= 2:
+        rx1, ry1 = verts[0]
+        rx2, ry2 = verts[1]
+    else:
+        rx1, ry1 = (0.0, 0.5)
+        rx2, ry2 = (1.0, 0.5)
+    return (
+        (rect[0] + rx1 * width, rect[1] + ry1 * height),
+        (rect[0] + rx2 * width, rect[1] + ry2 * height),
+    )
+
+
+from src.models.undo_manager import UndoManager, UndoAction
+from src.views.view_helpers import (
+    clear_selection,
+    log_undo_state,
+    register_shortcuts,
+    viewport_width_or_fallback,
+)
+from src.utils.trash_utils import build_trash_failure_message
+
+PAGETHUMBNAIL_MIME_TYPE = "application/x-pdfas-page"
+PDFCARD_MIME_TYPE = "application/x-pdfas-card"
+
+logger = logging.getLogger(__name__)
+
+
+class PageThumbnail(QFrame):
+    """Widget representing a single PDF page."""
+
+    clicked = pyqtSignal(object)
+    THUMBNAIL_SIZE = 120
+    CARD_PADDING = 30  # total horizontal/vertical padding around the thumbnail
+
+    def __init__(self, pdf_path: str, page_num: int, display_num: int = None, parent=None, *, thumb_size: int | None = None):
+        super().__init__(parent)
+        self._pdf_path = pdf_path
+        self._page_num = page_num
+        self._display_num = display_num if display_num is not None else page_num
+        self._is_selected = False
+        self._is_drop_target = False
+        self._is_search_hit = False
+        self._explicitly_hidden = False
+        self._drag_start_pos = None
+        self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
+        self._thumbnail_loaded = False
+        self.setAcceptDrops(True)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        """Set up the thumbnail UI in the same style as PDFCard."""
+        self.setFixedSize(self._thumb_size + self.CARD_PADDING, self._thumb_size + self.CARD_PADDING)
+        self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
+        self.setLineWidth(1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(5)
+
+        self._thumbnail_container = QWidget()
+        self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
+
+        self._image_label = QLabel(self._thumbnail_container)
+        self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
+        self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._image_label.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
+        self._image_label.move(0, 0)
+
+        # Page-number badge in the top-right, matching PDFCard's page-count badge.
+        self._number_label = QLabel(str(self._display_num + 1), self._thumbnail_container)
+        self._number_label.setStyleSheet(
+            "background-color: rgba(0, 0, 0, 0.7); color: white; padding: 2px 5px; border-radius: 3px; font-size: 11px;"
+        )
+        self._number_label.adjustSize()
+        self._number_label.move(self._thumb_size - self._number_label.width() - 3, 3)
+        self._number_label.raise_()
+
+        layout.addWidget(self._thumbnail_container, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.invalidate_thumbnail()
+        self._update_style()
+
+    def _reposition_number_badge(self) -> None:
+        self._number_label.adjustSize()
+        self._number_label.move(self._thumb_size - self._number_label.width() - 3, 3)
+
+    @property
+    def thumbnail_loaded(self) -> bool:
+        return self._thumbnail_loaded
+
+    def invalidate_thumbnail(self) -> None:
+        self._thumbnail_loaded = False
+        self._image_label.setPixmap(QPixmap())
+        self._image_label.setText("PDF")
+
+    def load_thumbnail(self) -> bool:
+        pixmap = get_page_thumbnail(self._pdf_path, self._page_num, self._thumb_size)
+        if pixmap.isNull():
+            self._image_label.setPixmap(QPixmap())
+            self._image_label.setText("...")
+            self._thumbnail_loaded = False
+            return False
+        self._image_label.setPixmap(pixmap)
+        self._image_label.setText("")
+        self._thumbnail_loaded = True
+        return True
+
+    def set_pixmap_direct(self, pixmap: QPixmap) -> None:
+        """Set a pre-rendered pixmap directly (for batch rendering)."""
+        if pixmap.isNull():
+            self._image_label.setPixmap(QPixmap())
+            self._image_label.setText("...")
+            self._thumbnail_loaded = False
+        else:
+            self._image_label.setPixmap(pixmap)
+            self._image_label.setText("")
+            self._thumbnail_loaded = True
+
+    def _update_style(self) -> None:
+        """Update style based on selection and drop-target state."""
+        if self._is_drop_target:
+            state = "droptarget"
+        elif self._is_selected:
+            state = "selected"
+        elif self._is_search_hit:
+            state = "search_hit"
+        else:
+            state = "normal"
+        self.setProperty("state", state)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    @property
+    def is_search_hit(self) -> bool:
+        return self._is_search_hit
+
+    def set_search_hit(self, on: bool) -> None:
+        on = bool(on)
+        if self._is_search_hit == on:
+            return
+        self._is_search_hit = on
+        self._update_style()
+
+    @property
+    def is_drop_target(self) -> bool:
+        return self._is_drop_target
+
+    def set_drop_target(self, on: bool) -> None:
+        on = bool(on)
+        if self._is_drop_target == on:
+            return
+        self._is_drop_target = on
+        self._update_style()
+
+    @property
+    def page_num(self) -> int:
+        return self._page_num
+
+    @property
+    def is_selected(self) -> bool:
+        return self._is_selected
+
+    def set_selected(self, selected: bool) -> None:
+        self._is_selected = selected
+        self._update_style()
+
+    def refresh(self) -> None:
+        self.invalidate_thumbnail()
+        self.load_thumbnail()
+
+    def set_thumbnail_size(self, size: int) -> None:
+        self._thumb_size = int(size)
+        self.setFixedSize(self._thumb_size + self.CARD_PADDING, self._thumb_size + self.CARD_PADDING)
+        self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
+        self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
+        self._reposition_number_badge()
+        self.invalidate_thumbnail()
+        self.updateGeometry()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.pos()
+            self.clicked.emit(self)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            parent_window = self.window()
+            if hasattr(parent_window, "_open_zoom_view"):
+                parent_window._open_zoom_view(self._page_num)
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        if self._drag_start_pos is None:
+            return
+        if (event.pos() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+            return
+
+        parent_window = self.window()
+        page_nums_list = [self._page_num]
+        if hasattr(parent_window, '_selected_thumbnails'):
+            selected_thumbs = parent_window._selected_thumbnails
+            if self in selected_thumbs and len(selected_thumbs) > 1:
+                page_nums_list = [thumb.page_num for thumb in selected_thumbs]
+                page_nums_str = ','.join(str(n) for n in page_nums_list)
+            else:
+                page_nums_str = str(self._page_num)
+        else:
+            page_nums_str = str(self._page_num)
+
+        logger.debug(f"Starting drag: pdf_path={self._pdf_path}, page_nums={page_nums_list}")
+
+        drag = QDrag(self)
+        mime_data = QMimeData()
+        data = f"{self._pdf_path}|{page_nums_str}".encode('utf-8')
+        mime_data.setData(PAGETHUMBNAIL_MIME_TYPE, data)
+        drag.setMimeData(mime_data)
+
+        pixmap = self.grab()
+        pixmap = pixmap.scaled(80, 80, Qt.AspectRatioMode.KeepAspectRatio)
+        
+        # Add badge for multiple selection
+        if len(page_nums_list) > 1:
+            from PyQt6.QtGui import QPainter, QColor, QFont
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.GlobalColor.white)
+            painter.setBrush(QColor(0, 120, 215))
+            badge_size = 20
+            painter.drawEllipse(pixmap.width() - badge_size, 0, badge_size, badge_size)
+            font = QFont()
+            font.setBold(True)
+            font.setPointSize(9)
+            painter.setFont(font)
+            painter.drawText(pixmap.width() - badge_size, 0, badge_size, badge_size,
+                           Qt.AlignmentFlag.AlignCenter, str(len(page_nums_list)))
+            painter.end()
+        
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+
+        result = drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
+        logger.debug(f"Drag completed with result: {result}")
+
+
+class AnnotationTextEdit(QPlainTextEdit):
+    commit_requested = pyqtSignal(str)
+    cancel_requested = pyqtSignal()
+    delete_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._finished = False
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def _emit_commit(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self.commit_requested.emit(self.toPlainText())
+
+    def _emit_cancel(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self.cancel_requested.emit()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self._emit_commit()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self._emit_cancel()
+            event.accept()
+            return
+        if (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            self._emit_commit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class ZoomPageWidget(QWidget):
+    wheel_zoom = pyqtSignal(int)
+    link_clicked = pyqtSignal(dict)
+    annotation_selected = pyqtSignal(object)
+    annotation_geometry_changed = pyqtSignal(object, object, str)
+    # LINE 端点ドラッグ専用：(annotation, new_rect_tuple, new_vertices, mode)
+    shape_geometry_changed_with_vertices = pyqtSignal(object, object, object, str)
+    annotation_create_requested = pyqtSignal(object)
+    shape_create_requested = pyqtSignal(object, object, object)  # (ShapeType, start_pt_tuple, end_pt_tuple)
+    annotation_edit_requested = pyqtSignal(object)
+    annotation_text_committed = pyqtSignal(object, str)
+    annotation_text_edit_cancelled = pyqtSignal()
+    annotation_delete_requested = pyqtSignal()
+    annotation_copy_requested = pyqtSignal(object)
+    annotation_paste_requested = pyqtSignal()
+    annotation_paste_placement_requested = pyqtSignal(object)
+    # Ctrl+ドラッグで複製: (annotation, new_rect_tuple, new_vertices_or_None)
+    annotation_duplicate_requested = pyqtSignal(object, object, object)
+
+    HANDLE_SIZE = 10
+
+    @staticmethod
+    def _min_dims_for_annotation(annot) -> tuple[float, float, float]:
+        # (min_w, min_h, min_span). min_span enforces max(w, h) for lines.
+        if isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
+            return (0.0, 0.0, 1.0)
+        return (1.0, 1.0, 0.0)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = None
+        self._zoom_factor = 1.0
+        self._words: list[tuple] = []
+        self._word_rects: list[QRectF] = []
+        self._links: list[dict] = []
+        self._link_rects: list[QRectF | None] = []
+        self._selected_word_indices: list[int] = []
+        self._selection_origin: QPoint | None = None
+        self._selection_rect: QRect | None = None
+        self._selection_active = False
+        self._pressed_link: dict | None = None
+        self._annotations: list[FreeTextAnnotData] = []
+        self._annotation_rects: list[QRectF] = []
+        self._selected_annotation_xref: int | None = None
+        self._hover_annotation_xref: int | None = None
+        self._annotation_create_mode = False
+        self._annotation_create_shape_type: ShapeType | None = None
+        self._annotation_create_origin_page: QPointF | None = None
+        self._annotation_create_current_page: QPointF | None = None
+        self._annotation_create_preview_rect: QRectF | None = None
+        self._drag_annotation_xref: int | None = None
+        self._drag_mode: str | None = None
+        self._drag_origin_page: QPointF | None = None
+        self._drag_base_rect: QRectF | None = None
+        self._pending_annotation_rect: QRectF | None = None
+        self._drag_base_vertices: tuple[tuple[float, float], ...] | None = None
+        self._pending_line_vertices: tuple[tuple[float, float], ...] | None = None
+        self._drag_moved = False
+        self._drag_copy_mode = False
+        self._inline_editor: AnnotationTextEdit | None = None
+        self._editing_annotation_xref: int | None = None
+        self._editing_annotation_original_text = ""
+        self._annotation_paste_available = False
+        self._paste_annotation: FreeTextAnnotData | None = None
+        self._paste_preview_rect: QRectF | None = None
+        self._paste_drag_active = False
+        self._search_hits_pdf: list[tuple[float, float, float, float]] = []
+        self._search_hit_rects: list[QRectF] = []
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+
+    def sizeHint(self):
+        if self._pixmap and not self._pixmap.isNull():
+            return self._pixmap.deviceIndependentSize().toSize()
+        return super().sizeHint()
+
+    def page_size_points(self) -> tuple[float, float]:
+        if not self._pixmap or self._pixmap.isNull() or self._zoom_factor <= 0:
+            return (0.0, 0.0)
+        logical_size = self._pixmap.deviceIndependentSize()
+        return (logical_size.width() / self._zoom_factor, logical_size.height() / self._zoom_factor)
+
+    def _clear_annotation_create_drag(self) -> None:
+        self._annotation_create_origin_page = None
+        self._annotation_create_current_page = None
+        self._annotation_create_preview_rect = None
+
+    def set_annotation_create_mode(self, enabled: bool, shape_type: ShapeType | None = None) -> None:
+        self._annotation_create_mode = bool(enabled)
+        self._annotation_create_shape_type = shape_type if enabled else None
+        self._clear_annotation_create_drag()
+        self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def set_selected_annotation_xref(self, xref: int | None) -> None:
+        self._selected_annotation_xref = xref
+        self.update()
+
+    def has_active_text_editor(self) -> bool:
+        return self._inline_editor is not None and self._inline_editor.isVisible()
+
+    def set_annotation_paste_available(self, available: bool) -> None:
+        self._annotation_paste_available = bool(available)
+
+    def has_annotation_paste_mode(self) -> bool:
+        return self._paste_annotation is not None
+
+    def begin_annotation_paste_mode(self, annotation: AnyAnnotData) -> None:
+        self._paste_annotation = annotation
+        self._paste_preview_rect = None
+        self._paste_drag_active = False
+        self._selection_origin = None
+        self._selection_rect = None
+        self._selection_active = False
+        self._pressed_link = None
+        self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def cancel_annotation_paste_mode(self) -> None:
+        if self._paste_annotation is None and self._paste_preview_rect is None and not self._paste_drag_active:
+            return
+        self._paste_annotation = None
+        self._paste_preview_rect = None
+        self._paste_drag_active = False
+        self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def begin_annotation_text_edit(self, annotation: FreeTextAnnotData) -> None:
+        self.cancel_annotation_text_edit()
+        editor = AnnotationTextEdit(self)
+        editor.setPlainText(annotation.content)
+        editor.commit_requested.connect(lambda text, annot=annotation: self._commit_inline_editor(annot, text))
+        editor.cancel_requested.connect(self.cancel_annotation_text_edit)
+        editor.delete_requested.connect(self.annotation_delete_requested)
+        pixel_size = max(10, round(annotation.fontsize * self._zoom_factor))
+        editor.setStyleSheet(self._inline_editor_stylesheet(annotation, pixel_size))
+        editor.setFrameStyle(QFrame.Shape.NoFrame)
+        editor.setContentsMargins(0, 0, 0, 0)
+        effective_border_width = annotation.border_width if annotation.border_color is not None else 0.0
+        text_inset_px = max(0, round(effective_border_width * 2.0 * self._zoom_factor))
+        editor.setViewportMargins(text_inset_px, text_inset_px, text_inset_px, 0)
+        editor.document().setDocumentMargin(0)
+        font = editor.font()
+        font.setPointSizeF(_pixel_size_to_pointf(pixel_size))
+        editor.setFont(font)
+        self._inline_editor = editor
+        self._editing_annotation_xref = annotation.xref
+        self._editing_annotation_original_text = annotation.content
+        self._selected_annotation_xref = annotation.xref
+        self._layout_inline_editor()
+        editor.show()
+        editor.setFocus()
+        editor.selectAll()
+        self.update()
+
+    def commit_annotation_text_edit(self) -> None:
+        if self._inline_editor is not None:
+            self._inline_editor._emit_commit()
+
+    def cancel_annotation_text_edit(self) -> None:
+        if self._inline_editor is None:
+            return
+        editor = self._inline_editor
+        self._inline_editor = None
+        self._editing_annotation_xref = None
+        self._editing_annotation_original_text = ""
+        editor.hide()
+        editor.deleteLater()
+        self.annotation_text_edit_cancelled.emit()
+        self.update()
+
+    def _commit_inline_editor(self, annotation: FreeTextAnnotData, text: str) -> None:
+        original = self._editing_annotation_original_text
+        xref = self._editing_annotation_xref
+        editor = self._inline_editor
+        self._inline_editor = None
+        self._editing_annotation_xref = None
+        self._editing_annotation_original_text = ""
+        if editor is not None:
+            editor.hide()
+            editor.deleteLater()
+        self.update()
+        if xref == annotation.xref and text != original:
+            self.annotation_text_committed.emit(annotation, text)
+        else:
+            self.annotation_text_edit_cancelled.emit()
+
+    def _inline_editor_stylesheet(self, annotation: FreeTextAnnotData, pixel_size: int) -> str:
+        opacity = max(0.0, min(1.0, annotation.opacity))
+        if annotation.fill_color is None:
+            fill_css = "transparent"
+        else:
+            fill_css = (
+                f"rgba({round(annotation.fill_color[0] * 255)}, "
+                f"{round(annotation.fill_color[1] * 255)}, "
+                f"{round(annotation.fill_color[2] * 255)}, "
+                f"{round(opacity * 255)})"
+            )
+        text_css = (
+            f"rgba({round(annotation.text_color[0] * 255)}, "
+            f"{round(annotation.text_color[1] * 255)}, "
+            f"{round(annotation.text_color[2] * 255)}, "
+            f"{round(opacity * 255)})"
+        )
+        return (
+            "QPlainTextEdit {"
+            f"background-color: {fill_css};"
+            f"color: {text_css};"
+            f"font-size: {max(1, int(pixel_size))}px;"
+            "border: 0px solid transparent;"
+            "padding: 0px;"
+            "margin: 0px;"
+            "}"
+        )
+
+    def _layout_inline_editor(self) -> None:
+        if self._inline_editor is None or self._editing_annotation_xref is None:
+            return
+        annotation = self._annotation_by_xref(self._editing_annotation_xref)
+        if annotation is None:
+            return
+        rect = self._annotation_widget_rect(annotation)
+        self._inline_editor.setGeometry(rect.toRect())
+
+    def set_page(self, pixmap, words, links, annotations, zoom_factor: float, selected_annotation_xref: int | None = None) -> None:
+        self._pixmap = pixmap
+        self._zoom_factor = zoom_factor or 1.0
+        self._words = words or []
+        self._links = links or []
+        self._annotations = annotations or []
+
+        scale = self._zoom_factor
+        self._word_rects = []
+        for word in self._words:
+            if len(word) < 4:
+                continue
+            x0, y0, x1, y1 = word[0], word[1], word[2], word[3]
+            self._word_rects.append(QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale))
+
+        self._link_rects = []
+        for link in self._links:
+            rect = link.get("from")
+            if rect is None:
+                self._link_rects.append(None)
+                continue
+            x0, y0, x1, y1 = rect
+            self._link_rects.append(QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale))
+
+        self._annotation_rects = []
+        for annot in self._annotations:
+            x0, y0, x1, y1 = annot.rect
+            self._annotation_rects.append(QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale))
+
+        self._search_hit_rects = [
+            QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+            for (x0, y0, x1, y1) in self._search_hits_pdf
+        ]
+
+        self._selected_word_indices = []
+        self._selection_origin = None
+        self._selection_rect = None
+        self._selection_active = False
+        self._pressed_link = None
+        self._selected_annotation_xref = selected_annotation_xref
+        self._hover_annotation_xref = None
+        self._drag_annotation_xref = None
+        self._drag_mode = None
+        self._drag_origin_page = None
+        self._drag_base_rect = None
+        self._pending_annotation_rect = None
+        self._drag_base_vertices = None
+        self._pending_line_vertices = None
+        self._drag_moved = False
+        self._clear_annotation_create_drag()
+        self._paste_preview_rect = None
+        self._paste_drag_active = False
+        if self._pixmap and not self._pixmap.isNull():
+            self.setMinimumSize(self._pixmap.deviceIndependentSize().toSize())
+        else:
+            self.setMinimumSize(0, 0)
+        self._layout_inline_editor()
+        self.updateGeometry()
+        self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def set_search_hit_rects(self, pdf_rects) -> None:
+        """Provide PDF-coordinate rects for the current page's search hits.
+
+        Rects are scaled by the current zoom factor for paintEvent.
+        Pass an empty list to clear.
+        """
+        self._search_hits_pdf = [
+            (float(r.x0), float(r.y0), float(r.x1), float(r.y1)) for r in pdf_rects
+        ]
+        scale = self._zoom_factor
+        self._search_hit_rects = [
+            QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+            for (x0, y0, x1, y1) in self._search_hits_pdf
+        ]
+        self.update()
+
+    def _rect_tuple_to_qrectf(self, rect: tuple[float, float, float, float]) -> QRectF:
+        return QRectF(QPointF(rect[0], rect[1]), QPointF(rect[2], rect[3]))
+
+    def _qrectf_to_rect_tuple(self, rect: QRectF) -> tuple[float, float, float, float]:
+        normalized = rect.normalized()
+        return (normalized.left(), normalized.top(), normalized.right(), normalized.bottom())
+
+    def _page_rect_to_widget_rect(self, rect: QRectF) -> QRectF:
+        offset = self._pixmap_offset()
+        return QRectF(
+            offset.x() + rect.left() * self._zoom_factor,
+            offset.y() + rect.top() * self._zoom_factor,
+            rect.width() * self._zoom_factor,
+            rect.height() * self._zoom_factor,
+        )
+
+    def _page_point_to_widget_point(self, pt: QPointF) -> QPointF:
+        offset = self._pixmap_offset()
+        return QPointF(
+            offset.x() + pt.x() * self._zoom_factor,
+            offset.y() + pt.y() * self._zoom_factor,
+        )
+
+    def _pixmap_offset(self) -> QPoint:
+        if not self._pixmap or self._pixmap.isNull():
+            return QPoint(0, 0)
+        logical_size = self._pixmap.deviceIndependentSize()
+        x = max(0, int((self.width() - logical_size.width()) / 2))
+        y = max(0, int((self.height() - logical_size.height()) / 2))
+        return QPoint(x, y)
+
+    def _point_in_pixmap(self, pos: QPoint) -> QPointF | None:
+        if not self._pixmap or self._pixmap.isNull():
+            return None
+        offset = self._pixmap_offset()
+        x = pos.x() - offset.x()
+        y = pos.y() - offset.y()
+        logical_size = self._pixmap.deviceIndependentSize()
+        if x < 0 or y < 0 or x > logical_size.width() or y > logical_size.height():
+            return None
+        return QPointF(x, y)
+
+    def _page_point_from_widget_pos(self, pos: QPoint, *, clamp: bool = False) -> QPointF | None:
+        pix_pos = self._point_in_pixmap(pos)
+        if pix_pos is None:
+            if not clamp or not self._pixmap or self._pixmap.isNull():
+                return None
+            offset = self._pixmap_offset()
+            logical_size = self._pixmap.deviceIndependentSize()
+            clamped_x = min(max(pos.x() - offset.x(), 0.0), logical_size.width())
+            clamped_y = min(max(pos.y() - offset.y(), 0.0), logical_size.height())
+            pix_pos = QPointF(clamped_x, clamped_y)
+        return QPointF(pix_pos.x() / self._zoom_factor, pix_pos.y() / self._zoom_factor)
+
+    def page_point_from_global_pos(self, global_pos: QPoint) -> QPointF | None:
+        return self._page_point_from_widget_pos(self.mapFromGlobal(global_pos))
+
+    def _apply_shape_shift_constraint(
+        self,
+        shape_type: "ShapeType | None",
+        origin: QPointF | None,
+        end: QPointF,
+    ) -> QPointF:
+        # Word-style: Shift 押下中は線を 0/45/90/135° にスナップ、他図形は bbox を正方形化。
+        if origin is None or shape_type is None:
+            return end
+        dx = end.x() - origin.x()
+        dy = end.y() - origin.y()
+        if shape_type == ShapeType.LINE:
+            length = math.hypot(dx, dy)
+            if length <= 0.0:
+                return end
+            angle = math.atan2(dy, dx)
+            step = math.pi / 4.0
+            snapped = round(angle / step) * step
+            return QPointF(
+                origin.x() + math.cos(snapped) * length,
+                origin.y() + math.sin(snapped) * length,
+            )
+        if shape_type in (ShapeType.RECTANGLE, ShapeType.ELLIPSE, ShapeType.TRIANGLE):
+            side = min(abs(dx), abs(dy))
+            sx = 1.0 if dx >= 0 else -1.0
+            sy = 1.0 if dy >= 0 else -1.0
+            return QPointF(origin.x() + sx * side, origin.y() + sy * side)
+        return end
+
+    def _link_at(self, pos: QPoint) -> dict | None:
+        pix_pos = self._point_in_pixmap(pos)
+        if pix_pos is None:
+            return None
+        for i, rect in enumerate(self._link_rects):
+            if rect and rect.contains(pix_pos):
+                return self._links[i]
+        return None
+
+    def _word_index_at(self, pos: QPoint) -> int | None:
+        pix_pos = self._point_in_pixmap(pos)
+        if pix_pos is None:
+            return None
+        for i, rect in enumerate(self._word_rects):
+            if rect.contains(pix_pos):
+                return i
+        return None
+
+    def _annotation_by_xref(self, xref: int | None) -> FreeTextAnnotData | None:
+        if xref is None:
+            return None
+        for annot in self._annotations:
+            if annot.xref == xref:
+                return annot
+        return None
+
+    def _annotation_widget_rect(self, annot: FreeTextAnnotData, rect_override: QRectF | None = None) -> QRectF:
+        rect = rect_override if rect_override is not None else self._rect_tuple_to_qrectf(annot.rect)
+        return self._page_rect_to_widget_rect(rect)
+
+    def _annotation_color(
+        self,
+        color: tuple[float, float, float] | None,
+        *,
+        opacity: float = 1.0,
+    ) -> QColor | None:
+        if color is None:
+            return None
+        return QColor(
+            round(color[0] * 255),
+            round(color[1] * 255),
+            round(color[2] * 255),
+            round(max(0.0, min(1.0, opacity)) * 255),
+        )
+
+    def _paint_annotation(self, painter: QPainter, annot: FreeTextAnnotData, rect: QRectF) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        text_rot = annot.text_rotation % 360
+        if text_rot:
+            center = rect.center()
+            painter.translate(center)
+            painter.rotate(text_rot)
+            # Use swapped dimensions for 90/270 so text wrapping matches native rendering
+            if text_rot in (90, 270):
+                w, h = rect.height(), rect.width()
+            else:
+                w, h = rect.width(), rect.height()
+            paint_rect = QRectF(-w / 2, -h / 2, w, h)
+        else:
+            paint_rect = rect
+
+        fill_color = self._annotation_color(annot.fill_color, opacity=annot.opacity)
+        if fill_color is not None:
+            painter.fillRect(paint_rect, fill_color)
+
+        pen_width = max(0.0, float(annot.border_width) * self._zoom_factor)
+        border_color = self._annotation_color(annot.border_color, opacity=annot.opacity)
+        if border_color is not None and pen_width > 0:
+            border_pen = QPen(border_color)
+            border_pen.setWidthF(pen_width)
+            painter.setPen(border_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            inset = pen_width / 2.0
+            border_rect = paint_rect
+            if paint_rect.width() > pen_width and paint_rect.height() > pen_width:
+                border_rect = paint_rect.adjusted(inset, inset, -inset, -inset)
+            painter.drawRect(border_rect)
+
+        if annot.content:
+            font = painter.font()
+            pixel_size = max(10, round(annot.fontsize * self._zoom_factor))
+            font.setPointSizeF(_pixel_size_to_pointf(pixel_size))
+            painter.setFont(font)
+            text_color = self._annotation_color(annot.text_color, opacity=annot.opacity)
+            if text_color is not None:
+                painter.setPen(text_color)
+            effective_border_width = annot.border_width if annot.border_color is not None else 0.0
+            text_inset = effective_border_width * 2.0 * self._zoom_factor
+            text_rect = paint_rect.adjusted(text_inset, text_inset, -text_inset, 0) if text_inset > 0 else paint_rect
+            painter.drawText(
+                text_rect,
+                int(
+                    Qt.AlignmentFlag.AlignLeft
+                    | Qt.AlignmentFlag.AlignTop
+                    | Qt.TextFlag.TextWordWrap
+                ),
+                annot.content,
+            )
+
+        painter.restore()
+
+    def _paint_shape_annotation(
+        self,
+        painter: QPainter,
+        shape: ShapeAnnotData,
+        rect: QRectF,
+        *,
+        vertices_override: tuple[tuple[float, float], ...] | None = None,
+    ) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        opacity = max(0.0, min(1.0, shape.opacity))
+        stroke_color = self._annotation_color(shape.stroke_color, opacity=opacity)
+        fill_color = self._annotation_color(shape.fill_color, opacity=opacity)
+
+        pen_width = max(0.0, float(shape.stroke_width) * self._zoom_factor)
+        if stroke_color is not None and pen_width > 0:
+            pen = QPen(stroke_color)
+            pen.setWidthF(pen_width)
+            painter.setPen(pen)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+
+        if fill_color is not None:
+            painter.setBrush(QBrush(fill_color))
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        center = rect.center()
+        rotation = shape.rotation
+        if rotation != 0.0:
+            painter.translate(center)
+            painter.rotate(rotation)
+            paint_rect = QRectF(-rect.width() / 2, -rect.height() / 2, rect.width(), rect.height())
+        else:
+            paint_rect = rect
+
+        if shape.shape_type == ShapeType.LINE:
+            verts = vertices_override if vertices_override is not None else shape.vertices
+            if verts and len(verts) >= 2:
+                rx1, ry1 = verts[0]
+                rx2, ry2 = verts[1]
+            else:
+                rx1, ry1 = (0.0, 0.5)
+                rx2, ry2 = (1.0, 0.5)
+            p1 = QPointF(
+                paint_rect.left() + rx1 * paint_rect.width(),
+                paint_rect.top() + ry1 * paint_rect.height(),
+            )
+            p2 = QPointF(
+                paint_rect.left() + rx2 * paint_rect.width(),
+                paint_rect.top() + ry2 * paint_rect.height(),
+            )
+            painter.drawLine(p1, p2)
+            if shape.arrow_start or shape.arrow_end:
+                self._draw_arrow_heads(painter, p1, p2, pen_width, shape.arrow_start, shape.arrow_end)
+
+        elif shape.shape_type == ShapeType.RECTANGLE:
+            inset = pen_width / 2.0 if pen_width > 0 else 0.0
+            draw_rect = paint_rect
+            if draw_rect.width() > pen_width and draw_rect.height() > pen_width:
+                draw_rect = paint_rect.adjusted(inset, inset, -inset, -inset)
+            painter.drawRect(draw_rect)
+
+        elif shape.shape_type == ShapeType.ELLIPSE:
+            inset = pen_width / 2.0 if pen_width > 0 else 0.0
+            draw_rect = paint_rect
+            if draw_rect.width() > pen_width and draw_rect.height() > pen_width:
+                draw_rect = paint_rect.adjusted(inset, inset, -inset, -inset)
+            painter.drawEllipse(draw_rect)
+
+        elif shape.shape_type == ShapeType.TRIANGLE:
+            ax, ay = shape.triangle_apex
+            ax = min(1.0, max(0.0, float(ax)))
+            ay = min(1.0, max(0.0, float(ay)))
+            apex_x = paint_rect.left() + ax * paint_rect.width()
+            apex_y = paint_rect.top() + ay * paint_rect.height()
+            poly = QPolygonF([
+                QPointF(apex_x, apex_y),
+                QPointF(paint_rect.right(), paint_rect.bottom()),
+                QPointF(paint_rect.left(), paint_rect.bottom()),
+            ])
+            painter.drawPolygon(poly)
+
+        elif shape.shape_type == ShapeType.BRACKET:
+            from src.utils.pdf_utils import _compute_bracket_vertices
+            # Compute bracket vertices in the local (unrotated) rect coordinate space
+            local_rect = (paint_rect.left(), paint_rect.top(), paint_rect.right(), paint_rect.bottom())
+            verts = _compute_bracket_vertices(local_rect, shape.bracket_style, shape.bracket_side)
+            poly = QPolygonF([QPointF(v[0], v[1]) for v in verts])
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(poly)
+
+        painter.restore()
+
+    def _draw_arrow_heads(
+        self,
+        painter: QPainter,
+        p1: QPointF,
+        p2: QPointF,
+        pen_width: float,
+        draw_start: bool,
+        draw_end: bool,
+    ) -> None:
+        import math
+        arrow_size = max(8.0, pen_width * 4)
+        dx = p2.x() - p1.x()
+        dy = p2.y() - p1.y()
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            return
+        ux, uy = dx / length, dy / length
+        px, py = -uy, ux
+
+        if draw_end:
+            tip = p2
+            base1 = QPointF(tip.x() - arrow_size * ux + arrow_size * 0.4 * px,
+                            tip.y() - arrow_size * uy + arrow_size * 0.4 * py)
+            base2 = QPointF(tip.x() - arrow_size * ux - arrow_size * 0.4 * px,
+                            tip.y() - arrow_size * uy - arrow_size * 0.4 * py)
+            painter.drawLine(tip, base1)
+            painter.drawLine(tip, base2)
+
+        if draw_start:
+            tip = p1
+            base1 = QPointF(tip.x() + arrow_size * ux + arrow_size * 0.4 * px,
+                            tip.y() + arrow_size * uy + arrow_size * 0.4 * py)
+            base2 = QPointF(tip.x() + arrow_size * ux - arrow_size * 0.4 * px,
+                            tip.y() + arrow_size * uy - arrow_size * 0.4 * py)
+            painter.drawLine(tip, base1)
+            painter.drawLine(tip, base2)
+
+    def _handle_rects(self, rect: QRectF) -> dict[str, QRectF]:
+        size = float(self.HANDLE_SIZE)
+        half = size / 2.0
+        cx = rect.center().x()
+        cy = rect.center().y()
+        positions = {
+            "nw": QPointF(rect.left(), rect.top()),
+            "n": QPointF(cx, rect.top()),
+            "ne": QPointF(rect.right(), rect.top()),
+            "e": QPointF(rect.right(), cy),
+            "se": QPointF(rect.right(), rect.bottom()),
+            "s": QPointF(cx, rect.bottom()),
+            "sw": QPointF(rect.left(), rect.bottom()),
+            "w": QPointF(rect.left(), cy),
+        }
+        return {
+            name: QRectF(point.x() - half, point.y() - half, size, size)
+            for name, point in positions.items()
+        }
+
+    def _line_endpoints_in_widget(
+        self,
+        shape: ShapeAnnotData,
+        rect_override: QRectF | None = None,
+        vertices_override: tuple[tuple[float, float], ...] | None = None,
+    ) -> tuple[QPointF, QPointF]:
+        widget_rect = self._annotation_widget_rect(shape, rect_override)
+        verts = vertices_override if vertices_override is not None else shape.vertices
+        if verts and len(verts) >= 2:
+            rx1, ry1 = verts[0]
+            rx2, ry2 = verts[1]
+        else:
+            rx1, ry1 = (0.0, 0.5)
+            rx2, ry2 = (1.0, 0.5)
+        p1 = QPointF(
+            widget_rect.left() + rx1 * widget_rect.width(),
+            widget_rect.top() + ry1 * widget_rect.height(),
+        )
+        p2 = QPointF(
+            widget_rect.left() + rx2 * widget_rect.width(),
+            widget_rect.top() + ry2 * widget_rect.height(),
+        )
+        rotation = float(shape.rotation or 0.0)
+        if rotation:
+            cx = widget_rect.center().x()
+            cy = widget_rect.center().y()
+            rad = math.radians(rotation)
+            cos_r = math.cos(rad)
+            sin_r = math.sin(rad)
+
+            def rot(p: QPointF) -> QPointF:
+                dx = p.x() - cx
+                dy = p.y() - cy
+                return QPointF(cx + dx * cos_r - dy * sin_r, cy + dx * sin_r + dy * cos_r)
+
+            p1 = rot(p1)
+            p2 = rot(p2)
+        return p1, p2
+
+    def _line_handle_rects(
+        self,
+        shape: ShapeAnnotData,
+        rect_override: QRectF | None = None,
+        vertices_override: tuple[tuple[float, float], ...] | None = None,
+    ) -> dict[str, QRectF]:
+        p1, p2 = self._line_endpoints_in_widget(shape, rect_override, vertices_override)
+        size = float(self.HANDLE_SIZE)
+        half = size / 2.0
+        return {
+            "ep_start": QRectF(p1.x() - half, p1.y() - half, size, size),
+            "ep_end": QRectF(p2.x() - half, p2.y() - half, size, size),
+        }
+
+    @staticmethod
+    def _point_to_segment_distance(p: QPointF, a: QPointF, b: QPointF) -> float:
+        dx = b.x() - a.x()
+        dy = b.y() - a.y()
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-9:
+            return math.hypot(p.x() - a.x(), p.y() - a.y())
+        t = ((p.x() - a.x()) * dx + (p.y() - a.y()) * dy) / seg_len_sq
+        t = max(0.0, min(1.0, t))
+        cx = a.x() + t * dx
+        cy = a.y() + t * dy
+        return math.hypot(p.x() - cx, p.y() - cy)
+
+    def _line_hit_test(self, shape: ShapeAnnotData, pos: QPoint) -> bool:
+        p1, p2 = self._line_endpoints_in_widget(shape)
+        pen_width = max(0.0, float(shape.stroke_width) * self._zoom_factor)
+        tolerance = max(6.0, pen_width / 2.0 + 4.0)
+        return self._point_to_segment_distance(QPointF(pos), p1, p2) <= tolerance
+
+    def _annotation_hit_test(self, pos: QPoint) -> tuple[FreeTextAnnotData | None, str | None]:
+        selected = self._annotation_by_xref(self._selected_annotation_xref)
+        if selected is not None:
+            if isinstance(selected, ShapeAnnotData) and selected.shape_type == ShapeType.LINE:
+                for handle, handle_rect in self._line_handle_rects(selected).items():
+                    if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
+                        return selected, handle
+            else:
+                selected_rect = self._annotation_widget_rect(selected)
+                for handle, handle_rect in self._handle_rects(selected_rect).items():
+                    if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
+                        return selected, handle
+        for annot in reversed(self._annotations):
+            if isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
+                if self._line_hit_test(annot, pos):
+                    return annot, "move"
+            elif self._annotation_widget_rect(annot).contains(QPointF(pos)):
+                return annot, "move"
+        return None, None
+
+    def _cursor_for_handle(self, handle: str | None) -> Qt.CursorShape:
+        mapping = {
+            "move": Qt.CursorShape.SizeAllCursor,
+            "n": Qt.CursorShape.SizeVerCursor,
+            "s": Qt.CursorShape.SizeVerCursor,
+            "e": Qt.CursorShape.SizeHorCursor,
+            "w": Qt.CursorShape.SizeHorCursor,
+            "ne": Qt.CursorShape.SizeBDiagCursor,
+            "sw": Qt.CursorShape.SizeBDiagCursor,
+            "nw": Qt.CursorShape.SizeFDiagCursor,
+            "se": Qt.CursorShape.SizeFDiagCursor,
+        }
+        return mapping.get(handle, Qt.CursorShape.ArrowCursor)
+
+    def _annotation_rect_close(self, left: QRectF | None, right: QRectF | None) -> bool:
+        if left is None or right is None:
+            return left is right
+        return (
+            abs(left.left() - right.left()) < 0.01
+            and abs(left.top() - right.top()) < 0.01
+            and abs(left.width() - right.width()) < 0.01
+            and abs(left.height() - right.height()) < 0.01
+        )
+
+    def annotation_rect_for_page_point(
+        self,
+        annotation: FreeTextAnnotData,
+        page_point: QPointF,
+    ) -> QRectF | None:
+        page_w, page_h = self.page_size_points()
+        if page_w <= 0 or page_h <= 0:
+            return None
+        src_x0, src_y0, src_x1, src_y1 = annotation.rect
+        width = min(max(1.0, float(src_x1 - src_x0)), page_w)
+        height = min(max(1.0, float(src_y1 - src_y0)), page_h)
+        left = min(max(0.0, page_point.x()), max(0.0, page_w - width))
+        top = min(max(0.0, page_point.y()), max(0.0, page_h - height))
+        return QRectF(left, top, width, height)
+
+    def _paste_rect_for_page_point(self, page_point: QPointF) -> QRectF | None:
+        if self._paste_annotation is None:
+            return None
+        return self.annotation_rect_for_page_point(self._paste_annotation, page_point)
+
+    def _drag_updated_line(
+        self, current_page: QPointF
+    ) -> tuple[QRectF, tuple[tuple[float, float], tuple[float, float]]] | None:
+        # LINE の端点ハンドル (ep_start / ep_end) ドラッグ時に、新しい bbox と正規化頂点を返す。
+        if (
+            self._drag_mode not in ("ep_start", "ep_end")
+            or self._drag_base_rect is None
+            or self._drag_base_vertices is None
+        ):
+            return None
+        base = self._drag_base_rect
+        verts = self._drag_base_vertices
+        if verts and len(verts) >= 2:
+            rx1, ry1 = verts[0]
+            rx2, ry2 = verts[1]
+        else:
+            rx1, ry1 = (0.0, 0.5)
+            rx2, ry2 = (1.0, 0.5)
+        bw = base.width()
+        bh = base.height()
+        sp_orig = QPointF(base.left() + rx1 * bw, base.top() + ry1 * bh)
+        ep_orig = QPointF(base.left() + rx2 * bw, base.top() + ry2 * bh)
+
+        page_w, page_h = self.page_size_points()
+        clamped = QPointF(
+            min(max(0.0, current_page.x()), page_w if page_w > 0 else current_page.x()),
+            min(max(0.0, current_page.y()), page_h if page_h > 0 else current_page.y()),
+        )
+        if self._drag_mode == "ep_start":
+            new_sp, new_ep = clamped, ep_orig
+        else:
+            new_sp, new_ep = sp_orig, clamped
+
+        x0 = min(new_sp.x(), new_ep.x())
+        x1 = max(new_sp.x(), new_ep.x())
+        y0 = min(new_sp.y(), new_ep.y())
+        y1 = max(new_sp.y(), new_ep.y())
+        if max(x1 - x0, y1 - y0) < 1.0:
+            return None
+        width = x1 - x0
+        height = y1 - y0
+        nrx1 = (new_sp.x() - x0) / width if width > 0 else 0.0
+        nry1 = (new_sp.y() - y0) / height if height > 0 else 0.5
+        nrx2 = (new_ep.x() - x0) / width if width > 0 else 1.0
+        nry2 = (new_ep.y() - y0) / height if height > 0 else 0.5
+        return QRectF(QPointF(x0, y0), QPointF(x1, y1)), ((nrx1, nry1), (nrx2, nry2))
+
+    def _drag_updated_rect(self, current_page: QPointF) -> QRectF | None:
+        if self._drag_mode is None or self._drag_origin_page is None or self._drag_base_rect is None:
+            return None
+
+        page_w, page_h = self.page_size_points()
+        base = self._drag_base_rect
+
+        if self._drag_mode == "move":
+            width = base.width()
+            height = base.height()
+            left = base.left() + (current_page.x() - self._drag_origin_page.x())
+            top = base.top() + (current_page.y() - self._drag_origin_page.y())
+            left = min(max(0.0, left), max(0.0, page_w - width))
+            top = min(max(0.0, top), max(0.0, page_h - height))
+            return QRectF(left, top, width, height)
+
+        annot = self._annotation_by_xref(self._drag_annotation_xref)
+        min_w, min_h, min_span = self._min_dims_for_annotation(annot)
+
+        left = base.left()
+        top = base.top()
+        right = base.right()
+        bottom = base.bottom()
+
+        if "w" in self._drag_mode:
+            left = min(max(0.0, current_page.x()), right - min_w)
+        if "e" in self._drag_mode:
+            right = max(min(page_w, current_page.x()), left + min_w)
+        if "n" in self._drag_mode:
+            top = min(max(0.0, current_page.y()), bottom - min_h)
+        if "s" in self._drag_mode:
+            bottom = max(min(page_h, current_page.y()), top + min_h)
+
+        if min_span > 0.0 and max(right - left, bottom - top) < min_span:
+            return None
+
+        return QRectF(QPointF(left, top), QPointF(right, bottom))
+
+    def _update_selection(self) -> None:
+        if not self._pixmap or self._pixmap.isNull() or self._selection_rect is None:
+            self._selected_word_indices = []
+            return
+        offset = self._pixmap_offset()
+        sel = QRectF(self._selection_rect.normalized())
+        sel.translate(-offset.x(), -offset.y())
+        logical_size = self._pixmap.deviceIndependentSize()
+        pix_bounds = QRectF(0, 0, logical_size.width(), logical_size.height())
+        sel = sel.intersected(pix_bounds)
+        if sel.isEmpty():
+            self._selected_word_indices = []
+            return
+        selected = []
+        for i, rect in enumerate(self._word_rects):
+            if rect.intersects(sel):
+                selected.append(i)
+        self._selected_word_indices = selected
+
+    def _selected_text(self) -> str:
+        if not self._selected_word_indices:
+            return ""
+        selected_words = [self._words[i] for i in self._selected_word_indices if i < len(self._words)]
+        selected_words.sort(key=lambda w: (w[5], w[6], w[7]) if len(w) > 7 else (0, 0, 0))
+        lines: list[str] = []
+        current_line: list[str] = []
+        current_key = None
+        for word in selected_words:
+            if len(word) < 5:
+                continue
+            key = (word[5], word[6]) if len(word) > 6 else (0, 0)
+            if current_key is None:
+                current_key = key
+            if key != current_key:
+                if current_line:
+                    lines.append(" ".join(current_line))
+                current_line = [word[4]]
+                current_key = key
+            else:
+                current_line.append(word[4])
+        if current_line:
+            lines.append(" ".join(current_line))
+        return "\n".join(lines)
+
+    def _update_cursor(self, pos: QPoint) -> None:
+        if self.has_annotation_paste_mode():
+            if self._point_in_pixmap(pos) is not None:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        if self._annotation_create_mode:
+            if self._point_in_pixmap(pos) is not None:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        annot, handle = self._annotation_hit_test(pos)
+        if annot is not None:
+            self._hover_annotation_xref = annot.xref
+            self.setCursor(self._cursor_for_handle(handle))
+            return
+        self._hover_annotation_xref = None
+        if self._link_at(pos):
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            return
+        if self._word_index_at(pos) is not None:
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+            return
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self.palette().brush(self.backgroundRole()))
+        if self._pixmap and not self._pixmap.isNull():
+            offset = self._pixmap_offset()
+            painter.drawPixmap(offset, self._pixmap)
+
+            if self._search_hit_rects:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 235, 59, 130))
+                offset_pt = QPointF(offset)
+                for rect in self._search_hit_rects:
+                    painter.drawRect(rect.translated(offset_pt))
+
+            if self._selected_word_indices:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(0, 120, 215, 80))
+                for idx in self._selected_word_indices:
+                    if idx < len(self._word_rects):
+                        rect = self._word_rects[idx].translated(QPointF(offset))
+                        painter.drawRect(rect)
+
+            for annot in self._annotations:
+                preview_rect: QRectF | None = None
+                dragging_this = annot.xref == self._drag_annotation_xref
+                if (
+                    dragging_this
+                    and self._pending_annotation_rect is not None
+                    and not self._drag_copy_mode
+                ):
+                    preview_rect = self._annotation_widget_rect(annot, self._pending_annotation_rect)
+                annot_rect = preview_rect or self._annotation_widget_rect(annot)
+                is_line_shape = (
+                    isinstance(annot, ShapeAnnotData)
+                    and annot.shape_type == ShapeType.LINE
+                )
+                line_vertices_override: tuple[tuple[float, float], ...] | None = None
+                if (
+                    is_line_shape
+                    and dragging_this
+                    and self._pending_line_vertices is not None
+                    and not self._drag_copy_mode
+                ):
+                    line_vertices_override = self._pending_line_vertices
+                is_being_edited = (
+                    annot.xref == self._editing_annotation_xref
+                    and self._inline_editor is not None
+                    and self._inline_editor.isVisible()
+                )
+                if not is_being_edited:
+                    if isinstance(annot, ShapeAnnotData):
+                        self._paint_shape_annotation(
+                            painter,
+                            annot,
+                            annot_rect,
+                            vertices_override=line_vertices_override,
+                        )
+                    else:
+                        self._paint_annotation(painter, annot, annot_rect)
+                if annot.xref == self._selected_annotation_xref:
+                    painter.setPen(QPen(QColor(0, 120, 215), 1))
+                    painter.setBrush(QBrush(QColor(255, 255, 255)))
+                    if is_line_shape:
+                        handle_rect_override = (
+                            self._pending_annotation_rect if preview_rect is not None else None
+                        )
+                        handle_iter = self._line_handle_rects(
+                            annot,
+                            handle_rect_override,
+                            line_vertices_override,
+                        ).values()
+                    else:
+                        handle_iter = self._handle_rects(annot_rect).values()
+                    for handle_rect in handle_iter:
+                        painter.drawRect(handle_rect)
+
+            if (
+                self._drag_copy_mode
+                and self._pending_annotation_rect is not None
+                and self._drag_annotation_xref is not None
+            ):
+                drag_annot = self._annotation_by_xref(self._drag_annotation_xref)
+                if drag_annot is not None:
+                    ghost_rect = self._annotation_widget_rect(drag_annot, self._pending_annotation_rect)
+                    painter.save()
+                    painter.setOpacity(0.6)
+                    if isinstance(drag_annot, ShapeAnnotData):
+                        self._paint_shape_annotation(painter, drag_annot, ghost_rect)
+                    else:
+                        self._paint_annotation(painter, drag_annot, ghost_rect)
+                    painter.restore()
+
+        if self._selection_rect is not None:
+            pen = QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self._selection_rect.normalized())
+        if self._annotation_create_preview_rect is not None:
+            painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if (
+                self._annotation_create_shape_type == ShapeType.LINE
+                and self._annotation_create_origin_page is not None
+                and self._annotation_create_current_page is not None
+            ):
+                p1 = self._page_point_to_widget_point(self._annotation_create_origin_page)
+                p2 = self._page_point_to_widget_point(self._annotation_create_current_page)
+                painter.drawLine(p1, p2)
+            else:
+                preview_rect = self._page_rect_to_widget_rect(self._annotation_create_preview_rect)
+                painter.drawRect(preview_rect)
+        if self._paste_annotation is not None and self._paste_preview_rect is not None:
+            preview_rect = self._annotation_widget_rect(self._paste_annotation, self._paste_preview_rect)
+            if isinstance(self._paste_annotation, ShapeAnnotData):
+                self._paint_shape_annotation(painter, self._paste_annotation, preview_rect)
+            else:
+                self._paint_annotation(painter, self._paste_annotation, preview_rect)
+            painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(preview_rect)
+
+    def wheelEvent(self, event) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Ctrl+ホイールでズーム
+            delta = event.angleDelta().y()
+            if delta == 0:
+                return
+            step = 5 if delta > 0 else -5
+            self.wheel_zoom.emit(step)
+            event.accept()
+        else:
+            # 通常スクロールは親に伝播
+            event.ignore()
+
+    def mousePressEvent(self, event) -> None:
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.setFocus()
+                page_point = self._page_point_from_widget_pos(event.pos())
+                if self.has_annotation_paste_mode():
+                    if page_point is None:
+                        self.cancel_annotation_paste_mode()
+                        event.accept()
+                        return
+                    if self._selected_annotation_xref is not None:
+                        self._selected_annotation_xref = None
+                        self.annotation_selected.emit(None)
+                    self._selection_origin = None
+                    self._selection_rect = None
+                    self._selection_active = False
+                    self._pressed_link = None
+                    self._paste_drag_active = True
+                    self._paste_preview_rect = self._paste_rect_for_page_point(page_point)
+                    self.update()
+                    event.accept()
+                    return
+                if self._annotation_create_mode:
+                    if page_point is None:
+                        event.accept()
+                        return
+                    if self._selected_annotation_xref is not None:
+                        self._selected_annotation_xref = None
+                        self.annotation_selected.emit(None)
+                    self._selected_word_indices = []
+                    self._selection_origin = None
+                    self._selection_rect = None
+                    self._selection_active = False
+                    self._pressed_link = None
+                    self._annotation_create_origin_page = page_point
+                    self._annotation_create_current_page = page_point
+                    self._annotation_create_preview_rect = QRectF(page_point, page_point)
+                    self.update()
+                    event.accept()
+                    return
+
+                annot, handle = self._annotation_hit_test(event.pos())
+                if annot is not None and handle is not None:
+                    ctrl_copy = (
+                        handle == "move"
+                        and bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+                    )
+                    self._selected_annotation_xref = annot.xref
+                    self.annotation_selected.emit(annot)
+                    self._drag_annotation_xref = annot.xref
+                    self._drag_mode = handle
+                    self._drag_origin_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
+                    self._drag_base_rect = self._rect_tuple_to_qrectf(annot.rect)
+                    self._pending_annotation_rect = QRectF(self._drag_base_rect)
+                    if isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
+                        base_verts = tuple(tuple(v) for v in annot.vertices) if annot.vertices else ()
+                        self._drag_base_vertices = base_verts
+                        self._pending_line_vertices = base_verts
+                    else:
+                        self._drag_base_vertices = None
+                        self._pending_line_vertices = None
+                    self._drag_moved = False
+                    self._drag_copy_mode = ctrl_copy
+                    self.update()
+                    event.accept()
+                    return
+
+                if self._selected_annotation_xref is not None:
+                    self._selected_annotation_xref = None
+                    self.annotation_selected.emit(None)
+
+                self._selection_origin = event.pos()
+                self._selection_rect = QRect(self._selection_origin, self._selection_origin)
+                self._pressed_link = self._link_at(event.pos())
+                self._selection_active = self._pressed_link is None
+                if self._selection_active:
+                    self._update_selection()
+                self.update()
+        except Exception as e:
+            logger.exception("Error in ZoomPageWidget.mousePressEvent")
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                annot, handle = self._annotation_hit_test(event.pos())
+                if annot is not None and handle == "move" and not isinstance(annot, ShapeAnnotData):
+                    self.annotation_edit_requested.emit(annot)
+                    event.accept()
+                    return
+        except Exception:
+            logger.exception("Error in ZoomPageWidget.mouseDoubleClickEvent")
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        try:
+            if self.has_annotation_paste_mode() and self._paste_drag_active:
+                current_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
+                if current_page is not None:
+                    self._paste_preview_rect = self._paste_rect_for_page_point(current_page)
+                    self.update()
+                event.accept()
+                return
+            if (
+                self._annotation_create_mode
+                and self._annotation_create_origin_page is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                current_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
+                if current_page is not None:
+                    if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                        current_page = self._apply_shape_shift_constraint(
+                            self._annotation_create_shape_type,
+                            self._annotation_create_origin_page,
+                            current_page,
+                        )
+                    self._annotation_create_current_page = current_page
+                    self._annotation_create_preview_rect = QRectF(
+                        self._annotation_create_origin_page,
+                        current_page,
+                    ).normalized()
+                    self.update()
+                event.accept()
+                return
+            if event.buttons() & Qt.MouseButton.LeftButton and self._drag_mode is not None:
+                current_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
+                if current_page is not None:
+                    if self._drag_mode in ("ep_start", "ep_end"):
+                        line_updated = self._drag_updated_line(current_page)
+                        if line_updated is not None:
+                            new_rect, new_vertices = line_updated
+                            self._pending_annotation_rect = new_rect
+                            self._pending_line_vertices = new_vertices
+                            rect_changed = not self._annotation_rect_close(new_rect, self._drag_base_rect)
+                            verts_changed = new_vertices != self._drag_base_vertices
+                            self._drag_moved = rect_changed or verts_changed
+                            self.update()
+                    else:
+                        updated = self._drag_updated_rect(current_page)
+                        if updated is not None:
+                            self._pending_annotation_rect = updated
+                            self._drag_moved = not self._annotation_rect_close(updated, self._drag_base_rect)
+                            self.update()
+                event.accept()
+                return
+            if event.buttons() & Qt.MouseButton.LeftButton and self._selection_origin is not None:
+                if not self._selection_active:
+                    if (event.pos() - self._selection_origin).manhattanLength() >= QApplication.startDragDistance():
+                        self._selection_active = True
+                        self._pressed_link = None
+                if self._selection_active:
+                    self._selection_rect = QRect(self._selection_origin, event.pos()).normalized()
+                    self._update_selection()
+                    self.update()
+            else:
+                self._update_cursor(event.pos())
+        except Exception as e:
+            logger.exception("Error in ZoomPageWidget.mouseMoveEvent")
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                if self.has_annotation_paste_mode():
+                    final_rect = self._paste_preview_rect
+                    self.cancel_annotation_paste_mode()
+                    if final_rect is not None:
+                        self.annotation_paste_placement_requested.emit(
+                            self._qrectf_to_rect_tuple(final_rect)
+                        )
+                    event.accept()
+                    return
+                if self._annotation_create_mode and self._annotation_create_origin_page is not None:
+                    current_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
+                    origin = self._annotation_create_origin_page
+                    end_point = current_page if current_page is not None else self._annotation_create_current_page
+                    shape_type = self._annotation_create_shape_type
+                    if (
+                        end_point is not None
+                        and origin is not None
+                        and event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                    ):
+                        end_point = self._apply_shape_shift_constraint(shape_type, origin, end_point)
+                    self._clear_annotation_create_drag()
+                    self.update()
+                    if origin is not None and end_point is not None:
+                        start_t = (origin.x(), origin.y())
+                        end_t = (end_point.x(), end_point.y())
+                        if shape_type is not None:
+                            self.shape_create_requested.emit(shape_type, start_t, end_t)
+                        else:
+                            final_rect = QRectF(origin, end_point).normalized()
+                            if final_rect.width() > 0 and final_rect.height() > 0:
+                                self.annotation_create_requested.emit(
+                                    self._qrectf_to_rect_tuple(final_rect)
+                                )
+                    event.accept()
+                    return
+                if self._drag_mode is not None:
+                    annot = self._annotation_by_xref(self._drag_annotation_xref)
+                    final_rect = self._pending_annotation_rect or self._drag_base_rect
+                    final_vertices = self._pending_line_vertices
+                    drag_mode = self._drag_mode
+                    copy_mode = self._drag_copy_mode
+                    if annot is not None and final_rect is not None and self._drag_moved:
+                        if copy_mode and drag_mode == "move":
+                            self.annotation_duplicate_requested.emit(
+                                annot,
+                                self._qrectf_to_rect_tuple(final_rect),
+                                None,
+                            )
+                        elif (
+                            isinstance(annot, ShapeAnnotData)
+                            and annot.shape_type == ShapeType.LINE
+                            and drag_mode in ("ep_start", "ep_end")
+                            and final_vertices is not None
+                        ):
+                            self.shape_geometry_changed_with_vertices.emit(
+                                annot,
+                                self._qrectf_to_rect_tuple(final_rect),
+                                final_vertices,
+                                drag_mode,
+                            )
+                        else:
+                            self.annotation_geometry_changed.emit(
+                                annot,
+                                self._qrectf_to_rect_tuple(final_rect),
+                                drag_mode,
+                            )
+                    self._drag_annotation_xref = None
+                    self._drag_mode = None
+                    self._drag_origin_page = None
+                    self._drag_base_rect = None
+                    self._pending_annotation_rect = None
+                    self._drag_base_vertices = None
+                    self._pending_line_vertices = None
+                    self._drag_moved = False
+                    self._drag_copy_mode = False
+                    self.update()
+                    event.accept()
+                    return
+                if self._selection_active:
+                    if self._selection_rect is not None:
+                        rect = self._selection_rect.normalized()
+                        if rect.width() < 3 and rect.height() < 3:
+                            idx = self._word_index_at(event.pos())
+                            self._selected_word_indices = [idx] if idx is not None else []
+                    self._selection_rect = None
+                    self._selection_active = False
+                else:
+                    if self._pressed_link is not None:
+                        self.link_clicked.emit(self._pressed_link)
+                self._selection_origin = None
+                self._pressed_link = None
+                self.update()
+        except Exception as e:
+            logger.exception("Error in ZoomPageWidget.mouseReleaseEvent")
+        event.accept()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self.has_annotation_paste_mode():
+            self.cancel_annotation_paste_mode()
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Copy):
+            annot = self._annotation_by_xref(self._selected_annotation_xref)
+            if annot is not None:
+                self.annotation_copy_requested.emit(annot)
+                event.accept()
+                return
+            text = self._selected_text()
+            if text:
+                QApplication.clipboard().setText(text)
+                event.accept()
+                return
+        if event.matches(QKeySequence.StandardKey.Paste) and self._annotation_paste_available:
+            self.annotation_paste_requested.emit()
+            event.accept()
+            return
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and self._selected_annotation_xref is not None
+        ):
+            self.annotation_delete_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._layout_inline_editor()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        if self.has_annotation_paste_mode():
+            self.cancel_annotation_paste_mode()
+
+
+class PageEditWindow(QMainWindow):
+    """Window for editing pages within a PDF."""
+
+    ZOOM_MIN = 25
+    ZOOM_MAX = 400
+    ZOOM_STEP = 5
+    PREVIEW_THUMB_MIN = 80
+    PREVIEW_THUMB_MAX = 400
+    PREVIEW_THUMB_STEP = 20
+
+    def __init__(self, pdf_path: str, undo_manager: UndoManager, parent=None):
+        super().__init__(parent)
+        self._pdf_path = pdf_path
+        self._undo_manager = undo_manager
+        self._did_initial_grid_layout = False
+        self._thumbnails: list[PageThumbnail] = []
+        self._selected_thumbnails: list[PageThumbnail] = []
+        self._grid_scroll = None
+        self._zoom_view = None
+        self._zoom_scroll = None
+        self._zoom_label = None
+        self._zoom_percent_label = None
+        self._zoom_page_label = None
+        self._zoom_prev_btn = None
+        self._zoom_next_btn = None
+        self._zoom_page_num = None
+        self._zoom_factor = 1.0
+        self._zoom_text_cache: dict[int, tuple[list[tuple], list[dict]]] = {}
+        self._zoom_annotations: list[FreeTextAnnotData] = []
+        self._selected_zoom_annotation: FreeTextAnnotData | None = None
+        self._copied_zoom_annotation: AnyAnnotData | None = None
+        self._zoom_annotation_drawer = None
+        self._zoom_annotation_panel = None
+        self._zoom_annotation_toggle_btn = None
+        self._zoom_annotation_open = False
+        self._zoom_annotation_form_sync = False
+        self._zoom_annotation_text_commit_in_progress = False
+        self._zoom_annotation_new_btn = None
+        self._zoom_annotation_delete_btn = None
+        self._zoom_annotation_order_front_btn = None
+        self._zoom_annotation_order_forward_btn = None
+        self._zoom_annotation_order_backward_btn = None
+        self._zoom_annotation_order_back_btn = None
+        self._zoom_annotation_width_spin = None
+        self._zoom_annotation_height_spin = None
+        self._zoom_annotation_fontsize_spin = None
+        self._zoom_annotation_opacity_slider = None
+        self._zoom_annotation_opacity_label = None
+        self._zoom_annotation_border_width_spin = None
+        self._zoom_annotation_text_color_btn = None
+        self._zoom_annotation_fill_color_btn = None
+        self._zoom_annotation_fill_color_clear_btn = None
+        self._zoom_annotation_border_color_btn = None
+        self._zoom_annotation_border_color_clear_btn = None
+        self._zoom_annotation_text_color = (0.0, 0.0, 0.0)
+        self._zoom_annotation_fill_color: tuple[float, float, float] | None = (1.0, 1.0, 0.6)
+        self._zoom_annotation_border_color: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
+        self._thumb_size = PageThumbnail.THUMBNAIL_SIZE
+        self._thumb_render_queue: deque[int] = deque()
+        self._thumb_render_queue_set: set[int] = set()
+        self._thumb_render_timer = QTimer(self)
+        self._thumb_render_timer.setSingleShot(True)
+        self._thumb_render_timer.timeout.connect(self._process_thumbnail_render_queue)
+        self._scroll_debounce_timer = QTimer(self)
+        self._scroll_debounce_timer.setSingleShot(True)
+        self._scroll_debounce_timer.setInterval(60)
+        self._scroll_debounce_timer.timeout.connect(self._enqueue_visible_thumbnail_renders)
+
+        # Drop indicator
+        self._drop_indicator = None
+        self._drop_indicator_index = -1
+
+        # Rubber band selection
+        self._rubber_band = None
+        self._rubber_band_origin = None
+
+        # Text search (Ctrl+F)
+        self._search_dialog = None
+        self._search_hits: dict[int, list] = {}
+        self._search_hit_pages: list[int] = []
+        self._search_cursor: int = -1
+
+        self._setup_ui()
+        self._setup_toolbar()
+        self._setup_shortcuts()
+        self._undo_manager.add_listener(self._on_undo_manager_changed)
+        QTimer.singleShot(0, self._load_pages)
+
+    def _setup_ui(self) -> None:
+        self.setWindowTitle(f"JusticePDF - Edit: {os.path.basename(self._pdf_path)}")
+        self.resize(800, 600)
+        self.setAcceptDrops(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._grid_scroll = QScrollArea()
+        self._grid_scroll.setWidgetResizable(True)
+        self._grid_scroll.viewport().installEventFilter(self)
+        self._grid_scroll.verticalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
+        self._grid_scroll.horizontalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
+        layout.addWidget(self._grid_scroll)
+
+        self._container = QWidget()
+        self._container.setAcceptDrops(True)
+        self._grid_scroll.setWidget(self._container)
+
+        self._grid_layout = QGridLayout(self._container)
+        self._grid_layout.setSpacing(10)
+        self._grid_layout.setContentsMargins(10, 10, 10, 10)
+        self._grid_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+        # Drop indicator line
+        self._drop_indicator = QFrame(self._container)
+        self._drop_indicator.setFrameShape(QFrame.Shape.VLine)
+        self._drop_indicator.setStyleSheet("background-color: #4f46e5;")
+        self._drop_indicator.setFixedWidth(3)
+        self._drop_indicator.hide()
+
+        # Rubber band for selection
+        self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self._container)
+
+        self._zoom_view = QWidget()
+        zoom_layout = QVBoxLayout(self._zoom_view)
+        zoom_layout.setContentsMargins(0, 0, 0, 0)
+
+        zoom_controls = QWidget()
+        controls_layout = QHBoxLayout(zoom_controls)
+        controls_layout.setContentsMargins(10, 10, 10, 10)
+
+        self._zoom_back_btn = QPushButton("Back")
+        self._zoom_back_btn.clicked.connect(self._exit_zoom_view)
+        controls_layout.addWidget(self._zoom_back_btn)
+
+        self._zoom_out_btn = QPushButton("-")
+        self._zoom_out_btn.clicked.connect(self._on_zoom_out)
+        controls_layout.addWidget(self._zoom_out_btn)
+
+        self._zoom_in_btn = QPushButton("+")
+        self._zoom_in_btn.clicked.connect(self._on_zoom_in)
+        controls_layout.addWidget(self._zoom_in_btn)
+
+        self._zoom_reset_btn = QPushButton("100%")
+        self._zoom_reset_btn.clicked.connect(self._on_zoom_reset)
+        controls_layout.addWidget(self._zoom_reset_btn)
+
+        self._zoom_percent_label = QLabel("100%")
+        controls_layout.addWidget(self._zoom_percent_label)
+
+        controls_layout.addStretch()
+
+        self._zoom_page_label = QLabel("")
+        controls_layout.addWidget(self._zoom_page_label)
+
+        zoom_layout.addWidget(zoom_controls)
+
+        self._zoom_scroll = QScrollArea()
+        self._zoom_scroll.setWidgetResizable(True)
+        self._zoom_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._zoom_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._zoom_label = ZoomPageWidget()
+        self._zoom_label.wheel_zoom.connect(self._on_zoom_wheel)
+        self._zoom_label.link_clicked.connect(self._on_zoom_link_clicked)
+        self._zoom_label.annotation_selected.connect(self._on_zoom_annotation_selected)
+        self._zoom_label.annotation_geometry_changed.connect(self._on_zoom_annotation_geometry_changed)
+        self._zoom_label.shape_geometry_changed_with_vertices.connect(
+            self._on_zoom_shape_geometry_changed_with_vertices
+        )
+        self._zoom_label.annotation_create_requested.connect(self._on_zoom_annotation_create_requested)
+        self._zoom_label.shape_create_requested.connect(self._on_zoom_shape_create_requested)
+        self._zoom_label.annotation_edit_requested.connect(self._on_zoom_annotation_edit_requested)
+        self._zoom_label.annotation_text_committed.connect(self._on_zoom_annotation_text_committed)
+        self._zoom_label.annotation_text_edit_cancelled.connect(self._on_zoom_annotation_text_edit_cancelled)
+        self._zoom_label.annotation_delete_requested.connect(self._delete_selected_zoom_annotation)
+        self._zoom_label.annotation_copy_requested.connect(self._on_zoom_annotation_copy_requested)
+        self._zoom_label.annotation_paste_requested.connect(self._on_zoom_annotation_paste_requested)
+        self._zoom_label.annotation_paste_placement_requested.connect(self._on_zoom_annotation_paste_placement_requested)
+        self._zoom_label.annotation_duplicate_requested.connect(self._on_zoom_annotation_duplicate_requested)
+        self._zoom_scroll.setWidget(self._zoom_label)
+
+        self._zoom_prev_btn = QToolButton()
+        self._zoom_prev_btn.setObjectName("zoomNav")
+        self._zoom_prev_btn.setArrowType(Qt.ArrowType.LeftArrow)
+        self._zoom_prev_btn.setToolTip("Previous page")
+        self._zoom_prev_btn.setAutoRaise(False)
+        self._zoom_prev_btn.setFixedWidth(56)
+        self._zoom_prev_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._zoom_prev_btn.clicked.connect(self._on_zoom_prev_page)
+
+        self._zoom_next_btn = QToolButton()
+        self._zoom_next_btn.setObjectName("zoomNav")
+        self._zoom_next_btn.setArrowType(Qt.ArrowType.RightArrow)
+        self._zoom_next_btn.setToolTip("Next page")
+        self._zoom_next_btn.setAutoRaise(False)
+        self._zoom_next_btn.setFixedWidth(56)
+        self._zoom_next_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._zoom_next_btn.clicked.connect(self._on_zoom_next_page)
+
+        nav_container = QWidget()
+        nav_layout = QHBoxLayout(nav_container)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(0)
+        nav_layout.addWidget(self._zoom_prev_btn)
+        nav_layout.addWidget(self._zoom_scroll, 1)
+        nav_layout.addWidget(self._zoom_next_btn)
+
+        zoom_content = QWidget()
+        zoom_content_layout = QHBoxLayout(zoom_content)
+        zoom_content_layout.setContentsMargins(0, 0, 0, 0)
+        zoom_content_layout.setSpacing(0)
+        zoom_content_layout.addWidget(nav_container, 1)
+
+        self._zoom_annotation_drawer = QFrame()
+        self._zoom_annotation_drawer.setObjectName("annotationDrawer")
+        self._zoom_annotation_drawer.setFrameShape(QFrame.Shape.StyledPanel)
+        drawer_layout = QHBoxLayout(self._zoom_annotation_drawer)
+        drawer_layout.setContentsMargins(0, 0, 0, 0)
+        drawer_layout.setSpacing(0)
+
+        self._zoom_annotation_toggle_btn = QToolButton()
+        self._zoom_annotation_toggle_btn.setText("◀")
+        self._zoom_annotation_toggle_btn.setToolTip("付箋編集")
+        self._zoom_annotation_toggle_btn.clicked.connect(self._toggle_zoom_annotation_drawer)
+        self._zoom_annotation_toggle_btn.setFixedWidth(32)
+        drawer_layout.addWidget(self._zoom_annotation_toggle_btn)
+
+        self._zoom_annotation_panel = QWidget()
+        panel_layout = QVBoxLayout(self._zoom_annotation_panel)
+        panel_layout.setContentsMargins(10, 10, 10, 10)
+
+        title = QLabel("FreeText")
+        panel_layout.addWidget(title)
+
+        action_row = QHBoxLayout()
+        self._zoom_annotation_new_btn = QPushButton("新規")
+        self._zoom_annotation_new_btn.setCheckable(True)
+        self._zoom_annotation_new_btn.clicked.connect(self._on_zoom_annotation_new_clicked)
+        action_row.addWidget(self._zoom_annotation_new_btn)
+
+        self._zoom_annotation_delete_btn = QPushButton("削除")
+        self._zoom_annotation_delete_btn.clicked.connect(self._delete_selected_zoom_annotation)
+        action_row.addWidget(self._zoom_annotation_delete_btn)
+        panel_layout.addLayout(action_row)
+
+        order_row = QHBoxLayout()
+        self._zoom_annotation_order_back_btn = QPushButton("最背面")
+        self._zoom_annotation_order_back_btn.setToolTip("最背面へ移動")
+        self._zoom_annotation_order_back_btn.setEnabled(False)
+        self._zoom_annotation_order_back_btn.clicked.connect(
+            lambda: self._reorder_selected_zoom_annotation("back")
+        )
+        order_row.addWidget(self._zoom_annotation_order_back_btn)
+
+        self._zoom_annotation_order_backward_btn = QPushButton("背面へ")
+        self._zoom_annotation_order_backward_btn.setToolTip("1つ背面へ移動")
+        self._zoom_annotation_order_backward_btn.setEnabled(False)
+        self._zoom_annotation_order_backward_btn.clicked.connect(
+            lambda: self._reorder_selected_zoom_annotation("backward")
+        )
+        order_row.addWidget(self._zoom_annotation_order_backward_btn)
+
+        self._zoom_annotation_order_forward_btn = QPushButton("前面へ")
+        self._zoom_annotation_order_forward_btn.setToolTip("1つ前面へ移動")
+        self._zoom_annotation_order_forward_btn.setEnabled(False)
+        self._zoom_annotation_order_forward_btn.clicked.connect(
+            lambda: self._reorder_selected_zoom_annotation("forward")
+        )
+        order_row.addWidget(self._zoom_annotation_order_forward_btn)
+
+        self._zoom_annotation_order_front_btn = QPushButton("最前面")
+        self._zoom_annotation_order_front_btn.setToolTip("最前面へ移動")
+        self._zoom_annotation_order_front_btn.setEnabled(False)
+        self._zoom_annotation_order_front_btn.clicked.connect(
+            lambda: self._reorder_selected_zoom_annotation("front")
+        )
+        order_row.addWidget(self._zoom_annotation_order_front_btn)
+        panel_layout.addLayout(order_row)
+
+        # Shape creation buttons
+        shape_label = QLabel("図形")
+        panel_layout.addWidget(shape_label)
+        shape_row = QHBoxLayout()
+        self._shape_buttons: dict[ShapeType, QToolButton] = {}
+        shape_defs = [
+            ("―", ShapeType.LINE, "線"),
+            ("△", ShapeType.TRIANGLE, "三角形"),
+            ("○", ShapeType.ELLIPSE, "楕円"),
+            ("□", ShapeType.RECTANGLE, "四角形"),
+            ("[ ]", ShapeType.BRACKET, "括弧"),
+        ]
+        for text, shape_type, tooltip in shape_defs:
+            btn = QToolButton()
+            btn.setText(text)
+            btn.setToolTip(tooltip)
+            btn.setCheckable(True)
+            btn.setMinimumWidth(40)
+            btn.clicked.connect(lambda checked, st=shape_type: self._on_shape_btn_clicked(st, checked))
+            shape_row.addWidget(btn)
+            self._shape_buttons[shape_type] = btn
+        panel_layout.addLayout(shape_row)
+
+        form = QFormLayout()
+        self._zoom_annotation_width_spin = QSpinBox()
+        self._zoom_annotation_width_spin.setRange(1, 5000)
+        self._zoom_annotation_width_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
+        self._zoom_annotation_width_label = QLabel("幅")
+        form.addRow(self._zoom_annotation_width_label, self._zoom_annotation_width_spin)
+
+        self._zoom_annotation_height_spin = QSpinBox()
+        self._zoom_annotation_height_spin.setRange(1, 5000)
+        self._zoom_annotation_height_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
+        self._zoom_annotation_height_label = QLabel("高さ")
+        form.addRow(self._zoom_annotation_height_label, self._zoom_annotation_height_spin)
+
+        self._zoom_annotation_fontsize_spin = QSpinBox()
+        self._zoom_annotation_fontsize_spin.setRange(6, 400)
+        self._zoom_annotation_fontsize_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
+        self._zoom_annotation_fontsize_label = QLabel("文字サイズ")
+        form.addRow(self._zoom_annotation_fontsize_label, self._zoom_annotation_fontsize_spin)
+
+        self._zoom_annotation_border_width_spin = QSpinBox()
+        self._zoom_annotation_border_width_spin.setRange(0, 100)
+        self._zoom_annotation_border_width_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
+        form.addRow("線幅", self._zoom_annotation_border_width_spin)
+        panel_layout.addLayout(form)
+
+        opacity_row = QWidget()
+        opacity_layout = QHBoxLayout(opacity_row)
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_layout.addWidget(QLabel("透明度"))
+        self._zoom_annotation_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_annotation_opacity_slider.setRange(0, 100)
+        self._zoom_annotation_opacity_slider.setValue(100)
+        self._zoom_annotation_opacity_slider.valueChanged.connect(self._on_zoom_annotation_opacity_changed)
+        opacity_layout.addWidget(self._zoom_annotation_opacity_slider, 1)
+        self._zoom_annotation_opacity_label = QLabel("100%")
+        opacity_layout.addWidget(self._zoom_annotation_opacity_label)
+        panel_layout.addWidget(opacity_row)
+
+        self._zoom_annotation_text_color_btn = QPushButton()
+        self._zoom_annotation_text_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("text"))
+        self._zoom_annotation_text_color_row = self._build_labeled_color_row("文字色", self._zoom_annotation_text_color_btn)
+        panel_layout.addWidget(self._zoom_annotation_text_color_row)
+
+        self._zoom_annotation_fill_color_btn = QPushButton()
+        self._zoom_annotation_fill_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("fill"))
+        self._zoom_annotation_fill_color_clear_btn = QPushButton("透明")
+        self._zoom_annotation_fill_color_clear_btn.clicked.connect(
+            lambda: self._clear_zoom_annotation_color("fill")
+        )
+        panel_layout.addWidget(
+            self._build_labeled_color_row(
+                "背景色",
+                self._zoom_annotation_fill_color_btn,
+                clear_button=self._zoom_annotation_fill_color_clear_btn,
+            )
+        )
+
+        self._zoom_annotation_border_color_btn = QPushButton()
+        self._zoom_annotation_border_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("border"))
+        self._zoom_annotation_border_color_clear_btn = QPushButton("透明")
+        self._zoom_annotation_border_color_clear_btn.clicked.connect(
+            lambda: self._clear_zoom_annotation_color("border")
+        )
+        panel_layout.addWidget(
+            self._build_labeled_color_row(
+                "線色",
+                self._zoom_annotation_border_color_btn,
+                clear_button=self._zoom_annotation_border_color_clear_btn,
+            )
+        )
+
+        # --- Shape-specific controls ---
+        # Rotation
+        self._zoom_shape_rotation_row = QWidget()
+        rot_layout = QHBoxLayout(self._zoom_shape_rotation_row)
+        rot_layout.setContentsMargins(0, 0, 0, 0)
+        rot_layout.addWidget(QLabel("回転"))
+        self._zoom_shape_rotation_spin = QSpinBox()
+        self._zoom_shape_rotation_spin.setRange(0, 359)
+        self._zoom_shape_rotation_spin.setWrapping(True)
+        self._zoom_shape_rotation_spin.setSuffix("°")
+        self._zoom_shape_rotation_spin.valueChanged.connect(self._on_zoom_shape_rotation_changed)
+        rot_layout.addWidget(self._zoom_shape_rotation_spin)
+        self._zoom_shape_rotation_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_shape_rotation_slider.setRange(0, 359)
+        self._zoom_shape_rotation_slider.valueChanged.connect(self._on_zoom_shape_rotation_slider_changed)
+        rot_layout.addWidget(self._zoom_shape_rotation_slider, 1)
+        panel_layout.addWidget(self._zoom_shape_rotation_row)
+        self._zoom_shape_rotation_row.hide()
+
+        # Line options: arrow checkboxes + start/end coordinates
+        self._zoom_shape_line_options = QWidget()
+        line_opt_layout = QVBoxLayout(self._zoom_shape_line_options)
+        line_opt_layout.setContentsMargins(0, 0, 0, 0)
+
+        arrow_row = QWidget()
+        arrow_layout = QHBoxLayout(arrow_row)
+        arrow_layout.setContentsMargins(0, 0, 0, 0)
+        self._zoom_shape_arrow_start_cb = QCheckBox("始点矢印")
+        self._zoom_shape_arrow_start_cb.stateChanged.connect(self._on_zoom_shape_option_changed)
+        arrow_layout.addWidget(self._zoom_shape_arrow_start_cb)
+        self._zoom_shape_arrow_end_cb = QCheckBox("終点矢印")
+        self._zoom_shape_arrow_end_cb.stateChanged.connect(self._on_zoom_shape_option_changed)
+        arrow_layout.addWidget(self._zoom_shape_arrow_end_cb)
+        line_opt_layout.addWidget(arrow_row)
+
+        endpoint_form = QFormLayout()
+        endpoint_form.setContentsMargins(0, 0, 0, 0)
+
+        self._zoom_shape_line_start_x_spin = QSpinBox()
+        self._zoom_shape_line_start_x_spin.setRange(0, 100000)
+        self._zoom_shape_line_start_x_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        self._zoom_shape_line_start_y_spin = QSpinBox()
+        self._zoom_shape_line_start_y_spin.setRange(0, 100000)
+        self._zoom_shape_line_start_y_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        start_row = QWidget()
+        start_layout = QHBoxLayout(start_row)
+        start_layout.setContentsMargins(0, 0, 0, 0)
+        start_layout.addWidget(QLabel("X"))
+        start_layout.addWidget(self._zoom_shape_line_start_x_spin, 1)
+        start_layout.addWidget(QLabel("Y"))
+        start_layout.addWidget(self._zoom_shape_line_start_y_spin, 1)
+        endpoint_form.addRow("始点", start_row)
+
+        self._zoom_shape_line_end_x_spin = QSpinBox()
+        self._zoom_shape_line_end_x_spin.setRange(0, 100000)
+        self._zoom_shape_line_end_x_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        self._zoom_shape_line_end_y_spin = QSpinBox()
+        self._zoom_shape_line_end_y_spin.setRange(0, 100000)
+        self._zoom_shape_line_end_y_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        end_row = QWidget()
+        end_layout = QHBoxLayout(end_row)
+        end_layout.setContentsMargins(0, 0, 0, 0)
+        end_layout.addWidget(QLabel("X"))
+        end_layout.addWidget(self._zoom_shape_line_end_x_spin, 1)
+        end_layout.addWidget(QLabel("Y"))
+        end_layout.addWidget(self._zoom_shape_line_end_y_spin, 1)
+        endpoint_form.addRow("終点", end_row)
+
+        line_opt_layout.addLayout(endpoint_form)
+
+        panel_layout.addWidget(self._zoom_shape_line_options)
+        self._zoom_shape_line_options.hide()
+
+        # Bracket options
+        self._zoom_shape_bracket_options = QWidget()
+        bracket_opt_layout = QFormLayout(self._zoom_shape_bracket_options)
+        bracket_opt_layout.setContentsMargins(0, 0, 0, 0)
+        self._zoom_shape_bracket_style_combo = QComboBox()
+        self._zoom_shape_bracket_style_combo.addItems(["角括弧 [ ]", "丸括弧 ( )", "波括弧 { }"])
+        self._zoom_shape_bracket_style_combo.currentIndexChanged.connect(self._on_zoom_shape_option_changed)
+        bracket_opt_layout.addRow("スタイル", self._zoom_shape_bracket_style_combo)
+        self._zoom_shape_bracket_size_combo = QComboBox()
+        self._zoom_shape_bracket_size_combo.addItems(["S", "M", "L"])
+        self._zoom_shape_bracket_size_combo.setCurrentIndex(1)
+        self._zoom_shape_bracket_size_combo.currentIndexChanged.connect(self._on_zoom_shape_option_changed)
+        bracket_opt_layout.addRow("サイズ", self._zoom_shape_bracket_size_combo)
+        self._zoom_shape_bracket_both_cb = QCheckBox("両側")
+        self._zoom_shape_bracket_both_cb.stateChanged.connect(self._on_zoom_shape_option_changed)
+        bracket_opt_layout.addRow("", self._zoom_shape_bracket_both_cb)
+        panel_layout.addWidget(self._zoom_shape_bracket_options)
+        self._zoom_shape_bracket_options.hide()
+
+        # Triangle options: apex X position (relative 0-100% within bbox)
+        self._zoom_shape_triangle_options = QWidget()
+        triangle_opt_layout = QFormLayout(self._zoom_shape_triangle_options)
+        triangle_opt_layout.setContentsMargins(0, 0, 0, 0)
+
+        apex_x_row = QWidget()
+        apex_x_layout = QHBoxLayout(apex_x_row)
+        apex_x_layout.setContentsMargins(0, 0, 0, 0)
+        self._zoom_shape_triangle_apex_x_spin = QSpinBox()
+        self._zoom_shape_triangle_apex_x_spin.setRange(0, 100)
+        self._zoom_shape_triangle_apex_x_spin.setSuffix("%")
+        self._zoom_shape_triangle_apex_x_spin.valueChanged.connect(self._on_zoom_shape_triangle_apex_x_changed)
+        apex_x_layout.addWidget(self._zoom_shape_triangle_apex_x_spin)
+        self._zoom_shape_triangle_apex_x_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_shape_triangle_apex_x_slider.setRange(0, 100)
+        self._zoom_shape_triangle_apex_x_slider.valueChanged.connect(self._on_zoom_shape_triangle_apex_x_slider_changed)
+        apex_x_layout.addWidget(self._zoom_shape_triangle_apex_x_slider, 1)
+        triangle_opt_layout.addRow("上頂点 X", apex_x_row)
+
+        panel_layout.addWidget(self._zoom_shape_triangle_options)
+        self._zoom_shape_triangle_options.hide()
+
+        # FreeText-only widgets container references for visibility toggling
+        self._zoom_freetext_only_widgets: list[QWidget] = []
+
+        panel_layout.addStretch()
+        drawer_layout.addWidget(self._zoom_annotation_panel)
+        zoom_content_layout.addWidget(self._zoom_annotation_drawer)
+        zoom_layout.addWidget(zoom_content, 1)
+        self._set_zoom_annotation_drawer_open(False)
+        self._set_selected_zoom_annotation(None)
+
+        layout.addWidget(self._zoom_view)
+        self._zoom_view.hide()
+
+    def _build_labeled_color_row(
+        self,
+        label_text: str,
+        button: QPushButton,
+        *,
+        clear_button: QPushButton | None = None,
+    ) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel(label_text))
+        button.setMinimumWidth(120)
+        layout.addWidget(button, 1)
+        if clear_button is not None:
+            clear_button.setFixedWidth(56)
+            layout.addWidget(clear_button)
+        return row
+
+    def _set_color_button_preview(
+        self,
+        button: QPushButton | None,
+        color: tuple[float, float, float] | None,
+        *,
+        allow_none: bool = False,
+    ) -> None:
+        if button is None:
+            return
+        if color is None and allow_none:
+            button.setText("透明")
+            button.setStyleSheet("background-color: transparent; color: #000000;")
+            return
+        qcolor = self._rgb_tuple_to_qcolor(color or (0.0, 0.0, 0.0))
+        button.setText(qcolor.name())
+        text_color = "#ffffff" if qcolor.lightnessF() < 0.5 else "#000000"
+        button.setStyleSheet(f"background-color: {qcolor.name()}; color: {text_color};")
+
+    def _rgb_tuple_to_qcolor(self, color: tuple[float, float, float]) -> QColor:
+        return QColor(
+            max(0, min(255, round(color[0] * 255))),
+            max(0, min(255, round(color[1] * 255))),
+            max(0, min(255, round(color[2] * 255))),
+        )
+
+    def _qcolor_to_rgb_tuple(self, color: QColor) -> tuple[float, float, float]:
+        return (color.redF(), color.greenF(), color.blueF())
+
+    def _set_zoom_annotation_drawer_open(self, is_open: bool) -> None:
+        self._zoom_annotation_open = bool(is_open)
+        if self._zoom_annotation_panel:
+            self._zoom_annotation_panel.setVisible(self._zoom_annotation_open)
+        if self._zoom_annotation_drawer:
+            self._zoom_annotation_drawer.setFixedWidth(320 if self._zoom_annotation_open else 32)
+        if self._zoom_annotation_toggle_btn:
+            self._zoom_annotation_toggle_btn.setText("▶" if self._zoom_annotation_open else "◀")
+
+    def _toggle_zoom_annotation_drawer(self) -> None:
+        self._set_zoom_annotation_drawer_open(not self._zoom_annotation_open)
+
+    def _set_zoom_annotation_create_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled:
+            self._set_shape_create_mode(None)
+        if self._zoom_label:
+            if enabled:
+                self._zoom_label.cancel_annotation_paste_mode()
+            self._zoom_label.set_annotation_create_mode(enabled)
+        if self._zoom_annotation_new_btn:
+            with QSignalBlocker(self._zoom_annotation_new_btn):
+                self._zoom_annotation_new_btn.setChecked(enabled)
+            self._zoom_annotation_new_btn.setText("配置待ち" if enabled else "新規")
+
+    def _set_selected_zoom_annotation(
+        self,
+        annotation: AnyAnnotData | None,
+        *,
+        open_drawer: bool = False,
+    ) -> None:
+        self._commit_inline_annotation_editor()
+        self._selected_zoom_annotation = annotation
+        if self._zoom_label:
+            self._zoom_label.set_selected_annotation_xref(annotation.xref if annotation else None)
+        if open_drawer and annotation is not None:
+            self._set_zoom_annotation_drawer_open(True)
+        self._zoom_annotation_form_sync = True
+        try:
+            is_shape = isinstance(annotation, ShapeAnnotData)
+            is_freetext = isinstance(annotation, FreeTextAnnotData)
+            has_selection = annotation is not None
+
+            # Toggle FreeText-only vs shape-only controls
+            self._zoom_annotation_fontsize_spin.setVisible(not is_shape)
+            self._zoom_annotation_fontsize_label.setVisible(not is_shape)
+            self._zoom_annotation_text_color_row.setVisible(not is_shape)
+            self._zoom_shape_rotation_row.setVisible(is_shape)
+            is_line_shape = is_shape and annotation.shape_type == ShapeType.LINE
+            self._zoom_shape_line_options.setVisible(is_line_shape)
+            self._zoom_shape_bracket_options.setVisible(is_shape and annotation.shape_type == ShapeType.BRACKET if is_shape else False)
+            self._zoom_shape_triangle_options.setVisible(is_shape and annotation.shape_type == ShapeType.TRIANGLE if is_shape else False)
+            # LINE は始点/終点で編集するので、Width/Height は隠す
+            for sz_widget in (
+                self._zoom_annotation_width_spin,
+                self._zoom_annotation_width_label,
+                self._zoom_annotation_height_spin,
+                self._zoom_annotation_height_label,
+            ):
+                if sz_widget is not None:
+                    sz_widget.setVisible(not is_line_shape)
+
+            widgets = [
+                self._zoom_annotation_width_spin,
+                self._zoom_annotation_height_spin,
+                self._zoom_annotation_opacity_slider,
+                self._zoom_annotation_border_width_spin,
+                self._zoom_annotation_fill_color_btn,
+                self._zoom_annotation_fill_color_clear_btn,
+                self._zoom_annotation_border_color_btn,
+                self._zoom_annotation_border_color_clear_btn,
+            ]
+            if not is_shape:
+                widgets.extend([
+                    self._zoom_annotation_fontsize_spin,
+                    self._zoom_annotation_text_color_btn,
+                ])
+            for widget in widgets:
+                if widget is not None:
+                    widget.setEnabled(has_selection)
+            if self._zoom_annotation_delete_btn:
+                self._zoom_annotation_delete_btn.setEnabled(has_selection)
+            for order_btn in (
+                self._zoom_annotation_order_back_btn,
+                self._zoom_annotation_order_backward_btn,
+                self._zoom_annotation_order_forward_btn,
+                self._zoom_annotation_order_front_btn,
+            ):
+                if order_btn is not None:
+                    order_btn.setEnabled(has_selection)
+
+            if annotation is None:
+                # 非選択時は最後の設定値を保持して次回の新規作成に引き継ぐ。
+                # スピン・スライダー・色はウィンドウのインスタンス状態としてそのまま残す。
+                self._zoom_shape_rotation_row.hide()
+                self._zoom_shape_line_options.hide()
+                self._zoom_shape_bracket_options.hide()
+                self._zoom_shape_triangle_options.hide()
+            elif is_shape:
+                x0, y0, x1, y1 = annotation.rect
+                is_line = annotation.shape_type == ShapeType.LINE
+                size_min = 0 if is_line else 1
+                if self._zoom_annotation_width_spin:
+                    self._zoom_annotation_width_spin.setRange(size_min, 5000)
+                    self._zoom_annotation_width_spin.setValue(max(size_min, round(x1 - x0)))
+                if self._zoom_annotation_height_spin:
+                    self._zoom_annotation_height_spin.setRange(size_min, 5000)
+                    self._zoom_annotation_height_spin.setValue(max(size_min, round(y1 - y0)))
+                if self._zoom_annotation_opacity_slider:
+                    self._zoom_annotation_opacity_slider.setValue(round(annotation.opacity * 100))
+                if self._zoom_annotation_opacity_label:
+                    self._zoom_annotation_opacity_label.setText(f"{round(annotation.opacity * 100)}%")
+                if self._zoom_annotation_border_width_spin:
+                    self._zoom_annotation_border_width_spin.setValue(round(annotation.stroke_width))
+                self._zoom_annotation_fill_color = annotation.fill_color
+                self._zoom_annotation_border_color = annotation.stroke_color
+                # Rotation
+                with QSignalBlocker(self._zoom_shape_rotation_spin):
+                    self._zoom_shape_rotation_spin.setValue(round(annotation.rotation))
+                with QSignalBlocker(self._zoom_shape_rotation_slider):
+                    self._zoom_shape_rotation_slider.setValue(round(annotation.rotation))
+                # Line arrows + endpoints
+                if annotation.shape_type == ShapeType.LINE:
+                    with QSignalBlocker(self._zoom_shape_arrow_start_cb):
+                        self._zoom_shape_arrow_start_cb.setChecked(annotation.arrow_start)
+                    with QSignalBlocker(self._zoom_shape_arrow_end_cb):
+                        self._zoom_shape_arrow_end_cb.setChecked(annotation.arrow_end)
+                    (sx_pt, sy_pt), (ex_pt, ey_pt) = _line_endpoints_from_shape(annotation)
+                    page_w, page_h = self._current_zoom_annotation_page_size()
+                    max_x = max(1, int(round(max(page_w, sx_pt, ex_pt)))) or 100000
+                    max_y = max(1, int(round(max(page_h, sy_pt, ey_pt)))) or 100000
+                    for spin, value, max_val in (
+                        (self._zoom_shape_line_start_x_spin, sx_pt, max_x),
+                        (self._zoom_shape_line_start_y_spin, sy_pt, max_y),
+                        (self._zoom_shape_line_end_x_spin, ex_pt, max_x),
+                        (self._zoom_shape_line_end_y_spin, ey_pt, max_y),
+                    ):
+                        with QSignalBlocker(spin):
+                            spin.setRange(0, max_val)
+                            spin.setValue(int(round(value)))
+                # Bracket options
+                if annotation.shape_type == ShapeType.BRACKET:
+                    style_idx = {"square": 0, "round": 1, "curly": 2}.get(annotation.bracket_style, 0)
+                    size_idx = {"small": 0, "medium": 1, "large": 2}.get(annotation.bracket_size, 1)
+                    with QSignalBlocker(self._zoom_shape_bracket_style_combo):
+                        self._zoom_shape_bracket_style_combo.setCurrentIndex(style_idx)
+                    with QSignalBlocker(self._zoom_shape_bracket_size_combo):
+                        self._zoom_shape_bracket_size_combo.setCurrentIndex(size_idx)
+                    with QSignalBlocker(self._zoom_shape_bracket_both_cb):
+                        self._zoom_shape_bracket_both_cb.setChecked(annotation.bracket_both_sides)
+                # Triangle apex
+                if annotation.shape_type == ShapeType.TRIANGLE:
+                    ax_pct = round(annotation.triangle_apex[0] * 100)
+                    with QSignalBlocker(self._zoom_shape_triangle_apex_x_spin):
+                        self._zoom_shape_triangle_apex_x_spin.setValue(ax_pct)
+                    with QSignalBlocker(self._zoom_shape_triangle_apex_x_slider):
+                        self._zoom_shape_triangle_apex_x_slider.setValue(ax_pct)
+            else:
+                # FreeText
+                x0, y0, x1, y1 = annotation.rect
+                if self._zoom_annotation_width_spin:
+                    self._zoom_annotation_width_spin.setRange(1, 5000)
+                    self._zoom_annotation_width_spin.setValue(max(1, round(x1 - x0)))
+                if self._zoom_annotation_height_spin:
+                    self._zoom_annotation_height_spin.setRange(1, 5000)
+                    self._zoom_annotation_height_spin.setValue(max(1, round(y1 - y0)))
+                if self._zoom_annotation_fontsize_spin:
+                    self._zoom_annotation_fontsize_spin.setValue(max(6, round(annotation.fontsize)))
+                if self._zoom_annotation_opacity_slider:
+                    self._zoom_annotation_opacity_slider.setValue(round(annotation.opacity * 100))
+                if self._zoom_annotation_opacity_label:
+                    self._zoom_annotation_opacity_label.setText(f"{round(annotation.opacity * 100)}%")
+                if self._zoom_annotation_border_width_spin:
+                    self._zoom_annotation_border_width_spin.setValue(round(annotation.border_width))
+                self._zoom_annotation_text_color = annotation.text_color
+                self._zoom_annotation_fill_color = annotation.fill_color
+                self._zoom_annotation_border_color = (
+                    annotation.border_color if annotation.border_width > 0 else None
+                )
+
+            self._set_color_button_preview(self._zoom_annotation_text_color_btn, self._zoom_annotation_text_color)
+            self._set_color_button_preview(
+                self._zoom_annotation_fill_color_btn,
+                self._zoom_annotation_fill_color,
+                allow_none=True,
+            )
+            if is_shape and annotation is not None:
+                border_preview = annotation.stroke_color
+            elif is_freetext and annotation is not None and annotation.border_width <= 0:
+                border_preview = None
+            else:
+                border_preview = self._zoom_annotation_border_color
+            self._set_color_button_preview(
+                self._zoom_annotation_border_color_btn,
+                border_preview,
+                allow_none=True,
+            )
+        finally:
+            self._zoom_annotation_form_sync = False
+
+    def _pick_zoom_annotation_color(self, kind: str) -> None:
+        if self._selected_zoom_annotation is None:
+            return
+        if kind == "text":
+            current = self._zoom_annotation_text_color
+        elif kind == "fill":
+            current = self._zoom_annotation_fill_color or (1.0, 1.0, 0.6)
+        else:
+            current = self._zoom_annotation_border_color or (0.0, 0.0, 0.0)
+        color = QColorDialog.getColor(self._rgb_tuple_to_qcolor(current), self, "色を選択")
+        if not color.isValid():
+            return
+        rgb = self._qcolor_to_rgb_tuple(color)
+        if kind == "text":
+            self._zoom_annotation_text_color = rgb
+            self._set_color_button_preview(self._zoom_annotation_text_color_btn, rgb)
+        elif kind == "fill":
+            self._zoom_annotation_fill_color = rgb
+            self._set_color_button_preview(self._zoom_annotation_fill_color_btn, rgb, allow_none=True)
+        else:
+            self._zoom_annotation_border_color = rgb
+            self._set_color_button_preview(self._zoom_annotation_border_color_btn, rgb, allow_none=True)
+        self._apply_zoom_annotation_form()
+
+    def _clear_zoom_annotation_color(self, kind: str) -> None:
+        if self._selected_zoom_annotation is None:
+            return
+        if kind == "fill":
+            self._zoom_annotation_fill_color = None
+            self._set_color_button_preview(self._zoom_annotation_fill_color_btn, None, allow_none=True)
+        elif kind == "border":
+            self._zoom_annotation_border_color = None
+            self._set_color_button_preview(self._zoom_annotation_border_color_btn, None, allow_none=True)
+        else:
+            return
+        self._apply_zoom_annotation_form()
+
+    def _current_zoom_annotation_page_size(self) -> tuple[float, float]:
+        if self._zoom_label:
+            return self._zoom_label.page_size_points()
+        return (0.0, 0.0)
+
+    def _annotation_data_from_form(
+        self,
+        base: FreeTextAnnotData,
+        *,
+        rect: tuple[float, float, float, float] | None = None,
+    ) -> FreeTextAnnotData:
+        x0, y0, x1, y1 = rect or base.rect
+        if rect is None and self._zoom_annotation_width_spin and self._zoom_annotation_height_spin:
+            width = float(self._zoom_annotation_width_spin.value())
+            height = float(self._zoom_annotation_height_spin.value())
+            x1 = x0 + width
+            y1 = y0 + height
+        border_width = float(self._zoom_annotation_border_width_spin.value()) if self._zoom_annotation_border_width_spin else base.border_width
+        border_color = None if border_width <= 0 else self._zoom_annotation_border_color
+        return FreeTextAnnotData(
+            page_num=base.page_num,
+            xref=base.xref,
+            rect=(x0, y0, x1, y1),
+            content=base.content,
+            fontsize=float(self._zoom_annotation_fontsize_spin.value()) if self._zoom_annotation_fontsize_spin else base.fontsize,
+            text_color=self._zoom_annotation_text_color,
+            fill_color=self._zoom_annotation_fill_color,
+            border_color=border_color,
+            border_width=border_width,
+            opacity=(float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else base.opacity,
+            fontname=base.fontname,
+            annotation_id=base.annotation_id,
+            subject="",
+        )
+
+    def _setup_toolbar(self) -> None:
+        toolbar = QToolBar()
+        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        self._undo_btn = QPushButton("Undo")
+        self._undo_btn.clicked.connect(self._on_undo)
+        toolbar.addWidget(self._undo_btn)
+
+        self._redo_btn = QPushButton("Redo")
+        self._redo_btn.clicked.connect(self._on_redo)
+        toolbar.addWidget(self._redo_btn)
+
+        toolbar.addSeparator()
+
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setObjectName("danger")
+        self._delete_btn.clicked.connect(self._on_delete)
+        toolbar.addWidget(self._delete_btn)
+
+        self._rename_btn = QPushButton("Rename")
+        self._rename_btn.clicked.connect(self._on_rename)
+        toolbar.addWidget(self._rename_btn)
+
+        self._title_btn = QPushButton("Title")
+        self._title_btn.clicked.connect(self._on_rename_pdf_title)
+        toolbar.addWidget(self._title_btn)
+
+        self._print_btn = QPushButton("Print")
+        self._print_btn.clicked.connect(self._on_print)
+        toolbar.addWidget(self._print_btn)
+
+        toolbar.addSeparator()
+
+        self._rotate_btn = QPushButton("Rotate")
+        self._rotate_btn.clicked.connect(self._on_rotate)
+        toolbar.addWidget(self._rotate_btn)
+
+        self._select_all_btn = QPushButton("Select All")
+        self._select_all_btn.clicked.connect(self._on_select_all)
+        toolbar.addWidget(self._select_all_btn)
+
+        self._update_button_states()
+
+    def _setup_shortcuts(self) -> None:
+        register_shortcuts(
+            self,
+            (
+                (QKeySequence.StandardKey.Undo, self._on_undo),
+                (QKeySequence.StandardKey.Redo, self._on_redo),
+                (QKeySequence.StandardKey.Delete, self._on_delete),
+                (QKeySequence(Qt.Key.Key_F2), self._on_rename),
+                (QKeySequence("Shift+F2"), self._on_rename_pdf_title),
+                (QKeySequence.StandardKey.SelectAll, self._on_select_all),
+                (QKeySequence(Qt.Key.Key_R), self._on_rotate),
+                (QKeySequence.StandardKey.Print, self._on_print),
+                (QKeySequence.StandardKey.Find, self._on_open_search),
+            ),
+        )
+        # 拡大モード中だけ有効化するページ送りショートカット。
+        # グリッドモードでは無効化し、PageUp/PageDown/Home/End を
+        # QScrollArea のデフォルトスクロールに譲る。
+        self._zoom_nav_actions: list[QAction] = []
+        for key, handler in (
+            (Qt.Key.Key_PageUp, self._on_zoom_prev_page),
+            (Qt.Key.Key_PageDown, self._on_zoom_next_page),
+            (Qt.Key.Key_Home, self._on_zoom_first_page),
+            (Qt.Key.Key_End, self._on_zoom_last_page),
+        ):
+            action = QAction(self)
+            action.setShortcut(QKeySequence(key))
+            action.triggered.connect(handler)
+            action.setEnabled(False)
+            self.addAction(action)
+            self._zoom_nav_actions.append(action)
+
+    def _find_zoom_annotation(self, xref: int | None) -> AnyAnnotData | None:
+        if xref is None:
+            return None
+        for annot in self._zoom_annotations:
+            if annot.xref == xref:
+                return annot
+        return None
+
+    def _set_copied_zoom_annotation(self, annotation: AnyAnnotData | None) -> None:
+        self._copied_zoom_annotation = annotation
+        if self._zoom_label:
+            self._zoom_label.set_annotation_paste_available(annotation is not None)
+
+    def _copy_zoom_annotation_data(self, annotation: FreeTextAnnotData) -> FreeTextAnnotData:
+        return FreeTextAnnotData(
+            page_num=annotation.page_num,
+            xref=annotation.xref,
+            rect=annotation.rect,
+            content=annotation.content,
+            fontsize=annotation.fontsize,
+            text_color=annotation.text_color,
+            fill_color=annotation.fill_color,
+            border_color=annotation.border_color,
+            border_width=annotation.border_width,
+            opacity=annotation.opacity,
+            fontname=annotation.fontname,
+            annotation_id=annotation.annotation_id,
+            subject=annotation.subject,
+        )
+
+    def _commit_inline_annotation_editor(self) -> None:
+        if (
+            self._zoom_label
+            and self._zoom_label.has_active_text_editor()
+            and not self._zoom_annotation_text_commit_in_progress
+        ):
+            self._zoom_label.commit_annotation_text_edit()
+
+    def _refresh_current_zoom_page(self, *, open_drawer: bool = False) -> None:
+        self._commit_inline_annotation_editor()
+        if self._zoom_page_num is not None and self._zoom_page_num < len(self._thumbnails):
+            self._request_thumbnail_refresh(self._zoom_page_num)
+        if self._zoom_view and self._zoom_view.isVisible():
+            self._render_zoom_page()
+            if open_drawer and self._selected_zoom_annotation is not None:
+                self._set_zoom_annotation_drawer_open(True)
+
+    def _on_zoom_annotation_selected(self, annotation: object) -> None:
+        self._set_zoom_annotation_create_mode(False)
+        self._set_shape_create_mode(None)
+        if isinstance(annotation, (FreeTextAnnotData, ShapeAnnotData)):
+            current = self._find_zoom_annotation(annotation.xref) or annotation
+            self._set_selected_zoom_annotation(current, open_drawer=True)
+        else:
+            self._set_selected_zoom_annotation(None)
+
+    def _on_zoom_annotation_edit_requested(self, annotation: object) -> None:
+        if not isinstance(annotation, FreeTextAnnotData) or not self._zoom_label:
+            return
+        current = self._find_zoom_annotation(annotation.xref) or annotation
+        self._set_selected_zoom_annotation(current, open_drawer=True)
+        self._zoom_label.begin_annotation_text_edit(current)
+
+    def _on_zoom_annotation_text_committed(self, annotation: object, text: str) -> None:
+        if not isinstance(annotation, FreeTextAnnotData):
+            return
+        current = self._find_zoom_annotation(annotation.xref) or annotation
+        if text == current.content:
+            return
+        new_annotation = FreeTextAnnotData(
+            page_num=current.page_num,
+            xref=current.xref,
+            rect=current.rect,
+            content=text,
+            fontsize=current.fontsize,
+            text_color=current.text_color,
+            fill_color=current.fill_color,
+            border_color=current.border_color,
+            border_width=current.border_width,
+            opacity=current.opacity,
+            fontname=current.fontname,
+            annotation_id=current.annotation_id,
+            subject="",
+        )
+        self._zoom_annotation_text_commit_in_progress = True
+        try:
+            self._run_zoom_annotation_replace(current, new_annotation, "Edit FreeText text")
+        finally:
+            self._zoom_annotation_text_commit_in_progress = False
+
+    def _on_zoom_annotation_text_edit_cancelled(self) -> None:
+        pass
+
+    def _handle_pdf_write_permission_denied(
+        self,
+        error: PdfWritePermissionError,
+        *,
+        selected_annotation: FreeTextAnnotData | None = None,
+    ) -> None:
+        logger.warning("PDF write blocked while editing %s", error.pdf_path)
+        logger.debug("PDF write blocked while editing %s", error.pdf_path, exc_info=True)
+        if selected_annotation is not None:
+            self._selected_zoom_annotation = selected_annotation
+        self._refresh_current_zoom_page(
+            open_drawer=selected_annotation is not None and self._zoom_annotation_open
+        )
+        pdf_name = os.path.basename(error.pdf_path or self._pdf_path)
+        QMessageBox.warning(
+            self,
+            "PDFを編集できません",
+            (
+                "このPDFは他のアプリで使用中のため保存できません。\n\n"
+                f"{pdf_name}\n\n"
+                "Acrobat などで閉じてから、もう一度お試しください。"
+            ),
+        )
+
+    def _handle_file_operation_error(self, error: Exception, pdf_path: str, action: str) -> None:
+        logger.warning("%s failed for %s", action, pdf_path)
+        logger.debug("%s failed for %s", action, pdf_path, exc_info=True)
+        pdf_name = os.path.basename(pdf_path)
+        QMessageBox.warning(
+            self,
+            f"{action}できません",
+            f"{action}に失敗しました。\n\n{pdf_name}\n\n{error}",
+        )
+
+    def _on_zoom_annotation_copy_requested(self, annotation: object) -> None:
+        if isinstance(annotation, ShapeAnnotData):
+            current = self._find_zoom_annotation(annotation.xref) or annotation
+            self._set_copied_zoom_annotation(current)
+            return
+        if not isinstance(annotation, FreeTextAnnotData):
+            return
+        current = self._find_zoom_annotation(annotation.xref) or annotation
+        self._set_copied_zoom_annotation(self._copy_zoom_annotation_data(current))
+
+    def _on_zoom_annotation_paste_requested(self) -> None:
+        if self._copied_zoom_annotation is None or self._zoom_label is None or self._zoom_page_num is None:
+            return
+        self._set_zoom_annotation_create_mode(False)
+        page_point = self._zoom_label.page_point_from_global_pos(QCursor.pos())
+        if page_point is None:
+            return
+        rect = self._zoom_label.annotation_rect_for_page_point(self._copied_zoom_annotation, page_point)
+        if rect is None:
+            return
+        self._on_zoom_annotation_paste_placement_requested(
+            self._zoom_label._qrectf_to_rect_tuple(rect)
+        )
+
+    def _on_zoom_annotation_paste_placement_requested(self, rect: object) -> None:
+        if (
+            self._copied_zoom_annotation is None
+            or self._zoom_page_num is None
+            or not isinstance(rect, tuple)
+            or len(rect) != 4
+        ):
+            return
+        new_rect = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+
+        if isinstance(self._copied_zoom_annotation, ShapeAnnotData):
+            src = self._copied_zoom_annotation
+            paste_data = ShapeAnnotData(
+                page_num=self._zoom_page_num, xref=0, rect=new_rect,
+                shape_type=src.shape_type,
+                stroke_color=src.stroke_color, fill_color=src.fill_color,
+                stroke_width=src.stroke_width, opacity=src.opacity,
+                rotation=src.rotation,
+                arrow_start=src.arrow_start, arrow_end=src.arrow_end,
+                bracket_style=src.bracket_style, bracket_size=src.bracket_size,
+                bracket_both_sides=False, bracket_side=src.bracket_side,
+                vertices=src.vertices,
+                triangle_apex=src.triangle_apex,
+                annotation_id="", subject="",
+            )
+            state_shape: dict[str, ShapeAnnotData | None] = {"created": None}
+
+            def do_paste_shape() -> None:
+                state_shape["created"] = create_shape_annot(self._pdf_path, paste_data)
+                self._selected_zoom_annotation = state_shape["created"]
+                self._refresh_current_zoom_page(open_drawer=True)
+
+            def undo_paste_shape() -> None:
+                created = state_shape["created"]
+                if created is not None:
+                    delete_shape_annot(self._pdf_path, created.page_num, created.xref)
+                self._selected_zoom_annotation = None
+                self._refresh_current_zoom_page()
+
+            try:
+                do_paste_shape()
+            except PdfWritePermissionError as error:
+                self._handle_pdf_write_permission_denied(error)
+                return
+            self._undo_manager.add_action(UndoAction(
+                description=f"Paste {paste_data.shape_type.value}",
+                undo_func=undo_paste_shape,
+                redo_func=do_paste_shape,
+            ))
+            return
+
+        paste_data_ft = FreeTextAnnotData(
+            page_num=self._zoom_page_num,
+            xref=0,
+            rect=new_rect,
+            content=self._copied_zoom_annotation.content,
+            fontsize=self._copied_zoom_annotation.fontsize,
+            text_color=self._copied_zoom_annotation.text_color,
+            fill_color=self._copied_zoom_annotation.fill_color,
+            border_color=self._copied_zoom_annotation.border_color,
+            border_width=self._copied_zoom_annotation.border_width,
+            opacity=self._copied_zoom_annotation.opacity,
+            fontname=self._copied_zoom_annotation.fontname,
+            annotation_id="",
+            subject="",
+        )
+        state: dict[str, FreeTextAnnotData | None] = {"created": None}
+
+        def do_paste() -> None:
+            state["created"] = create_freetext_annot(self._pdf_path, paste_data_ft)
+            self._selected_zoom_annotation = state["created"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_paste() -> None:
+            created = state["created"]
+            if created is not None:
+                delete_freetext_annot(self._pdf_path, created.page_num, created.xref)
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        try:
+            do_paste()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        self._undo_manager.add_action(UndoAction(
+            description="Paste FreeText",
+            undo_func=undo_paste,
+            redo_func=do_paste,
+        ))
+
+    def _on_zoom_annotation_duplicate_requested(
+        self, annotation: object, rect: object, vertices: object
+    ) -> None:
+        if (
+            self._zoom_page_num is None
+            or not isinstance(rect, tuple)
+            or len(rect) != 4
+        ):
+            return
+        new_rect = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+
+        if isinstance(annotation, ShapeAnnotData):
+            src = annotation
+            new_vertices = src.vertices
+            if isinstance(vertices, tuple):
+                new_vertices = tuple(tuple(v) for v in vertices)
+            dup_data = ShapeAnnotData(
+                page_num=self._zoom_page_num, xref=0, rect=new_rect,
+                shape_type=src.shape_type,
+                stroke_color=src.stroke_color, fill_color=src.fill_color,
+                stroke_width=src.stroke_width, opacity=src.opacity,
+                rotation=src.rotation,
+                arrow_start=src.arrow_start, arrow_end=src.arrow_end,
+                bracket_style=src.bracket_style, bracket_size=src.bracket_size,
+                bracket_both_sides=False, bracket_side=src.bracket_side,
+                vertices=new_vertices,
+                triangle_apex=src.triangle_apex,
+                annotation_id="", subject="",
+            )
+            state_shape: dict[str, ShapeAnnotData | None] = {"created": None}
+
+            def do_dup_shape() -> None:
+                state_shape["created"] = create_shape_annot(self._pdf_path, dup_data)
+                self._selected_zoom_annotation = state_shape["created"]
+                self._refresh_current_zoom_page(open_drawer=True)
+
+            def undo_dup_shape() -> None:
+                created = state_shape["created"]
+                if created is not None:
+                    delete_shape_annot(self._pdf_path, created.page_num, created.xref)
+                self._selected_zoom_annotation = None
+                self._refresh_current_zoom_page()
+
+            try:
+                do_dup_shape()
+            except PdfWritePermissionError as error:
+                self._handle_pdf_write_permission_denied(error)
+                return
+            self._undo_manager.add_action(UndoAction(
+                description=f"Duplicate {dup_data.shape_type.value}",
+                undo_func=undo_dup_shape,
+                redo_func=do_dup_shape,
+            ))
+            return
+
+        if not isinstance(annotation, FreeTextAnnotData):
+            return
+        src_ft = annotation
+        dup_ft = FreeTextAnnotData(
+            page_num=self._zoom_page_num, xref=0, rect=new_rect,
+            content=src_ft.content, fontsize=src_ft.fontsize,
+            text_color=src_ft.text_color, fill_color=src_ft.fill_color,
+            border_color=src_ft.border_color, border_width=src_ft.border_width,
+            opacity=src_ft.opacity, fontname=src_ft.fontname,
+            annotation_id="", subject="",
+        )
+        state_ft: dict[str, FreeTextAnnotData | None] = {"created": None}
+
+        def do_dup_ft() -> None:
+            state_ft["created"] = create_freetext_annot(self._pdf_path, dup_ft)
+            self._selected_zoom_annotation = state_ft["created"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_dup_ft() -> None:
+            created = state_ft["created"]
+            if created is not None:
+                delete_freetext_annot(self._pdf_path, created.page_num, created.xref)
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        try:
+            do_dup_ft()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        self._undo_manager.add_action(UndoAction(
+            description="Duplicate FreeText",
+            undo_func=undo_dup_ft,
+            redo_func=do_dup_ft,
+        ))
+
+    def _on_zoom_annotation_form_value_changed(self, _value: int) -> None:
+        self._apply_zoom_annotation_form()
+
+    def _on_zoom_annotation_opacity_changed(self, value: int) -> None:
+        if self._zoom_annotation_opacity_label:
+            self._zoom_annotation_opacity_label.setText(f"{int(value)}%")
+        self._apply_zoom_annotation_form()
+
+    # --- Shape methods ---
+
+    def _on_shape_btn_clicked(self, shape_type: ShapeType, checked: bool) -> None:
+        if not self._zoom_view or not self._zoom_view.isVisible() or self._zoom_page_num is None:
+            self._set_shape_create_mode(None)
+            return
+        if checked:
+            self._set_zoom_annotation_create_mode(False)
+            self._set_shape_create_mode(shape_type)
+            self._set_zoom_annotation_drawer_open(True)
+        else:
+            self._set_shape_create_mode(None)
+
+    def _set_shape_create_mode(self, shape_type: ShapeType | None) -> None:
+        for st, btn in self._shape_buttons.items():
+            with QSignalBlocker(btn):
+                btn.setChecked(st == shape_type)
+        if self._zoom_label:
+            if shape_type is not None:
+                self._zoom_label.cancel_annotation_paste_mode()
+                self._zoom_label.set_annotation_create_mode(True, shape_type=shape_type)
+            else:
+                if self._zoom_label._annotation_create_shape_type is not None:
+                    self._zoom_label.set_annotation_create_mode(False)
+
+    def _on_zoom_shape_create_requested(self, shape_type: object, start: object, end: object) -> None:
+        if (
+            self._zoom_page_num is None
+            or not isinstance(shape_type, ShapeType)
+            or not isinstance(start, tuple)
+            or len(start) != 2
+            or not isinstance(end, tuple)
+            or len(end) != 2
+        ):
+            return
+        sx, sy = float(start[0]), float(start[1])
+        ex, ey = float(end[0]), float(end[1])
+
+        vertices: tuple[tuple[float, float], ...] = ()
+        if shape_type == ShapeType.LINE:
+            x0, x1 = (sx, ex) if sx <= ex else (ex, sx)
+            y0, y1 = (sy, ey) if sy <= ey else (ey, sy)
+            if max(x1 - x0, y1 - y0) < 1.0:
+                return
+            width = x1 - x0
+            height = y1 - y0
+            rx1 = (sx - x0) / width if width > 0 else 0.0
+            ry1 = (sy - y0) / height if height > 0 else 0.5
+            rx2 = (ex - x0) / width if width > 0 else 1.0
+            ry2 = (ey - y0) / height if height > 0 else 0.5
+            vertices = ((rx1, ry1), (rx2, ry2))
+            rect_tuple = (x0, y0, x1, y1)
+        else:
+            x0, x1 = (sx, ex) if sx <= ex else (ex, sx)
+            y0, y1 = (sy, ey) if sy <= ey else (ey, sy)
+            if x1 - x0 < 1.0 or y1 - y0 < 1.0:
+                return
+            rect_tuple = (x0, y0, x1, y1)
+
+        self._set_shape_create_mode(None)
+
+        # For bracket with "both sides" checked, create a pair
+        if shape_type == ShapeType.BRACKET and self._zoom_shape_bracket_both_cb.isChecked():
+            self._create_bracket_pair(rect_tuple)
+            return
+
+        bracket_style = ["square", "round", "curly"][self._zoom_shape_bracket_style_combo.currentIndex()]
+        bracket_size = ["small", "medium", "large"][self._zoom_shape_bracket_size_combo.currentIndex()]
+
+        if shape_type == ShapeType.LINE:
+            arrow_start = bool(self._zoom_shape_arrow_start_cb.isChecked()) if self._zoom_shape_arrow_start_cb else False
+            arrow_end = bool(self._zoom_shape_arrow_end_cb.isChecked()) if self._zoom_shape_arrow_end_cb else True
+        else:
+            arrow_start = False
+            arrow_end = False
+        template = ShapeAnnotData(
+            page_num=self._zoom_page_num,
+            xref=0,
+            rect=rect_tuple,
+            shape_type=shape_type,
+            stroke_color=self._zoom_annotation_border_color or (0.0, 0.0, 0.0),
+            fill_color=self._zoom_annotation_fill_color if shape_type not in (ShapeType.LINE, ShapeType.BRACKET) else None,
+            stroke_width=max(1.0, float(self._zoom_annotation_border_width_spin.value())) if self._zoom_annotation_border_width_spin else 1.0,
+            opacity=(float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else 1.0,
+            rotation=0.0,
+            arrow_start=arrow_start,
+            arrow_end=arrow_end,
+            bracket_style=bracket_style,
+            bracket_size=bracket_size,
+            bracket_side="left",
+            vertices=vertices,
+        )
+        state: dict[str, ShapeAnnotData | None] = {"created": None}
+
+        def do_create() -> None:
+            state["created"] = create_shape_annot(self._pdf_path, template)
+            self._selected_zoom_annotation = state["created"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_create() -> None:
+            created = state["created"]
+            if created is not None:
+                delete_shape_annot(self._pdf_path, created.page_num, created.xref)
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        try:
+            do_create()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        self._undo_manager.add_action(UndoAction(
+            description=f"Create {shape_type.value}",
+            undo_func=undo_create,
+            redo_func=do_create,
+        ))
+
+    def _create_bracket_pair(self, rect_tuple: tuple[float, float, float, float]) -> None:
+        bracket_style = ["square", "round", "curly"][self._zoom_shape_bracket_style_combo.currentIndex()]
+        bracket_size = ["small", "medium", "large"][self._zoom_shape_bracket_size_combo.currentIndex()]
+        stroke_color = self._zoom_annotation_border_color or (0.0, 0.0, 0.0)
+        stroke_width = max(1.0, float(self._zoom_annotation_border_width_spin.value())) if self._zoom_annotation_border_width_spin else 1.0
+        opacity = (float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else 1.0
+
+        state: dict[str, tuple[ShapeAnnotData, ShapeAnnotData] | None] = {"pair": None}
+
+        def do_create() -> None:
+            state["pair"] = create_bracket_pair(
+                self._pdf_path,
+                rect_tuple,
+                self._zoom_page_num,
+                bracket_style=bracket_style,
+                bracket_size=bracket_size,
+                stroke_color=stroke_color,
+                stroke_width=stroke_width,
+                opacity=opacity,
+            )
+            self._selected_zoom_annotation = state["pair"][0]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_create() -> None:
+            pair = state["pair"]
+            if pair is not None:
+                delete_shape_annot(self._pdf_path, pair[0].page_num, pair[0].xref)
+                delete_shape_annot(self._pdf_path, pair[1].page_num, pair[1].xref)
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        try:
+            do_create()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        self._undo_manager.add_action(UndoAction(
+            description="Create bracket pair",
+            undo_func=undo_create,
+            redo_func=do_create,
+        ))
+
+    def _run_zoom_shape_replace(
+        self,
+        old_annotation: ShapeAnnotData,
+        new_annotation: ShapeAnnotData,
+        description: str,
+    ) -> None:
+        if not self._zoom_annotation_text_commit_in_progress:
+            self._commit_inline_annotation_editor()
+        state = {"old": old_annotation, "new": None}
+
+        def do_replace() -> None:
+            state["new"] = replace_shape_annot(
+                self._pdf_path,
+                old_annotation.page_num,
+                state["old"].xref,
+                new_annotation,
+            )
+            self._selected_zoom_annotation = state["new"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_replace() -> None:
+            state["old"] = replace_shape_annot(
+                self._pdf_path,
+                old_annotation.page_num,
+                state["new"].xref,
+                state["old"],
+            )
+            self._selected_zoom_annotation = state["old"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        try:
+            do_replace()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        self._undo_manager.add_action(UndoAction(
+            description=description,
+            undo_func=undo_replace,
+            redo_func=do_replace,
+        ))
+
+    def _shape_data_from_form(
+        self,
+        base: ShapeAnnotData,
+        *,
+        rect: tuple[float, float, float, float] | None = None,
+    ) -> ShapeAnnotData:
+        new_vertices = base.vertices
+        if base.shape_type == ShapeType.LINE and rect is None:
+            # LINE はフォームの始点・終点スピナーから幾何を再構築する
+            sx = float(self._zoom_shape_line_start_x_spin.value())
+            sy = float(self._zoom_shape_line_start_y_spin.value())
+            ex = float(self._zoom_shape_line_end_x_spin.value())
+            ey = float(self._zoom_shape_line_end_y_spin.value())
+            x0 = min(sx, ex)
+            x1 = max(sx, ex)
+            y0 = min(sy, ey)
+            y1 = max(sy, ey)
+            if max(x1 - x0, y1 - y0) < 1.0:
+                # 退化したら base のジオメトリを保持
+                x0, y0, x1, y1 = base.rect
+                new_vertices = base.vertices
+            else:
+                width = x1 - x0
+                height = y1 - y0
+                rx1 = (sx - x0) / width if width > 0 else 0.0
+                ry1 = (sy - y0) / height if height > 0 else 0.5
+                rx2 = (ex - x0) / width if width > 0 else 1.0
+                ry2 = (ey - y0) / height if height > 0 else 0.5
+                new_vertices = ((rx1, ry1), (rx2, ry2))
+        else:
+            x0, y0, x1, y1 = rect or base.rect
+            if rect is None and self._zoom_annotation_width_spin and self._zoom_annotation_height_spin:
+                width = float(self._zoom_annotation_width_spin.value())
+                height = float(self._zoom_annotation_height_spin.value())
+                if base.shape_type == ShapeType.LINE and width <= 0 and height <= 0:
+                    # Both-zero line is disallowed — keep previous rect size
+                    width = float(base.rect[2] - base.rect[0])
+                    height = float(base.rect[3] - base.rect[1])
+                x1 = x0 + width
+                y1 = y0 + height
+        stroke_width = float(self._zoom_annotation_border_width_spin.value()) if self._zoom_annotation_border_width_spin else base.stroke_width
+        stroke_color = self._zoom_annotation_border_color if stroke_width > 0 else base.stroke_color
+        rotation = float(self._zoom_shape_rotation_spin.value())
+        bracket_style = ["square", "round", "curly"][self._zoom_shape_bracket_style_combo.currentIndex()]
+        bracket_size = ["small", "medium", "large"][self._zoom_shape_bracket_size_combo.currentIndex()]
+        if base.shape_type == ShapeType.TRIANGLE:
+            apex_x = float(self._zoom_shape_triangle_apex_x_spin.value()) / 100.0
+            triangle_apex = (apex_x, 0.0)
+        else:
+            triangle_apex = base.triangle_apex
+
+        return ShapeAnnotData(
+            page_num=base.page_num,
+            xref=base.xref,
+            rect=(x0, y0, x1, y1),
+            shape_type=base.shape_type,
+            stroke_color=stroke_color,
+            fill_color=self._zoom_annotation_fill_color,
+            stroke_width=stroke_width,
+            opacity=(float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else base.opacity,
+            rotation=rotation,
+            arrow_start=self._zoom_shape_arrow_start_cb.isChecked(),
+            arrow_end=self._zoom_shape_arrow_end_cb.isChecked(),
+            bracket_style=bracket_style,
+            bracket_size=bracket_size,
+            bracket_both_sides=base.bracket_both_sides,
+            bracket_side=base.bracket_side,
+            group_id=base.group_id,
+            vertices=new_vertices,
+            triangle_apex=triangle_apex,
+            annotation_id=base.annotation_id,
+            subject="",
+        )
+
+    def _on_zoom_shape_rotation_changed(self, value: int) -> None:
+        with QSignalBlocker(self._zoom_shape_rotation_slider):
+            self._zoom_shape_rotation_slider.setValue(value)
+        self._apply_zoom_annotation_form()
+
+    def _on_zoom_shape_rotation_slider_changed(self, value: int) -> None:
+        with QSignalBlocker(self._zoom_shape_rotation_spin):
+            self._zoom_shape_rotation_spin.setValue(value)
+        self._apply_zoom_annotation_form()
+
+    def _on_zoom_shape_triangle_apex_x_changed(self, value: int) -> None:
+        with QSignalBlocker(self._zoom_shape_triangle_apex_x_slider):
+            self._zoom_shape_triangle_apex_x_slider.setValue(value)
+        self._apply_zoom_annotation_form()
+
+    def _on_zoom_shape_triangle_apex_x_slider_changed(self, value: int) -> None:
+        with QSignalBlocker(self._zoom_shape_triangle_apex_x_spin):
+            self._zoom_shape_triangle_apex_x_spin.setValue(value)
+        self._apply_zoom_annotation_form()
+
+    def _on_zoom_shape_option_changed(self, _value=None) -> None:
+        self._apply_zoom_annotation_form()
+
+    def _on_zoom_annotation_new_clicked(self, checked: bool) -> None:
+        if not self._zoom_view or not self._zoom_view.isVisible() or self._zoom_page_num is None:
+            self._set_zoom_annotation_create_mode(False)
+            return
+        if checked:
+            self._set_shape_create_mode(None)
+        self._set_zoom_annotation_drawer_open(True)
+        self._set_zoom_annotation_create_mode(checked)
+
+    def _on_zoom_annotation_create_requested(self, rect: object) -> None:
+        if (
+            self._zoom_page_num is None
+            or not isinstance(rect, tuple)
+            or len(rect) != 4
+        ):
+            return
+        rect_tuple = tuple(float(value) for value in rect)
+        if rect_tuple[2] <= rect_tuple[0] or rect_tuple[3] <= rect_tuple[1]:
+            return
+        self._set_zoom_annotation_create_mode(False)
+        fontsize = (
+            float(self._zoom_annotation_fontsize_spin.value())
+            if self._zoom_annotation_fontsize_spin and self._zoom_annotation_fontsize_spin.value() > 0
+            else 14.0
+        )
+        border_width = (
+            float(self._zoom_annotation_border_width_spin.value())
+            if self._zoom_annotation_border_width_spin and self._zoom_annotation_border_width_spin.value() > 0
+            else 1.0
+        )
+        opacity = (
+            float(self._zoom_annotation_opacity_slider.value()) / 100.0
+            if self._zoom_annotation_opacity_slider
+            else 1.0
+        )
+        template = FreeTextAnnotData(
+            page_num=self._zoom_page_num,
+            xref=0,
+            rect=rect_tuple,
+            content="",
+            fontsize=fontsize,
+            text_color=self._zoom_annotation_text_color,
+            fill_color=self._zoom_annotation_fill_color,
+            border_color=self._zoom_annotation_border_color,
+            border_width=border_width,
+            opacity=opacity,
+        )
+        state: dict[str, FreeTextAnnotData | None] = {"created": None}
+
+        def do_create() -> None:
+            state["created"] = create_freetext_annot(self._pdf_path, template)
+            self._selected_zoom_annotation = state["created"]
+            self._refresh_current_zoom_page(open_drawer=True)
+            if self._zoom_label and self._selected_zoom_annotation is not None:
+                current = self._find_zoom_annotation(self._selected_zoom_annotation.xref) or self._selected_zoom_annotation
+                self._zoom_label.begin_annotation_text_edit(current)
+
+        def undo_create() -> None:
+            created = state["created"]
+            if created is not None:
+                delete_freetext_annot(self._pdf_path, created.page_num, created.xref)
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        try:
+            do_create()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        self._undo_manager.add_action(UndoAction(
+            description="Create FreeText",
+            undo_func=undo_create,
+            redo_func=do_create,
+        ))
+
+    def _run_zoom_annotation_replace(
+        self,
+        old_annotation: FreeTextAnnotData,
+        new_annotation: FreeTextAnnotData,
+        description: str,
+    ) -> None:
+        if not self._zoom_annotation_text_commit_in_progress:
+            self._commit_inline_annotation_editor()
+        state = {"old": old_annotation, "new": None}
+
+        def do_replace() -> None:
+            state["new"] = replace_freetext_annot(
+                self._pdf_path,
+                old_annotation.page_num,
+                state["old"].xref,
+                new_annotation,
+            )
+            self._selected_zoom_annotation = state["new"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_replace() -> None:
+            state["old"] = replace_freetext_annot(
+                self._pdf_path,
+                old_annotation.page_num,
+                state["new"].xref,
+                state["old"],
+            )
+            self._selected_zoom_annotation = state["old"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        try:
+            do_replace()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error, selected_annotation=state["old"])
+            return
+        self._undo_manager.add_action(UndoAction(
+            description=description,
+            undo_func=undo_replace,
+            redo_func=do_replace,
+        ))
+
+    def _apply_zoom_annotation_form(self) -> None:
+        if self._zoom_annotation_form_sync or self._selected_zoom_annotation is None:
+            return
+        old_annotation = self._selected_zoom_annotation
+
+        if isinstance(old_annotation, ShapeAnnotData):
+            new_annotation = self._shape_data_from_form(old_annotation)
+            old_verts = tuple(tuple(v) for v in old_annotation.vertices) if old_annotation.vertices else ()
+            new_verts = tuple(tuple(v) for v in new_annotation.vertices) if new_annotation.vertices else ()
+            if (
+                old_annotation.rect == new_annotation.rect
+                and old_annotation.stroke_color == new_annotation.stroke_color
+                and old_annotation.fill_color == new_annotation.fill_color
+                and abs(old_annotation.stroke_width - new_annotation.stroke_width) < 0.01
+                and abs(old_annotation.opacity - new_annotation.opacity) < 0.01
+                and abs(old_annotation.rotation - new_annotation.rotation) < 0.01
+                and old_annotation.arrow_start == new_annotation.arrow_start
+                and old_annotation.arrow_end == new_annotation.arrow_end
+                and old_annotation.bracket_style == new_annotation.bracket_style
+                and old_annotation.bracket_size == new_annotation.bracket_size
+                and abs(old_annotation.triangle_apex[0] - new_annotation.triangle_apex[0]) < 1e-4
+                and abs(old_annotation.triangle_apex[1] - new_annotation.triangle_apex[1]) < 1e-4
+                and old_verts == new_verts
+            ):
+                return
+            self._run_zoom_shape_replace(old_annotation, new_annotation, f"Update {old_annotation.shape_type.value}")
+            return
+
+        new_annotation = self._annotation_data_from_form(old_annotation)
+        if (
+            old_annotation.rect == new_annotation.rect
+            and old_annotation.content == new_annotation.content
+            and abs(old_annotation.fontsize - new_annotation.fontsize) < 0.01
+            and old_annotation.text_color == new_annotation.text_color
+            and old_annotation.fill_color == new_annotation.fill_color
+            and old_annotation.border_color == new_annotation.border_color
+            and abs(old_annotation.border_width - new_annotation.border_width) < 0.01
+            and abs(old_annotation.opacity - new_annotation.opacity) < 0.01
+        ):
+            return
+        self._run_zoom_annotation_replace(old_annotation, new_annotation, "Update FreeText")
+
+    def _delete_selected_zoom_annotation(self) -> None:
+        if self._selected_zoom_annotation is None:
+            return
+        self._commit_inline_annotation_editor()
+        annot = self._selected_zoom_annotation
+
+        if isinstance(annot, ShapeAnnotData):
+            state = {"old": annot}
+
+            def do_delete_shape() -> None:
+                delete_shape_annot(self._pdf_path, state["old"].page_num, state["old"].xref)
+                self._selected_zoom_annotation = None
+                self._refresh_current_zoom_page()
+
+            def undo_delete_shape() -> None:
+                state["old"] = create_shape_annot(self._pdf_path, state["old"])
+                self._selected_zoom_annotation = state["old"]
+                self._refresh_current_zoom_page(open_drawer=True)
+
+            try:
+                do_delete_shape()
+            except PdfWritePermissionError as error:
+                self._handle_pdf_write_permission_denied(error)
+                return
+            self._undo_manager.add_action(UndoAction(
+                description=f"Delete {annot.shape_type.value}",
+                undo_func=undo_delete_shape,
+                redo_func=do_delete_shape,
+            ))
+            return
+
+        state = {"old": annot}
+
+        def do_delete() -> None:
+            delete_freetext_annot(self._pdf_path, state["old"].page_num, state["old"].xref)
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        def undo_delete() -> None:
+            state["old"] = create_freetext_annot(self._pdf_path, state["old"])
+            self._selected_zoom_annotation = state["old"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        try:
+            do_delete()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error, selected_annotation=state["old"])
+            return
+        self._undo_manager.add_action(UndoAction(
+            description="Delete FreeText",
+            undo_func=undo_delete,
+            redo_func=do_delete,
+        ))
+
+    def _reorder_selected_zoom_annotation(self, mode: str) -> None:
+        if self._selected_zoom_annotation is None or self._zoom_page_num is None:
+            return
+        self._commit_inline_annotation_editor()
+        annot = self._selected_zoom_annotation
+        page_num = annot.page_num
+        xref = annot.xref
+        before = get_annot_xref_order(self._pdf_path, page_num)
+        if xref not in before:
+            return
+
+        def do_reorder() -> None:
+            reorder_annot_on_page(self._pdf_path, page_num, xref, mode)
+            self._selected_zoom_annotation = self._find_zoom_annotation(xref) or annot
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_reorder() -> None:
+            set_annot_xref_order(self._pdf_path, page_num, before)
+            self._selected_zoom_annotation = self._find_zoom_annotation(xref) or annot
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        try:
+            do_reorder()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        after = get_annot_xref_order(self._pdf_path, page_num)
+        if after == before:
+            return
+        self._undo_manager.add_action(UndoAction(
+            description=f"Reorder annotation ({mode})",
+            undo_func=undo_reorder,
+            redo_func=do_reorder,
+        ))
+
+    def _on_zoom_annotation_geometry_changed(self, annotation: object, rect: object, mode: str) -> None:
+        if not isinstance(rect, tuple) or len(rect) != 4:
+            return
+        new_rect = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+
+        if isinstance(annotation, ShapeAnnotData):
+            old_annotation = self._find_zoom_annotation(annotation.xref) or annotation
+            if old_annotation.rect == new_rect:
+                return
+            new_annotation = ShapeAnnotData(
+                page_num=old_annotation.page_num,
+                xref=old_annotation.xref,
+                rect=new_rect,
+                shape_type=old_annotation.shape_type,
+                stroke_color=old_annotation.stroke_color,
+                fill_color=old_annotation.fill_color,
+                stroke_width=old_annotation.stroke_width,
+                opacity=old_annotation.opacity,
+                rotation=old_annotation.rotation,
+                arrow_start=old_annotation.arrow_start,
+                arrow_end=old_annotation.arrow_end,
+                bracket_style=old_annotation.bracket_style,
+                bracket_size=old_annotation.bracket_size,
+                bracket_both_sides=old_annotation.bracket_both_sides,
+                bracket_side=old_annotation.bracket_side,
+                group_id=old_annotation.group_id,
+                vertices=old_annotation.vertices,
+                triangle_apex=old_annotation.triangle_apex,
+                annotation_id=old_annotation.annotation_id,
+                subject=old_annotation.subject if mode == "move" else "",
+            )
+            description = f"Move {old_annotation.shape_type.value}" if mode == "move" else f"Resize {old_annotation.shape_type.value}"
+            self._run_zoom_shape_replace(old_annotation, new_annotation, description)
+            return
+
+        if not isinstance(annotation, FreeTextAnnotData):
+            return
+        old_annotation = self._find_zoom_annotation(annotation.xref) or annotation
+        new_annotation = FreeTextAnnotData(
+            page_num=old_annotation.page_num,
+            xref=old_annotation.xref,
+            rect=new_rect,
+            content=old_annotation.content,
+            fontsize=old_annotation.fontsize,
+            text_color=old_annotation.text_color,
+            fill_color=old_annotation.fill_color,
+            border_color=old_annotation.border_color,
+            border_width=old_annotation.border_width,
+            opacity=old_annotation.opacity,
+            fontname=old_annotation.fontname,
+            annotation_id=old_annotation.annotation_id,
+            subject=old_annotation.subject if mode == "move" else "",
+        )
+        if old_annotation.rect == new_annotation.rect:
+            return
+        description = "Move FreeText" if mode == "move" else "Resize FreeText"
+        self._run_zoom_annotation_replace(old_annotation, new_annotation, description)
+
+    def _on_zoom_shape_geometry_changed_with_vertices(
+        self, annotation: object, rect: object, vertices: object, mode: str
+    ) -> None:
+        if not isinstance(annotation, ShapeAnnotData):
+            return
+        if not isinstance(rect, tuple) or len(rect) != 4:
+            return
+        if not isinstance(vertices, tuple) or len(vertices) != 2:
+            return
+        try:
+            new_rect = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+            new_vertices = (
+                (float(vertices[0][0]), float(vertices[0][1])),
+                (float(vertices[1][0]), float(vertices[1][1])),
+            )
+        except (TypeError, ValueError, IndexError):
+            return
+        old_annotation = self._find_zoom_annotation(annotation.xref) or annotation
+        old_verts = tuple(tuple(v) for v in old_annotation.vertices) if old_annotation.vertices else ()
+        if old_annotation.rect == new_rect and old_verts == new_vertices:
+            return
+        new_annotation = ShapeAnnotData(
+            page_num=old_annotation.page_num,
+            xref=old_annotation.xref,
+            rect=new_rect,
+            shape_type=old_annotation.shape_type,
+            stroke_color=old_annotation.stroke_color,
+            fill_color=old_annotation.fill_color,
+            stroke_width=old_annotation.stroke_width,
+            opacity=old_annotation.opacity,
+            rotation=old_annotation.rotation,
+            arrow_start=old_annotation.arrow_start,
+            arrow_end=old_annotation.arrow_end,
+            bracket_style=old_annotation.bracket_style,
+            bracket_size=old_annotation.bracket_size,
+            bracket_both_sides=old_annotation.bracket_both_sides,
+            bracket_side=old_annotation.bracket_side,
+            group_id=old_annotation.group_id,
+            vertices=new_vertices,
+            triangle_apex=old_annotation.triangle_apex,
+            annotation_id=old_annotation.annotation_id,
+            subject="",
+        )
+        description = f"Move {old_annotation.shape_type.value} endpoint"
+        self._run_zoom_shape_replace(old_annotation, new_annotation, description)
+
+    def _update_button_states(self) -> None:
+        has_selection = len(self._selected_thumbnails) > 0
+        zoom_active = bool(
+            self._zoom_view
+            and self._zoom_view.isVisible()
+            and self._zoom_page_num is not None
+        )
+        can_edit_pages = has_selection or zoom_active
+        self._delete_btn.setEnabled(can_edit_pages)
+        self._rename_btn.setEnabled(True)
+        self._title_btn.setEnabled(True)
+        self._rotate_btn.setEnabled(can_edit_pages)
+        self._undo_btn.setEnabled(self._undo_manager.can_undo())
+        self._redo_btn.setEnabled(self._undo_manager.can_redo())
+
+    def _debug_undo_state(self, reason: str) -> None:
+        log_undo_state(
+            logger=logger,
+            context_name="PageEditWindow",
+            reason=reason,
+            undo_button=self._undo_btn,
+            redo_button=self._redo_btn,
+            undo_manager=self._undo_manager,
+        )
+
+    def _on_undo_manager_changed(self, reason: str) -> None:
+        self._update_button_states()
+        self._debug_undo_state(reason)
+
+    def _reset_thumbnail_render_queue(self) -> None:
+        self._thumb_render_timer.stop()
+        self._scroll_debounce_timer.stop()
+        self._thumb_render_queue.clear()
+        self._thumb_render_queue_set.clear()
+
+    def _schedule_thumbnail_render(self) -> None:
+        if self._thumb_render_queue and not self._thumb_render_timer.isActive():
+            self._thumb_render_timer.start(0)
+
+    def _enqueue_thumbnail_render(self, page_num: int, *, priority: bool = False) -> None:
+        if page_num < 0 or page_num >= len(self._thumbnails):
+            return
+        thumb = self._thumbnails[page_num]
+        if thumb._explicitly_hidden or thumb.thumbnail_loaded:
+            return
+        if page_num in self._thumb_render_queue_set:
+            return
+        if priority:
+            self._thumb_render_queue.appendleft(page_num)
+        else:
+            self._thumb_render_queue.append(page_num)
+        self._thumb_render_queue_set.add(page_num)
+
+    def _visible_rect_in_container(self) -> QRect:
+        if not self._grid_scroll:
+            return QRect()
+        viewport = self._grid_scroll.viewport()
+        top_left = self._container.mapFrom(viewport, QPoint(0, 0))
+        bottom_right = self._container.mapFrom(
+            viewport,
+            QPoint(max(0, viewport.width() - 1), max(0, viewport.height() - 1)),
+        )
+        return QRect(top_left, bottom_right).normalized()
+
+    def _enqueue_visible_thumbnail_renders(self) -> None:
+        if not self._thumbnails or not self._grid_scroll:
+            return
+        visible_rect = self._visible_rect_in_container()
+        visible_pages = []
+        for page_num, thumb in enumerate(self._thumbnails):
+            if thumb._explicitly_hidden or not thumb.isVisible():
+                continue
+            if thumb.geometry().intersects(visible_rect):
+                if not thumb.thumbnail_loaded:
+                    visible_pages.append(page_num)
+        if not visible_pages:
+            self._schedule_thumbnail_render()
+            return
+        visible_set = set(visible_pages)
+        # キュー再構築: 表示中ページを先頭、残りをその後ろ
+        remaining = deque()
+        for pn in self._thumb_render_queue:
+            if pn not in visible_set:
+                remaining.append(pn)
+        new_queue = deque(visible_pages)
+        new_queue.extend(remaining)
+        self._thumb_render_queue = new_queue
+        self._thumb_render_queue_set = set(new_queue)
+        self._schedule_thumbnail_render()
+
+    def _enqueue_all_thumbnail_renders(self) -> None:
+        for page_num, thumb in enumerate(self._thumbnails):
+            if thumb._explicitly_hidden:
+                continue
+            self._enqueue_thumbnail_render(page_num)
+        # 表示ページの優先化後にスケジュール開始（次のイベントループで）
+        QTimer.singleShot(0, self._enqueue_visible_thumbnail_renders)
+
+    def _request_thumbnail_refresh(self, page_num: int) -> None:
+        if page_num < 0 or page_num >= len(self._thumbnails):
+            return
+        thumb = self._thumbnails[page_num]
+        thumb.invalidate_thumbnail()
+        self._enqueue_thumbnail_render(page_num, priority=True)
+        self._schedule_thumbnail_render()
+
+    def _process_thumbnail_render_queue(self) -> None:
+        batch: list[int] = []
+        while self._thumb_render_queue and len(batch) < 5:
+            page_num = self._thumb_render_queue.popleft()
+            self._thumb_render_queue_set.discard(page_num)
+            if page_num < 0 or page_num >= len(self._thumbnails):
+                continue
+            thumb = self._thumbnails[page_num]
+            if thumb._explicitly_hidden or thumb.thumbnail_loaded:
+                continue
+            batch.append(page_num)
+        if batch:
+            pixmaps = render_page_thumbnails_batch(self._pdf_path, batch, self._thumb_size)
+            for pn in batch:
+                if pn < len(self._thumbnails):
+                    self._thumbnails[pn].set_pixmap_direct(pixmaps.get(pn, QPixmap()))
+        self._schedule_thumbnail_render()
+
+    def _on_grid_viewport_changed(self, _value: int) -> None:
+        self._scroll_debounce_timer.start()  # デバウンス（スクロール停止150ms後に優先化）
+
+    def _load_pages(self) -> None:
+        self._reset_thumbnail_render_queue()
+        # ページ構成が変わったので検索結果は破棄する
+        self._invalidate_search_results()
+        # 既存のサムネイルをグリッドから先に取り除く
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            # setParent(None)は呼ばない（deleteLater()で処理される）
+
+        for thumb in self._thumbnails:
+            thumb.deleteLater()
+        self._thumbnails.clear()
+        self._selected_thumbnails.clear()
+        self._zoom_text_cache.clear()
+        self._zoom_annotations = []
+
+        # ファイル存在チェック
+        if not os.path.exists(self._pdf_path):
+            return
+
+        page_count = get_page_count(self._pdf_path)
+        if page_count == 0:
+            return
+
+        # ズームビューのページ番号を調整
+        if self._zoom_page_num is not None and self._zoom_page_num >= page_count:
+            self._zoom_page_num = max(0, page_count - 1)
+
+        for i in range(page_count):
+            thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
+            thumb.clicked.connect(self._on_thumbnail_clicked)
+            self._thumbnails.append(thumb)
+
+        self._refresh_grid()
+        self._enqueue_all_thumbnail_renders()
+        if self._zoom_view and self._zoom_view.isVisible():
+            self._render_zoom_page()
+
+    def refresh_from_disk(self) -> None:
+        """Reload the current PDF from disk without closing the edit window."""
+        if not os.path.exists(self._pdf_path):
+            return
+
+        self._commit_inline_annotation_editor()
+        clear_pixmap_cache_for_path(self._pdf_path)
+        page_count = get_page_count(self._pdf_path)
+        if page_count != len(self._thumbnails):
+            self._load_pages()
+            return
+
+        self._zoom_text_cache.clear()
+        self._zoom_annotations = []
+        self._reset_thumbnail_render_queue()
+        for thumb in self._thumbnails:
+            thumb.invalidate_thumbnail()
+        self._enqueue_all_thumbnail_renders()
+
+        if self._zoom_view and self._zoom_view.isVisible():
+            self._render_zoom_page()
+
+    def _on_external_pdf_rotation(self) -> None:
+        """外部（MainWindow等）で回転されたPDFを即時反映する。"""
+        self.refresh_from_disk()
+
+    def _grid_available_width(self) -> int:
+        """Width source for column calculation (always consistent)."""
+        return viewport_width_or_fallback(self._grid_scroll, self.width())
+
+    def _refresh_grid(self) -> None:
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            # 削除予定のウィジェットには触らない
+            widget = item.widget()
+            if widget and widget in self._thumbnails:
+                widget.setParent(None)
+
+        available_width = self._grid_available_width()
+        spacing = self._grid_layout.horizontalSpacing()
+        if spacing < 0:
+            spacing = self._grid_layout.spacing()
+        spacing = int(spacing)
+        m = self._grid_layout.contentsMargins()
+        usable = max(1, int(available_width) - int(m.left() + m.right()))
+
+        w = int(self._thumb_size)
+        cols = max(1, int((usable + spacing) // (w + spacing)))
+
+        visible_thumbs = [t for t in self._thumbnails if not t._explicitly_hidden]
+        for i, thumb in enumerate(visible_thumbs):
+            row = i // cols
+            col = i % cols
+            self._grid_layout.addWidget(thumb, row, col)
+            thumb.setVisible(True)
+        self._enqueue_visible_thumbnail_renders()
+
+    def _remove_page_thumbnails(self, page_indices: list[int]) -> None:
+        """指定されたページのサムネイルを削除（差分更新）"""
+        self._reset_thumbnail_render_queue()
+        # グリッドから全サムネイルを一旦取り除く
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget and widget in self._thumbnails:
+                widget.setParent(None)
+
+        # 指定されたインデックスのサムネイルを削除（逆順で処理）
+        for idx in sorted(page_indices, reverse=True):
+            if 0 <= idx < len(self._thumbnails):
+                thumb = self._thumbnails.pop(idx)
+                if thumb in self._selected_thumbnails:
+                    self._selected_thumbnails.remove(thumb)
+                thumb.deleteLater()
+
+        # ページ番号を再割り当て
+        for i, thumb in enumerate(self._thumbnails):
+            thumb._page_num = i
+            thumb._display_num = i
+            thumb._number_label.setText(str(i + 1))
+            thumb._reposition_number_badge()
+
+        # ズームビューのページ番号を調整
+        if self._zoom_page_num is not None:
+            page_count = len(self._thumbnails)
+            if page_count == 0:
+                self._zoom_page_num = None
+                if self._zoom_view and self._zoom_view.isVisible():
+                    self._exit_zoom_view()
+            elif self._zoom_page_num >= page_count:
+                self._zoom_page_num = max(0, page_count - 1)
+                if self._zoom_view and self._zoom_view.isVisible():
+                    self._render_zoom_page()
+
+        # ズームテキストキャッシュをクリア（ページ番号が変わるため）
+        self._zoom_text_cache.clear()
+        self._zoom_annotations = []
+
+        self._refresh_grid()
+        self._enqueue_all_thumbnail_renders()
+
+    def _clear_selection(self) -> None:
+        clear_selection(self._selected_thumbnails)
+        self._update_button_states()
+
+    def _set_thumbnail_size(self, size: int) -> None:
+        size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
+        if size == self._thumb_size:
+            return
+        self._reset_thumbnail_render_queue()
+        self._thumb_size = size
+        for thumb in self._thumbnails:
+            thumb.set_thumbnail_size(self._thumb_size)
+        self._refresh_grid()
+        self._enqueue_all_thumbnail_renders()
+
+    def eventFilter(self, obj, event) -> bool:
+        grid_scroll = getattr(self, "_grid_scroll", None)
+        if grid_scroll and obj is grid_scroll.viewport() and event.type() == QEvent.Type.Wheel:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                if self._zoom_view and self._zoom_view.isVisible():
+                    return False
+                delta = event.angleDelta().y()
+                if delta != 0:
+                    step = self.PREVIEW_THUMB_STEP if delta > 0 else -self.PREVIEW_THUMB_STEP
+                    self._set_thumbnail_size(self._thumb_size + step)
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
+
+    def hide_page(self, page_num: int) -> None:
+        for thumb in self._thumbnails:
+            if thumb.page_num == page_num:
+                thumb._explicitly_hidden = True
+                thumb.setVisible(False)
+                if thumb in self._selected_thumbnails:
+                    self._selected_thumbnails.remove(thumb)
+                break
+
+    def _on_thumbnail_clicked(self, thumb: PageThumbnail) -> None:
+        modifiers = QApplication.keyboardModifiers()
+
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            if thumb in self._selected_thumbnails:
+                thumb.set_selected(False)
+                self._selected_thumbnails.remove(thumb)
+            else:
+                thumb.set_selected(True)
+                self._selected_thumbnails.append(thumb)
+        elif modifiers & Qt.KeyboardModifier.ShiftModifier:
+            if self._selected_thumbnails:
+                start_idx = self._thumbnails.index(self._selected_thumbnails[-1])
+                end_idx = self._thumbnails.index(thumb)
+                if start_idx > end_idx:
+                    start_idx, end_idx = end_idx, start_idx
+                for i in range(start_idx, end_idx + 1):
+                    if self._thumbnails[i] not in self._selected_thumbnails:
+                        self._thumbnails[i].set_selected(True)
+                        self._selected_thumbnails.append(self._thumbnails[i])
+            else:
+                thumb.set_selected(True)
+                self._selected_thumbnails.append(thumb)
+        else:
+            if thumb not in self._selected_thumbnails:
+                self._clear_selection()
+                thumb.set_selected(True)
+                self._selected_thumbnails.append(thumb)
+
+        self._update_button_states()
+
+    def _open_zoom_view(self, page_num: int) -> None:
+        self._commit_inline_annotation_editor()
+        self._zoom_page_num = page_num
+        self._selected_zoom_annotation = None
+        self._set_zoom_annotation_create_mode(False)
+        self._set_zoom_percent(100)
+        if self._grid_scroll:
+            self._grid_scroll.hide()
+        if self._zoom_view:
+            self._zoom_view.show()
+        for action in getattr(self, "_zoom_nav_actions", ()):
+            action.setEnabled(True)
+        self._update_button_states()
+
+    def _exit_zoom_view(self) -> None:
+        self._commit_inline_annotation_editor()
+        last_page = self._zoom_page_num
+        self._set_zoom_annotation_create_mode(False)
+        self._set_selected_zoom_annotation(None)
+        for action in getattr(self, "_zoom_nav_actions", ()):
+            action.setEnabled(False)
+        if self._zoom_view:
+            self._zoom_view.hide()
+        if self._grid_scroll:
+            self._grid_scroll.show()
+        # 最後に表示していたページを選択状態にする
+        if last_page is not None and 0 <= last_page < len(self._thumbnails):
+            self._clear_selection()
+            thumb = self._thumbnails[last_page]
+            thumb.set_selected(True)
+            self._selected_thumbnails.append(thumb)
+            # サムネイルが見える位置にスクロール
+            if self._grid_scroll:
+                self._grid_scroll.ensureWidgetVisible(thumb)
+        self._update_button_states()
+
+    def _set_zoom_percent(self, value: int) -> None:
+        value = max(self.ZOOM_MIN, min(self.ZOOM_MAX, value))
+        self._zoom_factor = value / 100.0
+        if self._zoom_percent_label:
+            self._zoom_percent_label.setText(f"{value}%")
+        self._render_zoom_page()
+
+    def _on_zoom_wheel(self, step: int) -> None:
+        current = int(self._zoom_factor * 100)
+        self._set_zoom_percent(current + step)
+
+    def _on_zoom_in(self) -> None:
+        current = int(self._zoom_factor * 100)
+        self._set_zoom_percent(current + self.ZOOM_STEP)
+
+    def _on_zoom_out(self) -> None:
+        current = int(self._zoom_factor * 100)
+        self._set_zoom_percent(current - self.ZOOM_STEP)
+
+    def _on_zoom_reset(self) -> None:
+        self._set_zoom_percent(100)
+
+    def _on_zoom_prev_page(self) -> None:
+        if self._zoom_page_num is None:
+            return
+        if self._zoom_page_num <= 0:
+            self._update_zoom_nav_buttons()
+            return
+        self._commit_inline_annotation_editor()
+        self._set_zoom_annotation_create_mode(False)
+        self._selected_zoom_annotation = None
+        self._zoom_page_num -= 1
+        self._render_zoom_page()
+
+    def _on_zoom_next_page(self) -> None:
+        if self._zoom_page_num is None:
+            return
+        page_count = get_page_count(self._pdf_path)
+        if self._zoom_page_num >= page_count - 1:
+            self._update_zoom_nav_buttons(page_count)
+            return
+        self._commit_inline_annotation_editor()
+        self._set_zoom_annotation_create_mode(False)
+        self._selected_zoom_annotation = None
+        self._zoom_page_num += 1
+        self._render_zoom_page()
+
+    def _on_zoom_first_page(self) -> None:
+        if self._zoom_page_num is None:
+            return
+        if self._zoom_page_num == 0:
+            return
+        self._commit_inline_annotation_editor()
+        self._set_zoom_annotation_create_mode(False)
+        self._selected_zoom_annotation = None
+        self._zoom_page_num = 0
+        self._render_zoom_page()
+
+    def _on_zoom_last_page(self) -> None:
+        if self._zoom_page_num is None:
+            return
+        page_count = get_page_count(self._pdf_path)
+        if page_count <= 0:
+            return
+        last_index = page_count - 1
+        if self._zoom_page_num == last_index:
+            return
+        self._commit_inline_annotation_editor()
+        self._set_zoom_annotation_create_mode(False)
+        self._selected_zoom_annotation = None
+        self._zoom_page_num = last_index
+        self._render_zoom_page()
+
+    def _update_zoom_nav_buttons(self, page_count: int | None = None) -> None:
+        if not self._zoom_prev_btn or not self._zoom_next_btn:
+            return
+        if self._zoom_page_num is None:
+            self._zoom_prev_btn.setEnabled(False)
+            self._zoom_next_btn.setEnabled(False)
+            return
+        if page_count is None:
+            page_count = get_page_count(self._pdf_path)
+        if page_count <= 0:
+            self._zoom_prev_btn.setEnabled(False)
+            self._zoom_next_btn.setEnabled(False)
+            return
+        self._zoom_prev_btn.setEnabled(self._zoom_page_num > 0)
+        self._zoom_next_btn.setEnabled(self._zoom_page_num < page_count - 1)
+
+    def _render_zoom_page(self) -> None:
+        if not self._zoom_annotation_text_commit_in_progress:
+            self._commit_inline_annotation_editor()
+        if self._zoom_page_num is None or not self._zoom_label:
+            return
+        page_count = get_page_count(self._pdf_path)
+        self._update_zoom_nav_buttons(page_count)
+        if self._zoom_page_label:
+            self._zoom_page_label.setText(f"{self._zoom_page_num + 1} / {page_count}")
+        if self._zoom_page_num >= page_count:
+            self._exit_zoom_view()
+            return
+        dpr = self._zoom_label.devicePixelRatioF()
+        pixmap = get_page_pixmap(
+            self._pdf_path,
+            self._zoom_page_num,
+            self._zoom_factor * dpr,
+            annots=False,
+        )
+        pixmap.setDevicePixelRatio(dpr)
+        words = []
+        links = []
+        if self._zoom_page_num in self._zoom_text_cache:
+            words, links = self._zoom_text_cache[self._zoom_page_num]
+        else:
+            words = get_page_words(self._pdf_path, self._zoom_page_num)
+            links = get_page_links(self._pdf_path, self._zoom_page_num)
+            self._zoom_text_cache[self._zoom_page_num] = (words, links)
+        freetext_annots = list_freetext_annots(self._pdf_path, self._zoom_page_num)
+        shape_annots = list_shape_annots(self._pdf_path, self._zoom_page_num)
+        merged = freetext_annots + shape_annots
+        xref_order = get_annot_xref_order(self._pdf_path, self._zoom_page_num)
+        order_index = {x: i for i, x in enumerate(xref_order)}
+        # PDF の /Annots 配列順（描画順）に並べ替え。未登録 xref は末尾に置く。
+        merged.sort(key=lambda a: order_index.get(a.xref, len(order_index)))
+        self._zoom_annotations = merged
+        selected_xref = self._selected_zoom_annotation.xref if self._selected_zoom_annotation else None
+        current_selection = self._find_zoom_annotation(selected_xref)
+        self._zoom_label.set_page(
+            pixmap,
+            words,
+            links,
+            self._zoom_annotations,
+            self._zoom_factor,
+            current_selection.xref if current_selection else None,
+        )
+        hit_rects = self._search_hits.get(self._zoom_page_num, [])
+        self._zoom_label.set_search_hit_rects(hit_rects)
+        self._set_selected_zoom_annotation(current_selection)
+
+    def _on_zoom_link_clicked(self, link: dict) -> None:
+        uri = link.get("uri")
+        if uri:
+            QDesktopServices.openUrl(QUrl(uri))
+            return
+        file_path = link.get("file")
+        if file_path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
+            return
+        target_page = link.get("page")
+        if isinstance(target_page, int):
+            self._zoom_page_num = target_page
+            self._render_zoom_page()
+
+    def _on_undo(self) -> None:
+        self._commit_inline_annotation_editor()
+        try:
+            self._undo_manager.undo()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
+            return
+        self._load_pages()
+        self._update_button_states()
+
+    def _on_redo(self) -> None:
+        self._commit_inline_annotation_editor()
+        try:
+            self._undo_manager.redo()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
+            return
+        self._load_pages()
+        self._update_button_states()
+
+    def _on_delete(self) -> None:
+        # ズームビュー表示中の場合
+        if self._zoom_view and self._zoom_view.isVisible():
+            if self._selected_zoom_annotation is not None:
+                self._delete_selected_zoom_annotation()
+                return
+            self._delete_zoom_page()
+            return
+
+        if not self._selected_thumbnails:
+            return
+
+        import tempfile
+
+        indices = sorted([t.page_num for t in self._selected_thumbnails], reverse=True)
+        pdf_path = self._pdf_path
+
+        # 全ページ削除かチェック
+        page_count = get_page_count(pdf_path)
+        if len(indices) >= page_count:
+            # 全ページ削除 → ファイル削除＋UNDO対応
+            backup_fd, backup_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(backup_fd)
+            shutil.copy2(pdf_path, backup_path)
+            self._delete_all_pages(backup_path)
+            return
+
+        backup_fd, backup_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(backup_fd)
+
+        sorted_indices = sorted(indices)
+        extract_pages(pdf_path, backup_path, sorted_indices)
+
+        def do_delete():
+            remove_pages(pdf_path, indices)
+            self._load_pages()
+
+        def undo_delete():
+            insert_pages(pdf_path, backup_path, sorted_indices)
+            self._load_pages()
+
+        try:
+            do_delete()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+
+        self._undo_manager.add_action(UndoAction(
+            description=f"Delete {len(indices)} page(s)",
+            undo_func=undo_delete,
+            redo_func=do_delete
+        ))
+
+    def _on_rename(self) -> None:
+        old_path = self._pdf_path
+        old_name = os.path.basename(old_path)
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", "New name:", text=old_name
+        )
+
+        if ok and new_name and new_name != old_name:
+            if not new_name.lower().endswith(".pdf"):
+                new_name += ".pdf"
+            new_path = os.path.join(os.path.dirname(old_path), new_name)
+            if os.path.abspath(old_path) == os.path.abspath(new_path):
+                return
+
+            def _get_main_window():
+                from src.views.main_window import MainWindow
+
+                owner = self.parent()
+                return owner if isinstance(owner, MainWindow) else None
+
+            def do_rename() -> None:
+                main_window = _get_main_window()
+                if main_window:
+                    main_window._perform_rename(old_path, new_path)
+                else:
+                    os.rename(old_path, new_path)
+                    self._pdf_path = new_path
+                    self.setWindowTitle(f"JusticePDF - Edit: {new_name}")
+
+            def undo_rename() -> None:
+                main_window = _get_main_window()
+                if main_window:
+                    main_window._perform_rename(new_path, old_path)
+                else:
+                    os.rename(new_path, old_path)
+                    self._pdf_path = old_path
+                    self.setWindowTitle(f"JusticePDF - Edit: {old_name}")
+
+            try:
+                do_rename()
+            except OSError as error:
+                self._handle_file_operation_error(error, old_path, "名前変更")
+                return
+            self._undo_manager.add_action(UndoAction(
+                description="Rename PDF",
+                undo_func=undo_rename,
+                redo_func=do_rename
+            ))
+
+    def _on_rename_pdf_title(self) -> None:
+        old_path = self._pdf_path
+        old_name = os.path.basename(old_path)
+        old_title = get_pdf_metadata_title(old_path) or os.path.splitext(old_name)[0]
+        new_title, ok = QInputDialog.getText(
+            self, "Rename PDF Title", "New PDF title:", text=old_title
+        )
+
+        if not ok or not new_title or new_title == old_title:
+            return
+
+        def do_rename_pdf_title() -> None:
+            update_pdf_metadata_title(old_path, new_title)
+            self.refresh_from_disk()
+
+        def undo_rename_pdf_title() -> None:
+            update_pdf_metadata_title(old_path, old_title)
+            self.refresh_from_disk()
+
+        try:
+            do_rename_pdf_title()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        except Exception as error:
+            self._handle_file_operation_error(error, old_path, "PDFタイトル変更")
+            return
+        self._undo_manager.add_action(UndoAction(
+            description="Rename PDF Name",
+            undo_func=undo_rename_pdf_title,
+            redo_func=do_rename_pdf_title
+        ))
+
+    def _on_print(self) -> None:
+        """Print the current PDF."""
+        print_pdfs([self._pdf_path], self)
+
+    def _on_rotate(self) -> None:
+        # ズームビュー表示中の場合
+        if self._zoom_view and self._zoom_view.isVisible():
+            self._rotate_zoom_page()
+            return
+
+        if not self._selected_thumbnails:
+            return
+
+        indices = [t.page_num for t in self._selected_thumbnails]
+        pdf_path = self._pdf_path
+        selected_thumbs = list(self._selected_thumbnails)
+
+        def do_rotate():
+            rotate_pages(pdf_path, indices, 90)
+            for thumb in selected_thumbs:
+                self._request_thumbnail_refresh(thumb.page_num)
+
+        def undo_rotate():
+            rotate_pages(pdf_path, indices, 270)
+            for thumb in selected_thumbs:
+                self._request_thumbnail_refresh(thumb.page_num)
+
+        try:
+            do_rotate()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+
+        self._undo_manager.add_action(UndoAction(
+            description=f"Rotate {len(indices)} page(s)",
+            undo_func=undo_rotate,
+            redo_func=do_rotate
+        ))
+
+    def _on_select_all(self) -> None:
+        self._clear_selection()
+        for thumb in self._thumbnails:
+            thumb.set_selected(True)
+            self._selected_thumbnails.append(thumb)
+        self._update_button_states()
+
+    def _delete_zoom_page(self) -> None:
+        """ズームビュー表示中のページを削除"""
+        import tempfile
+
+        if self._zoom_page_num is None:
+            return
+
+        pdf_path = self._pdf_path
+        page_count = get_page_count(pdf_path)
+        current_page = self._zoom_page_num
+
+        # 全ページ削除かチェック
+        if page_count <= 1:
+            backup_fd, backup_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(backup_fd)
+            shutil.copy2(pdf_path, backup_path)
+            self._delete_all_pages_from_zoom(backup_path)
+            return
+
+        # 削除後に表示するページを計算
+        if current_page >= page_count - 1:
+            # 最後のページを削除 → 一つ前のページを表示
+            next_page = current_page - 1
+        else:
+            # それ以外 → 同じインデックス（次のページが繰り上がる）
+            next_page = current_page
+
+        # バックアップ作成
+        backup_fd, backup_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(backup_fd)
+        extract_pages(pdf_path, backup_path, [current_page])
+
+        deleted_page = current_page
+
+        def do_delete():
+            remove_pages(pdf_path, [deleted_page])
+            self._remove_page_thumbnails([deleted_page])
+            self._zoom_text_cache.clear()
+            if self._zoom_view and self._zoom_view.isVisible():
+                new_page_count = get_page_count(pdf_path)
+                if new_page_count > 0:
+                    self._zoom_page_num = min(next_page, new_page_count - 1)
+                    self._render_zoom_page()
+
+        def undo_delete():
+            insert_pages(pdf_path, backup_path, [deleted_page])
+            self._load_pages()
+            self._zoom_text_cache.clear()
+            if self._zoom_view and self._zoom_view.isVisible():
+                self._zoom_page_num = deleted_page
+                self._render_zoom_page()
+
+        try:
+            do_delete()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+
+        self._undo_manager.add_action(UndoAction(
+            description="Delete page from zoom view",
+            undo_func=undo_delete,
+            redo_func=do_delete
+        ))
+
+    def _rotate_zoom_page(self) -> None:
+        """ズームビュー表示中のページを回転"""
+        if self._zoom_page_num is None:
+            return
+
+        pdf_path = self._pdf_path
+        page_num = self._zoom_page_num
+
+        def do_rotate():
+            rotate_pages(pdf_path, [page_num], 90)
+            # ズームテキストキャッシュをクリアして再描画
+            self._zoom_text_cache.pop(page_num, None)
+            if self._zoom_view and self._zoom_view.isVisible():
+                self._render_zoom_page()
+            # サムネイルも更新
+            if page_num < len(self._thumbnails):
+                self._request_thumbnail_refresh(page_num)
+
+        def undo_rotate():
+            rotate_pages(pdf_path, [page_num], 270)
+            self._zoom_text_cache.pop(page_num, None)
+            if self._zoom_view and self._zoom_view.isVisible():
+                self._render_zoom_page()
+            if page_num < len(self._thumbnails):
+                self._request_thumbnail_refresh(page_num)
+
+        try:
+            do_rotate()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+
+        self._undo_manager.add_action(UndoAction(
+            description="Rotate page from zoom view",
+            undo_func=undo_rotate,
+            redo_func=do_rotate
+        ))
+
+    def _delete_all_pages(self, backup_path: str) -> None:
+        """全ページ削除（ファイルをゴミ箱へ移動し、UNDO対応）"""
+        from send2trash import send2trash
+        from src.views.main_window import MainWindow
+
+        pdf_path = self._pdf_path
+
+        def _get_main_window():
+            owner = self.parent()
+            return owner if isinstance(owner, MainWindow) else None
+
+        def _close_edit_windows() -> None:
+            for widget in QApplication.topLevelWidgets():
+                if isinstance(widget, PageEditWindow) and widget._pdf_path == pdf_path:
+                    widget.close()
+
+        def do_delete():
+            main_window = _get_main_window()
+            removed_card = False
+            if main_window:
+                main_window._register_internal_remove([pdf_path])
+                main_window._remove_card(pdf_path)
+                main_window._refresh_grid()
+                removed_card = True
+            # ファイルをゴミ箱へ
+            try:
+                if os.path.exists(pdf_path):
+                    send2trash(pdf_path)
+            except OSError:
+                if main_window:
+                    main_window._internal_removes.discard(main_window._normalize_path(pdf_path))
+                    if removed_card and main_window._get_card_by_path(pdf_path) is None:
+                        main_window._add_card(pdf_path)
+                        main_window._refresh_grid()
+                raise
+            # このPDFのPageEditWindowをすべて閉じる
+            _close_edit_windows()
+
+        def undo_delete():
+            main_window = _get_main_window()
+            if main_window:
+                main_window._register_internal_add([pdf_path])
+            # バックアップからファイル復元
+            shutil.copy2(backup_path, pdf_path)
+            if main_window:
+                restored_card = main_window._get_card_by_path(pdf_path)
+                if restored_card is None:
+                    restored_card = main_window._add_card(pdf_path)
+                    main_window._refresh_grid()
+                    main_window._internal_adds.discard(main_window._normalize_path(pdf_path))
+                # 復元後は編集画面を再度開く
+                main_window._on_card_double_clicked(restored_card)
+
+        try:
+            do_delete()
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                "削除できません",
+                build_trash_failure_message(pdf_path, error),
+            )
+            return
+
+        self._undo_manager.add_action(UndoAction(
+            description="Delete all pages (file to trash)",
+            undo_func=undo_delete,
+            redo_func=do_delete
+        ))
+
+    def _delete_all_pages_from_zoom(self, backup_path: str) -> None:
+        """ズームビューから最後の1ページ削除時の処理"""
+        self._delete_all_pages(backup_path)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_grid()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Run one post-show reflow so initial column count uses stable viewport width.
+        if not self._did_initial_grid_layout:
+            self._did_initial_grid_layout = True
+            QTimer.singleShot(0, self._refresh_grid)
+
+    def mousePressEvent(self, event) -> None:
+        """Handle mouse press - start rubber band selection on empty area."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            child = self.childAt(event.pos())
+            while child is not None:
+                if isinstance(child, PageThumbnail):
+                    super().mousePressEvent(event)
+                    return
+                child = child.parent()
+            # Start rubber band selection on empty area
+            container_pos = self._container.mapFrom(self, event.pos())
+            self._rubber_band_origin = container_pos
+            self._rubber_band.setGeometry(container_pos.x(), container_pos.y(), 0, 0)
+            self._rubber_band.show()
+            self._clear_selection()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        """Handle mouse move for rubber band selection."""
+        if self._rubber_band_origin is not None:
+            container_pos = self._container.mapFrom(self, event.pos())
+            from PyQt6.QtCore import QRect
+            rect = QRect(self._rubber_band_origin, container_pos).normalized()
+            self._rubber_band.setGeometry(rect)
+            # Select thumbnails intersecting with rubber band
+            self._clear_selection()
+            for thumb in self._thumbnails:
+                if thumb.isVisible() and rect.intersects(thumb.geometry()):
+                    thumb.set_selected(True)
+                    self._selected_thumbnails.append(thumb)
+            self._update_button_states()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        """Handle mouse release to end rubber band selection."""
+        if event.button() == Qt.MouseButton.LeftButton and self._rubber_band_origin is not None:
+            self._rubber_band.hide()
+            self._rubber_band_origin = None
+        super().mouseReleaseEvent(event)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
+            event.acceptProposedAction()
+            return
+        if event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
+            source_path = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')
+            if source_path != self._pdf_path:
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        """Handle drag move event - show drop indicator."""
+        if event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
+            event.acceptProposedAction()
+            drop_pos = self._container.mapFrom(self, event.position().toPoint())
+            self._show_drop_indicator(drop_pos)
+        elif event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
+            source_path = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')
+            if source_path != self._pdf_path:
+                event.acceptProposedAction()
+                drop_pos = self._container.mapFrom(self, event.position().toPoint())
+                self._show_drop_indicator(drop_pos)
+
+    def dragLeaveEvent(self, event) -> None:
+        """Handle drag leave event - hide drop indicator."""
+        self._hide_drop_indicator()
+        super().dragLeaveEvent(event)
+
+    def _show_drop_indicator(self, pos) -> None:
+        """Show drop indicator at the appropriate position."""
+        idx = self._get_drop_page_index(pos)
+        if idx == self._drop_indicator_index:
+            return
+
+        self._drop_indicator_index = idx
+
+        if not self._thumbnails:
+            self._drop_indicator.hide()
+            return
+
+        # Calculate indicator position
+        visible_thumbs = [t for t in self._thumbnails if t.isVisible()]
+        if not visible_thumbs:
+            self._drop_indicator.hide()
+            return
+
+        if idx == 0:
+            ref_thumb = visible_thumbs[0]
+            x = ref_thumb.geometry().left() - 5
+        elif idx >= len(visible_thumbs):
+            ref_thumb = visible_thumbs[-1]
+            x = ref_thumb.geometry().right() + 2
+        else:
+            ref_thumb = visible_thumbs[min(idx, len(visible_thumbs) - 1)]
+            x = ref_thumb.geometry().left() - 5
+
+        thumb_rect = visible_thumbs[0].geometry() if visible_thumbs else None
+        if thumb_rect:
+            self._drop_indicator.setFixedHeight(thumb_rect.height())
+            self._drop_indicator.move(x, ref_thumb.geometry().top())
+            self._drop_indicator.raise_()
+            self._drop_indicator.show()
+
+        targets = []
+        if 0 <= idx - 1 < len(self._thumbnails):
+            left = self._thumbnails[idx - 1]
+            if left.isVisible():
+                targets.append(left)
+        if 0 <= idx < len(self._thumbnails):
+            right = self._thumbnails[idx]
+            if right.isVisible():
+                targets.append(right)
+        self._clear_all_drop_targets(except_thumbs=targets)
+        for t in targets:
+            t.set_drop_target(True)
+
+    def _clear_all_drop_targets(self, except_thumbs=()) -> None:
+        """Turn off droptarget highlight on every thumbnail (optionally skipping some)."""
+        skip = set(except_thumbs)
+        for thumb in self._thumbnails:
+            if thumb in skip:
+                continue
+            if thumb.is_drop_target:
+                thumb.set_drop_target(False)
+
+    def _hide_drop_indicator(self) -> None:
+        """Hide the drop indicator."""
+        self._drop_indicator.hide()
+        self._drop_indicator_index = -1
+        self._clear_all_drop_targets()
+
+    def dropEvent(self, event) -> None:
+        """Handle drop event."""
+        logger.debug(f"PageEditWindow.dropEvent called, mimeData formats: {event.mimeData().formats()}")
+        self._hide_drop_indicator()
+
+        if event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
+            data = event.mimeData().data(PAGETHUMBNAIL_MIME_TYPE).data().decode('utf-8')
+            pdf_path, page_nums_str = data.split('|')
+            page_nums = [int(n) for n in page_nums_str.split(',') if n]
+            drop_pos = self._container.mapFrom(self, event.position().toPoint())
+            logger.debug(f"PAGETHUMBNAIL drop: pdf_path={pdf_path}, page_nums={page_nums}, drop_pos={drop_pos}")
+
+            if pdf_path == self._pdf_path:
+                logger.debug("Same file, calling _handle_page_reorder")
+                self._handle_page_reorder(page_nums, drop_pos)
+            else:
+                logger.debug("Different file, calling _handle_page_insert")
+                self._handle_page_insert(pdf_path, page_nums, drop_pos)
+            event.acceptProposedAction()
+        elif event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
+            source_path = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')
+            logger.debug(f"PDFCARD drop: source_path={source_path}")
+            if source_path != self._pdf_path:
+                drop_pos = self._container.mapFrom(self, event.position().toPoint())
+                page_count = get_page_count(source_path)
+                logger.debug(f"Inserting all {page_count} pages from {source_path}")
+                if page_count > 0:
+                    all_pages = list(range(page_count))
+                    self._handle_page_insert(source_path, all_pages, drop_pos)
+            event.acceptProposedAction()
+        else:
+            logger.debug("Unknown drop format, ignoring")
+
+    def _handle_page_reorder(self, source_pages: list[int], drop_pos) -> None:
+        target_page = self._get_drop_page_index(drop_pos)
+
+        source_pages = sorted(set(source_pages))
+        if not source_pages or target_page == -1:
+            return
+
+        page_count = get_page_count(self._pdf_path)
+        remaining = [i for i in range(page_count) if i not in source_pages]
+        removed_before = sum(1 for p in source_pages if p < target_page)
+        insert_index = max(0, min(target_page - removed_before, len(remaining)))
+        new_order = remaining[:insert_index] + source_pages + remaining[insert_index:]
+        if new_order == list(range(page_count)):
+            return
+
+        pdf_path = self._pdf_path
+        moved_count = len(source_pages)
+        final_insert_index = insert_index
+
+        def do_reorder():
+            reorder_pages(pdf_path, new_order)
+            self._load_pages()
+            # Select moved pages
+            self._clear_selection()
+            for i in range(final_insert_index, final_insert_index + moved_count):
+                if i < len(self._thumbnails):
+                    self._thumbnails[i].set_selected(True)
+                    self._selected_thumbnails.append(self._thumbnails[i])
+            self._update_button_states()
+
+        def undo_reorder():
+            inverse = [0] * len(new_order)
+            for i, pos in enumerate(new_order):
+                inverse[pos] = i
+            reorder_pages(pdf_path, inverse)
+            self._load_pages()
+
+        try:
+            do_reorder()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+
+        self._undo_manager.add_action(UndoAction(
+            description="Reorder page",
+            undo_func=undo_reorder,
+            redo_func=do_reorder
+        ))
+
+    def _handle_page_insert(self, source_pdf_path: str, source_pages: list[int], drop_pos) -> None:
+        import tempfile
+        from send2trash import send2trash
+
+        logger.debug(f"_handle_page_insert called: source={source_pdf_path}, pages={source_pages}, drop_pos={drop_pos}")
+        
+        source_pages = sorted(set(source_pages))
+        if not source_pages:
+            logger.debug("No source pages, returning")
+            return
+
+        insert_at = self._get_drop_page_index(drop_pos)
+        logger.debug(f"insert_at={insert_at}")
+        if insert_at == -1:
+            logger.debug("insert_at is -1, returning")
+            return
+
+        modifiers = QApplication.keyboardModifiers()
+        is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        logger.debug(f"is_copy={is_copy}")
+
+        tmp_path = None
+        inserted_count = len(source_pages)
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp_path = tmp.name
+            logger.debug(f"Extracting pages to tmp_path={tmp_path}")
+            if not extract_pages(source_pdf_path, tmp_path, source_pages):
+                logger.debug("extract_pages failed, returning")
+                return
+
+            page_count = get_page_count(self._pdf_path)
+            insert_at = max(0, min(insert_at, page_count))
+            logger.debug(f"Inserting pages at index {insert_at} into {self._pdf_path}")
+            insert_pages(self._pdf_path, tmp_path, [insert_at] * len(source_pages))
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                logger.debug(f"Cleaning up tmp_path={tmp_path}")
+                os.unlink(tmp_path)
+
+        logger.debug("Reloading pages in target window")
+        self._load_pages()
+
+        # Select inserted pages
+        self._clear_selection()
+        for i in range(insert_at, insert_at + inserted_count):
+            if i < len(self._thumbnails):
+                self._thumbnails[i].set_selected(True)
+                self._selected_thumbnails.append(self._thumbnails[i])
+        self._update_button_states()
+
+        try:
+            if not is_copy:
+                logger.debug(f"Removing pages from source: {source_pdf_path}")
+                file_deleted = remove_pages(source_pdf_path, source_pages)
+                logger.debug(f"file_deleted={file_deleted}")
+
+                for widget in QApplication.topLevelWidgets():
+                    if isinstance(widget, PageEditWindow) and widget._pdf_path == source_pdf_path:
+                        if file_deleted:
+                            logger.debug(f"File deleted, closing PageEditWindow for {source_pdf_path}")
+                            widget.close()
+                        else:
+                            logger.debug(f"Reloading pages in source PageEditWindow for {source_pdf_path}")
+                            widget._load_pages()
+                        break
+                if file_deleted:
+                    logger.debug(f"Removing card for {source_pdf_path} from MainWindow")
+                    from src.views.main_window import MainWindow
+                    owner = self.parent()
+                    if isinstance(owner, MainWindow):
+                        owner._remove_card(source_pdf_path)
+                        owner._refresh_grid()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(error)
+            return
+
+        logger.debug("_handle_page_insert completed")
+
+    def _get_drop_page_index(self, pos) -> int:
+        pad = max(0, self._grid_layout.spacing() // 2)
+        for i, thumb in enumerate(self._thumbnails):
+            thumb_rect = thumb.geometry()
+            expanded_rect = thumb_rect.adjusted(-pad, -pad, pad, pad)
+            if expanded_rect.contains(pos):
+                center_x = thumb_rect.center().x()
+                if pos.x() < center_x:
+                    return i
+                return i + 1
+        if self._thumbnails:
+            return len(self._thumbnails)
+        return 0
+
+    def closeEvent(self, event) -> None:
+        """Handle window close - unlock the card in main window."""
+        from src.views.main_window import MainWindow
+
+        logger.debug(f"PageEditWindow closing for {self._pdf_path}")
+
+        self._reset_thumbnail_render_queue()
+        self._undo_manager.remove_listener(self._on_undo_manager_changed)
+
+        if self._search_dialog is not None:
+            self._search_dialog.close()
+            self._search_dialog = None
+
+        owner = self.parent()
+        if isinstance(owner, MainWindow):
+            owner.unlock_card(self._pdf_path)
+        super().closeEvent(event)
+
+    # --- Text search (Ctrl+F) ---
+
+    def _on_open_search(self) -> None:
+        """Open or focus the modeless search dialog."""
+        from src.views.search_dialog import SearchDialog
+
+        if self._search_dialog is None:
+            self._search_dialog = SearchDialog(self)
+            self._search_dialog.search_requested.connect(self._on_search_execute)
+            self._search_dialog.next_requested.connect(self._on_search_next)
+            self._search_dialog.prev_requested.connect(self._on_search_prev)
+            self._search_dialog.finished.connect(self._on_search_dialog_finished)
+        self._search_dialog.show()
+        self._search_dialog.raise_()
+        self._search_dialog.activateWindow()
+        self._search_dialog.focus_input()
+
+    def _on_search_dialog_finished(self, _result: int) -> None:
+        self._clear_search_highlights()
+
+    def _on_search_execute(self, query: str) -> None:
+        query = (query or "").strip()
+        # まず以前のハイライトをクリア
+        self._clear_search_highlights()
+        if not query:
+            if self._search_dialog is not None:
+                self._search_dialog.set_status(0, 0)
+            return
+        self._search_hits = search_text_in_pdf(self._pdf_path, query)
+        self._search_hit_pages = sorted(self._search_hits.keys())
+        self._apply_search_highlights()
+        if not self._search_hit_pages:
+            self._search_cursor = -1
+            if self._search_dialog is not None:
+                self._search_dialog.set_status(0, 0)
+            return
+        self._search_cursor = 0
+        self._jump_to_search_page(self._search_hit_pages[0])
+        if self._search_dialog is not None:
+            self._search_dialog.set_status(1, len(self._search_hit_pages))
+
+    def _on_search_next(self) -> None:
+        if not self._search_hit_pages:
+            return
+        self._search_cursor = (self._search_cursor + 1) % len(self._search_hit_pages)
+        self._jump_to_search_page(self._search_hit_pages[self._search_cursor])
+        if self._search_dialog is not None:
+            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+
+    def _on_search_prev(self) -> None:
+        if not self._search_hit_pages:
+            return
+        self._search_cursor = (self._search_cursor - 1) % len(self._search_hit_pages)
+        self._jump_to_search_page(self._search_hit_pages[self._search_cursor])
+        if self._search_dialog is not None:
+            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+
+    def _jump_to_search_page(self, page_num: int) -> None:
+        if page_num < 0 or page_num >= len(self._thumbnails):
+            return
+        zoom_visible = bool(self._zoom_view and self._zoom_view.isVisible())
+        if zoom_visible:
+            # ズーム表示中は対応ページに切り替えてヒット矩形を表示
+            self._commit_inline_annotation_editor()
+            self._set_zoom_annotation_create_mode(False)
+            self._selected_zoom_annotation = None
+            self._zoom_page_num = page_num
+            self._render_zoom_page()
+        else:
+            # サムネイルグリッド表示中は選択 + スクロール
+            self._clear_selection()
+            thumb = self._thumbnails[page_num]
+            thumb.set_selected(True)
+            self._selected_thumbnails.append(thumb)
+            if self._grid_scroll:
+                self._grid_scroll.ensureWidgetVisible(thumb)
+            self._update_button_states()
+
+    def _apply_search_highlights(self) -> None:
+        hit_set = set(self._search_hit_pages)
+        for thumb in self._thumbnails:
+            thumb.set_search_hit(thumb.page_num in hit_set)
+
+    def _clear_search_highlights(self) -> None:
+        for thumb in self._thumbnails:
+            thumb.set_search_hit(False)
+        self._search_hits = {}
+        self._search_hit_pages = []
+        self._search_cursor = -1
+        if self._zoom_label is not None:
+            self._zoom_label.set_search_hit_rects([])
+
+    def _invalidate_search_results(self) -> None:
+        """ページ構成が変わったときに呼び、検索状態とダイアログ表示を初期化する。"""
+        self._search_hits = {}
+        self._search_hit_pages = []
+        self._search_cursor = -1
+        if self._zoom_label is not None:
+            self._zoom_label.set_search_hit_rects([])
+        if self._search_dialog is not None:
+            self._search_dialog.clear_status()
