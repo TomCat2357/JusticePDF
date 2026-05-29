@@ -284,6 +284,38 @@ def update_pdf_toc(
         _save_document_in_place(doc, pdf_path, incremental=incremental)
 
 
+def _file_bookmark_title(pdf_path: str) -> str:
+    """しおりに使うファイル名(カードと同じく拡張子つきの basename)。"""
+    return os.path.basename(pdf_path)
+
+
+def _file_toc_entries(title: str, start0: int, sub: list) -> list[TocEntry]:
+    """新しく結合する1ファイル分の TOC を組む。
+
+    開始ページにファイル名(level 1)を置き、そのファイルが元々持っていたしおり
+    ``sub`` はその子(level+1)としてページをオフセットして並べる。
+    ``start0`` は結合後ドキュメントでの 0 始まり開始ページ。
+    """
+    entries: list[TocEntry] = [TocEntry(level=1, title=title, page=start0 + 1)]
+    for level, sub_title, page in sub:
+        entries.append(
+            TocEntry(level=int(level) + 1, title=str(sub_title), page=int(page) + start0)
+        )
+    return entries
+
+
+def _offset_toc_entries(toc: list, offset: int) -> list[TocEntry]:
+    """既存しおりを level は変えずページだけ ``offset`` して TocEntry 化する。
+
+    結合先(dest)が既に持つファイル名しおりを再ネストせず、そのままの階層で残す
+    ために使う。これにより1ファイルずつ重ねても階層が深くならない(フラットを維持)。
+    """
+    return [
+        TocEntry(level=int(level), title=str(title), page=int(page) + offset)
+        for level, title, page in toc
+    ]
+
+
 def _parse_float_array(value: str) -> list[float]:
     return [float(item) for item in re.findall(_FLOAT_RE, value or "")]
 
@@ -1554,13 +1586,29 @@ def replace_freetext_annot(
         doc.close()
 
 
-def merge_pdfs(output_path: str, pdf_paths: list[str]) -> None:
-    """Merge multiple PDFs into one."""
+def merge_pdfs(
+    output_path: str, pdf_paths: list[str], *, add_file_bookmarks: bool = False
+) -> None:
+    """Merge multiple PDFs into one.
+
+    add_file_bookmarks=True のとき、結合した各ファイルの開始ページにファイル名の
+    しおり(アウトライン)を level 1 で付け、各ファイルが元々持つしおりはその子として残す。
+    ファイル名しおりは常にフラット(全ファイルが level 1)に並ぶ。
+    """
     output_doc = fitz.open()
+    entries: list[TocEntry] = []
+    start = 0
     for path in pdf_paths:
-        src_doc = fitz.open(path)
-        output_doc.insert_pdf(src_doc)
-        src_doc.close()
+        with fitz.open(path) as src_doc:
+            count = len(src_doc)
+            sub = src_doc.get_toc(simple=True) if add_file_bookmarks else []
+            output_doc.insert_pdf(src_doc)
+        if add_file_bookmarks and count > 0:
+            entries.extend(_file_toc_entries(_file_bookmark_title(path), start, sub))
+        start += count
+    if add_file_bookmarks and entries:
+        entries = normalize_toc(entries, page_count=len(output_doc))
+        output_doc.set_toc([[e.level, e.title, e.page] for e in entries])
     output_doc.save(output_path)
     output_doc.close()
 
@@ -1570,34 +1618,149 @@ def merge_pdfs_in_place(
     pdf_paths: list[str],
     *,
     insert_at: int | None = None,
+    add_file_bookmarks: bool = False,
 ) -> None:
     """Merge PDFs into an existing destination file in place.
 
     If insert_at is None, append to end. Otherwise insert sequentially starting at insert_at.
     Uses incremental save when possible; falls back to full save to temp.
+
+    add_file_bookmarks=True のとき、挿入した各ファイルの開始ページにファイル名のしおりを
+    level 1 で付け、各ファイルが元々持つしおりはその子として残す。
+    insert_at は None(末尾追加)または 0(先頭挿入)のときのみしおりを付与する。
+
+    結合先(dest)が既にファイル名しおりを持つ場合(=過去に重ねた結果)は、それを
+    再ネストせずそのままの階層で残す。これにより1ファイルずつ繰り返し重ねても
+    ファイル名しおりは常にフラット(全ファイルが level 1)に保たれ、重ねた順番で
+    階層が深くなることがない。
     """
     if not pdf_paths:
         return
 
     dest_doc = fitz.open(dest_path)
     try:
+        dest_orig_count = len(dest_doc)
+        dest_orig_toc = dest_doc.get_toc(simple=True) if add_file_bookmarks else []
+        source_entries: list[TocEntry] = []
         if insert_at is None:
+            start = dest_orig_count
             for path in pdf_paths:
                 if path == dest_path:
                     continue
                 with fitz.open(path) as src_doc:
+                    count = len(src_doc)
+                    sub = src_doc.get_toc(simple=True) if add_file_bookmarks else []
                     dest_doc.insert_pdf(src_doc)
+                if add_file_bookmarks and count > 0:
+                    source_entries.extend(
+                        _file_toc_entries(_file_bookmark_title(path), start, sub)
+                    )
+                start += count
+            dest_start = 0
         else:
             idx = insert_at
             for path in pdf_paths:
                 if path == dest_path:
                     continue
                 with fitz.open(path) as src_doc:
+                    count = len(src_doc)
+                    sub = src_doc.get_toc(simple=True) if add_file_bookmarks else []
                     dest_doc.insert_pdf(src_doc, start_at=idx)
-                    idx += len(src_doc)
+                if add_file_bookmarks and count > 0:
+                    source_entries.extend(
+                        _file_toc_entries(_file_bookmark_title(path), idx, sub)
+                    )
+                idx += count
+            total_inserted = idx - insert_at
+            # 先頭挿入(insert_at==0)のとき、結合先の元ページは挿入分だけ後ろへずれる
+            dest_start = total_inserted if insert_at == 0 else 0
+
+        # しおり付与は insert_at が None / 0 のときのみ(結合先ページが連続するケース)
+        if add_file_bookmarks and insert_at in (None, 0):
+            entries = list(source_entries)
+            if dest_orig_count > 0:
+                if dest_orig_toc:
+                    # 既存しおり(過去のファイル名しおり等)は再ネストせずそのまま残す
+                    entries.extend(_offset_toc_entries(dest_orig_toc, dest_start))
+                else:
+                    # しおりが無い素のファイルなら dest 自身に level 1 を1つだけ付ける
+                    entries.append(
+                        TocEntry(
+                            level=1,
+                            title=_file_bookmark_title(dest_path),
+                            page=dest_start + 1,
+                        )
+                    )
+            if entries:
+                # ページ順に並べ替え(安定ソートなので同ページ内の親→子順は保たれる)
+                entries.sort(key=lambda e: e.page)
+                entries = normalize_toc(entries, page_count=len(dest_doc))
+                dest_doc.set_toc([[e.level, e.title, e.page] for e in entries])
         _save_document_in_place(dest_doc, dest_path, incremental=True)
     finally:
         dest_doc.close()
+
+
+def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
+    """選択したファイル/フォルダを1つのPDFに結合し、フォルダ構成を反映した階層しおりを付ける。
+
+    - ``paths`` の各要素はファイル(.pdf)またはフォルダ。与えられた順に処理する
+      (トップレベルの並び順は呼び出し側が決める)。
+    - フォルダはしおりの見出し(その階層)になり、中身(.pdf とサブフォルダ)を名前順に
+      子として再帰的に並べる。入れ子フォルダはさらに深い階層になる。
+    - フォルダ見出しは、その配下で最初に現れるページを指す。
+    - PDF ページを1ページも含まないフォルダは見出しごと省略する。
+    - 戻り値は結合したページ総数。0 のとき出力ファイルは作成されない。
+    """
+    output_doc = fitz.open()
+
+    def build(path: str, level: int) -> list[TocEntry]:
+        """``path`` 配下のページを output_doc に挿入しつつ、しおり項目を返す。"""
+        if os.path.isdir(path):
+            start0 = len(output_doc)
+            child_entries: list[TocEntry] = []
+            try:
+                names = sorted(os.listdir(path), key=str.lower)
+            except OSError:
+                names = []
+            for name in names:
+                full = os.path.join(path, name)
+                if os.path.isdir(full) or name.lower().endswith(".pdf"):
+                    child_entries.extend(build(full, level + 1))
+            if len(output_doc) <= start0:
+                return []  # PDF ページを含まない空フォルダは省略
+            title = os.path.basename(os.path.normpath(path)) or path
+            return [TocEntry(level=level, title=title, page=start0 + 1), *child_entries]
+
+        # ファイル(.pdf のみ)
+        if not path.lower().endswith(".pdf"):
+            return []
+        try:
+            with fitz.open(path) as src_doc:
+                count = len(src_doc)
+                if count == 0:
+                    return []
+                start0 = len(output_doc)
+                output_doc.insert_pdf(src_doc)
+        except Exception:
+            logger.warning("結合をスキップしました(開けません): %s", path)
+            return []
+        return [TocEntry(level=level, title=_file_bookmark_title(path), page=start0 + 1)]
+
+    try:
+        entries: list[TocEntry] = []
+        for path in paths:
+            if os.path.exists(path):
+                entries.extend(build(path, 1))
+        total = len(output_doc)
+        if total == 0:
+            return 0
+        entries = normalize_toc(entries, page_count=total)
+        output_doc.set_toc([[e.level, e.title, e.page] for e in entries])
+        output_doc.save(output_path)
+        return total
+    finally:
+        output_doc.close()
 
 
 def extract_pages(src_path: str, output_path: str, page_indices: list[int]) -> bool:

@@ -244,6 +244,14 @@ class MainWindow(QMainWindow):
         self._title_btn.clicked.connect(self._on_rename_pdf_title)
         toolbar.addWidget(self._title_btn)
 
+        self._merge_btn = QPushButton("Merge")
+        self._merge_btn.setToolTip(
+            "選択したファイル・フォルダを1つのPDFに結合\n"
+            "（フォルダ構成をしおりの階層として再現します）"
+        )
+        self._merge_btn.clicked.connect(self._on_merge_selected)
+        toolbar.addWidget(self._merge_btn)
+
         toolbar.addSeparator()
 
         self._import_btn = QPushButton("Import")
@@ -320,6 +328,10 @@ class MainWindow(QMainWindow):
         self._undo_btn.setEnabled(self._undo_manager.can_undo() and not busy)
         self._redo_btn.setEnabled(self._undo_manager.can_redo() and not busy)
         self._export_btn.setEnabled(has_any)
+        # 結合: フォルダを1つ以上、またはファイルを2つ以上選択しているとき有効
+        n_folders = len(self._selected_folder_cards)
+        n_files = len(self._selected_cards)
+        self._merge_btn.setEnabled((n_folders >= 1 or n_files >= 2) and not busy)
 
     def _begin_async_operation(self) -> None:
         """Mark start of a background file operation."""
@@ -1036,7 +1048,7 @@ class MainWindow(QMainWindow):
                 backups[p] = str(dst)
 
             # Merge PDFs
-            merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path])
+            merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path], add_file_bookmarks=True)
 
             # Trash merged-away files (batch)
             send2trash(trash_paths)
@@ -1061,7 +1073,7 @@ class MainWindow(QMainWindow):
                 card.refresh()
 
             def do_merge_sync() -> None:
-                merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path])
+                merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path], add_file_bookmarks=True)
                 self._register_internal_remove(trash_paths)
                 send2trash(trash_paths)
                 self._rebuild_cards_from_paths(new_paths)
@@ -1440,6 +1452,195 @@ class MainWindow(QMainWindow):
                 )
             else:
                 QMessageBox.warning(self, title, f"削除に失敗しました: {exc}")
+
+        worker = FileOperationWorker(_do_io, parent=self)
+        worker.finished.connect(_on_success)
+        worker.error.connect(_on_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        self._active_worker = worker
+        worker.start()
+
+    def _on_merge_selected(self) -> None:
+        """選択したファイル・フォルダを1つのPDFに結合する。
+
+        - トップレベルの並び順はグリッド表示順(フォルダが先、次にファイル)。
+        - フォルダ構成はしおり(目次)の階層として再現される
+          (:func:`merge_paths_to_pdf`)。
+        - 結合後、元のファイル/フォルダはゴミ箱へ移動する(Undo で復元可)。
+        - 出力は現在のフォルダに「結合_<最初の項目名>.pdf」として自動命名する。
+        """
+        import tempfile
+        from pathlib import Path
+        from src.utils.pdf_utils import merge_paths_to_pdf
+
+        if self._operation_in_progress:
+            return
+
+        folder_paths = self._selected_folder_paths_in_grid_order()
+        file_paths = self._selected_card_paths_in_grid_order()
+        # トップレベルの並び: フォルダ(グリッド順) → 単独ファイル(グリッド順)
+        items = folder_paths + file_paths
+        if not items or (not folder_paths and len(file_paths) < 2):
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "結合",
+            f"選択した {len(items)} 項目を1つのPDFに結合します。\n"
+            "フォルダ構成はしおり(目次)の階層として再現されます。\n\n"
+            "結合後、元のファイル・フォルダはゴミ箱へ移動します"
+            "（「元に戻す」で復元できます）。\n\n続けますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        first_stem = Path(items[0].rstrip("/\\")).stem or "merged"
+        output_path = str(
+            ensure_unique_path(
+                str(self._work_dir), f"結合_{first_stem}.pdf", pattern="{stem}({i}){ext}"
+            )
+        )
+        pdf_cards = [c for c in self._cards if c.pdf_path in set(file_paths)]
+
+        # Phase A: 即時 UI 更新(結合元カードを外し、新ファイルは内部追加として予約)
+        self._register_internal_remove(items)
+        self._register_internal_add([output_path])
+        for path in folder_paths:
+            self._remove_folder_card(path)
+        for card in pdf_cards:
+            if card in self._cards:
+                self._cards.remove(card)
+            card.deleteLater()
+        self._selected_folder_cards.clear()
+        self._selected_cards.clear()
+        self._refresh_grid()
+        self._begin_async_operation()
+
+        # Phase B: 重い I/O — バックアップ → 結合 → 結合元をゴミ箱へ
+        def _do_io() -> dict[str, dict[str, str]]:
+            backup_dir = tempfile.mkdtemp(prefix="justicepdf_merge_backup_")
+            folder_backups: dict[str, str] = {}
+            pdf_backups: dict[str, str] = {}
+            for path in folder_paths:
+                bp = Path(backup_dir) / Path(path).name
+                shutil.copytree(path, bp)
+                folder_backups[path] = str(bp)
+            for path in file_paths:
+                bp = Path(backup_dir) / Path(path).name
+                shutil.copy2(path, bp)
+                pdf_backups[path] = str(bp)
+
+            total = merge_paths_to_pdf(output_path, items)
+            if total <= 0:
+                raise RuntimeError("結合できるPDFページがありませんでした。")
+
+            deleted: list[str] = []
+            try:
+                for path in items:
+                    send2trash(path)
+                    deleted.append(path)
+            except OSError:
+                # 途中失敗時は、すでにゴミ箱へ送った分を復元してから送出
+                for restored in deleted:
+                    bp = folder_backups.get(restored) or pdf_backups.get(restored)
+                    if not bp or not os.path.exists(bp):
+                        continue
+                    if restored in folder_backups:
+                        shutil.copytree(bp, restored)
+                    else:
+                        shutil.copy2(bp, restored)
+                if os.path.exists(output_path):
+                    os.unlink(output_path)
+                raise
+            return {"folders": folder_backups, "pdfs": pdf_backups}
+
+        def _on_success(result: object) -> None:
+            backups: dict[str, dict[str, str]] = result  # type: ignore[assignment]
+            folder_backups = backups["folders"]
+            pdf_backups = backups["pdfs"]
+            restore_paths = list(folder_backups.keys()) + list(pdf_backups.keys())
+
+            # 結合結果カードを追加(ウォッチャが先に追加していれば再利用)して選択
+            self._clear_selection()
+            new_card = self._get_card_by_path(output_path) or self._add_card(output_path)
+            new_card.set_selected(True)
+            self._selected_cards.append(new_card)
+            self._refresh_grid()
+            self._update_button_states()
+
+            def undo_merge() -> None:
+                # 結合結果を取り消し、元のファイル/フォルダを復元する
+                self._register_internal_remove([output_path])
+                self._remove_card(output_path)
+                if os.path.exists(output_path):
+                    try:
+                        send2trash(output_path)
+                    except Exception:
+                        try:
+                            os.unlink(output_path)
+                        except OSError:
+                            pass
+                self._register_internal_add(restore_paths)
+                for original, backup in folder_backups.items():
+                    if not os.path.exists(original):
+                        shutil.copytree(backup, original)
+                    if self._get_folder_card_by_path(original) is None:
+                        self._add_folder_card(original)
+                for original, backup in pdf_backups.items():
+                    if not os.path.exists(original):
+                        shutil.copy2(backup, original)
+                    if self._get_card_by_path(original) is None:
+                        self._add_card(original)
+                self._refresh_grid()
+
+            def redo_merge() -> None:
+                # 再結合 → 結合元を再びゴミ箱へ
+                self._register_internal_add([output_path])
+                merge_paths_to_pdf(output_path, items)
+                self._register_internal_remove(restore_paths)
+                for path in folder_paths:
+                    self._remove_folder_card(path)
+                for path in file_paths:
+                    self._remove_card(path)
+                for path in restore_paths:
+                    if os.path.exists(path):
+                        try:
+                            send2trash(path)
+                        except Exception:
+                            pass
+                self._clear_selection()
+                card = self._get_card_by_path(output_path) or self._add_card(output_path)
+                card.set_selected(True)
+                self._selected_cards.append(card)
+                self._refresh_grid()
+                self._update_button_states()
+
+            self._undo_manager.add_action(UndoAction(
+                description=f"Merge {len(items)} item(s)",
+                undo_func=undo_merge,
+                redo_func=redo_merge,
+            ))
+            self._end_async_operation()
+
+        def _on_error(exc: Exception) -> None:
+            # ロールバック: 外したカードを戻し、予約を解除する
+            self._internal_adds.discard(self._normalize_path(output_path))
+            for path in folder_paths:
+                if os.path.exists(path):
+                    self._internal_removes.discard(self._normalize_path(path))
+                    if self._get_folder_card_by_path(path) is None:
+                        self._add_folder_card(path)
+            existing = {c.pdf_path for c in self._cards}
+            for path in file_paths:
+                if os.path.exists(path) and path not in existing:
+                    self._internal_removes.discard(self._normalize_path(path))
+                    self._add_card(path)
+            self._refresh_grid()
+            self._end_async_operation()
+            QMessageBox.warning(self, "結合", f"結合に失敗しました: {exc}")
 
         worker = FileOperationWorker(_do_io, parent=self)
         worker.finished.connect(_on_success)
@@ -3053,7 +3254,7 @@ class MainWindow(QMainWindow):
         
         try:
             # Merge: source pages first, then target pages
-            merge_pdfs_in_place(target_path, source_paths, insert_at=0)
+            merge_pdfs_in_place(target_path, source_paths, insert_at=0, add_file_bookmarks=True)
             
             target_card.refresh()
             
@@ -3068,7 +3269,7 @@ class MainWindow(QMainWindow):
                 target_card.refresh()
             
             def redo_copy_merge():
-                merge_pdfs_in_place(target_path, source_paths, insert_at=0)
+                merge_pdfs_in_place(target_path, source_paths, insert_at=0, add_file_bookmarks=True)
                 target_card.refresh()
             
             self._undo_manager.add_action(UndoAction(
