@@ -46,8 +46,11 @@ _WORD_EXTS = {".doc", ".docx", ".docm"}
 _EXCEL_EXTS = {".xls", ".xlsx", ".xlsm"}
 _PPT_EXTS = {".ppt", ".pptx"}
 _OFFICE_EXTS = _WORD_EXTS | _EXCEL_EXTS | _PPT_EXTS
+# Image extensions importable here must match what conversion supports;
+# kept in sync with _IMAGE_EXTS in src/workers/import_worker.py.
 _IMAGE_EXTS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif",
+    ".jp2", ".jpx", ".ppm", ".pgm", ".pbm", ".pnm", ".pam", ".svg",
 }
 _IMPORT_EXTS = {".pdf"} | _OFFICE_EXTS | _IMAGE_EXTS
 

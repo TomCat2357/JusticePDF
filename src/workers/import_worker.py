@@ -26,8 +26,12 @@ _OFFICE_EXTS = {
     ".xls", ".xlsx", ".xlsm",
     ".ppt", ".pptx",
 }
+# Image extensions that PyMuPDF (fitz) can open and convert to PDF.
+# Kept in sync with images_to_pdf() in src/utils/pdf_utils.py and with
+# _IMAGE_EXTS in src/views/main_window.py.
 _IMAGE_EXTS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif",
+    ".jp2", ".jpx", ".ppm", ".pgm", ".pbm", ".pnm", ".pam", ".svg",
 }
 
 
