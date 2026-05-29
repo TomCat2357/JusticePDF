@@ -124,7 +124,7 @@ class ExportOptionsDialog(QDialog):
             lambda v: self._img_quality_value.setText(f"{v}%")
         )
 
-        self._optimize_combo.currentIndexChanged.connect(self._update_controls)
+        self._optimize_combo.currentIndexChanged.connect(self._on_optimize_changed)
 
         # Text deletion checkbox (PDF only) — rasterizes to image-only PDF
         self._rasterize_cb = QCheckBox("テキストデータを削除（画像のみ）")
@@ -184,8 +184,9 @@ class ExportOptionsDialog(QDialog):
         rasterize = is_pdf and self._rasterize_cb.isChecked()
         opt_idx = self._optimize_combo.currentIndex()
 
-        # When rasterizing, the optimize level is ignored — gray it out.
-        self._optimize_combo.setEnabled(is_pdf and not rasterize)
+        # Optimization stays selectable for PDF. Even while rasterizing the
+        # level acts as a starting preset for image DPI/quality.
+        self._optimize_combo.setEnabled(is_pdf)
 
         # JPEG/PNG radio appears only while rasterizing.
         self._raster_fmt_widget.setVisible(rasterize)
@@ -203,11 +204,18 @@ class ExportOptionsDialog(QDialog):
         self._img_quality_label.setVisible(show_quality)
         self._img_quality_widget.setVisible(show_quality)
 
-        if rasterize:
-            # User fully controls DPI/quality in the image-only path.
-            self._img_dpi_combo.setEnabled(True)
-            self._img_quality_slider.setEnabled(True)
-        elif opt_idx in self._PRESETS:
+        # Presets lock DPI/quality only in the non-rasterize path. While
+        # rasterizing the user can always fine-tune them (Custom likewise).
+        preset_locked = (not rasterize) and (opt_idx in self._PRESETS)
+        self._img_dpi_combo.setEnabled(not preset_locked)
+        self._img_quality_slider.setEnabled(not preset_locked)
+
+    def _on_optimize_changed(self, *_args) -> None:
+        """Apply the preset DPI/quality for the chosen optimize level, then
+        refresh visibility/enabled state. Selecting a preset seeds the image
+        DPI/quality values; while rasterizing they remain editable afterward."""
+        opt_idx = self._optimize_combo.currentIndex()
+        if opt_idx in self._PRESETS:
             dpi, quality = self._PRESETS[opt_idx]
             dpi_idx = next(
                 (i for i, (_, d) in enumerate(self._IMG_DPI_OPTIONS) if d == dpi),
@@ -215,11 +223,7 @@ class ExportOptionsDialog(QDialog):
             )
             self._img_dpi_combo.setCurrentIndex(dpi_idx)
             self._img_quality_slider.setValue(quality)
-            self._img_dpi_combo.setEnabled(False)
-            self._img_quality_slider.setEnabled(False)
-        elif opt_idx == 5:  # Custom
-            self._img_dpi_combo.setEnabled(True)
-            self._img_quality_slider.setEnabled(True)
+        self._update_controls()
 
     def get_options(self) -> dict:
         fmt_text = self._fmt_combo.currentText()

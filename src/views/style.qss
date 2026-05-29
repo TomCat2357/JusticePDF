@@ -335,6 +335,22 @@ QCheckBox::indicator:checked  {
 }
 QCheckBox::indicator:disabled { background-color: #f4f4f0; border-color: #e6e6e2; }
 
+QRadioButton { spacing: 6px; color: #18181b; }
+QRadioButton::indicator {
+    width: 14px; height: 14px;
+    border: 1px solid #d9d9d4;
+    border-radius: 8px;
+    background-color: #ffffff;
+}
+QRadioButton::indicator:hover { border: 1px solid #4f46e5; }
+QRadioButton::indicator:checked {
+    border: 1px solid #4f46e5;
+    background-color: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+        stop:0 #4f46e5, stop:0.45 #4f46e5, stop:0.5 #ffffff, stop:1 #ffffff);
+}
+QRadioButton::indicator:disabled { background-color: #f4f4f0; border-color: #e6e6e2; }
+QRadioButton:disabled { color: #a1a1aa; }
+
 /* Sliders (quality sliders in export dialog) */
 QSlider::groove:horizontal {
     height: 4px;
