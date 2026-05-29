@@ -33,6 +33,7 @@ from src.utils.pdf_utils import (
     delete_shape_annot, create_bracket_pair,
     reorder_annot_on_page, get_annot_xref_order, set_annot_xref_order,
     search_text_in_pdf,
+    TocEntry, get_pdf_toc, update_pdf_toc,
 )
 def _pixel_size_to_pointf(pixel_size: int) -> float:
     # Convert pixel size to a point size so QFont.pointSize() stays positive.
@@ -68,6 +69,7 @@ def _line_endpoints_from_shape(
 
 
 from src.models.undo_manager import UndoManager, UndoAction
+from src.views.bookmarks_panel import BookmarksPanel
 from src.views.view_helpers import (
     clear_selection,
     log_undo_state,
@@ -2208,6 +2210,17 @@ class PageEditWindow(QMainWindow):
         panel_layout.addStretch()
         drawer_layout.addWidget(self._zoom_annotation_panel)
         zoom_content_layout.addWidget(self._zoom_annotation_drawer)
+
+        # しおり(アウトライン)編集ドロワー
+        self._bookmarks_panel = BookmarksPanel()
+        self._bookmarks_panel.set_current_page_provider(
+            lambda: (self._zoom_page_num or 0) + 1
+        )
+        self._bookmarks_panel.bookmarks_changed.connect(self._run_toc_update)
+        self._bookmarks_panel.jump_requested.connect(self._jump_zoom_to_page)
+        self._bookmarks_panel.open_changed.connect(self._on_bookmarks_drawer_open_changed)
+        zoom_content_layout.addWidget(self._bookmarks_panel)
+
         zoom_layout.addWidget(zoom_content, 1)
         self._set_zoom_annotation_drawer_open(False)
         self._set_selected_zoom_annotation(None)
@@ -2269,9 +2282,70 @@ class PageEditWindow(QMainWindow):
             self._zoom_annotation_drawer.setFixedWidth(320 if self._zoom_annotation_open else 32)
         if self._zoom_annotation_toggle_btn:
             self._zoom_annotation_toggle_btn.setText("▶" if self._zoom_annotation_open else "◀")
+        # 横幅を確保するため、付箋ドロワーを開いたらしおりドロワーを閉じる
+        if self._zoom_annotation_open and getattr(self, "_bookmarks_panel", None):
+            if self._bookmarks_panel.is_open:
+                self._bookmarks_panel.set_open(False)
 
     def _toggle_zoom_annotation_drawer(self) -> None:
         self._set_zoom_annotation_drawer_open(not self._zoom_annotation_open)
+
+    def _on_bookmarks_drawer_open_changed(self, is_open: bool) -> None:
+        if is_open:
+            # 付箋ドロワーと排他にする
+            if self._zoom_annotation_open:
+                self._set_zoom_annotation_drawer_open(False)
+            self._reload_bookmarks_tree()
+
+    def _reload_bookmarks_tree(self) -> None:
+        """ディスク上のしおりでツリーを再構築する。ドロワーが閉じていれば何もしない。"""
+        panel = getattr(self, "_bookmarks_panel", None)
+        if panel is None or not panel.is_open:
+            return
+        panel.load_entries(get_pdf_toc(self._pdf_path))
+
+    def _jump_zoom_to_page(self, page_one_based: int) -> None:
+        """しおりクリック時に該当ページ(1始まり)へズーム移動する。"""
+        if self._zoom_page_num is None:
+            return
+        page_count = get_page_count(self._pdf_path)
+        if page_count <= 0:
+            return
+        target = max(0, min(page_one_based - 1, page_count - 1))
+        self._commit_inline_annotation_editor()
+        self._set_zoom_annotation_create_mode(False)
+        self._selected_zoom_annotation = None
+        self._zoom_page_num = target
+        self._render_zoom_page()
+
+    def _run_toc_update(self, new_entries: list[TocEntry], description: str) -> None:
+        """しおり変更を PDF に保存し、Undo/Redo に登録する(TOC全体スナップショット方式)。"""
+        old_entries = get_pdf_toc(self._pdf_path)
+        state: dict[str, list[TocEntry]] = {"old": old_entries, "new": list(new_entries)}
+
+        def do_update(reload_tree: bool = True) -> None:
+            update_pdf_toc(self._pdf_path, state["new"])
+            if reload_tree:
+                self._reload_bookmarks_tree()
+
+        def undo_update() -> None:
+            update_pdf_toc(self._pdf_path, state["old"])
+            self._reload_bookmarks_tree()
+
+        try:
+            # パネルは既に編集後の状態を表示しているため、ここでは再構築しない
+            do_update(reload_tree=False)
+        except PdfWritePermissionError as error:
+            # 保存できなかったので、表示をディスク上の真値に戻す
+            self._reload_bookmarks_tree()
+            self._handle_pdf_write_permission_denied(error)
+            return
+        self._undo_manager.add_action(UndoAction(
+            description=description,
+            undo_func=undo_update,
+            redo_func=lambda: do_update(True),
+        ))
+        self._update_button_states()
 
     def _set_zoom_annotation_create_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -3946,6 +4020,7 @@ class PageEditWindow(QMainWindow):
             self._zoom_view.show()
         for action in getattr(self, "_zoom_nav_actions", ()):
             action.setEnabled(True)
+        self._reload_bookmarks_tree()
         self._update_button_states()
 
     def _exit_zoom_view(self) -> None:

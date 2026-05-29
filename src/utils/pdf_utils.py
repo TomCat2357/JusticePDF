@@ -85,6 +85,18 @@ class ShapeAnnotData:
 AnyAnnotData = FreeTextAnnotData | ShapeAnnotData
 
 
+@dataclass(slots=True)
+class TocEntry:
+    """A single PDF bookmark (outline) entry.
+
+    PyMuPDF の TOC 仕様に合わせて level / page はともに 1 始まり。
+    """
+
+    level: int
+    title: str
+    page: int
+
+
 class _PixmapCache:
     def __init__(self, maxsize: int = 256):
         self._maxsize = maxsize
@@ -210,6 +222,66 @@ def get_pdf_metadata_title(pdf_path: str) -> str:
     except Exception:
         logger.debug("Failed to read PDF metadata title: %s", pdf_path, exc_info=True)
         return ""
+
+
+def get_pdf_toc(pdf_path: str) -> list[TocEntry]:
+    """PDFのしおり(アウトライン/TOC)を取得する。
+
+    取得できない場合や例外時は空リストを返す。各エントリの level / page は
+    1 始まり（PyMuPDF仕様）。
+    """
+    try:
+        with fitz.open(pdf_path) as doc:
+            raw = doc.get_toc(simple=True)  # [[level, title, page], ...]
+            return [
+                TocEntry(level=int(level), title=str(title), page=int(page))
+                for level, title, page in raw
+            ]
+    except Exception:
+        logger.debug("Failed to read PDF TOC: %s", pdf_path, exc_info=True)
+        return []
+
+
+def normalize_toc(
+    entries: list[TocEntry], *, page_count: int | None = None
+) -> list[TocEntry]:
+    """``set_toc`` が受理できる形にしおりを補正する。
+
+    - 先頭は強制的に level 1
+    - 各 level は直前の level+1 を上限にクランプ（下限 1）
+    - 空タイトルは "(無題)" にフォールバック
+    - page は page_count 指定時に 1..page_count へクランプ
+
+    例外を投げず「正す」方針。UI での昇格/降格の中間状態でも安全に保存できる。
+    """
+    result: list[TocEntry] = []
+    prev_level = 0
+    for entry in entries:
+        level = max(1, min(int(entry.level), prev_level + 1))
+        title = entry.title if entry.title.strip() else "(無題)"
+        page = int(entry.page)
+        if page_count is not None and page_count > 0:
+            page = max(1, min(page, page_count))
+        else:
+            page = max(1, page)
+        result.append(TocEntry(level=level, title=title, page=page))
+        prev_level = level
+    return result
+
+
+def update_pdf_toc(
+    pdf_path: str, entries: list[TocEntry], *, incremental: bool = False
+) -> None:
+    """しおりを一括設定する。``entries`` が空ならしおりを全削除する。
+
+    TOC 再構築は旧オブジェクトを残してファイルが肥大するため、既定では全保存
+    （``incremental=False``）を用いる。
+    """
+    with fitz.open(pdf_path) as doc:
+        normalized = normalize_toc(entries, page_count=doc.page_count)
+        toc_list = [[e.level, e.title, e.page] for e in normalized]
+        doc.set_toc(toc_list)
+        _save_document_in_place(doc, pdf_path, incremental=incremental)
 
 
 def _parse_float_array(value: str) -> list[float]:
