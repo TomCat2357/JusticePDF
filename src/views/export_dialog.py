@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -11,6 +12,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QRadioButton,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -122,12 +124,29 @@ class ExportOptionsDialog(QDialog):
             lambda v: self._img_quality_value.setText(f"{v}%")
         )
 
-        self._optimize_combo.currentIndexChanged.connect(self._on_optimize_changed)
-        self._on_optimize_changed(0)
+        self._optimize_combo.currentIndexChanged.connect(self._update_controls)
 
         # Text deletion checkbox (PDF only) — rasterizes to image-only PDF
         self._rasterize_cb = QCheckBox("テキストデータを削除（画像のみ）")
         layout.addWidget(self._rasterize_cb)
+
+        # Rasterize image format (shown only when the checkbox is on)
+        self._raster_fmt_widget = QWidget()
+        raster_fmt_layout = QHBoxLayout(self._raster_fmt_widget)
+        raster_fmt_layout.setContentsMargins(20, 0, 0, 0)
+        self._raster_jpeg_radio = QRadioButton("JPEG（高圧縮）")
+        self._raster_png_radio = QRadioButton("PNG（可逆・文字くっきり）")
+        self._raster_jpeg_radio.setChecked(True)
+        self._raster_fmt_group = QButtonGroup(self)
+        self._raster_fmt_group.addButton(self._raster_jpeg_radio)
+        self._raster_fmt_group.addButton(self._raster_png_radio)
+        raster_fmt_layout.addWidget(self._raster_jpeg_radio)
+        raster_fmt_layout.addWidget(self._raster_png_radio)
+        raster_fmt_layout.addStretch()
+        layout.addWidget(self._raster_fmt_widget)
+
+        self._rasterize_cb.toggled.connect(self._update_controls)
+        self._raster_jpeg_radio.toggled.connect(self._update_controls)
 
         # Buttons
         btn_box = QDialogButtonBox()
@@ -138,19 +157,58 @@ class ExportOptionsDialog(QDialog):
         layout.addWidget(btn_box)
 
         # Wire format change
-        self._fmt_combo.currentIndexChanged.connect(self._on_format_changed)
-        self._on_format_changed(0)
+        self._fmt_combo.currentIndexChanged.connect(self._update_controls)
 
-    def _on_optimize_changed(self, index: int) -> None:
-        show_img = index >= 2
-        self._img_dpi_label.setVisible(show_img)
-        self._img_dpi_combo.setVisible(show_img)
-        self._img_quality_label.setVisible(show_img)
-        self._img_quality_widget.setVisible(show_img)
+        # Initial sync once every widget exists
+        self._update_controls()
 
-        if index in self._PRESETS:
-            dpi, quality = self._PRESETS[index]
-            # Set preset values and disable editing
+    def _update_controls(self, *_args) -> None:
+        """Show/hide and enable/disable controls based on format, optimize
+        level, and the rasterize (text-deletion) toggle."""
+        fmt_text = self._fmt_combo.currentText()
+        is_pdf = "*.pdf" in fmt_text
+        is_jpeg = "*.jpg" in fmt_text
+        is_image = not is_pdf
+
+        # Image-output (PNG/JPEG) controls
+        self._dpi_label.setVisible(is_image)
+        self._dpi_spin.setVisible(is_image)
+        self._quality_label.setVisible(is_jpeg)
+        self._quality_widget.setVisible(is_jpeg)
+
+        # PDF-only top-level controls
+        self._optimize_label.setVisible(is_pdf)
+        self._optimize_combo.setVisible(is_pdf)
+        self._rasterize_cb.setVisible(is_pdf)
+
+        rasterize = is_pdf and self._rasterize_cb.isChecked()
+        opt_idx = self._optimize_combo.currentIndex()
+
+        # When rasterizing, the optimize level is ignored — gray it out.
+        self._optimize_combo.setEnabled(is_pdf and not rasterize)
+
+        # JPEG/PNG radio appears only while rasterizing.
+        self._raster_fmt_widget.setVisible(rasterize)
+        raster_jpeg = self._raster_jpeg_radio.isChecked()
+
+        # Image DPI applies to rasterize OR to optimize levels >= 2.
+        show_dpi = is_pdf and (rasterize or opt_idx >= 2)
+        self._img_dpi_label.setVisible(show_dpi)
+        self._img_dpi_combo.setVisible(show_dpi)
+
+        # Image quality applies to (rasterize & JPEG) or optimize levels >= 2.
+        show_quality = is_pdf and (
+            (rasterize and raster_jpeg) or (not rasterize and opt_idx >= 2)
+        )
+        self._img_quality_label.setVisible(show_quality)
+        self._img_quality_widget.setVisible(show_quality)
+
+        if rasterize:
+            # User fully controls DPI/quality in the image-only path.
+            self._img_dpi_combo.setEnabled(True)
+            self._img_quality_slider.setEnabled(True)
+        elif opt_idx in self._PRESETS:
+            dpi, quality = self._PRESETS[opt_idx]
             dpi_idx = next(
                 (i for i, (_, d) in enumerate(self._IMG_DPI_OPTIONS) if d == dpi),
                 2,
@@ -159,32 +217,9 @@ class ExportOptionsDialog(QDialog):
             self._img_quality_slider.setValue(quality)
             self._img_dpi_combo.setEnabled(False)
             self._img_quality_slider.setEnabled(False)
-        elif index == 5:  # Custom
+        elif opt_idx == 5:  # Custom
             self._img_dpi_combo.setEnabled(True)
             self._img_quality_slider.setEnabled(True)
-
-    def _on_format_changed(self, index: int) -> None:
-        fmt_text = self._fmt_combo.currentText()
-        is_pdf = "*.pdf" in fmt_text
-        is_jpeg = "*.jpg" in fmt_text
-        is_image = not is_pdf
-
-        self._dpi_label.setVisible(is_image)
-        self._dpi_spin.setVisible(is_image)
-
-        self._quality_label.setVisible(is_jpeg)
-        self._quality_widget.setVisible(is_jpeg)
-
-        self._optimize_label.setVisible(is_pdf)
-        self._optimize_combo.setVisible(is_pdf)
-        opt_idx = self._optimize_combo.currentIndex()
-        show_img = is_pdf and opt_idx >= 2
-        self._img_dpi_label.setVisible(show_img)
-        self._img_dpi_combo.setVisible(show_img)
-        self._img_quality_label.setVisible(show_img)
-        self._img_quality_widget.setVisible(show_img)
-
-        self._rasterize_cb.setVisible(is_pdf)
 
     def get_options(self) -> dict:
         fmt_text = self._fmt_combo.currentText()
@@ -203,4 +238,5 @@ class ExportOptionsDialog(QDialog):
             "pdf_image_dpi": self._IMG_DPI_OPTIONS[self._img_dpi_combo.currentIndex()][1],
             "pdf_image_quality": self._img_quality_slider.value(),
             "rasterize": self._rasterize_cb.isChecked(),
+            "rasterize_format": "jpeg" if self._raster_jpeg_radio.isChecked() else "png",
         }

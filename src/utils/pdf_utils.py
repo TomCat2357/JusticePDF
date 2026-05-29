@@ -2074,18 +2074,29 @@ def export_pdf_compressed(
         doc.close()
 
 
-def rasterize_pdf(src_path: str, output_path: str, dpi: int = 150) -> None:
+def rasterize_pdf(
+    src_path: str,
+    output_path: str,
+    dpi: int = 150,
+    *,
+    image_format: str = "png",
+    jpeg_quality: int = 75,
+) -> None:
     """Create a rasterized (image-only) copy of a PDF.
 
-    Each page is rendered to a PNG at the given DPI, then reassembled
-    into a new PDF.  The result looks identical but contains no
-    selectable text or vector data.
+    Each page is rendered to an image at the given DPI and embedded into
+    a new page that keeps the original page dimensions.  The result looks
+    identical but contains no selectable text or vector data.
 
     Args:
         src_path: Source PDF file path.
         output_path: Destination PDF path.
         dpi: Resolution for rasterization.
+        image_format: "png" (lossless, sharp text) or "jpeg" (lossy,
+            much smaller for photo/scan-heavy pages).
+        jpeg_quality: JPEG quality (1-100); ignored for PNG.
     """
+    is_jpeg = image_format.lower() in ("jpeg", "jpg")
     scale = dpi / 72.0
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
@@ -2093,13 +2104,17 @@ def rasterize_pdf(src_path: str, output_path: str, dpi: int = 150) -> None:
         for page_num in range(len(src_doc)):
             page = src_doc[page_num]
             pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
-            img_data = pix.tobytes("png")
-            img_doc = fitz.open("png", img_data)
-            pdf_bytes = img_doc.convert_to_pdf()
-            img_doc.close()
-            img_pdf = fitz.open("pdf", pdf_bytes)
-            out_doc.insert_pdf(img_pdf)
-            img_pdf.close()
+            if is_jpeg:
+                if pix.alpha:  # JPEG cannot carry an alpha channel
+                    pix = fitz.Pixmap(pix, 0)
+                img_data = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
+            else:
+                img_data = pix.tobytes("png")
+            # Keep the original page size; embed the image without re-encoding.
+            out_page = out_doc.new_page(
+                width=page.rect.width, height=page.rect.height
+            )
+            out_page.insert_image(out_page.rect, stream=img_data)
         out_doc.save(output_path, garbage=1, deflate=True)
     finally:
         src_doc.close()

@@ -2500,6 +2500,7 @@ class MainWindow(QMainWindow):
                 image_dpi=options["pdf_image_dpi"],
                 image_quality=options["pdf_image_quality"],
                 rasterize=options["rasterize"],
+                rasterize_format=options["rasterize_format"],
             )
         else:
             self._export_as_images(
@@ -2516,6 +2517,7 @@ class MainWindow(QMainWindow):
         image_dpi: int = 150,
         image_quality: int = 75,
         rasterize: bool = False,
+        rasterize_format: str = "jpeg",
     ) -> None:
         """Copy, optimize-export, or rasterize PDF files to the destination directory."""
         ok = 0
@@ -2530,7 +2532,12 @@ class MainWindow(QMainWindow):
                 filename = os.path.basename(src)
                 dst_path = ensure_unique_path(dst_dir, filename, pattern="{stem}({i}){ext}")
                 if rasterize:
-                    rasterize_pdf(src, str(dst_path))
+                    rasterize_pdf(
+                        src, str(dst_path),
+                        dpi=image_dpi,
+                        image_format=rasterize_format,
+                        jpeg_quality=image_quality,
+                    )
                 elif optimize_level > 0:
                     export_pdf_compressed(
                         src, str(dst_path),
