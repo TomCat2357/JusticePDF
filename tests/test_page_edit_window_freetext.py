@@ -238,6 +238,59 @@ def test_zoom_can_move_resize_and_undo_redo_freetext(qtbot, tmp_path):
 
 
 @pytest.mark.usefixtures("qtbot")
+def test_zoom_arrow_keys_move_selected_freetext_with_fine_modifier(qtbot, tmp_path):
+    pdf_path = tmp_path / "arrow-move.pdf"
+    _make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 170, 120),
+            content="arrow",
+            fontsize=14,
+            text_color=(0.0, 0.0, 0.0),
+            fill_color=(1.0, 1.0, 0.6),
+            border_color=(0.0, 0.0, 0.0),
+            border_width=2,
+            opacity=1.0,
+        ),
+    )
+
+    window = _create_window(qtbot, pdf_path)
+    _open_zoom(window, qtbot)
+
+    annot = _annotation_for(window, created.xref)
+    rect = window._zoom_label._annotation_widget_rect(annot)
+    qtbot.mouseClick(window._zoom_label, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+    qtbot.waitUntil(
+        lambda: window._selected_zoom_annotation is not None
+        and window._selected_zoom_annotation.xref == created.xref
+    )
+
+    step = window._zoom_label.ANNOTATION_MOVE_STEP
+    fine = window._zoom_label.ANNOTATION_MOVE_STEP_FINE
+
+    # 通常ステップで右へ移動。
+    qtbot.keyClick(window._zoom_label, Qt.Key.Key_Right)
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].rect[0] != 40.0)
+    moved = list_freetext_annots(str(pdf_path), 0)[0].rect
+    assert moved[0] == pytest.approx(40.0 + step, abs=0.5)
+    assert moved[1] == pytest.approx(50.0, abs=0.5)
+
+    # Alt 押下時は細かいステップで下へ移動。
+    qtbot.keyClick(window._zoom_label, Qt.Key.Key_Down, Qt.KeyboardModifier.AltModifier)
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].rect[1] != moved[1])
+    fine_moved = list_freetext_annots(str(pdf_path), 0)[0].rect
+    assert fine_moved[1] == pytest.approx(moved[1] + fine, abs=0.5)
+
+    # Undo で 1 ステップずつ戻る。
+    window._on_undo()
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].rect[1] == pytest.approx(moved[1], abs=0.5))
+
+
+@pytest.mark.usefixtures("qtbot")
 def test_zoom_delete_key_removes_selected_freetext_instead_of_page(qtbot, tmp_path):
     pdf_path = tmp_path / "delete-selected.pdf"
     _make_pdf(pdf_path)

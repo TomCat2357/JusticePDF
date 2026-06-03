@@ -367,6 +367,16 @@ class ZoomPageWidget(QWidget):
     annotation_duplicate_requested = pyqtSignal(object, object, object)
 
     HANDLE_SIZE = 10
+    # 矢印キーによる注釈移動量（PDF ポイント）。通常 / 細かい移動。
+    ANNOTATION_MOVE_STEP = 5.0
+    ANNOTATION_MOVE_STEP_FINE = 1.0
+    # 矢印キー -> (dx, dy) の単位ベクトル（ページ座標は下方向が +y）。
+    _ARROW_DELTAS = {
+        Qt.Key.Key_Left: (-1.0, 0.0),
+        Qt.Key.Key_Right: (1.0, 0.0),
+        Qt.Key.Key_Up: (0.0, -1.0),
+        Qt.Key.Key_Down: (0.0, 1.0),
+    }
 
     @staticmethod
     def _min_dims_for_annotation(annot) -> tuple[float, float, float]:
@@ -1702,7 +1712,44 @@ class ZoomPageWidget(QWidget):
             self.annotation_delete_requested.emit()
             event.accept()
             return
+        if (
+            event.key() in self._ARROW_DELTAS
+            and self._selected_annotation_xref is not None
+            and self._inline_editor is None
+        ):
+            ux, uy = self._ARROW_DELTAS[event.key()]
+            # Alt（または Shift）押下時は細かく、それ以外は通常ステップで移動。
+            fine = bool(
+                event.modifiers()
+                & (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier)
+            )
+            step = self.ANNOTATION_MOVE_STEP_FINE if fine else self.ANNOTATION_MOVE_STEP
+            if self._move_selected_annotation(ux * step, uy * step):
+                event.accept()
+                return
         super().keyPressEvent(event)
+
+    def _move_selected_annotation(self, dx: float, dy: float) -> bool:
+        annot = self._annotation_by_xref(self._selected_annotation_xref)
+        if annot is None:
+            return False
+        base = self._rect_tuple_to_qrectf(annot.rect).normalized()
+        width = base.width()
+        height = base.height()
+        page_w, page_h = self.page_size_points()
+        left = base.left() + dx
+        top = base.top() + dy
+        if page_w > 0:
+            left = min(max(0.0, left), max(0.0, page_w - width))
+        if page_h > 0:
+            top = min(max(0.0, top), max(0.0, page_h - height))
+        new_rect = QRectF(left, top, width, height)
+        if self._annotation_rect_close(new_rect, base):
+            return False
+        self.annotation_geometry_changed.emit(
+            annot, self._qrectf_to_rect_tuple(new_rect), "move"
+        )
+        return True
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
