@@ -1860,6 +1860,32 @@ def insert_pages(dest_path: str, src_path: str, insert_indices: list[int]) -> No
         src_doc.close()
 
 
+def _render_page_to_image_bytes(
+    page: fitz.Page,
+    dpi: int,
+    *,
+    image_format: str = "png",
+    jpeg_quality: int = 75,
+) -> tuple[bytes, str]:
+    """Render a page to encoded image bytes.
+
+    Args:
+        page: Source page.
+        dpi: Resolution for rasterization.
+        image_format: "png" (lossless) or "jpeg"/"jpg" (lossy).
+        jpeg_quality: JPEG quality (1-100); ignored for PNG.
+
+    Returns:
+        ``(data, ext)`` where ``ext`` is ".jpg" or ".png".
+    """
+    pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0))
+    if image_format.lower() in ("jpeg", "jpg"):
+        if pix.alpha:  # JPEG cannot carry an alpha channel
+            pix = fitz.Pixmap(pix, 0)
+        return pix.tobytes("jpeg", jpg_quality=jpeg_quality), ".jpg"
+    return pix.tobytes("png"), ".png"
+
+
 def export_pages_as_images(
     pdf_path: str,
     output_dir: str,
@@ -1881,9 +1907,6 @@ def export_pages_as_images(
     Returns:
         List of created image file paths.
     """
-    scale = dpi / 72.0
-    is_jpeg = fmt.lower() in ("jpeg", "jpg")
-    ext = ".jpg" if is_jpeg else ".png"
     base = os.path.splitext(os.path.basename(pdf_path))[0]
     created: list[str] = []
 
@@ -1891,14 +1914,12 @@ def export_pages_as_images(
     try:
         indices = page_indices if page_indices is not None else list(range(len(doc)))
         for page_num in indices:
-            page = doc[page_num]
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
-            filename = f"{base}_p{page_num + 1}{ext}"
-            out_path = os.path.join(output_dir, filename)
-            if is_jpeg:
-                pix.save(out_path, jpg_quality=quality)
-            else:
-                pix.save(out_path)
+            data, ext = _render_page_to_image_bytes(
+                doc[page_num], dpi, image_format=fmt, jpeg_quality=quality
+            )
+            out_path = os.path.join(output_dir, f"{base}_p{page_num + 1}{ext}")
+            with open(out_path, "wb") as f:
+                f.write(data)
             created.append(out_path)
     finally:
         doc.close()
@@ -2044,18 +2065,19 @@ def export_pdf_compressed(
 ) -> None:
     """Export a PDF with optimization.
 
+    The caller decides *image_dpi* / *image_quality*; for the standard/high/max
+    presets the export dialog seeds them, and for the custom level the user sets
+    them directly. This function only branches on *optimize_level*:
+
     Args:
         src_path: Source PDF file path.
         dst_path: Destination PDF file path.
-        optimize_level: Optimization level 0-5.
+        optimize_level: Optimization level.
             0 = no optimization (plain save),
             1 = cleanup only (garbage collection + deflate),
-            2 = standard image recompression (200 dpi / 85%),
-            3 = high image recompression (150 dpi / 50%),
-            4 = maximum image recompression (72 dpi / 10%),
-            5 = custom (uses *image_dpi* / *image_quality*).
-        image_dpi: Target max DPI for image recompression (used at level 5).
-        image_quality: JPEG quality (1-100) for image recompression (used at level 5).
+            >= 2 = image recompression using *image_dpi* / *image_quality*.
+        image_dpi: Target max DPI for image recompression (levels >= 2).
+        image_quality: JPEG quality (1-100) for image recompression (levels >= 2).
     """
     doc = fitz.open(src_path)
     try:
@@ -2096,20 +2118,14 @@ def rasterize_pdf(
             much smaller for photo/scan-heavy pages).
         jpeg_quality: JPEG quality (1-100); ignored for PNG.
     """
-    is_jpeg = image_format.lower() in ("jpeg", "jpg")
-    scale = dpi / 72.0
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
     try:
         for page_num in range(len(src_doc)):
             page = src_doc[page_num]
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
-            if is_jpeg:
-                if pix.alpha:  # JPEG cannot carry an alpha channel
-                    pix = fitz.Pixmap(pix, 0)
-                img_data = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
-            else:
-                img_data = pix.tobytes("png")
+            img_data, _ = _render_page_to_image_bytes(
+                page, dpi, image_format=image_format, jpeg_quality=jpeg_quality
+            )
             # Keep the original page size; embed the image without re-encoding.
             out_page = out_doc.new_page(
                 width=page.rect.width, height=page.rect.height
