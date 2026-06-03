@@ -88,10 +88,11 @@ def test_zoom_drawer_starts_closed_and_can_create_freetext(qtbot, tmp_path):
     _open_zoom(window, qtbot)
 
     assert window._zoom_annotation_open is False
-    assert window._zoom_annotation_toggle_btn.isVisible()
+    assert window._zoom_object_btn.isVisible()
 
-    qtbot.mouseClick(window._zoom_annotation_toggle_btn, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window._zoom_object_btn, Qt.MouseButton.LeftButton)
     assert window._zoom_annotation_open is True
+    assert window._zoom_object_btn.isChecked() is True
 
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
     assert window._zoom_annotation_new_btn.isChecked() is True
@@ -279,7 +280,7 @@ def test_zoom_delete_key_in_editor_deletes_char_not_annotation(qtbot, tmp_path):
     window = _create_window(qtbot, pdf_path)
     _open_zoom(window, qtbot)
 
-    qtbot.mouseClick(window._zoom_annotation_toggle_btn, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window._zoom_object_btn, Qt.MouseButton.LeftButton)
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
     _drag_on_zoom_label(qtbot, window, (60, 80), (160, 140))
     qtbot.waitUntil(lambda: window._zoom_label.has_active_text_editor())

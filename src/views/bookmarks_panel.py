@@ -58,6 +58,7 @@ class BookmarksPanel(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
 
         self._is_open = False
+        self._collapsed_width = 32
         self._loading = False
         self._suppress_item_changed = False
         self._current_page_provider: Callable[[], int] | None = None
@@ -162,13 +163,24 @@ class BookmarksPanel(QFrame):
         changed = is_open != self._is_open
         self._is_open = is_open
         self._panel.setVisible(is_open)
-        self.setFixedWidth(self.DRAWER_WIDTH if is_open else 32)
+        self.setFixedWidth(self.DRAWER_WIDTH if is_open else self._collapsed_width)
         self._toggle_btn.setText("▶" if is_open else "◀")
         if changed:
             self.open_changed.emit(is_open)
 
     def toggle(self) -> None:
         self.set_open(not self._is_open)
+
+    def use_external_toggle(self) -> None:
+        """開閉トグルを外部ボタンに委譲する。
+
+        内蔵のトグルボタンを隠し、折りたたみ時の幅を0にする。開閉自体は
+        呼び出し側が ``set_open`` / ``toggle`` で制御する。
+        """
+        self._collapsed_width = 0
+        self._toggle_btn.hide()
+        if not self._is_open:
+            self.setFixedWidth(0)
 
     # ------------------------------------------------------------------
     # ツリー <-> list[TocEntry] 変換

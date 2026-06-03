@@ -1867,6 +1867,36 @@ class PageEditWindow(QMainWindow):
         self._zoom_percent_label = QLabel("100%")
         controls_layout.addWidget(self._zoom_percent_label)
 
+        # ページ移動(◁ ▷)
+        self._zoom_prev_btn = QToolButton()
+        self._zoom_prev_btn.setObjectName("zoomNav")
+        self._zoom_prev_btn.setArrowType(Qt.ArrowType.LeftArrow)
+        self._zoom_prev_btn.setToolTip("前のページ")
+        self._zoom_prev_btn.setFixedWidth(40)
+        self._zoom_prev_btn.clicked.connect(self._on_zoom_prev_page)
+        controls_layout.addWidget(self._zoom_prev_btn)
+
+        self._zoom_next_btn = QToolButton()
+        self._zoom_next_btn.setObjectName("zoomNav")
+        self._zoom_next_btn.setArrowType(Qt.ArrowType.RightArrow)
+        self._zoom_next_btn.setToolTip("次のページ")
+        self._zoom_next_btn.setFixedWidth(40)
+        self._zoom_next_btn.clicked.connect(self._on_zoom_next_page)
+        controls_layout.addWidget(self._zoom_next_btn)
+
+        # オブジェクト(付箋)/しおり ドロワー開閉(右端の内蔵トグルから移設)
+        self._zoom_object_btn = QPushButton("オブジェクト")
+        self._zoom_object_btn.setCheckable(True)
+        self._zoom_object_btn.setToolTip("付箋編集")
+        self._zoom_object_btn.clicked.connect(self._toggle_zoom_annotation_drawer)
+        controls_layout.addWidget(self._zoom_object_btn)
+
+        self._zoom_bookmark_btn = QPushButton("しおり")
+        self._zoom_bookmark_btn.setCheckable(True)
+        self._zoom_bookmark_btn.setToolTip("しおり編集")
+        self._zoom_bookmark_btn.clicked.connect(self._toggle_bookmarks_drawer)
+        controls_layout.addWidget(self._zoom_bookmark_btn)
+
         controls_layout.addStretch()
 
         self._zoom_page_label = QLabel("")
@@ -1898,37 +1928,11 @@ class PageEditWindow(QMainWindow):
         self._zoom_label.annotation_duplicate_requested.connect(self._on_zoom_annotation_duplicate_requested)
         self._zoom_scroll.setWidget(self._zoom_label)
 
-        self._zoom_prev_btn = QToolButton()
-        self._zoom_prev_btn.setObjectName("zoomNav")
-        self._zoom_prev_btn.setArrowType(Qt.ArrowType.LeftArrow)
-        self._zoom_prev_btn.setToolTip("Previous page")
-        self._zoom_prev_btn.setAutoRaise(False)
-        self._zoom_prev_btn.setFixedWidth(56)
-        self._zoom_prev_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self._zoom_prev_btn.clicked.connect(self._on_zoom_prev_page)
-
-        self._zoom_next_btn = QToolButton()
-        self._zoom_next_btn.setObjectName("zoomNav")
-        self._zoom_next_btn.setArrowType(Qt.ArrowType.RightArrow)
-        self._zoom_next_btn.setToolTip("Next page")
-        self._zoom_next_btn.setAutoRaise(False)
-        self._zoom_next_btn.setFixedWidth(56)
-        self._zoom_next_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self._zoom_next_btn.clicked.connect(self._on_zoom_next_page)
-
-        nav_container = QWidget()
-        nav_layout = QHBoxLayout(nav_container)
-        nav_layout.setContentsMargins(0, 0, 0, 0)
-        nav_layout.setSpacing(0)
-        nav_layout.addWidget(self._zoom_prev_btn)
-        nav_layout.addWidget(self._zoom_scroll, 1)
-        nav_layout.addWidget(self._zoom_next_btn)
-
         zoom_content = QWidget()
         zoom_content_layout = QHBoxLayout(zoom_content)
         zoom_content_layout.setContentsMargins(0, 0, 0, 0)
         zoom_content_layout.setSpacing(0)
-        zoom_content_layout.addWidget(nav_container, 1)
+        zoom_content_layout.addWidget(self._zoom_scroll, 1)
 
         self._zoom_annotation_drawer = QFrame()
         self._zoom_annotation_drawer.setObjectName("annotationDrawer")
@@ -1937,11 +1941,13 @@ class PageEditWindow(QMainWindow):
         drawer_layout.setContentsMargins(0, 0, 0, 0)
         drawer_layout.setSpacing(0)
 
+        # 開閉トグルはツールバーの「オブジェクト」ボタンへ移設したため内蔵ボタンは隠す
         self._zoom_annotation_toggle_btn = QToolButton()
         self._zoom_annotation_toggle_btn.setText("◀")
         self._zoom_annotation_toggle_btn.setToolTip("付箋編集")
         self._zoom_annotation_toggle_btn.clicked.connect(self._toggle_zoom_annotation_drawer)
         self._zoom_annotation_toggle_btn.setFixedWidth(32)
+        self._zoom_annotation_toggle_btn.hide()
         drawer_layout.addWidget(self._zoom_annotation_toggle_btn)
 
         self._zoom_annotation_panel = QWidget()
@@ -2219,6 +2225,8 @@ class PageEditWindow(QMainWindow):
         self._bookmarks_panel.bookmarks_changed.connect(self._run_toc_update)
         self._bookmarks_panel.jump_requested.connect(self._jump_zoom_to_page)
         self._bookmarks_panel.open_changed.connect(self._on_bookmarks_drawer_open_changed)
+        # 開閉トグルはツールバーの「しおり」ボタンへ移設したため内蔵トグルを隠す
+        self._bookmarks_panel.use_external_toggle()
         zoom_content_layout.addWidget(self._bookmarks_panel)
 
         zoom_layout.addWidget(zoom_content, 1)
@@ -2279,9 +2287,11 @@ class PageEditWindow(QMainWindow):
         if self._zoom_annotation_panel:
             self._zoom_annotation_panel.setVisible(self._zoom_annotation_open)
         if self._zoom_annotation_drawer:
-            self._zoom_annotation_drawer.setFixedWidth(320 if self._zoom_annotation_open else 32)
+            self._zoom_annotation_drawer.setFixedWidth(320 if self._zoom_annotation_open else 0)
         if self._zoom_annotation_toggle_btn:
             self._zoom_annotation_toggle_btn.setText("▶" if self._zoom_annotation_open else "◀")
+        if getattr(self, "_zoom_object_btn", None) is not None:
+            self._zoom_object_btn.setChecked(self._zoom_annotation_open)
         # 横幅を確保するため、付箋ドロワーを開いたらしおりドロワーを閉じる
         if self._zoom_annotation_open and getattr(self, "_bookmarks_panel", None):
             if self._bookmarks_panel.is_open:
@@ -2290,7 +2300,14 @@ class PageEditWindow(QMainWindow):
     def _toggle_zoom_annotation_drawer(self) -> None:
         self._set_zoom_annotation_drawer_open(not self._zoom_annotation_open)
 
+    def _toggle_bookmarks_drawer(self) -> None:
+        panel = getattr(self, "_bookmarks_panel", None)
+        if panel is not None:
+            panel.set_open(not panel.is_open)
+
     def _on_bookmarks_drawer_open_changed(self, is_open: bool) -> None:
+        if getattr(self, "_zoom_bookmark_btn", None) is not None:
+            self._zoom_bookmark_btn.setChecked(is_open)
         if is_open:
             # 付箋ドロワーと排他にする
             if self._zoom_annotation_open:
