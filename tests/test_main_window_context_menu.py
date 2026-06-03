@@ -44,9 +44,12 @@ def window_factory(monkeypatch, qtbot, tmp_path):
         qtbot.addWidget(window)
         window.show()
 
+        # 実運用ではカードは作業フォルダ(_work_dir)配下のファイルに対応する。
+        # tmp_path 直下に置くと _reconcile_with_disk が作業フォルダ外として
+        # カードを除去してしまうため、_work_dir 内にPDFを作成する。
         paths: list[str] = []
         for index in range(count):
-            path = tmp_path / f"doc_{index}.pdf"
+            path = window._work_dir / f"doc_{index}.pdf"
             path.write_bytes(b"%PDF-1.4\n%%EOF\n")
             window._add_card(str(path))
             paths.append(str(path))
