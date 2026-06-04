@@ -1792,6 +1792,9 @@ class PageEditWindow(QMainWindow):
         self._zoom_text_cache: dict[int, tuple[list[tuple], list[dict]]] = {}
         self._zoom_annotations: list[FreeTextAnnotData] = []
         self._selected_zoom_annotation: FreeTextAnnotData | None = None
+        # 注釈未選択でも新規作成のデフォルト値を編集できるよう、現在の作成モードを保持する。
+        # None=非作成 / "freetext"=FreeText新規 / ShapeType=図形新規
+        self._zoom_create_mode: ShapeType | str | None = None
         self._copied_zoom_annotation: AnyAnnotData | None = None
         self._zoom_annotation_drawer = None
         self._zoom_annotation_panel = None
@@ -2163,13 +2166,9 @@ class PageEditWindow(QMainWindow):
         panel_layout.addWidget(self._zoom_shape_rotation_row)
         self._zoom_shape_rotation_row.hide()
 
-        # Line options: arrow checkboxes + start/end coordinates
-        self._zoom_shape_line_options = QWidget()
-        line_opt_layout = QVBoxLayout(self._zoom_shape_line_options)
-        line_opt_layout.setContentsMargins(0, 0, 0, 0)
-
-        arrow_row = QWidget()
-        arrow_layout = QHBoxLayout(arrow_row)
+        # Line options: 矢印は選択時・作成時の両方で表示。始点/終点座標は既存図形の編集時のみ。
+        self._zoom_shape_arrow_options = QWidget()
+        arrow_layout = QHBoxLayout(self._zoom_shape_arrow_options)
         arrow_layout.setContentsMargins(0, 0, 0, 0)
         self._zoom_shape_arrow_start_cb = QCheckBox("始点矢印")
         self._zoom_shape_arrow_start_cb.stateChanged.connect(self._on_zoom_shape_option_changed)
@@ -2177,9 +2176,11 @@ class PageEditWindow(QMainWindow):
         self._zoom_shape_arrow_end_cb = QCheckBox("終点矢印")
         self._zoom_shape_arrow_end_cb.stateChanged.connect(self._on_zoom_shape_option_changed)
         arrow_layout.addWidget(self._zoom_shape_arrow_end_cb)
-        line_opt_layout.addWidget(arrow_row)
+        panel_layout.addWidget(self._zoom_shape_arrow_options)
+        self._zoom_shape_arrow_options.hide()
 
-        endpoint_form = QFormLayout()
+        self._zoom_shape_line_endpoint_options = QWidget()
+        endpoint_form = QFormLayout(self._zoom_shape_line_endpoint_options)
         endpoint_form.setContentsMargins(0, 0, 0, 0)
 
         self._zoom_shape_line_start_x_spin = QSpinBox()
@@ -2212,10 +2213,8 @@ class PageEditWindow(QMainWindow):
         end_layout.addWidget(self._zoom_shape_line_end_y_spin, 1)
         endpoint_form.addRow("終点", end_row)
 
-        line_opt_layout.addLayout(endpoint_form)
-
-        panel_layout.addWidget(self._zoom_shape_line_options)
-        self._zoom_shape_line_options.hide()
+        panel_layout.addWidget(self._zoom_shape_line_endpoint_options)
+        self._zoom_shape_line_endpoint_options.hide()
 
         # Bracket options
         self._zoom_shape_bracket_options = QWidget()
@@ -2253,6 +2252,11 @@ class PageEditWindow(QMainWindow):
         self._zoom_shape_triangle_apex_x_slider.setRange(0, 100)
         self._zoom_shape_triangle_apex_x_slider.valueChanged.connect(self._on_zoom_shape_triangle_apex_x_slider_changed)
         apex_x_layout.addWidget(self._zoom_shape_triangle_apex_x_slider, 1)
+        # 新規三角形のデフォルト頂点位置（中央）に合わせる
+        with QSignalBlocker(self._zoom_shape_triangle_apex_x_spin):
+            self._zoom_shape_triangle_apex_x_spin.setValue(50)
+        with QSignalBlocker(self._zoom_shape_triangle_apex_x_slider):
+            self._zoom_shape_triangle_apex_x_slider.setValue(50)
         triangle_opt_layout.addRow("上頂点 X", apex_x_row)
 
         panel_layout.addWidget(self._zoom_shape_triangle_options)
@@ -2424,6 +2428,22 @@ class PageEditWindow(QMainWindow):
             with QSignalBlocker(self._zoom_annotation_new_btn):
                 self._zoom_annotation_new_btn.setChecked(enabled)
             self._zoom_annotation_new_btn.setText("配置待ち" if enabled else "新規")
+        self._set_zoom_create_mode("freetext" if enabled else None)
+
+    def _set_zoom_create_mode(self, mode: ShapeType | str | None) -> None:
+        """作成モードを更新し、変化した場合のみ右パネルへ反映する。
+
+        作成モードへ入るとき（mode が None 以外）は、選択中の注釈があっても解除して
+        新規作成のデフォルト値（線色など）を右パネルへ表示する。これにより「線を選択中に
+        □を押す」と、その注釈の編集ではなく□の新規配置モードへ切り替わる。
+        作成モードを抜けるとき（mode=None）に注釈が選択されていればその編集表示を優先し触らない。
+        変化が無いのに再構築すると、選択時に余分なレイアウト更新が走るため差分時のみ実行する。
+        """
+        if self._zoom_create_mode == mode:
+            return
+        self._zoom_create_mode = mode
+        if mode is not None or self._selected_zoom_annotation is None:
+            self._set_selected_zoom_annotation(None)
 
     def _set_selected_zoom_annotation(
         self,
@@ -2443,16 +2463,33 @@ class PageEditWindow(QMainWindow):
             is_freetext = isinstance(annotation, FreeTextAnnotData)
             has_selection = annotation is not None
 
+            # 注釈未選択でも作成モード中は新規作成のデフォルト値を編集できるようにする。
+            # 注釈選択中はその注釈の編集を優先するため、作成モードは無視する。
+            create_mode = self._zoom_create_mode if not has_selection else None
+            create_shape_type = create_mode if isinstance(create_mode, ShapeType) else None
+            controls_active = has_selection or create_mode is not None
+
+            # 表示・有効化の判定は「選択中の注釈」または「作成対象」に基づく
+            panel_shape_type = annotation.shape_type if is_shape else create_shape_type
+            panel_is_shape = is_shape or create_shape_type is not None
+            is_line_shape = panel_shape_type == ShapeType.LINE
+
             # Toggle FreeText-only vs shape-only controls
-            self._zoom_annotation_fontsize_spin.setVisible(not is_shape)
-            self._zoom_annotation_fontsize_label.setVisible(not is_shape)
-            self._zoom_annotation_text_color_row.setVisible(not is_shape)
+            self._zoom_annotation_fontsize_spin.setVisible(not panel_is_shape)
+            self._zoom_annotation_fontsize_label.setVisible(not panel_is_shape)
+            self._zoom_annotation_text_color_row.setVisible(not panel_is_shape)
+            # 回転は既存図形の編集時のみ（新規は描画後に調整する）
             self._zoom_shape_rotation_row.setVisible(is_shape)
-            is_line_shape = is_shape and annotation.shape_type == ShapeType.LINE
-            self._zoom_shape_line_options.setVisible(is_line_shape)
-            self._zoom_shape_bracket_options.setVisible(is_shape and annotation.shape_type == ShapeType.BRACKET if is_shape else False)
-            self._zoom_shape_triangle_options.setVisible(is_shape and annotation.shape_type == ShapeType.TRIANGLE if is_shape else False)
-            # LINE は始点/終点で編集するので、Width/Height は隠す
+            # 矢印は LINE の選択時・作成時の両方で表示
+            self._zoom_shape_arrow_options.setVisible(is_line_shape)
+            # 始点/終点座標は既存 LINE の編集時のみ（作成前は未確定）
+            self._zoom_shape_line_endpoint_options.setVisible(is_line_shape and is_shape)
+            self._zoom_shape_bracket_options.setVisible(panel_shape_type == ShapeType.BRACKET)
+            self._zoom_shape_triangle_options.setVisible(panel_shape_type == ShapeType.TRIANGLE)
+            # 幅/高さは描画で確定するため作成モードでは隠す。LINE は始点/終点で編集するので隠す。
+            # それ以外（選択あり／完全未選択）は従来通り表示する（未選択時は無効化のみ）。
+            hide_size = create_mode is not None or (is_shape and annotation.shape_type == ShapeType.LINE)
+            show_size = not hide_size
             for sz_widget in (
                 self._zoom_annotation_width_spin,
                 self._zoom_annotation_width_label,
@@ -2460,7 +2497,7 @@ class PageEditWindow(QMainWindow):
                 self._zoom_annotation_height_label,
             ):
                 if sz_widget is not None:
-                    sz_widget.setVisible(not is_line_shape)
+                    sz_widget.setVisible(show_size)
 
             widgets = [
                 self._zoom_annotation_width_spin,
@@ -2472,14 +2509,15 @@ class PageEditWindow(QMainWindow):
                 self._zoom_annotation_border_color_btn,
                 self._zoom_annotation_border_color_clear_btn,
             ]
-            if not is_shape:
+            if not panel_is_shape:
                 widgets.extend([
                     self._zoom_annotation_fontsize_spin,
                     self._zoom_annotation_text_color_btn,
                 ])
             for widget in widgets:
                 if widget is not None:
-                    widget.setEnabled(has_selection)
+                    widget.setEnabled(controls_active)
+            # 削除・重ね順は対象注釈が必要なので選択時のみ有効化する
             if self._zoom_annotation_delete_btn:
                 self._zoom_annotation_delete_btn.setEnabled(has_selection)
             for order_btn in (
@@ -2491,14 +2529,9 @@ class PageEditWindow(QMainWindow):
                 if order_btn is not None:
                     order_btn.setEnabled(has_selection)
 
-            if annotation is None:
-                # 非選択時は最後の設定値を保持して次回の新規作成に引き継ぐ。
-                # スピン・スライダー・色はウィンドウのインスタンス状態としてそのまま残す。
-                self._zoom_shape_rotation_row.hide()
-                self._zoom_shape_line_options.hide()
-                self._zoom_shape_bracket_options.hide()
-                self._zoom_shape_triangle_options.hide()
-            elif is_shape:
+            # 非選択（作成モード含む）時は最後の設定値（インスタンス状態）を保持し、
+            # 次回の新規作成に引き継ぐ。スピン・スライダー・色は再設定しない。
+            if is_shape:
                 x0, y0, x1, y1 = annotation.rect
                 is_line = annotation.shape_type == ShapeType.LINE
                 size_min = 0 if is_line else 1
@@ -2557,7 +2590,7 @@ class PageEditWindow(QMainWindow):
                         self._zoom_shape_triangle_apex_x_spin.setValue(ax_pct)
                     with QSignalBlocker(self._zoom_shape_triangle_apex_x_slider):
                         self._zoom_shape_triangle_apex_x_slider.setValue(ax_pct)
-            else:
+            elif is_freetext:
                 # FreeText
                 x0, y0, x1, y1 = annotation.rect
                 if self._zoom_annotation_width_spin:
@@ -2601,7 +2634,8 @@ class PageEditWindow(QMainWindow):
             self._zoom_annotation_form_sync = False
 
     def _pick_zoom_annotation_color(self, kind: str) -> None:
-        if self._selected_zoom_annotation is None:
+        # 注釈選択中はその注釈へ適用、作成モード中は新規作成のデフォルト色を更新する
+        if self._selected_zoom_annotation is None and self._zoom_create_mode is None:
             return
         if kind == "text":
             current = self._zoom_annotation_text_color
@@ -2625,7 +2659,7 @@ class PageEditWindow(QMainWindow):
         self._apply_zoom_annotation_form()
 
     def _clear_zoom_annotation_color(self, kind: str) -> None:
-        if self._selected_zoom_annotation is None:
+        if self._selected_zoom_annotation is None and self._zoom_create_mode is None:
             return
         if kind == "fill":
             self._zoom_annotation_fill_color = None
@@ -3114,6 +3148,7 @@ class PageEditWindow(QMainWindow):
             else:
                 if self._zoom_label._annotation_create_shape_type is not None:
                     self._zoom_label.set_annotation_create_mode(False)
+        self._set_zoom_create_mode(shape_type)
 
     def _on_zoom_shape_create_requested(self, shape_type: object, start: object, end: object) -> None:
         if (
@@ -3165,6 +3200,10 @@ class PageEditWindow(QMainWindow):
         else:
             arrow_start = False
             arrow_end = False
+        if shape_type == ShapeType.TRIANGLE and self._zoom_shape_triangle_apex_x_spin:
+            triangle_apex = (float(self._zoom_shape_triangle_apex_x_spin.value()) / 100.0, 0.0)
+        else:
+            triangle_apex = (0.5, 0.0)
         template = ShapeAnnotData(
             page_num=self._zoom_page_num,
             xref=0,
@@ -3181,6 +3220,7 @@ class PageEditWindow(QMainWindow):
             bracket_size=bracket_size,
             bracket_side="left",
             vertices=vertices,
+            triangle_apex=triangle_apex,
         )
         state: dict[str, ShapeAnnotData | None] = {"created": None}
 
