@@ -368,7 +368,8 @@ class ZoomPageWidget(QWidget):
 
     HANDLE_SIZE = 10
     # 矢印キーによる注釈移動量（PDF ポイント）。通常 / 細かい移動。
-    ANNOTATION_MOVE_STEP = 5.0
+    # 押下回数によらず一定ステップ（加速なし）。
+    ANNOTATION_MOVE_STEP = 10.0
     ANNOTATION_MOVE_STEP_FINE = 1.0
     # 矢印キー -> (dx, dy) の単位ベクトル（ページ座標は下方向が +y）。
     _ARROW_DELTAS = {
