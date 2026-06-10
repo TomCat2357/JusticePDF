@@ -96,7 +96,7 @@
 
 ```bash
 # 仮想環境
-uv venv .venv --python 3.13
+uv venv .venv --python 3.14
 
 # 依存関係インストール
 uv sync
