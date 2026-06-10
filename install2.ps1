@@ -19,7 +19,7 @@ if (-not $script:ScriptDir -or $script:ScriptDir.Trim() -eq "")
 # Config
 # =========================
 $ProjectName   = "JusticePDF"
-$PythonVersion = "3.11"
+$PythonVersion = "3.13"
 $ScoopRoot     = Join-Path $env:USERPROFILE "scoop"
 
 # =========================
@@ -207,12 +207,12 @@ function Ensure-Python([string]$Version)
     Refresh-ProcessPath
     Append-PathOnce $shimDir
 
-    # Python 3.11 は versions バケットから python311 としてインストール
-    Ensure-ScoopApp "python311" "versions"
+    # Python 3.13 は versions バケットから python313 としてインストール
+    Ensure-ScoopApp "python313" "versions"
 
-    # python311 をデフォルトの python shim に設定
-    Write-Info "Setting python311 as default python shim..."
-    & scoop reset python311 2>$null | Out-Host
+    # python313 をデフォルトの python shim に設定
+    Write-Info "Setting python313 as default python shim..."
+    & scoop reset python313 2>$null | Out-Host
     Refresh-ProcessPath
     Append-PathOnce $shimDir
 
