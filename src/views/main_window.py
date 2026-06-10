@@ -36,6 +36,7 @@ from src.utils.pdf_utils import (
 from src.views.export_dialog import ExportOptionsDialog
 from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
+from src.utils.zip_utils import prepare_zip_imports
 from src.utils.windows_shell import show_native_file_context_menu
 from src.workers.file_worker import FileOperationWorker
 from src.workers.import_worker import ImportWorker, find_soffice
@@ -53,6 +54,9 @@ _IMAGE_EXTS = {
     ".jp2", ".jpx", ".ppm", ".pgm", ".pbm", ".pnm", ".pam", ".svg",
 }
 _IMPORT_EXTS = {".pdf"} | _OFFICE_EXTS | _IMAGE_EXTS
+# Archives expanded on drop/import (password-less only); handled separately
+# from _IMPORT_EXTS because a zip is extracted, not converted file-by-file.
+_ZIP_EXTS = {".zip"}
 
 
 def _exts_to_filter(label: str, exts: set[str]) -> str:
@@ -2196,7 +2200,7 @@ class MainWindow(QMainWindow):
 
     def _on_import(self) -> None:
         """Handle import action (files)."""
-        all_filter = _exts_to_filter("All importable files", _IMPORT_EXTS)
+        all_filter = _exts_to_filter("All importable files", _IMPORT_EXTS | _ZIP_EXTS)
         filters = [
             all_filter,
             _exts_to_filter("PDF", {".pdf"}),
@@ -2204,6 +2208,7 @@ class MainWindow(QMainWindow):
             _exts_to_filter("Excel", _EXCEL_EXTS),
             _exts_to_filter("PowerPoint", _PPT_EXTS),
             _exts_to_filter("Images", _IMAGE_EXTS),
+            _exts_to_filter("ZIP", _ZIP_EXTS),
             "All files (*)",
         ]
         dialog = QFileDialog(self, "Import")
@@ -2311,14 +2316,26 @@ class MainWindow(QMainWindow):
         button, drag-and-drop onto the main window, and drops onto a
         FolderCard (via ``dest_root``).  Runs asynchronously in an
         ``ImportWorker`` thread; the user may cancel mid-batch.
+
+        A password-less ``.zip`` is expanded into a folder named after the
+        archive (under ``dest_root``); its contents then go through the same
+        conversion pipeline.  Password protected / unreadable archives are
+        reported and skipped.
         """
         if self._operation_in_progress or self._active_import_worker is not None:
             QMessageBox.information(self, "Import", "別のインポートが進行中です。完了までお待ちください。")
             return
 
         root = Path(dest_root) if dest_root else Path(self._work_dir)
-        tree = self._build_import_tree(paths, root)
+
+        prep = prepare_zip_imports(paths)
+        if prep.encrypted or prep.broken:
+            self._notify_zip_problems(prep.encrypted, prep.broken)
+        cleanup_dirs = prep.temp_dirs
+
+        tree = self._build_import_tree(prep.paths, root)
         if not tree:
+            self._cleanup_temp_dirs(cleanup_dirs)
             return
 
         office_count = self._count_office_files(tree)
@@ -2334,13 +2351,45 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.No,
             )
             if result != QMessageBox.StandardButton.Yes:
+                self._cleanup_temp_dirs(cleanup_dirs)
                 return
 
-        self._start_import_worker(tree)
+        self._start_import_worker(tree, cleanup_dirs=cleanup_dirs)
 
-    def _start_import_worker(self, tree: list[tuple[str, str]]) -> None:
+    def _notify_zip_problems(
+        self,
+        encrypted: list[str],
+        broken: list[str],
+    ) -> None:
+        """Warn about zips that could not be expanded."""
+        sections: list[str] = []
+        if encrypted:
+            names = "\n".join(f"・{n}" for n in encrypted)
+            sections.append(
+                f"パスワード付きのため展開できませんでした（{len(encrypted)} 件）:\n{names}"
+            )
+        if broken:
+            names = "\n".join(f"・{n}" for n in broken)
+            sections.append(
+                f"ZIPとして開けませんでした（{len(broken)} 件）:\n{names}"
+            )
+        if sections:
+            QMessageBox.warning(self, "ZIP展開", "\n\n".join(sections))
+
+    def _cleanup_temp_dirs(self, dirs: list[str] | None) -> None:
+        """Remove temporary extraction directories (best-effort)."""
+        for d in dirs or []:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _start_import_worker(
+        self,
+        tree: list[tuple[str, str]],
+        *,
+        cleanup_dirs: list[str] | None = None,
+    ) -> None:
         total = len(tree)
         if total == 0:
+            self._cleanup_temp_dirs(cleanup_dirs)
             return
 
         # Pre-register expected destinations so FolderWatcher events don't
@@ -2378,6 +2427,7 @@ class MainWindow(QMainWindow):
             self._active_import_progress = None
             self._end_async_operation()
             self._on_import_finished(imported, failed, cancelled, tree)
+            self._cleanup_temp_dirs(cleanup_dirs)
             worker.deleteLater()
 
         worker.progress_updated.connect(_on_progress)
@@ -2737,7 +2787,7 @@ class MainWindow(QMainWindow):
                     event.acceptProposedAction()
                     return
                 ext = os.path.splitext(local)[1].lower()
-                if ext in _IMPORT_EXTS:
+                if ext in _IMPORT_EXTS or ext in _ZIP_EXTS:
                     event.acceptProposedAction()
                     return
 
@@ -3359,7 +3409,7 @@ class MainWindow(QMainWindow):
                 paths.append(local)
             else:
                 ext = os.path.splitext(local)[1].lower()
-                if ext in _IMPORT_EXTS:
+                if ext in _IMPORT_EXTS or ext in _ZIP_EXTS:
                     paths.append(local)
         if paths:
             self._import_paths(paths)
