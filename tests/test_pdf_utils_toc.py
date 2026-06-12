@@ -12,25 +12,18 @@ from src.utils.pdf_utils import (
     update_pdf_toc,
 )
 from src.utils import pdf_utils
-
-
-def _make_pdf(path, *, pages: int = 5, width: int = 320, height: int = 420) -> None:
-    doc = fitz.open()
-    for _ in range(pages):
-        doc.new_page(width=width, height=height)
-    doc.save(path)
-    doc.close()
+from tests.helpers import make_pdf
 
 
 def test_get_pdf_toc_empty(tmp_path):
     pdf_path = tmp_path / "empty.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path, pages=5)
     assert get_pdf_toc(str(pdf_path)) == []
 
 
 def test_set_get_toc_roundtrip_hierarchy(tmp_path):
     pdf_path = tmp_path / "toc.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path, pages=5)
 
     entries = [
         TocEntry(1, "Chapter 1", 1),
@@ -47,7 +40,7 @@ def test_set_get_toc_roundtrip_hierarchy(tmp_path):
 
 def test_update_toc_empty_clears_all(tmp_path):
     pdf_path = tmp_path / "clear.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path, pages=5)
 
     update_pdf_toc(str(pdf_path), [TocEntry(1, "Only", 1)])
     assert len(get_pdf_toc(str(pdf_path))) == 1
@@ -81,7 +74,7 @@ def test_normalize_toc_clamps_page_range():
 
 def test_update_toc_with_broken_levels_does_not_raise(tmp_path):
     pdf_path = tmp_path / "broken.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path, pages=5)
 
     # Starts at level 3 with a +2 gap afterwards — invalid for set_toc directly.
     update_pdf_toc(
@@ -94,7 +87,7 @@ def test_update_toc_with_broken_levels_does_not_raise(tmp_path):
 
 def test_update_toc_page_is_one_based(tmp_path):
     pdf_path = tmp_path / "onebased.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path, pages=5)
 
     update_pdf_toc(str(pdf_path), [TocEntry(1, "T", 2)])
     with fitz.open(str(pdf_path)) as doc:
@@ -105,7 +98,7 @@ def test_update_toc_page_is_one_based(tmp_path):
 def test_rasterize_pdf_preserves_bookmarks(tmp_path):
     src_path = tmp_path / "src.pdf"
     out_path = tmp_path / "out.pdf"
-    _make_pdf(src_path, pages=4)
+    make_pdf(src_path, pages=4)
 
     entries = [
         TocEntry(1, "Chapter 1", 1),
@@ -127,7 +120,7 @@ def test_rasterize_pdf_preserves_bookmarks(tmp_path):
 def test_rasterize_pdf_without_bookmarks(tmp_path):
     src_path = tmp_path / "src.pdf"
     out_path = tmp_path / "out.pdf"
-    _make_pdf(src_path, pages=3)
+    make_pdf(src_path, pages=3)
 
     rasterize_pdf(str(src_path), str(out_path), dpi=72)
 
@@ -136,7 +129,7 @@ def test_rasterize_pdf_without_bookmarks(tmp_path):
 
 def test_update_toc_raises_permission_error_when_locked(tmp_path, monkeypatch):
     pdf_path = tmp_path / "locked.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path, pages=5)
 
     monkeypatch.setattr(
         pdf_utils.shutil,

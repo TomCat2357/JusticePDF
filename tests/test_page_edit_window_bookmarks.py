@@ -1,33 +1,15 @@
 from __future__ import annotations
 
-import fitz
 import pytest
 
-from src.models.undo_manager import UndoManager
 from src.utils.pdf_utils import get_pdf_toc
-from src.views.page_edit_window import PageEditWindow
-
-
-def _make_pdf(path, *, pages: int = 4, width: int = 320, height: int = 420) -> None:
-    doc = fitz.open()
-    for _ in range(pages):
-        doc.new_page(width=width, height=height)
-    doc.save(path)
-    doc.close()
-
-
-def _create_window(qtbot, pdf_path) -> PageEditWindow:
-    window = PageEditWindow(str(pdf_path), UndoManager(max_size=20))
-    qtbot.addWidget(window)
-    window.show()
-    window._load_pages()
-    return window
+from tests.helpers import create_page_edit_window, make_pdf
 
 
 def test_add_bookmark_persists_and_undo_redo(qtbot, tmp_path):
     pdf_path = tmp_path / "bm.pdf"
-    _make_pdf(pdf_path)
-    window = _create_window(qtbot, pdf_path)
+    make_pdf(pdf_path, pages=4)
+    window = create_page_edit_window(qtbot, pdf_path)
 
     window._open_zoom_view(2)  # 0-based page index 2 -> page 3
     window._bookmarks_panel.set_open(True)
@@ -51,8 +33,8 @@ def test_add_bookmark_persists_and_undo_redo(qtbot, tmp_path):
 
 def test_jump_changes_zoom_page(qtbot, tmp_path):
     pdf_path = tmp_path / "jump.pdf"
-    _make_pdf(pdf_path)
-    window = _create_window(qtbot, pdf_path)
+    make_pdf(pdf_path, pages=4)
+    window = create_page_edit_window(qtbot, pdf_path)
 
     window._open_zoom_view(0)
     window._bookmarks_panel.set_open(True)
@@ -67,8 +49,8 @@ def test_jump_changes_zoom_page(qtbot, tmp_path):
 
 def test_hierarchy_persists_to_disk(qtbot, tmp_path):
     pdf_path = tmp_path / "hier.pdf"
-    _make_pdf(pdf_path)
-    window = _create_window(qtbot, pdf_path)
+    make_pdf(pdf_path, pages=4)
+    window = create_page_edit_window(qtbot, pdf_path)
 
     window._open_zoom_view(0)
     panel = window._bookmarks_panel
@@ -89,8 +71,8 @@ def test_hierarchy_persists_to_disk(qtbot, tmp_path):
 
 def test_drawer_mutually_exclusive_with_annotation_drawer(qtbot, tmp_path):
     pdf_path = tmp_path / "excl.pdf"
-    _make_pdf(pdf_path)
-    window = _create_window(qtbot, pdf_path)
+    make_pdf(pdf_path, pages=4)
+    window = create_page_edit_window(qtbot, pdf_path)
     window._open_zoom_view(0)
 
     window._bookmarks_panel.set_open(True)

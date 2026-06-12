@@ -3,44 +3,13 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-import fitz
 import pytest
-from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QMessageBox
 
 from src.utils.pdf_utils import get_pdf_toc
 from src.views import main_window, pdf_card
-
-
-class FakeWatcher(QObject):
-    file_added = pyqtSignal(str)
-    file_removed = pyqtSignal(str)
-    file_modified = pyqtSignal(str)
-    folder_added = pyqtSignal(str)
-    folder_removed = pyqtSignal(str)
-
-    def __init__(self, folder_path: str):
-        super().__init__()
-        self._folder_path = folder_path
-
-    def start(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def get_subfolders(self) -> list[str]:
-        return []
-
-
-def _make_pdf(path: Path, *, pages: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open()
-    for _ in range(pages):
-        doc.new_page(width=300, height=400)
-    doc.save(str(path))
-    doc.close()
+from tests.helpers import FakeWatcher, make_pdf
 
 
 @pytest.fixture
@@ -80,10 +49,10 @@ def test_merge_selected_builds_hierarchical_pdf(merge_window, qtbot):
 
     # work/FolderA/{a1.pdf, Sub/s1.pdf} と work/loose.pdf
     folder_a = work_dir / "FolderA"
-    _make_pdf(folder_a / "a1.pdf", pages=1)
-    _make_pdf(folder_a / "Sub" / "s1.pdf", pages=1)
+    make_pdf(folder_a / "a1.pdf", pages=1)
+    make_pdf(folder_a / "Sub" / "s1.pdf", pages=1)
     loose = work_dir / "loose.pdf"
-    _make_pdf(loose, pages=1)
+    make_pdf(loose, pages=1)
 
     # カードを作って選択(フォルダ→ファイルの順)
     fc = window._add_folder_card(str(folder_a))
@@ -122,9 +91,9 @@ def test_merge_selected_undo_restores_sources(merge_window, qtbot):
     window, work_dir, trashed = merge_window
 
     folder_a = work_dir / "FolderA"
-    _make_pdf(folder_a / "a1.pdf", pages=1)
+    make_pdf(folder_a / "a1.pdf", pages=1)
     loose = work_dir / "loose.pdf"
-    _make_pdf(loose, pages=2)
+    make_pdf(loose, pages=2)
 
     fc = window._add_folder_card(str(folder_a))
     fc.set_selected(True)

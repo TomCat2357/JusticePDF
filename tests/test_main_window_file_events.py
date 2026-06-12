@@ -3,34 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QApplication
 
 from src.views import main_window, pdf_card
 from src.views import page_edit_window as page_edit_window_module
 from src.models.undo_manager import UndoManager
-
-
-class FakeWatcher(QObject):
-    file_added = pyqtSignal(str)
-    file_removed = pyqtSignal(str)
-    file_modified = pyqtSignal(str)
-    folder_added = pyqtSignal(str)
-    folder_removed = pyqtSignal(str)
-
-    def __init__(self, folder_path: str):
-        super().__init__()
-        self._folder_path = folder_path
-
-    def start(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def get_subfolders(self) -> list[str]:
-        return []
+from tests.helpers import FakeWatcher
 
 
 @pytest.fixture

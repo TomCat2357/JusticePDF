@@ -6,12 +6,12 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QApplication
 
 from src.utils import zip_utils
 from src.views import main_window, pdf_card
+from tests.helpers import FakeWatcher
 
 _PDF_BYTES = b"%PDF-1.4\n%%EOF\n"
 
@@ -139,32 +139,11 @@ def test_prepare_zip_imports_reports_broken(tmp_path):
 # MainWindow integration
 # ─────────────────────────────────────────────────────────────────
 
-class _FakeWatcher(QObject):
-    file_added = pyqtSignal(str)
-    file_removed = pyqtSignal(str)
-    file_modified = pyqtSignal(str)
-    folder_added = pyqtSignal(str)
-    folder_removed = pyqtSignal(str)
-
-    def __init__(self, folder_path: str):
-        super().__init__()
-        self._folder_path = folder_path
-
-    def start(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def get_subfolders(self) -> list[str]:
-        return []
-
-
 @pytest.fixture
 def window(monkeypatch, qtbot, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    monkeypatch.setattr(main_window, "FolderWatcher", _FakeWatcher)
+    monkeypatch.setattr(main_window, "FolderWatcher", FakeWatcher)
     monkeypatch.setattr(main_window.MainWindow, "_load_existing_files", lambda self: None)
     monkeypatch.setattr(
         pdf_card,

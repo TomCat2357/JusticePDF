@@ -3,55 +3,23 @@
 
 from __future__ import annotations
 
-import fitz
 import pytest
-from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QApplication
 
-from src.models.undo_manager import UndoManager
 from src.utils.pdf_utils import (
     ShapeType,
     list_shape_annots,
 )
 from src.views import page_edit_window as page_edit_window_module
-from src.views.page_edit_window import PageEditWindow
-
-
-def _make_pdf(path, *, width: int = 320, height: int = 420) -> None:
-    doc = fitz.open()
-    doc.new_page(width=width, height=height)
-    doc.save(path)
-    doc.close()
-
-
-def _create_window(qtbot, pdf_path) -> PageEditWindow:
-    window = PageEditWindow(str(pdf_path), UndoManager(max_size=20))
-    qtbot.addWidget(window)
-    window.show()
-    window._load_pages()
-    return window
-
-
-def _open_zoom(window: PageEditWindow, qtbot) -> None:
-    window._open_zoom_view(0)
-    qtbot.waitUntil(
-        lambda: window._zoom_view.isVisible()
-        and window._zoom_label is not None
-        and window._zoom_label._pixmap is not None
-        and not window._zoom_label._pixmap.isNull()
-    )
-
-
-def _page_click_pos(window: PageEditWindow, x: int, y: int) -> QPoint:
-    offset = window._zoom_label._pixmap_offset()
-    return QPoint(int(offset.x() + x), int(offset.y() + y))
+from tests.helpers import create_page_edit_window, make_pdf, open_zoom, page_click_pos
 
 
 def _drag_on_zoom_label(qtbot, window, start, end) -> None:
-    qtbot.mousePress(window._zoom_label, Qt.MouseButton.LeftButton, pos=_page_click_pos(window, *start))
-    qtbot.mouseMove(window._zoom_label, _page_click_pos(window, *end))
-    qtbot.mouseRelease(window._zoom_label, Qt.MouseButton.LeftButton, pos=_page_click_pos(window, *end))
+    qtbot.mousePress(window._zoom_label, Qt.MouseButton.LeftButton, pos=page_click_pos(window, *start))
+    qtbot.mouseMove(window._zoom_label, page_click_pos(window, *end))
+    qtbot.mouseRelease(window._zoom_label, Qt.MouseButton.LeftButton, pos=page_click_pos(window, *end))
 
 
 def _enter_shape_mode(qtbot, window, shape_type: ShapeType) -> None:
@@ -61,10 +29,10 @@ def _enter_shape_mode(qtbot, window, shape_type: ShapeType) -> None:
 @pytest.mark.usefixtures("qtbot")
 def test_shape_button_enables_style_controls_without_selection(qtbot, tmp_path):
     pdf_path = tmp_path / "shape-controls.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     # 何も選択していない初期状態では、線色などのコントロールは無効
     assert window._selected_zoom_annotation is None
@@ -93,10 +61,10 @@ def test_shape_button_enables_style_controls_without_selection(qtbot, tmp_path):
 @pytest.mark.usefixtures("qtbot")
 def test_pick_line_color_in_create_mode_applies_to_new_line(qtbot, monkeypatch, tmp_path):
     pdf_path = tmp_path / "line-color.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     _enter_shape_mode(qtbot, window, ShapeType.LINE)
 
@@ -123,10 +91,10 @@ def test_pick_line_color_in_create_mode_applies_to_new_line(qtbot, monkeypatch, 
 @pytest.mark.usefixtures("qtbot")
 def test_rectangle_create_mode_uses_default_border_and_fill(qtbot, monkeypatch, tmp_path):
     pdf_path = tmp_path / "rect-color.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     _enter_shape_mode(qtbot, window, ShapeType.RECTANGLE)
     # 矩形では背景色も編集対象として有効化される
@@ -154,10 +122,10 @@ def test_rectangle_create_mode_uses_default_border_and_fill(qtbot, monkeypatch, 
 @pytest.mark.usefixtures("qtbot")
 def test_triangle_apex_default_applies_to_new_triangle(qtbot, tmp_path):
     pdf_path = tmp_path / "triangle-apex.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     _enter_shape_mode(qtbot, window, ShapeType.TRIANGLE)
     assert window._zoom_shape_triangle_options.isVisible() is True
@@ -176,10 +144,10 @@ def test_triangle_apex_default_applies_to_new_triangle(qtbot, tmp_path):
 @pytest.mark.usefixtures("qtbot")
 def test_freetext_new_mode_enables_text_color_without_selection(qtbot, tmp_path):
     pdf_path = tmp_path / "ft-defaults.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     assert window._zoom_annotation_text_color_btn.isEnabled() is False
 
@@ -202,10 +170,10 @@ def test_freetext_new_mode_enables_text_color_without_selection(qtbot, tmp_path)
 @pytest.mark.usefixtures("qtbot")
 def test_switching_from_freetext_to_shape_mode_updates_panel(qtbot, tmp_path):
     pdf_path = tmp_path / "switch-mode.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
     assert window._zoom_create_mode == "freetext"
@@ -225,10 +193,10 @@ def test_shape_button_while_annotation_selected_enters_create_mode(qtbot, tmp_pa
     """線を選択（アクティベイト）中に□を押したら、その線の編集ではなく
     □の新規配置モードへ切り替わること（選択が解除され作成デフォルトを表示）。"""
     pdf_path = tmp_path / "select-then-shape.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     # 線を1本描く → 作成直後はその線が選択（アクティベイト）状態になる
     _enter_shape_mode(qtbot, window, ShapeType.LINE)

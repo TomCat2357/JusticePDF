@@ -14,16 +14,10 @@ from src.utils.pdf_utils import (
     replace_freetext_annot,
 )
 from src.utils import pdf_utils
+from tests.helpers import make_pdf
 
 
 pytestmark = pytest.mark.usefixtures("qapp")
-
-
-def _make_pdf(path, *, width: int = 320, height: int = 420) -> None:
-    doc = fitz.open()
-    doc.new_page(width=width, height=height)
-    doc.save(path)
-    doc.close()
 
 
 def _assert_color_close(actual, expected) -> None:
@@ -41,7 +35,7 @@ def _page_rgb(path, x: int, y: int, *, annots: bool = True) -> tuple[int, int, i
 
 def test_freetext_create_replace_delete_roundtrip(tmp_path):
     pdf_path = tmp_path / "roundtrip.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -99,7 +93,7 @@ def test_freetext_create_replace_delete_roundtrip(tmp_path):
 
 def test_list_freetext_annots_reads_existing_richtext(tmp_path):
     pdf_path = tmp_path / "existing-richtext.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     doc = fitz.open(str(pdf_path))
     page = doc[0]
@@ -131,7 +125,7 @@ def test_list_freetext_annots_reads_existing_richtext(tmp_path):
 
 def test_freetext_create_and_replace_keep_richtext_appearance_data(tmp_path):
     pdf_path = tmp_path / "richtext-appearance.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -197,7 +191,7 @@ def test_freetext_create_and_replace_keep_richtext_appearance_data(tmp_path):
 
 def test_freetext_create_with_empty_content_generates_visible_border_appearance(tmp_path):
     pdf_path = tmp_path / "empty-border-appearance.pdf"
-    _make_pdf(pdf_path, width=300, height=300)
+    make_pdf(pdf_path, width=300, height=300)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -228,7 +222,7 @@ def test_freetext_create_with_empty_content_generates_visible_border_appearance(
 
 def test_freetext_replace_updates_empty_border_appearance(tmp_path):
     pdf_path = tmp_path / "replace-empty-border-appearance.pdf"
-    _make_pdf(pdf_path, width=300, height=300)
+    make_pdf(pdf_path, width=300, height=300)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -274,7 +268,7 @@ def test_freetext_replace_updates_empty_border_appearance(tmp_path):
 
 def test_freetext_create_preserves_transparent_fill_and_border_metadata(tmp_path):
     pdf_path = tmp_path / "transparent-colors.pdf"
-    _make_pdf(pdf_path, width=300, height=300)
+    make_pdf(pdf_path, width=300, height=300)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -311,7 +305,7 @@ def test_freetext_create_preserves_transparent_fill_and_border_metadata(tmp_path
 
 def test_get_page_pixmap_can_exclude_annotation_appearance(tmp_path):
     pdf_path = tmp_path / "pixmap-annots-flag.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     create_freetext_annot(
         str(pdf_path),
@@ -345,7 +339,7 @@ def test_get_page_pixmap_can_exclude_annotation_appearance(tmp_path):
 
 def test_replace_freetext_annot_raises_permission_error_when_destination_is_locked(tmp_path, monkeypatch):
     pdf_path = tmp_path / "locked-replace.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -467,7 +461,7 @@ def test_freetext_annot_has_correct_rotate_key_on_rotated_page(tmp_path, rotatio
 def test_freetext_text_rotation_after_page_rotation(tmp_path):
     """text_rotation must reflect delta between current and creation rotation."""
     pdf_path = tmp_path / "text-rot.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     create_freetext_annot(
         str(pdf_path),
@@ -493,7 +487,7 @@ def test_freetext_text_rotation_after_page_rotation(tmp_path):
 def test_freetext_edit_resets_rotation_on_rotated_page(tmp_path):
     """Replacing with subject='' resets page_rotation to current page rotation."""
     pdf_path = tmp_path / "edit-reset.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -538,7 +532,7 @@ def test_freetext_edit_resets_rotation_on_rotated_page(tmp_path):
 def test_freetext_undo_restores_original_rotation(tmp_path):
     """Restoring old annotation data (with subject metadata) preserves original rotation."""
     pdf_path = tmp_path / "undo-rot.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -591,7 +585,7 @@ def test_freetext_undo_restores_original_rotation(tmp_path):
 def test_freetext_move_preserves_rotation(tmp_path):
     """Move (with subject preserved) should keep original rotation."""
     pdf_path = tmp_path / "move-rot.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     create_freetext_annot(
         str(pdf_path),
@@ -627,7 +621,7 @@ def test_freetext_move_preserves_rotation(tmp_path):
 
 def test_rotate_pages_raises_permission_error_when_destination_is_locked(tmp_path, monkeypatch):
     pdf_path = tmp_path / "locked-rotate.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     monkeypatch.setattr(
         fitz.Document,
