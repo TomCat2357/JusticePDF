@@ -307,13 +307,20 @@ class MainWindow(QMainWindow):
         self._select_all_btn.clicked.connect(self._on_select_all)
         toolbar.addWidget(self._select_all_btn)
 
-        self._sort_name_btn = QPushButton("名前順")
-        self._sort_name_btn.clicked.connect(self._on_sort_by_name)
-        toolbar.addWidget(self._sort_name_btn)
-
-        self._sort_date_btn = QPushButton("日付順")
-        self._sort_date_btn.clicked.connect(self._on_sort_by_date)
-        toolbar.addWidget(self._sort_date_btn)
+        # 並び替え（名前順・日付順 × 昇順・降順）を 1 つのボタンに統合し、
+        # クリックでドロップダウンメニューを表示する。
+        self._sort_btn = QPushButton("並び替え")
+        self._sort_menu = QMenu(self._sort_btn)
+        self._sort_menu.addAction("名前順（昇順）").triggered.connect(
+            lambda: self._apply_sort("name", True))
+        self._sort_menu.addAction("名前順（降順）").triggered.connect(
+            lambda: self._apply_sort("name", False))
+        self._sort_menu.addAction("日付順（昇順）").triggered.connect(
+            lambda: self._apply_sort("date", True))
+        self._sort_menu.addAction("日付順（降順）").triggered.connect(
+            lambda: self._apply_sort("date", False))
+        self._sort_btn.setMenu(self._sort_menu)
+        toolbar.addWidget(self._sort_btn)
 
         self._update_button_states()
 
@@ -2776,28 +2783,16 @@ class MainWindow(QMainWindow):
             self._selected_cards.append(card)
         self._update_button_states()
 
-    def _on_sort_by_name(self) -> None:
-        """Handle sort by name."""
-        self._sort_by("name", default_ascending=True)
-
-    def _on_sort_by_date(self) -> None:
-        """Handle sort by date."""
-        self._sort_by("date", default_ascending=False)
-
-    def _sort_by(self, sort_type: str, default_ascending: bool) -> None:
-        """Sort cards by the specified type with undo support."""
+    def _apply_sort(self, sort_type: str, ascending: bool) -> None:
+        """Sort cards by the specified type/direction with undo support."""
         # Store paths instead of widget references
         old_paths = [card.pdf_path for card in self._cards]
         old_sort_order = self._sort_order
         old_ascending = self._sort_ascending
 
-        if self._sort_order == sort_type:
-            self._sort_ascending = not self._sort_ascending
-        else:
-            self._sort_order = sort_type
-            self._sort_ascending = default_ascending
+        self._sort_order = sort_type
+        self._sort_ascending = ascending
 
-        new_ascending = self._sort_ascending
         self._sort_cards()
         self._refresh_grid()
         new_paths = [card.pdf_path for card in self._cards]
@@ -2811,7 +2806,7 @@ class MainWindow(QMainWindow):
         def redo():
             self._rebuild_cards_from_paths(new_paths)
             self._sort_order = sort_type
-            self._sort_ascending = new_ascending
+            self._sort_ascending = ascending
             self._refresh_grid()
 
         self._undo_manager.add_action(UndoAction(
