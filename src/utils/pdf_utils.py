@@ -2131,6 +2131,11 @@ def rasterize_pdf(
                 width=page.rect.width, height=page.rect.height
             )
             out_page.insert_image(out_page.rect, stream=img_data)
+        # Pages are copied 1:1 in the same order, so the source bookmarks
+        # (outline/TOC) stay valid; carry them over to the rasterized output.
+        toc = src_doc.get_toc(simple=True)
+        if toc:
+            out_doc.set_toc(toc)
         out_doc.save(output_path, garbage=1, deflate=True)
     finally:
         src_doc.close()
