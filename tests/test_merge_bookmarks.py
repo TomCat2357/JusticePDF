@@ -1,30 +1,19 @@
 from __future__ import annotations
 
-import fitz
-
 from src.utils.pdf_utils import (
     get_pdf_toc,
     merge_paths_to_pdf,
     merge_pdfs,
     merge_pdfs_in_place,
 )
-
-
-def _make_pdf(path, *, pages: int, toc: list | None = None) -> None:
-    doc = fitz.open()
-    for _ in range(pages):
-        doc.new_page(width=300, height=400)
-    if toc:
-        doc.set_toc(toc)
-    doc.save(str(path))
-    doc.close()
+from tests.helpers import make_pdf
 
 
 def test_merge_in_place_append_adds_file_bookmarks(tmp_path):
     a = tmp_path / "a.pdf"
     b = tmp_path / "b.pdf"
-    _make_pdf(a, pages=2)
-    _make_pdf(b, pages=3)
+    make_pdf(a, pages=2)
+    make_pdf(b, pages=3)
 
     merge_pdfs_in_place(str(a), [str(b)], add_file_bookmarks=True)
 
@@ -38,8 +27,8 @@ def test_merge_in_place_append_adds_file_bookmarks(tmp_path):
 def test_merge_in_place_insert_at_zero(tmp_path):
     a = tmp_path / "a.pdf"
     b = tmp_path / "b.pdf"
-    _make_pdf(a, pages=2)  # destination
-    _make_pdf(b, pages=3)  # inserted first
+    make_pdf(a, pages=2)  # destination
+    make_pdf(b, pages=3)  # inserted first
 
     merge_pdfs_in_place(str(a), [str(b)], insert_at=0, add_file_bookmarks=True)
 
@@ -56,8 +45,8 @@ def test_merge_keeps_source_bookmarks_as_children(tmp_path):
     # 結合先(a)の既存しおりは再ネストせずそのまま残る。
     a = tmp_path / "a.pdf"
     b = tmp_path / "b.pdf"
-    _make_pdf(a, pages=2, toc=[[1, "A-Chapter", 1]])
-    _make_pdf(b, pages=3, toc=[[1, "B-Chapter", 2]])
+    make_pdf(a, pages=2, toc=[[1, "A-Chapter", 1]])
+    make_pdf(b, pages=3, toc=[[1, "B-Chapter", 2]])
 
     merge_pdfs_in_place(str(a), [str(b)], add_file_bookmarks=True)
 
@@ -75,10 +64,10 @@ def test_repeated_merges_stay_flat(tmp_path):
     b = tmp_path / "b.pdf"
     c = tmp_path / "c.pdf"
     d = tmp_path / "d.pdf"
-    _make_pdf(a, pages=1)
-    _make_pdf(b, pages=1)
-    _make_pdf(c, pages=1)
-    _make_pdf(d, pages=1)
+    make_pdf(a, pages=1)
+    make_pdf(b, pages=1)
+    make_pdf(c, pages=1)
+    make_pdf(d, pages=1)
 
     # 末尾追加で1ファイルずつ重ねる
     merge_pdfs_in_place(str(a), [str(b)], add_file_bookmarks=True)
@@ -100,9 +89,9 @@ def test_repeated_insert_at_zero_stay_flat(tmp_path):
     a = tmp_path / "a.pdf"  # 結合先(常に末尾に残る)
     b = tmp_path / "b.pdf"
     c = tmp_path / "c.pdf"
-    _make_pdf(a, pages=1)
-    _make_pdf(b, pages=1)
-    _make_pdf(c, pages=1)
+    make_pdf(a, pages=1)
+    make_pdf(b, pages=1)
+    make_pdf(c, pages=1)
 
     merge_pdfs_in_place(str(a), [str(b)], insert_at=0, add_file_bookmarks=True)
     merge_pdfs_in_place(str(a), [str(c)], insert_at=0, add_file_bookmarks=True)
@@ -121,9 +110,9 @@ def test_merge_pdfs_fresh_adds_bookmarks(tmp_path):
     b = tmp_path / "b.pdf"
     c = tmp_path / "c.pdf"
     out = tmp_path / "out.pdf"
-    _make_pdf(a, pages=2)
-    _make_pdf(b, pages=3)
-    _make_pdf(c, pages=1)
+    make_pdf(a, pages=2)
+    make_pdf(b, pages=3)
+    make_pdf(c, pages=1)
 
     merge_pdfs(str(out), [str(a), str(b), str(c)], add_file_bookmarks=True)
 
@@ -138,8 +127,8 @@ def test_merge_pdfs_fresh_adds_bookmarks(tmp_path):
 def test_merge_without_flag_adds_no_bookmarks(tmp_path):
     a = tmp_path / "a.pdf"
     b = tmp_path / "b.pdf"
-    _make_pdf(a, pages=2)
-    _make_pdf(b, pages=3)
+    make_pdf(a, pages=2)
+    make_pdf(b, pages=3)
 
     merge_pdfs_in_place(str(a), [str(b)])  # default: no bookmarks
 
@@ -150,9 +139,9 @@ def test_three_way_merge_in_place(tmp_path):
     a = tmp_path / "a.pdf"
     b = tmp_path / "b.pdf"
     c = tmp_path / "c.pdf"
-    _make_pdf(a, pages=2)
-    _make_pdf(b, pages=1)
-    _make_pdf(c, pages=4)
+    make_pdf(a, pages=2)
+    make_pdf(b, pages=1)
+    make_pdf(c, pages=4)
 
     merge_pdfs_in_place(str(a), [str(b), str(c)], add_file_bookmarks=True)
 
@@ -174,11 +163,11 @@ def test_merge_paths_builds_folder_hierarchy(tmp_path):
     folder = tmp_path / "FolderA"
     sub = folder / "Sub"
     sub.mkdir(parents=True)
-    _make_pdf(folder / "a1.pdf", pages=1)
-    _make_pdf(sub / "s1.pdf", pages=1)
-    _make_pdf(sub / "s2.pdf", pages=1)
+    make_pdf(folder / "a1.pdf", pages=1)
+    make_pdf(sub / "s1.pdf", pages=1)
+    make_pdf(sub / "s2.pdf", pages=1)
     loose = tmp_path / "loose.pdf"
-    _make_pdf(loose, pages=1)
+    make_pdf(loose, pages=1)
     out = tmp_path / "merged.pdf"
 
     total = merge_paths_to_pdf(str(out), [str(folder), str(loose)])
@@ -199,9 +188,9 @@ def test_merge_paths_top_level_order_is_preserved(tmp_path):
     # トップレベルは呼び出し側が渡した順(フォルダ→ファイル)で並ぶ
     folder = tmp_path / "Docs"
     folder.mkdir()
-    _make_pdf(folder / "inner.pdf", pages=1)
+    make_pdf(folder / "inner.pdf", pages=1)
     x = tmp_path / "x.pdf"
-    _make_pdf(x, pages=2)
+    make_pdf(x, pages=2)
     out = tmp_path / "merged.pdf"
 
     merge_paths_to_pdf(str(out), [str(folder), str(x)])
@@ -221,8 +210,8 @@ def test_merge_paths_skips_empty_folders(tmp_path):
     (empty / "note.txt").write_text("not a pdf", encoding="utf-8")
     x = tmp_path / "x.pdf"
     y = tmp_path / "y.pdf"
-    _make_pdf(x, pages=1)
-    _make_pdf(y, pages=1)
+    make_pdf(x, pages=1)
+    make_pdf(y, pages=1)
     out = tmp_path / "merged.pdf"
 
     total = merge_paths_to_pdf(str(out), [str(empty), str(x), str(y)])

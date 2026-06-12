@@ -3,6 +3,8 @@ import os
 from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel, QApplication, QWidget
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QUrl
 from PyQt6.QtGui import QDrag, QPixmap
+
+from src.views.view_helpers import apply_drag_pixmap
 from src.utils.pdf_utils import get_pdf_card_info
 
 PDFCARD_MIME_TYPE = "application/x-pdfas-card"
@@ -258,29 +260,7 @@ class PDFCard(QFrame):
             mime_data.setUrls(urls)
         drag.setMimeData(mime_data)
 
-        # Create drag pixmap
-        pixmap = self.grab()
-        pixmap = pixmap.scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatio)
-        
-        # Add badge for multiple selection
-        if len(selected_paths) > 1:
-            from PyQt6.QtGui import QPainter, QColor, QFont
-            painter = QPainter(pixmap)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            painter.setPen(Qt.GlobalColor.white)
-            painter.setBrush(QColor(0, 120, 215))
-            badge_size = 24
-            painter.drawEllipse(pixmap.width() - badge_size, 0, badge_size, badge_size)
-            font = QFont()
-            font.setBold(True)
-            font.setPointSize(10)
-            painter.setFont(font)
-            painter.drawText(pixmap.width() - badge_size, 0, badge_size, badge_size,
-                           Qt.AlignmentFlag.AlignCenter, str(len(selected_paths)))
-            painter.end()
-        
-        drag.setPixmap(pixmap)
-        drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+        apply_drag_pixmap(drag, self, count=len(selected_paths))
 
         # Allow both move (internal/cross-window) and copy (external/Ctrl).
         drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)

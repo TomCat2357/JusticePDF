@@ -6,7 +6,6 @@ from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication
 
-from src.models.undo_manager import UndoManager
 from src.utils.pdf_utils import (
     FreeTextAnnotData,
     PdfWritePermissionError,
@@ -16,40 +15,11 @@ from src.utils.pdf_utils import (
 )
 from src.views import page_edit_window as page_edit_window_module
 from src.views.page_edit_window import PageEditWindow
-
-
-def _make_pdf(path, *, width: int = 320, height: int = 420) -> None:
-    doc = fitz.open()
-    doc.new_page(width=width, height=height)
-    doc.save(path)
-    doc.close()
-
-
-def _create_window(qtbot, pdf_path) -> PageEditWindow:
-    window = PageEditWindow(str(pdf_path), UndoManager(max_size=20))
-    qtbot.addWidget(window)
-    window.show()
-    window._load_pages()
-    return window
-
-
-def _open_zoom(window: PageEditWindow, qtbot) -> None:
-    window._open_zoom_view(0)
-    qtbot.waitUntil(
-        lambda: window._zoom_view.isVisible()
-        and window._zoom_label is not None
-        and window._zoom_label._pixmap is not None
-        and not window._zoom_label._pixmap.isNull()
-    )
-
-
-def _page_click_pos(window: PageEditWindow, x: int, y: int) -> QPoint:
-    offset = window._zoom_label._pixmap_offset()
-    return QPoint(int(offset.x() + x), int(offset.y() + y))
+from tests.helpers import create_page_edit_window, make_pdf, open_zoom, page_click_pos
 
 
 def _page_global_pos(window: PageEditWindow, x: int, y: int) -> QPoint:
-    return window._zoom_label.mapToGlobal(_page_click_pos(window, x, y))
+    return window._zoom_label.mapToGlobal(page_click_pos(window, x, y))
 
 
 def _set_cursor_pos(qtbot, pos: QPoint) -> None:
@@ -65,13 +35,13 @@ def _drag_on_zoom_label(qtbot, window: PageEditWindow, start: tuple[int, int], e
     qtbot.mousePress(
         window._zoom_label,
         Qt.MouseButton.LeftButton,
-        pos=_page_click_pos(window, *start),
+        pos=page_click_pos(window, *start),
     )
-    qtbot.mouseMove(window._zoom_label, _page_click_pos(window, *end))
+    qtbot.mouseMove(window._zoom_label, page_click_pos(window, *end))
     qtbot.mouseRelease(
         window._zoom_label,
         Qt.MouseButton.LeftButton,
-        pos=_page_click_pos(window, *end),
+        pos=page_click_pos(window, *end),
     )
 
 
@@ -82,10 +52,10 @@ def _annotation_for(window: PageEditWindow, xref: int):
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_drawer_starts_closed_and_can_create_freetext(qtbot, tmp_path):
     pdf_path = tmp_path / "drawer-create.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     assert window._zoom_annotation_open is False
     assert window._zoom_object_btn.isVisible()
@@ -113,7 +83,7 @@ def test_zoom_drawer_starts_closed_and_can_create_freetext(qtbot, tmp_path):
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_selects_existing_freetext_and_applies_direct_edit_and_form_changes(qtbot, tmp_path):
     pdf_path = tmp_path / "select-apply.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     doc = fitz.open(str(pdf_path))
     page = doc[0]
@@ -130,8 +100,8 @@ def test_zoom_selects_existing_freetext_and_applies_direct_edit_and_form_changes
     doc.saveIncr()
     doc.close()
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     base_pixel = window._zoom_label._pixmap.toImage().pixelColor(110, 90)
     assert base_pixel.red() > 240
@@ -187,7 +157,7 @@ def test_zoom_selects_existing_freetext_and_applies_direct_edit_and_form_changes
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_can_move_resize_and_undo_redo_freetext(qtbot, tmp_path):
     pdf_path = tmp_path / "drag-resize.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -205,8 +175,8 @@ def test_zoom_can_move_resize_and_undo_redo_freetext(qtbot, tmp_path):
         ),
     )
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     annot = _annotation_for(window, created.xref)
     rect = window._zoom_label._annotation_widget_rect(annot)
@@ -240,7 +210,7 @@ def test_zoom_can_move_resize_and_undo_redo_freetext(qtbot, tmp_path):
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_arrow_keys_move_selected_freetext_with_fine_modifier(qtbot, tmp_path):
     pdf_path = tmp_path / "arrow-move.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -258,8 +228,8 @@ def test_zoom_arrow_keys_move_selected_freetext_with_fine_modifier(qtbot, tmp_pa
         ),
     )
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     annot = _annotation_for(window, created.xref)
     rect = window._zoom_label._annotation_widget_rect(annot)
@@ -293,7 +263,7 @@ def test_zoom_arrow_keys_move_selected_freetext_with_fine_modifier(qtbot, tmp_pa
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_delete_key_removes_selected_freetext_instead_of_page(qtbot, tmp_path):
     pdf_path = tmp_path / "delete-selected.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -311,8 +281,8 @@ def test_zoom_delete_key_removes_selected_freetext_instead_of_page(qtbot, tmp_pa
         ),
     )
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     annot = _annotation_for(window, created.xref)
     rect = window._zoom_label._annotation_widget_rect(annot)
@@ -328,10 +298,10 @@ def test_zoom_delete_key_removes_selected_freetext_instead_of_page(qtbot, tmp_pa
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_delete_key_in_editor_deletes_char_not_annotation(qtbot, tmp_path):
     pdf_path = tmp_path / "delete-char-in-editor.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     qtbot.mouseClick(window._zoom_object_btn, Qt.MouseButton.LeftButton)
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
@@ -354,7 +324,7 @@ def test_zoom_delete_key_in_editor_deletes_char_not_annotation(qtbot, tmp_path):
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_can_clear_fill_and_border_colors(qtbot, tmp_path):
     pdf_path = tmp_path / "clear-transparent-colors.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -372,8 +342,8 @@ def test_zoom_can_clear_fill_and_border_colors(qtbot, tmp_path):
         ),
     )
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     annot = _annotation_for(window, created.xref)
     rect = window._zoom_label._annotation_widget_rect(annot)
@@ -401,7 +371,7 @@ def test_zoom_can_clear_fill_and_border_colors(qtbot, tmp_path):
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_can_copy_paste_freetext_and_undo_redo(qtbot, tmp_path):
     pdf_path = tmp_path / "copy-paste.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -421,8 +391,8 @@ def test_zoom_can_copy_paste_freetext_and_undo_redo(qtbot, tmp_path):
         ),
     )
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     source = _annotation_for(window, created.xref)
     rect = window._zoom_label._annotation_widget_rect(source)
@@ -476,7 +446,7 @@ def test_zoom_can_copy_paste_freetext_and_undo_redo(qtbot, tmp_path):
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_paste_ignores_cursor_outside_page(qtbot, tmp_path):
     pdf_path = tmp_path / "copy-paste-outside.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -494,8 +464,8 @@ def test_zoom_paste_ignores_cursor_outside_page(qtbot, tmp_path):
         ),
     )
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     source = _annotation_for(window, created.xref)
     rect = window._zoom_label._annotation_widget_rect(source)
@@ -520,7 +490,7 @@ def test_zoom_paste_ignores_cursor_outside_page(qtbot, tmp_path):
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_editor_ctrl_c_v_prioritize_text_editing(qtbot, tmp_path):
     pdf_path = tmp_path / "editor-priority.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -538,8 +508,8 @@ def test_zoom_editor_ctrl_c_v_prioritize_text_editing(qtbot, tmp_path):
         ),
     )
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     annot = _annotation_for(window, created.xref)
     rect = window._zoom_label._annotation_widget_rect(annot)
@@ -572,7 +542,7 @@ def test_zoom_editor_ctrl_c_v_prioritize_text_editing(qtbot, tmp_path):
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_text_edit_shows_warning_and_exits_editor_when_pdf_is_locked(qtbot, tmp_path, monkeypatch):
     pdf_path = tmp_path / "locked-edit.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     created = create_freetext_annot(
         str(pdf_path),
@@ -590,8 +560,8 @@ def test_zoom_text_edit_shows_warning_and_exits_editor_when_pdf_is_locked(qtbot,
         ),
     )
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     annot = _annotation_for(window, created.xref)
     rect = window._zoom_label._annotation_widget_rect(annot)
@@ -627,10 +597,10 @@ def test_zoom_text_edit_shows_warning_and_exits_editor_when_pdf_is_locked(qtbot,
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_rotate_shows_warning_when_pdf_is_locked(qtbot, tmp_path, monkeypatch):
     pdf_path = tmp_path / "locked-rotate.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     captured: dict[str, str] = {}
 
@@ -653,9 +623,9 @@ def test_zoom_rotate_shows_warning_when_pdf_is_locked(qtbot, tmp_path, monkeypat
 @pytest.mark.usefixtures("qtbot")
 def test_page_edit_rename_shows_warning_when_pdf_is_locked(qtbot, tmp_path, monkeypatch):
     pdf_path = tmp_path / "locked-rename.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
+    window = create_page_edit_window(qtbot, pdf_path)
 
     captured: dict[str, str] = {}
 
@@ -685,9 +655,9 @@ def test_page_edit_rename_shows_warning_when_pdf_is_locked(qtbot, tmp_path, monk
 @pytest.mark.usefixtures("qtbot")
 def test_page_edit_title_rename_shows_warning_when_pdf_is_locked(qtbot, tmp_path, monkeypatch):
     pdf_path = tmp_path / "locked-title.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
-    window = _create_window(qtbot, pdf_path)
+    window = create_page_edit_window(qtbot, pdf_path)
 
     captured: dict[str, str] = {}
 
@@ -717,7 +687,7 @@ def test_page_edit_title_rename_shows_warning_when_pdf_is_locked(qtbot, tmp_path
 @pytest.mark.usefixtures("qtbot")
 def test_zoom_copy_without_selected_annotation_still_copies_selected_text(qtbot, tmp_path):
     pdf_path = tmp_path / "selected-text-copy.pdf"
-    _make_pdf(pdf_path)
+    make_pdf(pdf_path)
 
     doc = fitz.open(str(pdf_path))
     page = doc[0]
@@ -725,8 +695,8 @@ def test_zoom_copy_without_selected_annotation_still_copies_selected_text(qtbot,
     doc.saveIncr()
     doc.close()
 
-    window = _create_window(qtbot, pdf_path)
-    _open_zoom(window, qtbot)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
 
     assert len(window._zoom_label._words) >= 2
     window._zoom_label._selected_word_indices = list(range(len(window._zoom_label._words)))

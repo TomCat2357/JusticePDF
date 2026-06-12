@@ -127,13 +127,6 @@ def _save(widget, name: str) -> Path:
     return out
 
 
-def _patch_main_window(monkeypatch_targets: list[tuple]):
-    """Apply monkey-patches similar to tests/conftest.py + window_factory."""
-    setattr(main_window, "FolderWatcher", FakeWatcher)
-    main_window.MainWindow._load_existing_files = lambda self: None  # type: ignore[assignment]
-    monkeypatch_targets.append(None)  # placeholder
-
-
 # ---------- Scene builders ----------
 
 def build_main_window(work_dir: Path, with_folders: bool = True) -> "main_window.MainWindow":

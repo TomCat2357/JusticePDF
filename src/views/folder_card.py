@@ -6,6 +6,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QUrl, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import QDrag, QPixmap
 
+from src.views.view_helpers import apply_drag_pixmap
+
 from src.views.pdf_card import PDFCARD_MIME_TYPE
 
 FOLDERCARD_MIME_TYPE = "application/x-pdfas-folder"
@@ -206,10 +208,7 @@ class FolderCard(QFrame):
             mime_data.setUrls(urls)
         drag.setMimeData(mime_data)
 
-        pixmap = self.grab()
-        pixmap = pixmap.scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatio)
-        drag.setPixmap(pixmap)
-        drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+        apply_drag_pixmap(drag, self)
 
         drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
 

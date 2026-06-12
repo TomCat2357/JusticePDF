@@ -3,18 +3,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import fitz
+import pytest
 
 from src.utils.pdf_utils import clear_pixmap_cache_for_path, get_pdf_card_info
+from tests.helpers import make_pdf
 
 
-def _make_pdf(path: Path, fill: tuple[float, float, float], *, page_count: int = 1) -> None:
-    doc = fitz.open()
-    for _ in range(page_count):
-        page = doc.new_page(width=120, height=120)
-        page.draw_rect(fitz.Rect(0, 0, 120, 120), color=fill, fill=fill)
-    doc.save(path)
-    doc.close()
+pytestmark = pytest.mark.usefixtures("qapp")
 
 
 def _center_rgb(pixmap) -> tuple[int, int, int]:
@@ -28,11 +23,11 @@ def test_get_pdf_card_info_refreshes_when_same_path_is_replaced_with_same_mtime(
     replacement_path = tmp_path / "replacement.pdf"
     fixed_ns = 1_700_000_000_000_000_000
 
-    _make_pdf(pdf_path, (1.0, 0.0, 0.0), page_count=1)
+    make_pdf(pdf_path, pages=1, width=120, height=120, fill=(1.0, 0.0, 0.0))
     os.utime(pdf_path, ns=(fixed_ns, fixed_ns))
     first_pixmap, first_page_count = get_pdf_card_info(str(pdf_path), size=64)
 
-    _make_pdf(replacement_path, (0.0, 0.0, 1.0), page_count=2)
+    make_pdf(replacement_path, pages=2, width=120, height=120, fill=(0.0, 0.0, 1.0))
     os.utime(replacement_path, ns=(fixed_ns, fixed_ns))
     os.replace(replacement_path, pdf_path)
     os.utime(pdf_path, ns=(fixed_ns, fixed_ns))
