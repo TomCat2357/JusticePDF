@@ -2533,16 +2533,18 @@ class MainWindow(QMainWindow):
             )
 
     def _on_export(self) -> None:
-        """Export selected PDFs (or all PDFs if none selected) to a chosen folder.
+        """Export the selected PDFs to a chosen folder.
 
-        A dialog lets the user pick format, DPI, quality, and compression
-        settings before choosing the output directory.
+        If no PDFs are selected, a dialog prompts the user to make a
+        selection and the export is aborted. A dialog lets the user pick
+        format, DPI, quality, and compression settings before choosing the
+        output directory.
         """
-        targets = [c.pdf_path for c in self._selected_cards] if self._selected_cards else [c.pdf_path for c in self._cards]
-
-        if not targets:
-            QMessageBox.information(self, "Export", "エクスポート対象のPDFがありません。")
+        if not self._selected_cards:
+            QMessageBox.information(self, "Export", "エクスポートするファイルを選択してください。")
             return
+
+        targets = [c.pdf_path for c in self._selected_cards]
 
         dialog = ExportOptionsDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
