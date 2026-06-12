@@ -4,6 +4,7 @@ import os
 import shutil
 import logging
 from collections import deque
+from collections.abc import Callable
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
@@ -2881,6 +2882,33 @@ class PageEditWindow(QMainWindow):
             ),
         )
 
+    def _push_undoable(
+        self,
+        description: str,
+        do_func: Callable[[], None],
+        undo_func: Callable[[], None],
+        *,
+        selected_annotation_on_error: FreeTextAnnotData | None = None,
+    ) -> bool:
+        """do_func を実行し、成功時のみ Undo/Redo 履歴に登録する。
+
+        PdfWritePermissionError 時は警告ダイアログを表示して False を返す
+        (履歴には積まない)。redo には do_func をそのまま使う。
+        """
+        try:
+            do_func()
+        except PdfWritePermissionError as error:
+            self._handle_pdf_write_permission_denied(
+                error, selected_annotation=selected_annotation_on_error
+            )
+            return False
+        self._undo_manager.add_action(UndoAction(
+            description=description,
+            undo_func=undo_func,
+            redo_func=do_func,
+        ))
+        return True
+
     def _handle_file_operation_error(self, error: Exception, pdf_path: str, action: str) -> None:
         logger.warning("%s failed for %s", action, pdf_path)
         logger.debug("%s failed for %s", action, pdf_path, exc_info=True)
@@ -2954,16 +2982,9 @@ class PageEditWindow(QMainWindow):
                 self._selected_zoom_annotation = None
                 self._refresh_current_zoom_page()
 
-            try:
-                do_paste_shape()
-            except PdfWritePermissionError as error:
-                self._handle_pdf_write_permission_denied(error)
-                return
-            self._undo_manager.add_action(UndoAction(
-                description=f"Paste {paste_data.shape_type.value}",
-                undo_func=undo_paste_shape,
-                redo_func=do_paste_shape,
-            ))
+            self._push_undoable(
+                f"Paste {paste_data.shape_type.value}", do_paste_shape, undo_paste_shape
+            )
             return
 
         paste_data_ft = FreeTextAnnotData(
@@ -2995,16 +3016,7 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        try:
-            do_paste()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-        self._undo_manager.add_action(UndoAction(
-            description="Paste FreeText",
-            undo_func=undo_paste,
-            redo_func=do_paste,
-        ))
+        self._push_undoable("Paste FreeText", do_paste, undo_paste)
 
     def _on_zoom_annotation_duplicate_requested(
         self, annotation: object, rect: object, vertices: object
@@ -3049,16 +3061,9 @@ class PageEditWindow(QMainWindow):
                 self._selected_zoom_annotation = None
                 self._refresh_current_zoom_page()
 
-            try:
-                do_dup_shape()
-            except PdfWritePermissionError as error:
-                self._handle_pdf_write_permission_denied(error)
-                return
-            self._undo_manager.add_action(UndoAction(
-                description=f"Duplicate {dup_data.shape_type.value}",
-                undo_func=undo_dup_shape,
-                redo_func=do_dup_shape,
-            ))
+            self._push_undoable(
+                f"Duplicate {dup_data.shape_type.value}", do_dup_shape, undo_dup_shape
+            )
             return
 
         if not isinstance(annotation, FreeTextAnnotData):
@@ -3086,16 +3091,7 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        try:
-            do_dup_ft()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-        self._undo_manager.add_action(UndoAction(
-            description="Duplicate FreeText",
-            undo_func=undo_dup_ft,
-            redo_func=do_dup_ft,
-        ))
+        self._push_undoable("Duplicate FreeText", do_dup_ft, undo_dup_ft)
 
     def _on_zoom_annotation_form_value_changed(self, _value: int) -> None:
         self._apply_zoom_annotation_form()
@@ -3217,16 +3213,7 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        try:
-            do_create()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-        self._undo_manager.add_action(UndoAction(
-            description=f"Create {shape_type.value}",
-            undo_func=undo_create,
-            redo_func=do_create,
-        ))
+        self._push_undoable(f"Create {shape_type.value}", do_create, undo_create)
 
     def _create_bracket_pair(self, rect_tuple: tuple[float, float, float, float]) -> None:
         bracket_style = ["square", "round", "curly"][self._zoom_shape_bracket_style_combo.currentIndex()]
@@ -3259,16 +3246,7 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        try:
-            do_create()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-        self._undo_manager.add_action(UndoAction(
-            description="Create bracket pair",
-            undo_func=undo_create,
-            redo_func=do_create,
-        ))
+        self._push_undoable("Create bracket pair", do_create, undo_create)
 
     def _run_zoom_shape_replace(
         self,
@@ -3300,16 +3278,7 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = state["old"]
             self._refresh_current_zoom_page(open_drawer=True)
 
-        try:
-            do_replace()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-        self._undo_manager.add_action(UndoAction(
-            description=description,
-            undo_func=undo_replace,
-            redo_func=do_replace,
-        ))
+        self._push_undoable(description, do_replace, undo_replace)
 
     def _shape_data_from_form(
         self,
@@ -3472,16 +3441,7 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        try:
-            do_create()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-        self._undo_manager.add_action(UndoAction(
-            description="Create FreeText",
-            undo_func=undo_create,
-            redo_func=do_create,
-        ))
+        self._push_undoable("Create FreeText", do_create, undo_create)
 
     def _run_zoom_annotation_replace(
         self,
@@ -3513,16 +3473,10 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = state["old"]
             self._refresh_current_zoom_page(open_drawer=True)
 
-        try:
-            do_replace()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error, selected_annotation=state["old"])
-            return
-        self._undo_manager.add_action(UndoAction(
-            description=description,
-            undo_func=undo_replace,
-            redo_func=do_replace,
-        ))
+        self._push_undoable(
+            description, do_replace, undo_replace,
+            selected_annotation_on_error=state["old"],
+        )
 
     def _apply_zoom_annotation_form(self) -> None:
         if self._zoom_annotation_form_sync or self._selected_zoom_annotation is None:
@@ -3585,16 +3539,9 @@ class PageEditWindow(QMainWindow):
                 self._selected_zoom_annotation = state["old"]
                 self._refresh_current_zoom_page(open_drawer=True)
 
-            try:
-                do_delete_shape()
-            except PdfWritePermissionError as error:
-                self._handle_pdf_write_permission_denied(error)
-                return
-            self._undo_manager.add_action(UndoAction(
-                description=f"Delete {annot.shape_type.value}",
-                undo_func=undo_delete_shape,
-                redo_func=do_delete_shape,
-            ))
+            self._push_undoable(
+                f"Delete {annot.shape_type.value}", do_delete_shape, undo_delete_shape
+            )
             return
 
         state = {"old": annot}
@@ -3609,16 +3556,10 @@ class PageEditWindow(QMainWindow):
             self._selected_zoom_annotation = state["old"]
             self._refresh_current_zoom_page(open_drawer=True)
 
-        try:
-            do_delete()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error, selected_annotation=state["old"])
-            return
-        self._undo_manager.add_action(UndoAction(
-            description="Delete FreeText",
-            undo_func=undo_delete,
-            redo_func=do_delete,
-        ))
+        self._push_undoable(
+            "Delete FreeText", do_delete, undo_delete,
+            selected_annotation_on_error=state["old"],
+        )
 
     def _reorder_selected_zoom_annotation(self, mode: str) -> None:
         if self._selected_zoom_annotation is None or self._zoom_page_num is None:
@@ -4345,17 +4286,7 @@ class PageEditWindow(QMainWindow):
             insert_pages(pdf_path, backup_path, sorted_indices)
             self._load_pages()
 
-        try:
-            do_delete()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-
-        self._undo_manager.add_action(UndoAction(
-            description=f"Delete {len(indices)} page(s)",
-            undo_func=undo_delete,
-            redo_func=do_delete
-        ))
+        self._push_undoable(f"Delete {len(indices)} page(s)", do_delete, undo_delete)
 
     def _on_rename(self) -> None:
         old_path = self._pdf_path
@@ -4466,17 +4397,7 @@ class PageEditWindow(QMainWindow):
             for thumb in selected_thumbs:
                 self._request_thumbnail_refresh(thumb.page_num)
 
-        try:
-            do_rotate()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-
-        self._undo_manager.add_action(UndoAction(
-            description=f"Rotate {len(indices)} page(s)",
-            undo_func=undo_rotate,
-            redo_func=do_rotate
-        ))
+        self._push_undoable(f"Rotate {len(indices)} page(s)", do_rotate, undo_rotate)
 
     def _on_select_all(self) -> None:
         self._clear_selection()
@@ -4537,17 +4458,7 @@ class PageEditWindow(QMainWindow):
                 self._zoom_page_num = deleted_page
                 self._render_zoom_page()
 
-        try:
-            do_delete()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-
-        self._undo_manager.add_action(UndoAction(
-            description="Delete page from zoom view",
-            undo_func=undo_delete,
-            redo_func=do_delete
-        ))
+        self._push_undoable("Delete page from zoom view", do_delete, undo_delete)
 
     def _rotate_zoom_page(self) -> None:
         """ズームビュー表示中のページを回転"""
@@ -4575,17 +4486,7 @@ class PageEditWindow(QMainWindow):
             if page_num < len(self._thumbnails):
                 self._request_thumbnail_refresh(page_num)
 
-        try:
-            do_rotate()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-
-        self._undo_manager.add_action(UndoAction(
-            description="Rotate page from zoom view",
-            undo_func=undo_rotate,
-            redo_func=do_rotate
-        ))
+        self._push_undoable("Rotate page from zoom view", do_rotate, undo_rotate)
 
     def _delete_all_pages(self, backup_path: str) -> None:
         """全ページ削除（ファイルをゴミ箱へ移動し、UNDO対応）"""
@@ -4873,17 +4774,7 @@ class PageEditWindow(QMainWindow):
             reorder_pages(pdf_path, inverse)
             self._load_pages()
 
-        try:
-            do_reorder()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error)
-            return
-
-        self._undo_manager.add_action(UndoAction(
-            description="Reorder page",
-            undo_func=undo_reorder,
-            redo_func=do_reorder
-        ))
+        self._push_undoable("Reorder page", do_reorder, undo_reorder)
 
     def _handle_page_insert(self, source_pdf_path: str, source_pages: list[int], drop_pos) -> None:
         import tempfile
