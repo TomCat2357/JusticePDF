@@ -6,7 +6,8 @@ import logging
 from collections.abc import Callable, Iterable
 from typing import Protocol, TypeVar
 
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtGui import QAction, QColor, QDrag, QFont, QKeySequence, QPainter
 from PyQt6.QtWidgets import QAbstractButton, QScrollArea, QWidget
 
 Shortcut = QKeySequence | QKeySequence.StandardKey | str
@@ -85,3 +86,34 @@ def clear_selection(items: list[TSelectable]) -> None:
     for item in items:
         item.set_selected(False)
     items.clear()
+
+
+def apply_drag_pixmap(
+    drag: QDrag,
+    widget: QWidget,
+    *,
+    max_size: int = 100,
+    count: int = 1,
+    badge_size: int = 24,
+    badge_font_size: int = 10,
+) -> None:
+    """Set a scaled grab of the widget as the drag pixmap and hot spot.
+
+    When ``count`` > 1, draw a count badge in the top-right corner.
+    """
+    pixmap = widget.grab().scaled(max_size, max_size, Qt.AspectRatioMode.KeepAspectRatio)
+    if count > 1:
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.GlobalColor.white)
+        painter.setBrush(QColor(0, 120, 215))
+        painter.drawEllipse(pixmap.width() - badge_size, 0, badge_size, badge_size)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(badge_font_size)
+        painter.setFont(font)
+        painter.drawText(pixmap.width() - badge_size, 0, badge_size, badge_size,
+                         Qt.AlignmentFlag.AlignCenter, str(count))
+        painter.end()
+    drag.setPixmap(pixmap)
+    drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))

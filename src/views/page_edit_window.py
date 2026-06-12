@@ -71,6 +71,7 @@ def _line_endpoints_from_shape(
 from src.models.undo_manager import UndoManager, UndoAction
 from src.views.bookmarks_panel import BookmarksPanel
 from src.views.view_helpers import (
+    apply_drag_pixmap,
     clear_selection,
     log_undo_state,
     register_shortcuts,
@@ -277,28 +278,8 @@ class PageThumbnail(QFrame):
         mime_data.setData(PAGETHUMBNAIL_MIME_TYPE, data)
         drag.setMimeData(mime_data)
 
-        pixmap = self.grab()
-        pixmap = pixmap.scaled(80, 80, Qt.AspectRatioMode.KeepAspectRatio)
-        
-        # Add badge for multiple selection
-        if len(page_nums_list) > 1:
-            from PyQt6.QtGui import QPainter, QColor, QFont
-            painter = QPainter(pixmap)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            painter.setPen(Qt.GlobalColor.white)
-            painter.setBrush(QColor(0, 120, 215))
-            badge_size = 20
-            painter.drawEllipse(pixmap.width() - badge_size, 0, badge_size, badge_size)
-            font = QFont()
-            font.setBold(True)
-            font.setPointSize(9)
-            painter.setFont(font)
-            painter.drawText(pixmap.width() - badge_size, 0, badge_size, badge_size,
-                           Qt.AlignmentFlag.AlignCenter, str(len(page_nums_list)))
-            painter.end()
-        
-        drag.setPixmap(pixmap)
-        drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+        apply_drag_pixmap(drag, self, max_size=80, count=len(page_nums_list),
+                          badge_size=20, badge_font_size=9)
 
         result = drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
         logger.debug(f"Drag completed with result: {result}")
