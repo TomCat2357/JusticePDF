@@ -8,6 +8,7 @@ from src.utils.pdf_utils import (
     TocEntry,
     get_pdf_toc,
     normalize_toc,
+    rasterize_pdf,
     update_pdf_toc,
 )
 from src.utils import pdf_utils
@@ -99,6 +100,38 @@ def test_update_toc_page_is_one_based(tmp_path):
     with fitz.open(str(pdf_path)) as doc:
         raw = doc.get_toc(simple=True)
     assert raw[0][2] == 2
+
+
+def test_rasterize_pdf_preserves_bookmarks(tmp_path):
+    src_path = tmp_path / "src.pdf"
+    out_path = tmp_path / "out.pdf"
+    _make_pdf(src_path, pages=4)
+
+    entries = [
+        TocEntry(1, "Chapter 1", 1),
+        TocEntry(2, "Section 1.1", 2),
+        TocEntry(1, "Chapter 2", 3),
+    ]
+    update_pdf_toc(str(src_path), entries)
+
+    rasterize_pdf(str(src_path), str(out_path), dpi=72)
+
+    result = get_pdf_toc(str(out_path))
+    assert [(e.level, e.title, e.page) for e in result] == [
+        (1, "Chapter 1", 1),
+        (2, "Section 1.1", 2),
+        (1, "Chapter 2", 3),
+    ]
+
+
+def test_rasterize_pdf_without_bookmarks(tmp_path):
+    src_path = tmp_path / "src.pdf"
+    out_path = tmp_path / "out.pdf"
+    _make_pdf(src_path, pages=3)
+
+    rasterize_pdf(str(src_path), str(out_path), dpi=72)
+
+    assert get_pdf_toc(str(out_path)) == []
 
 
 def test_update_toc_raises_permission_error_when_locked(tmp_path, monkeypatch):
