@@ -27,10 +27,16 @@ class ExportOptionsDialog(QDialog):
 
     # Preset DPI and quality for each optimization level that includes image recompression.
     # {optimize_index: (dpi, quality%)}
+    # The low-compression side is intentionally sparse (only "なし"/"軽量"); the
+    # useful high-compression side is finely graded so the 150→60 dpi range is
+    # smoothly selectable instead of jumping straight to the strongest preset.
     _PRESETS: dict[int, tuple[int, int]] = {
-        2: (200, 85),
-        3: (150, 50),
-        4: (72, 10),
+        2: (150, 55),
+        3: (130, 42),
+        4: (110, 32),
+        5: (95, 24),
+        6: (80, 16),
+        7: (60, 10),
     }
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -80,8 +86,11 @@ class ExportOptionsDialog(QDialog):
         self._optimize_combo.addItems([
             "なし（そのまま保存）",
             "軽量（不要データ除去のみ）",
-            "標準（画像再圧縮 - 高画質）",
             "高圧縮（画像再圧縮）",
+            "強圧縮（画像再圧縮）",
+            "中強圧縮（画像再圧縮）",
+            "より強い圧縮（画像再圧縮）",
+            "かなり強い圧縮（画像再圧縮）",
             "最大圧縮（画像再圧縮 - 低画質）",
             "カスタム（画像再圧縮 - 任意設定）",
         ])
@@ -91,17 +100,24 @@ class ExportOptionsDialog(QDialog):
 
         # Image DPI for optimization (PDF only, levels 2+)
         self._img_dpi_combo = QComboBox()
+        # Includes every DPI used by _PRESETS (60/80/95/110/130/150) so preset
+        # selection can seed the exact value, plus rounder values for Custom.
         self._IMG_DPI_OPTIONS = [
-            ("72 dpi（最小・低画質）", 72),
-            ("100 dpi（小）", 100),
+            ("60 dpi（最小・低画質）", 60),
+            ("72 dpi", 72),
+            ("80 dpi", 80),
+            ("95 dpi", 95),
+            ("100 dpi", 100),
+            ("110 dpi", 110),
+            ("130 dpi", 130),
             ("150 dpi（標準）", 150),
-            ("200 dpi（やや高画質）", 200),
+            ("200 dpi（高画質）", 200),
             ("300 dpi（高画質）", 300),
             ("600 dpi（最高画質）", 600),
         ]
         for label, _ in self._IMG_DPI_OPTIONS:
             self._img_dpi_combo.addItem(label)
-        self._img_dpi_combo.setCurrentIndex(2)  # default: 150 dpi
+        self._img_dpi_combo.setCurrentIndex(self._dpi_option_index(150))  # default: 150 dpi
         self._img_dpi_label = QLabel("画像DPI:")
         form.addRow(self._img_dpi_label, self._img_dpi_combo)
 
@@ -210,6 +226,17 @@ class ExportOptionsDialog(QDialog):
         self._img_dpi_combo.setEnabled(not preset_locked)
         self._img_quality_slider.setEnabled(not preset_locked)
 
+    def _dpi_option_index(self, dpi: int) -> int:
+        """Return the _IMG_DPI_OPTIONS index whose DPI equals *dpi*, falling
+        back to the 150 dpi entry (or 0) when not present."""
+        for i, (_, d) in enumerate(self._IMG_DPI_OPTIONS):
+            if d == dpi:
+                return i
+        for i, (_, d) in enumerate(self._IMG_DPI_OPTIONS):
+            if d == 150:
+                return i
+        return 0
+
     def _on_optimize_changed(self, *_args) -> None:
         """Apply the preset DPI/quality for the chosen optimize level, then
         refresh visibility/enabled state. Selecting a preset seeds the image
@@ -217,11 +244,7 @@ class ExportOptionsDialog(QDialog):
         opt_idx = self._optimize_combo.currentIndex()
         if opt_idx in self._PRESETS:
             dpi, quality = self._PRESETS[opt_idx]
-            dpi_idx = next(
-                (i for i, (_, d) in enumerate(self._IMG_DPI_OPTIONS) if d == dpi),
-                2,
-            )
-            self._img_dpi_combo.setCurrentIndex(dpi_idx)
+            self._img_dpi_combo.setCurrentIndex(self._dpi_option_index(dpi))
             self._img_quality_slider.setValue(quality)
         self._update_controls()
 
