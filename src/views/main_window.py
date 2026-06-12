@@ -64,6 +64,17 @@ def _exts_to_filter(label: str, exts: set[str]) -> str:
     pattern = " ".join(f"*{e}" for e in sorted(exts))
     return f"{label} ({pattern})"
 
+
+def _format_size(num_bytes: int) -> str:
+    """Format a byte count as a human-readable string (B/KB/MB/GB)."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+
 # If conversion-required files exceed this count the user is warned first.
 IMPORT_OFFICE_WARN_THRESHOLD = 5
 
@@ -2572,6 +2583,11 @@ class MainWindow(QMainWindow):
         """Copy, optimize-export, or rasterize PDF files to the destination directory."""
         ok = 0
         failed: list[tuple[str, str]] = []
+        # Aggregate before/after sizes for files that were actually
+        # compressed or rasterized (size changes); plain copies are excluded.
+        total_before = 0
+        total_after = 0
+        compressed_count = 0
 
         for src in targets:
             try:
@@ -2581,6 +2597,7 @@ class MainWindow(QMainWindow):
 
                 filename = os.path.basename(src)
                 dst_path = ensure_unique_path(dst_dir, filename, pattern="{stem}({i}){ext}")
+                transformed = rasterize or optimize_level > 0
                 if rasterize:
                     rasterize_pdf(
                         src, str(dst_path),
@@ -2598,10 +2615,24 @@ class MainWindow(QMainWindow):
                 else:
                     shutil.copy2(src, dst_path)
                 ok += 1
+                if transformed:
+                    # Best-effort size aggregation; failures here must not
+                    # turn a successful export into a reported failure.
+                    try:
+                        total_before += os.path.getsize(src)
+                        total_after += os.path.getsize(str(dst_path))
+                        compressed_count += 1
+                    except OSError:
+                        pass
             except Exception as e:
                 failed.append((src, str(e)))
 
-        self._show_export_result(ok, failed)
+        self._show_export_result(
+            ok, failed,
+            total_before=total_before,
+            total_after=total_after,
+            compressed_count=compressed_count,
+        )
 
     def _export_as_images(
         self,
@@ -2636,7 +2667,21 @@ class MainWindow(QMainWindow):
         ok: int,
         failed: list[tuple[str, str]],
         label: str = "件",
+        *,
+        total_before: int | None = None,
+        total_after: int | None = None,
+        compressed_count: int = 0,
     ) -> None:
+        size_line = ""
+        if compressed_count > 0 and total_before is not None and total_after is not None:
+            before = _format_size(total_before)
+            after = _format_size(total_after)
+            if total_before > 0:
+                reduction = (1 - total_after / total_before) * 100
+                size_line = f"\n圧縮前: {before}  →  圧縮後: {after}（-{reduction:.0f}%）"
+            else:
+                size_line = f"\n圧縮前: {before}  →  圧縮後: {after}"
+
         if failed:
             details = "\n".join([f"- {os.path.basename(s)}: {r}" for s, r in failed[:20]])
             if len(failed) > 20:
@@ -2644,10 +2689,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "エクスポート結果",
-                f"{ok} {label}エクスポートしました。\n失敗: {len(failed)} 件\n\n{details}",
+                f"{ok} {label}エクスポートしました。{size_line}\n失敗: {len(failed)} 件\n\n{details}",
             )
         else:
-            QMessageBox.information(self, "エクスポート結果", f"{ok} {label}エクスポートしました。")
+            QMessageBox.information(
+                self,
+                "エクスポート結果",
+                f"{ok} {label}エクスポートしました。{size_line}",
+            )
 
     def _on_print(self) -> None:
         """Print selected PDFs (or all PDFs if none selected)."""
