@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
     QDialog, QFileDialog, QInputDialog, QMessageBox, QFrame, QRubberBand,
-    QProgressDialog,
+    QProgressDialog, QMenu,
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QPoint, QRect
 from PyQt6.QtGui import QKeySequence
@@ -236,30 +236,30 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        self._undo_btn = QPushButton("Undo")
+        self._undo_btn = QPushButton("元に戻す")
         self._undo_btn.clicked.connect(self._on_undo)
         toolbar.addWidget(self._undo_btn)
 
-        self._redo_btn = QPushButton("Redo")
+        self._redo_btn = QPushButton("やり直し")
         self._redo_btn.clicked.connect(self._on_redo)
         toolbar.addWidget(self._redo_btn)
 
         toolbar.addSeparator()
 
-        self._delete_btn = QPushButton("Delete")
+        self._delete_btn = QPushButton("削除")
         self._delete_btn.setObjectName("danger")
         self._delete_btn.clicked.connect(self._on_delete)
         toolbar.addWidget(self._delete_btn)
 
-        self._rename_btn = QPushButton("Rename")
+        self._rename_btn = QPushButton("名前変更")
         self._rename_btn.clicked.connect(self._on_rename)
         toolbar.addWidget(self._rename_btn)
 
-        self._title_btn = QPushButton("Title")
+        self._title_btn = QPushButton("タイトル")
         self._title_btn.clicked.connect(self._on_rename_pdf_title)
         toolbar.addWidget(self._title_btn)
 
-        self._merge_btn = QPushButton("Merge")
+        self._merge_btn = QPushButton("結合")
         self._merge_btn.setToolTip(
             "選択したファイル・フォルダを1つのPDFに結合\n"
             "（フォルダ構成をしおりの階層として再現します）"
@@ -269,46 +269,49 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        self._import_btn = QPushButton("Import")
-        self._import_btn.clicked.connect(self._on_import)
+        # インポート（ファイル / フォルダ）を 1 つのボタンに統合し、
+        # クリックでドロップダウンメニューを表示する。
+        self._import_btn = QPushButton("インポート")
+        self._import_menu = QMenu(self._import_btn)
+        import_files_action = self._import_menu.addAction("ファイルをインポート")
+        import_files_action.triggered.connect(self._on_import)
+        import_folder_action = self._import_menu.addAction("フォルダをインポート")
+        import_folder_action.triggered.connect(self._on_import_folder)
+        self._import_btn.setMenu(self._import_menu)
         toolbar.addWidget(self._import_btn)
 
-        self._import_folder_btn = QPushButton("Import Folder")
-        self._import_folder_btn.clicked.connect(self._on_import_folder)
-        toolbar.addWidget(self._import_folder_btn)
-
-        self._new_folder_btn = QPushButton("New Folder")
+        self._new_folder_btn = QPushButton("新規フォルダ")
         self._new_folder_btn.clicked.connect(self._on_new_folder)
         toolbar.addWidget(self._new_folder_btn)
 
-        self._export_btn = QPushButton("Export")
+        self._export_btn = QPushButton("エクスポート")
         self._export_btn.setObjectName("primary")
         self._export_btn.clicked.connect(self._on_export)
         toolbar.addWidget(self._export_btn)
 
-        self._print_btn = QPushButton("Print")
+        self._print_btn = QPushButton("印刷")
         self._print_btn.clicked.connect(self._on_print)
         toolbar.addWidget(self._print_btn)
 
-        self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn = QPushButton("更新")
         self._refresh_btn.clicked.connect(self._on_refresh)
         toolbar.addWidget(self._refresh_btn)
 
         toolbar.addSeparator()
 
-        self._rotate_btn = QPushButton("Rotate")
+        self._rotate_btn = QPushButton("回転")
         self._rotate_btn.clicked.connect(self._on_rotate)
         toolbar.addWidget(self._rotate_btn)
 
-        self._select_all_btn = QPushButton("Select All")
+        self._select_all_btn = QPushButton("すべて選択")
         self._select_all_btn.clicked.connect(self._on_select_all)
         toolbar.addWidget(self._select_all_btn)
 
-        self._sort_name_btn = QPushButton("Sort Name")
+        self._sort_name_btn = QPushButton("名前順")
         self._sort_name_btn.clicked.connect(self._on_sort_by_name)
         toolbar.addWidget(self._sort_name_btn)
 
-        self._sort_date_btn = QPushButton("Sort Date")
+        self._sort_date_btn = QPushButton("日付順")
         self._sort_date_btn.clicked.connect(self._on_sort_by_date)
         toolbar.addWidget(self._sort_date_btn)
 
