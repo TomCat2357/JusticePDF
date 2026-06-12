@@ -34,6 +34,15 @@ from src.utils.pdf_utils import (
     export_pages_as_images, export_pdf_compressed, images_to_pdf, rasterize_pdf,
 )
 from src.views.export_dialog import ExportOptionsDialog
+from src.utils.constants import (
+    WORD_EXTS as _WORD_EXTS,
+    EXCEL_EXTS as _EXCEL_EXTS,
+    PPT_EXTS as _PPT_EXTS,
+    OFFICE_EXTS as _OFFICE_EXTS,
+    IMAGE_EXTS as _IMAGE_EXTS,
+    IMPORT_EXTS as _IMPORT_EXTS,
+    ZIP_EXTS as _ZIP_EXTS,
+)
 from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
 from src.utils.zip_utils import prepare_zip_imports
@@ -42,21 +51,6 @@ from src.workers.file_worker import FileOperationWorker
 from src.workers.import_worker import ImportWorker, find_soffice
 
 logger = logging.getLogger(__name__)
-
-_WORD_EXTS = {".doc", ".docx", ".docm"}
-_EXCEL_EXTS = {".xls", ".xlsx", ".xlsm"}
-_PPT_EXTS = {".ppt", ".pptx"}
-_OFFICE_EXTS = _WORD_EXTS | _EXCEL_EXTS | _PPT_EXTS
-# Image extensions importable here must match what conversion supports;
-# kept in sync with _IMAGE_EXTS in src/workers/import_worker.py.
-_IMAGE_EXTS = {
-    ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif",
-    ".jp2", ".jpx", ".ppm", ".pgm", ".pbm", ".pnm", ".pam", ".svg",
-}
-_IMPORT_EXTS = {".pdf"} | _OFFICE_EXTS | _IMAGE_EXTS
-# Archives expanded on drop/import (password-less only); handled separately
-# from _IMPORT_EXTS because a zip is extracted, not converted file-by-file.
-_ZIP_EXTS = {".zip"}
 
 
 def _exts_to_filter(label: str, exts: set[str]) -> str:

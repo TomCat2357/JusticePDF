@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 import fitz
@@ -675,12 +675,6 @@ def _rotate_vertices(
     return [_rotate_point(x, y, cx, cy, angle_deg) for x, y in vertices]
 
 
-def _bounding_rect_of_vertices(vertices: list[tuple[float, float]]) -> tuple[float, float, float, float]:
-    xs = [v[0] for v in vertices]
-    ys = [v[1] for v in vertices]
-    return (min(xs), min(ys), max(xs), max(ys))
-
-
 def _ellipse_vertices(cx: float, cy: float, rx: float, ry: float, n: int = 32) -> list[tuple[float, float]]:
     return [
         (cx + rx * math.cos(2 * math.pi * i / n), cy + ry * math.sin(2 * math.pi * i / n))
@@ -1033,16 +1027,21 @@ def _extract_shape_data(
     )
 
 
+def _page_numbers_for(doc: fitz.Document, page_num: int | None) -> range | list[int] | None:
+    """対象ページ番号の列を返す。page_num が範囲外なら None。"""
+    if page_num is None:
+        return range(len(doc))
+    if 0 <= page_num < len(doc):
+        return [page_num]
+    return None
+
+
 def list_shape_annots(pdf_path: str, page_num: int | None = None) -> list[ShapeAnnotData]:
     results: list[ShapeAnnotData] = []
     try:
         with fitz.open(pdf_path) as doc:
-            page_numbers: range | list[int]
-            if page_num is None:
-                page_numbers = range(len(doc))
-            elif 0 <= page_num < len(doc):
-                page_numbers = [page_num]
-            else:
+            page_numbers = _page_numbers_for(doc, page_num)
+            if page_numbers is None:
                 return []
 
             for pn in page_numbers:
@@ -1511,12 +1510,8 @@ def list_freetext_annots(pdf_path: str, page_num: int | None = None) -> list[Fre
     results: list[FreeTextAnnotData] = []
     try:
         with fitz.open(pdf_path) as doc:
-            page_numbers: range | list[int]
-            if page_num is None:
-                page_numbers = range(len(doc))
-            elif 0 <= page_num < len(doc):
-                page_numbers = [page_num]
-            else:
+            page_numbers = _page_numbers_for(doc, page_num)
+            if page_numbers is None:
                 return []
 
             for pn in page_numbers:

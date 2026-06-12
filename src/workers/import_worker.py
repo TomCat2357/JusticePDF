@@ -19,20 +19,12 @@ from typing import Any
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-logger = logging.getLogger(__name__)
+from src.utils.constants import (
+    IMAGE_EXTS as _IMAGE_EXTS,
+    OFFICE_EXTS as _OFFICE_EXTS,
+)
 
-_OFFICE_EXTS = {
-    ".doc", ".docx", ".docm",
-    ".xls", ".xlsx", ".xlsm",
-    ".ppt", ".pptx",
-}
-# Image extensions that PyMuPDF (fitz) can open and convert to PDF.
-# Kept in sync with images_to_pdf() in src/utils/pdf_utils.py and with
-# _IMAGE_EXTS in src/views/main_window.py.
-_IMAGE_EXTS = {
-    ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif",
-    ".jp2", ".jpx", ".ppm", ".pgm", ".pbm", ".pnm", ".pam", ".svg",
-}
+logger = logging.getLogger(__name__)
 
 
 def find_soffice() -> str | None:
@@ -49,8 +41,7 @@ def find_soffice() -> str | None:
         if path and os.path.isfile(path):
             return path
 
-    import shutil as sh
-    return sh.which("soffice")
+    return shutil.which("soffice")
 
 
 def _convert_via_office_com(src_path: str, dest_pdf_path: Path) -> None:
