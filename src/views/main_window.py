@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Callable
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
@@ -186,6 +187,38 @@ class MainWindow(QMainWindow):
 
         # Load existing files
         self._load_existing_files()
+
+    @classmethod
+    def open_external_folder(cls, source_dir: str) -> "MainWindow":
+        """Open a folder launched from Explorer's「JusticePDFで開く」.
+
+        The folder is copied into the PDFs library (``~/Documents/PDFs``) under
+        a non-colliding name and that copy becomes this window's work dir; the
+        folder's contents are imported into it once the event loop starts.
+
+        Only this single window opens — the work dir is the copy itself, so
+        there is no separate PDFs-library window.  (This differs from importing
+        a file, which lands flat in the library window, and from a mixed
+        file+folder launch, which still needs the library window as host.)
+        """
+        library = Path.home() / "Documents" / "PDFs"
+        library.mkdir(parents=True, exist_ok=True)
+        folder_name = os.path.basename(os.path.abspath(source_dir).rstrip(os.sep)) or "folder"
+        dest = Path(str(ensure_unique_path(library, folder_name, pattern="{stem}({i}){ext}")))
+        dest.mkdir(parents=True, exist_ok=True)
+
+        window = cls(folder_path=str(dest))
+
+        # Import the folder's *contents* (not the folder itself) into the copy,
+        # reproducing its structure without nesting it under a same-named child.
+        # Deferred so the ImportWorker's progress dialog runs after show().
+        try:
+            children = [str(p) for p in Path(source_dir).iterdir()]
+        except OSError:
+            children = []
+        if children:
+            QTimer.singleShot(0, lambda: window.import_external_paths(children))
+        return window
 
     def _setup_ui(self) -> None:
         """Set up the main UI."""
@@ -1206,14 +1239,24 @@ class MainWindow(QMainWindow):
 
     def _on_folder_card_double_clicked(self, fc: FolderCard, alt_pressed: bool = False) -> None:
         """Open a new MainWindow scoped to the clicked subfolder."""
-        if not os.path.isdir(fc.folder_path):
-            return
+        self._open_folder_in_new_window(fc.folder_path)
+
+    def _open_folder_in_new_window(self, folder_path: str) -> "MainWindow | None":
+        """Open ``folder_path`` in a cascaded child window (or focus if open).
+
+        Shared by subfolder double-click and the Explorer "open folder" launch
+        (which mirrors a dropped folder into the PDFs library, then opens the
+        copy here).  Returns the window now showing the folder, or ``None`` if
+        the path is not a directory.
+        """
+        if not os.path.isdir(folder_path):
+            return None
         # If already open, bring that window to front.
         for w in MainWindow._instances:
             if w is self:
                 continue
             try:
-                if self._normalize_path(str(w._work_dir)) == self._normalize_path(fc.folder_path):
+                if self._normalize_path(str(w._work_dir)) == self._normalize_path(folder_path):
                     if w.isMinimized():
                         w.setWindowState(
                             (w.windowState() & ~Qt.WindowState.WindowMinimized)
@@ -1222,11 +1265,11 @@ class MainWindow(QMainWindow):
                     w.show()
                     w.raise_()
                     w.activateWindow()
-                    return
+                    return w
             except RuntimeError:
                 continue
 
-        new_window = MainWindow(fc.folder_path)
+        new_window = MainWindow(folder_path)
 
         existing_count = sum(
             1 for w in MainWindow._instances
@@ -1246,6 +1289,7 @@ class MainWindow(QMainWindow):
 
         # Hold a reference so Qt doesn't GC the new top-level window.
         self._child_windows.append(new_window)
+        return new_window
 
     def _on_folder_card_dropped_on(
         self,
@@ -2314,7 +2358,7 @@ class MainWindow(QMainWindow):
         self,
         paths: list[str],
         dest_root: Path,
-    ) -> list[tuple[str, str]]:
+    ) -> tuple[list[tuple[str, str]], list[str]]:
         """Build a flat list of (src, dest) pairs for the importer.
 
         Directories are walked recursively; the nested structure is preserved
@@ -2322,8 +2366,16 @@ class MainWindow(QMainWindow):
         resolved via ``ensure_unique_path`` so neither the real work dir nor
         any new subfolder ever sees a clobber.  Office/image sources are given
         ``.pdf`` destinations.
+
+        Returns ``(tree, top_dirs)`` where ``top_dirs`` lists the top-level
+        folders newly created under ``dest_root`` for each imported directory
+        (in input order).  Callers that mirror a dropped folder — e.g. the
+        Explorer "open folder" launch — use this to open the copied folder.
+        The directories are created here (``mkdir``) even when they contain no
+        importable files, so ``top_dirs`` is reliable regardless of contents.
         """
         used_dest: set[str] = set()
+        top_dirs: list[str] = []
 
         def _alloc_dest(parent: Path, filename: str) -> Path:
             parent.mkdir(parents=True, exist_ok=True)
@@ -2355,6 +2407,7 @@ class MainWindow(QMainWindow):
                         str(ensure_unique_path(dest_root, folder_name, pattern="{stem}({i}){ext}", use_original=False))
                     )
                 target_root.mkdir(parents=True, exist_ok=True)
+                top_dirs.append(str(target_root))
                 for root, _dirs, files in os.walk(p):
                     rel = os.path.relpath(root, p)
                     dest_parent = target_root if rel == "." else (target_root / rel)
@@ -2374,7 +2427,7 @@ class MainWindow(QMainWindow):
                 dest_name = _normalize_dest_name(os.path.basename(p))
                 dest_full = _alloc_dest(dest_root, dest_name)
                 tree.append((p, str(dest_full)))
-        return tree
+        return tree, top_dirs
 
     def _count_office_files(self, tree: list[tuple[str, str]]) -> int:
         return sum(
@@ -2382,22 +2435,40 @@ class MainWindow(QMainWindow):
             if os.path.splitext(src)[1].lower() in _OFFICE_EXTS
         )
 
-    def import_external_paths(self, paths: list[str]) -> None:
-        """Explorer の右クリックから渡されたファイル群を作業フォルダへ取り込む。
+    def import_external_paths(
+        self,
+        paths: list[str],
+        *,
+        open_imported_folders: bool = False,
+    ) -> None:
+        """Explorer の右クリックから渡されたパスを作業フォルダへ取り込む。
 
         ``main.py`` がコマンドライン引数（``%1``）で受け取ったパスを起動後に
         取り込むための公開エントリ。存在するパスだけを既存の ``_import_paths``
         に流す。
+
+        ``open_imported_folders`` が真のときは、取り込んだフォルダ（PDFs 配下に
+        作られたコピー）を新しいウィンドウで開く。フォルダを右クリックして
+        「JusticePDFで開く」を実行したときに、フォルダごと PDFs にコピーして
+        コピー先を開く挙動を、ファイルの取り込み挙動に揃えるために使う。
         """
         valid = [p for p in paths if Path(p).exists()]
-        if valid:
-            self._import_paths(valid)
+        if not valid:
+            return
+        on_top_dirs = self._open_imported_folders if open_imported_folders else None
+        self._import_paths(valid, on_top_dirs=on_top_dirs)
+
+    def _open_imported_folders(self, top_dirs: list[str]) -> None:
+        """Open each copied top-level folder produced by an external import."""
+        for d in top_dirs:
+            self._open_folder_in_new_window(d)
 
     def _import_paths(
         self,
         paths: list[str],
         *,
         dest_root: Path | None = None,
+        on_top_dirs: "Callable[[list[str]], None] | None" = None,
     ) -> None:
         """Import PDF / Office / image files and folders into the work tree.
 
@@ -2410,6 +2481,12 @@ class MainWindow(QMainWindow):
         archive (under ``dest_root``); its contents then go through the same
         conversion pipeline.  Password protected / unreadable archives are
         reported and skipped.
+
+        ``on_top_dirs`` (if given) is called with the list of top-level folders
+        created for imported directories as soon as they exist on disk — before
+        the async copy/convert worker runs — so a caller can open the copied
+        folder immediately and watch files land in it live.  It is invoked only
+        when at least one directory was imported.
         """
         if self._operation_in_progress or self._active_import_worker is not None:
             QMessageBox.information(self, "インポート", "別のインポートが進行中です。完了までお待ちください。")
@@ -2422,7 +2499,16 @@ class MainWindow(QMainWindow):
             self._notify_zip_problems(prep.encrypted, prep.broken)
         cleanup_dirs = prep.temp_dirs
 
-        tree = self._build_import_tree(prep.paths, root)
+        tree, top_dirs = self._build_import_tree(prep.paths, root)
+
+        # Open the copied folder(s) right away.  The directories already exist
+        # (created during the build pass); the import worker fills them in
+        # afterwards and each opened window's FolderWatcher reflects new files
+        # as they arrive.  Opening before _start_import_worker also lets its
+        # internal-add pre-registration find the new window.
+        if on_top_dirs and top_dirs:
+            on_top_dirs(top_dirs)
+
         if not tree:
             self._cleanup_temp_dirs(cleanup_dirs)
             return
