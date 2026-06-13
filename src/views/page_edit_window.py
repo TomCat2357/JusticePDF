@@ -33,6 +33,9 @@ from src.utils.pdf_utils import (
     ShapeType, ShapeAnnotData, AnyAnnotData,
     list_shape_annots, create_shape_annot, replace_shape_annot,
     delete_shape_annot, create_bracket_pair,
+    MarkupType, TextMarkupAnnotData,
+    list_markup_annots, create_markup_annot, delete_markup_annot,
+    replace_markup_annot,
     reorder_annot_on_page, get_annot_xref_order, set_annot_xref_order,
     search_text_in_pdf,
     TocEntry, get_pdf_toc, update_pdf_toc,
@@ -854,6 +857,53 @@ class ZoomPageWidget(QWidget):
 
         painter.restore()
 
+    def _paint_markup_annotation(self, painter: QPainter, annot: TextMarkupAnnotData) -> None:
+        """Render highlight / underline / strikeout from quads.
+
+        ズームビューのページ画像は注釈なし (annots=False) で描画されるため、
+        マークアップの見た目はここで描く。保存済み PDF を PyMuPDF が
+        描画する際は実際のマークアップ注釈として再現される。
+        """
+        base = self._annotation_color(annot.color, opacity=1.0) or QColor(255, 255, 0)
+        opacity = max(0.0, min(1.0, float(annot.opacity)))
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if annot.markup_type == MarkupType.HIGHLIGHT:
+            fill = QColor(base)
+            fill.setAlphaF(opacity)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill)
+            for quad in annot.quads:
+                rect = self._page_rect_to_widget_rect(self._rect_tuple_to_qrectf(quad))
+                painter.drawRect(rect)
+        else:
+            line_color = QColor(base)
+            line_color.setAlphaF(opacity)
+            for quad in annot.quads:
+                rect = self._page_rect_to_widget_rect(self._rect_tuple_to_qrectf(quad))
+                line_width = max(1.0, rect.height() * 0.06)
+                pen = QPen(line_color)
+                pen.setWidthF(line_width)
+                painter.setPen(pen)
+                if annot.markup_type == MarkupType.UNDERLINE:
+                    y = rect.bottom() - line_width
+                else:  # STRIKEOUT
+                    y = rect.center().y()
+                painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+        painter.restore()
+
+    def selected_markup_quads(self) -> list[tuple[float, float, float, float]]:
+        """Return PDF-space quads (x0, y0, x1, y1) for the current text selection."""
+        quads: list[tuple[float, float, float, float]] = []
+        for idx in sorted(self._selected_word_indices):
+            if idx >= len(self._words):
+                continue
+            word = self._words[idx]
+            if len(word) < 4:
+                continue
+            quads.append((float(word[0]), float(word[1]), float(word[2]), float(word[3])))
+        return quads
+
     def _paint_shape_annotation(
         self,
         painter: QPainter,
@@ -1085,7 +1135,8 @@ class ZoomPageWidget(QWidget):
                 for handle, handle_rect in self._line_handle_rects(selected).items():
                     if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
                         return selected, handle
-            else:
+            elif isinstance(selected, (FreeTextAnnotData, ShapeAnnotData)):
+                # マークアップ（quad ベース）はリサイズ・移動ハンドルを持たない。
                 selected_rect = self._annotation_widget_rect(selected)
                 for handle, handle_rect in self._handle_rects(selected_rect).items():
                     if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
@@ -1094,6 +1145,10 @@ class ZoomPageWidget(QWidget):
             if isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
                 if self._line_hit_test(annot, pos):
                     return annot, "move"
+            elif isinstance(annot, TextMarkupAnnotData):
+                # マークアップは選択のみ（移動・リサイズ不可）。
+                if self._annotation_widget_rect(annot).contains(QPointF(pos)):
+                    return annot, "select"
             elif self._annotation_widget_rect(annot).contains(QPointF(pos)):
                 return annot, "move"
         return None, None
@@ -1347,6 +1402,7 @@ class ZoomPageWidget(QWidget):
                     and self._inline_editor is not None
                     and self._inline_editor.isVisible()
                 )
+                is_markup = isinstance(annot, TextMarkupAnnotData)
                 if not is_being_edited:
                     if isinstance(annot, ShapeAnnotData):
                         self._paint_shape_annotation(
@@ -1355,9 +1411,17 @@ class ZoomPageWidget(QWidget):
                             annot_rect,
                             vertices_override=line_vertices_override,
                         )
+                    elif is_markup:
+                        self._paint_markup_annotation(painter, annot)
                     else:
                         self._paint_annotation(painter, annot, annot_rect)
                 if annot.xref == self._selected_annotation_xref:
+                    if is_markup:
+                        # マークアップは選択枠（破線）のみ表示。ハンドルなし。
+                        painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine))
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.drawRect(annot_rect)
+                        continue
                     painter.setPen(QPen(QColor(0, 120, 215), 1))
                     painter.setBrush(QBrush(QColor(255, 255, 255)))
                     if is_line_shape:
@@ -1500,6 +1564,17 @@ class ZoomPageWidget(QWidget):
                     return
 
                 annot, handle = self._annotation_hit_test(event.pos())
+                if annot is not None and handle == "select":
+                    # マークアップ: 選択のみ。ドラッグによる移動・リサイズはしない。
+                    self._selected_annotation_xref = annot.xref
+                    self.annotation_selected.emit(annot)
+                    self._selection_origin = None
+                    self._selection_rect = None
+                    self._selection_active = False
+                    self._pressed_link = None
+                    self.update()
+                    event.accept()
+                    return
                 if annot is not None and handle is not None:
                     ctrl_copy = (
                         handle == "move"
@@ -1906,6 +1981,9 @@ class PageEditWindow(QMainWindow):
         self._zoom_annotation_text_color = (0.0, 0.0, 0.0)
         self._zoom_annotation_fill_color: tuple[float, float, float] | None = (1.0, 1.0, 0.6)
         self._zoom_annotation_border_color: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
+        self._zoom_markup_color: tuple[float, float, float] = (1.0, 0.92, 0.23)
+        self._zoom_markup_color_btn: QPushButton | None = None
+        self._markup_buttons: dict[MarkupType, QToolButton] = {}
         self._thumb_size = PageThumbnail.THUMBNAIL_SIZE
         self._thumb_render_queue: deque[int] = deque()
         self._thumb_render_queue_set: set[int] = set()
@@ -2170,6 +2248,31 @@ class PageEditWindow(QMainWindow):
             shape_row.addWidget(btn)
             self._shape_buttons[shape_type] = btn
         panel_layout.addLayout(shape_row)
+
+        # Text markup (highlight / underline / strikeout)
+        markup_label = QLabel("文字装飾")
+        panel_layout.addWidget(markup_label)
+        markup_row = QHBoxLayout()
+        self._markup_buttons: dict[MarkupType, QToolButton] = {}
+        markup_defs = [
+            ("ﾏｰｶｰ", MarkupType.HIGHLIGHT, "ハイライト（テキスト選択後にクリック）"),
+            ("U", MarkupType.UNDERLINE, "下線（テキスト選択後にクリック）"),
+            ("S", MarkupType.STRIKEOUT, "取り消し線（テキスト選択後にクリック）"),
+        ]
+        for text, markup_type, tooltip in markup_defs:
+            btn = QToolButton()
+            btn.setText(text)
+            btn.setToolTip(tooltip)
+            btn.setMinimumWidth(48)
+            btn.clicked.connect(lambda _checked=False, mt=markup_type: self._on_markup_btn_clicked(mt))
+            markup_row.addWidget(btn)
+            self._markup_buttons[markup_type] = btn
+        self._zoom_markup_color_btn = QPushButton()
+        self._zoom_markup_color_btn.setToolTip("マークアップの色")
+        self._zoom_markup_color_btn.clicked.connect(self._pick_markup_color)
+        markup_row.addWidget(self._zoom_markup_color_btn)
+        panel_layout.addLayout(markup_row)
+        self._set_color_button_preview(self._zoom_markup_color_btn, self._zoom_markup_color)
 
         form = QFormLayout()
         self._zoom_annotation_width_spin = QSpinBox()
@@ -2556,13 +2659,16 @@ class PageEditWindow(QMainWindow):
         try:
             is_shape = isinstance(annotation, ShapeAnnotData)
             is_freetext = isinstance(annotation, FreeTextAnnotData)
+            is_markup = isinstance(annotation, TextMarkupAnnotData)
             has_selection = annotation is not None
 
             # 注釈未選択でも作成モード中は新規作成のデフォルト値を編集できるようにする。
             # 注釈選択中はその注釈の編集を優先するため、作成モードは無視する。
             create_mode = self._zoom_create_mode if not has_selection else None
             create_shape_type = create_mode if isinstance(create_mode, ShapeType) else None
-            controls_active = has_selection or create_mode is not None
+            # マークアップ選択時は専用の「文字装飾」行で色を編集するため、
+            # 汎用フォーム（幅/高さ/文字サイズ/各色など）は無効化する。
+            controls_active = (has_selection and not is_markup) or create_mode is not None
 
             # 表示・有効化の判定は「選択中の注釈」または「作成対象」に基づく
             panel_shape_type = annotation.shape_type if is_shape else create_shape_type
@@ -2570,9 +2676,11 @@ class PageEditWindow(QMainWindow):
             is_line_shape = panel_shape_type == ShapeType.LINE
 
             # Toggle FreeText-only vs shape-only controls
-            self._zoom_annotation_fontsize_spin.setVisible(not panel_is_shape)
-            self._zoom_annotation_fontsize_label.setVisible(not panel_is_shape)
-            self._zoom_annotation_text_color_row.setVisible(not panel_is_shape)
+            self._zoom_annotation_fontsize_spin.setVisible(not panel_is_shape and not is_markup)
+            self._zoom_annotation_fontsize_label.setVisible(not panel_is_shape and not is_markup)
+            self._zoom_annotation_text_color_row.setVisible(not panel_is_shape and not is_markup)
+            # マークアップ用ツール行（色・タイプ）の選択状態を反映
+            self._update_markup_controls(annotation if is_markup else None)
             # 回転は既存図形の編集時のみ（新規は描画後に調整する）
             self._zoom_shape_rotation_row.setVisible(is_shape)
             # 矢印は LINE の選択時・作成時の両方で表示
@@ -2584,7 +2692,7 @@ class PageEditWindow(QMainWindow):
             # 幅/高さは描画で確定するため作成モードでは隠す。LINE は始点/終点で編集するので隠す。
             # それ以外（選択あり／完全未選択）は従来通り表示する（未選択時は無効化のみ）。
             hide_size = create_mode is not None or (is_shape and annotation.shape_type == ShapeType.LINE)
-            show_size = not hide_size
+            show_size = not hide_size and not is_markup
             for sz_widget in (
                 self._zoom_annotation_width_spin,
                 self._zoom_annotation_width_label,
@@ -2766,6 +2874,129 @@ class PageEditWindow(QMainWindow):
             return
         self._apply_zoom_annotation_form()
 
+    # --- Text markup (highlight / underline / strikeout) -----------------
+
+    def _markup_default_opacity(self, markup_type: MarkupType) -> float:
+        # ハイライトは半透明で文字が透ける。下線/取り消し線は不透明。
+        return 0.4 if markup_type == MarkupType.HIGHLIGHT else 1.0
+
+    def _update_markup_controls(self, selected: object) -> None:
+        """マークアップツール行の色見本を選択中の注釈（あれば）に合わせる。"""
+        if self._zoom_markup_color_btn is None:
+            return
+        if isinstance(selected, TextMarkupAnnotData):
+            self._set_color_button_preview(self._zoom_markup_color_btn, selected.color)
+        else:
+            self._set_color_button_preview(self._zoom_markup_color_btn, self._zoom_markup_color)
+
+    def _on_markup_btn_clicked(self, markup_type: MarkupType) -> None:
+        selected = self._selected_zoom_annotation
+        if isinstance(selected, TextMarkupAnnotData):
+            # 選択中のマークアップの種類を変更する。
+            if selected.markup_type == markup_type:
+                return
+            new_annotation = TextMarkupAnnotData(
+                page_num=selected.page_num,
+                xref=selected.xref,
+                quads=selected.quads,
+                markup_type=markup_type,
+                color=selected.color,
+                opacity=self._markup_default_opacity(markup_type),
+            )
+            self._run_zoom_markup_replace(selected, new_annotation, f"Change to {markup_type.value}")
+            return
+        self._create_markup_from_selection(markup_type)
+
+    def _create_markup_from_selection(self, markup_type: MarkupType) -> None:
+        if self._zoom_page_num is None or self._zoom_label is None:
+            return
+        quads = self._zoom_label.selected_markup_quads()
+        if not quads:
+            self._flash_zoom_hint("マークアップするテキストを選択してください")
+            return
+        template = TextMarkupAnnotData(
+            page_num=self._zoom_page_num,
+            xref=0,
+            quads=tuple(quads),
+            markup_type=markup_type,
+            color=self._zoom_markup_color,
+            opacity=self._markup_default_opacity(markup_type),
+        )
+        state: dict[str, TextMarkupAnnotData | None] = {"created": None}
+
+        def do_create() -> None:
+            state["created"] = create_markup_annot(self._pdf_path, template)
+            self._selected_zoom_annotation = state["created"]
+            # set_page() refreshes and clears the text selection.
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_create() -> None:
+            created = state["created"]
+            if created is not None:
+                delete_markup_annot(self._pdf_path, created.page_num, created.xref)
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        self._push_undoable(f"Create {markup_type.value}", do_create, undo_create)
+
+    def _pick_markup_color(self) -> None:
+        selected = self._selected_zoom_annotation
+        is_markup = isinstance(selected, TextMarkupAnnotData)
+        current = selected.color if is_markup else self._zoom_markup_color
+        color = QColorDialog.getColor(self._rgb_tuple_to_qcolor(current), self, "色を選択")
+        if not color.isValid():
+            return
+        rgb = self._qcolor_to_rgb_tuple(color)
+        self._zoom_markup_color = rgb
+        if self._zoom_markup_color_btn is not None:
+            self._set_color_button_preview(self._zoom_markup_color_btn, rgb)
+        if is_markup:
+            new_annotation = TextMarkupAnnotData(
+                page_num=selected.page_num,
+                xref=selected.xref,
+                quads=selected.quads,
+                markup_type=selected.markup_type,
+                color=rgb,
+                opacity=selected.opacity,
+            )
+            self._run_zoom_markup_replace(selected, new_annotation, "Update markup color")
+
+    def _run_zoom_markup_replace(
+        self,
+        old_annotation: TextMarkupAnnotData,
+        new_annotation: TextMarkupAnnotData,
+        description: str,
+    ) -> None:
+        state: dict[str, TextMarkupAnnotData | None] = {"old": old_annotation, "new": None}
+
+        def do_replace() -> None:
+            state["new"] = replace_markup_annot(
+                self._pdf_path,
+                old_annotation.page_num,
+                state["old"].xref,
+                new_annotation,
+            )
+            self._selected_zoom_annotation = state["new"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_replace() -> None:
+            state["old"] = replace_markup_annot(
+                self._pdf_path,
+                old_annotation.page_num,
+                state["new"].xref,
+                state["old"],
+            )
+            self._selected_zoom_annotation = state["old"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        self._push_undoable(description, do_replace, undo_replace)
+
+    def _flash_zoom_hint(self, message: str) -> None:
+        """簡易ヒント表示（ステータスバー or ツールチップ）。"""
+        bar = self.statusBar() if hasattr(self, "statusBar") else None
+        if bar is not None:
+            bar.showMessage(message, 3000)
+
     def _current_zoom_annotation_page_size(self) -> tuple[float, float]:
         if self._zoom_label:
             return self._zoom_label.page_size_points()
@@ -2928,7 +3159,7 @@ class PageEditWindow(QMainWindow):
     def _on_zoom_annotation_selected(self, annotation: object) -> None:
         self._set_zoom_annotation_create_mode(False)
         self._set_shape_create_mode(None)
-        if isinstance(annotation, (FreeTextAnnotData, ShapeAnnotData)):
+        if isinstance(annotation, (FreeTextAnnotData, ShapeAnnotData, TextMarkupAnnotData)):
             current = self._find_zoom_annotation(annotation.xref) or annotation
             self._set_selected_zoom_annotation(current, open_drawer=True)
         else:
@@ -3596,6 +3827,10 @@ class PageEditWindow(QMainWindow):
             return
         old_annotation = self._selected_zoom_annotation
 
+        if isinstance(old_annotation, TextMarkupAnnotData):
+            # マークアップは専用の「文字装飾」行でのみ編集する。
+            return
+
         if isinstance(old_annotation, ShapeAnnotData):
             new_annotation = self._shape_data_from_form(old_annotation)
             old_verts = tuple(tuple(v) for v in old_annotation.vertices) if old_annotation.vertices else ()
@@ -3638,6 +3873,24 @@ class PageEditWindow(QMainWindow):
             return
         self._commit_inline_annotation_editor()
         annot = self._selected_zoom_annotation
+
+        if isinstance(annot, TextMarkupAnnotData):
+            state = {"old": annot}
+
+            def do_delete_markup() -> None:
+                delete_markup_annot(self._pdf_path, state["old"].page_num, state["old"].xref)
+                self._selected_zoom_annotation = None
+                self._refresh_current_zoom_page()
+
+            def undo_delete_markup() -> None:
+                state["old"] = create_markup_annot(self._pdf_path, state["old"])
+                self._selected_zoom_annotation = state["old"]
+                self._refresh_current_zoom_page(open_drawer=True)
+
+            self._push_undoable(
+                f"Delete {annot.markup_type.value}", do_delete_markup, undo_delete_markup
+            )
+            return
 
         if isinstance(annot, ShapeAnnotData):
             state = {"old": annot}
@@ -4342,7 +4595,8 @@ class PageEditWindow(QMainWindow):
             self._zoom_text_cache[self._zoom_page_num] = (words, links)
         freetext_annots = list_freetext_annots(self._pdf_path, self._zoom_page_num)
         shape_annots = list_shape_annots(self._pdf_path, self._zoom_page_num)
-        merged = freetext_annots + shape_annots
+        markup_annots = list_markup_annots(self._pdf_path, self._zoom_page_num)
+        merged = freetext_annots + shape_annots + markup_annots
         xref_order = get_annot_xref_order(self._pdf_path, self._zoom_page_num)
         order_index = {x: i for i, x in enumerate(xref_order)}
         # PDF の /Annots 配列順（描画順）に並べ替え。未登録 xref は末尾に置く。
