@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QInputDialog, QLabel, QFrame, QApplication, QRubberBand, QMessageBox,
     QToolButton, QSizePolicy, QPlainTextEdit, QFormLayout,
     QSpinBox, QDoubleSpinBox, QColorDialog, QSlider, QCheckBox, QComboBox,
-    QMenu
+    QMenu, QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import (
     Qt, QMimeData, QSize, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl,
@@ -36,6 +36,9 @@ from src.utils.pdf_utils import (
     MarkupType, TextMarkupAnnotData,
     list_markup_annots, create_markup_annot, delete_markup_annot,
     replace_markup_annot,
+    NoteAnnotData,
+    list_note_annots, create_note_annot, delete_note_annot,
+    replace_note_annot,
     reorder_annot_on_page, get_annot_xref_order, set_annot_xref_order,
     search_text_in_pdf,
     TocEntry, get_pdf_toc, update_pdf_toc,
@@ -333,6 +336,26 @@ class AnnotationTextEdit(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+class NoteContentEdit(QPlainTextEdit):
+    """付箋本文の編集欄。フォーカスを失ったとき、または Ctrl+Enter で確定する。"""
+
+    commit_requested = pyqtSignal()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.commit_requested.emit()
+
+    def keyPressEvent(self, event) -> None:
+        if (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            self.commit_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class ZoomPageWidget(QWidget):
     wheel_zoom = pyqtSignal(int)
     link_clicked = pyqtSignal(dict)
@@ -342,6 +365,7 @@ class ZoomPageWidget(QWidget):
     shape_geometry_changed_with_vertices = pyqtSignal(object, object, object, str)
     annotation_create_requested = pyqtSignal(object)
     shape_create_requested = pyqtSignal(object, object, object)  # (ShapeType, start_pt_tuple, end_pt_tuple)
+    note_create_requested = pyqtSignal(object)  # placement point tuple (page coords)
     annotation_edit_requested = pyqtSignal(object)
     annotation_text_committed = pyqtSignal(object, str)
     annotation_text_edit_cancelled = pyqtSignal()
@@ -357,6 +381,8 @@ class ZoomPageWidget(QWidget):
     zoom_region_requested = pyqtSignal(object)
 
     HANDLE_SIZE = 10
+    # 付箋アイコンの画面上の固定サイズ（px）。ズームに依らず一定。
+    NOTE_ICON_PX = 22
     # 矢印キーによる注釈移動量（PDF ポイント）。細かい / 通常 / 粗い移動。
     # 押下回数によらず一定ステップ（加速なし）。
     # Alt/Shift=細かく、無修飾=通常、Ctrl=粗く。
@@ -429,6 +455,10 @@ class ZoomPageWidget(QWidget):
         self._marquee_active = False
         self._marquee_origin: QPoint | None = None
         self._marquee_rect: QRect | None = None
+        # 付箋（ノート）配置モードとホバーポップアップ状態。
+        self._note_create_mode = False
+        self._hover_note_xref: int | None = None
+        self._note_popup: QFrame | None = None
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         # 右ドラッグを範囲指定に使うため、既定のコンテキストメニューを抑止する。
@@ -456,6 +486,17 @@ class ZoomPageWidget(QWidget):
         self._clear_annotation_create_drag()
         self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
         self.update()
+
+    def set_note_create_mode(self, enabled: bool) -> None:
+        self._note_create_mode = bool(enabled)
+        self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def _note_widget_rect(self, note: NoteAnnotData) -> QRectF:
+        """Fixed-pixel icon rect (does not scale with zoom)."""
+        top_left = self._page_point_to_widget_point(QPointF(note.point[0], note.point[1]))
+        size = float(self.NOTE_ICON_PX)
+        return QRectF(top_left.x(), top_left.y(), size, size)
 
     def set_selected_annotation_xref(self, xref: int | None) -> None:
         self._selected_annotation_xref = xref
@@ -639,6 +680,8 @@ class ZoomPageWidget(QWidget):
         self._clear_annotation_create_drag()
         self._paste_preview_rect = None
         self._paste_drag_active = False
+        self._hover_note_xref = None
+        self._hide_note_popup()
         if self._pixmap and not self._pixmap.isNull():
             self.setMinimumSize(self._pixmap.deviceIndependentSize().toSize())
         else:
@@ -904,6 +947,34 @@ class ZoomPageWidget(QWidget):
             quads.append((float(word[0]), float(word[1]), float(word[2]), float(word[3])))
         return quads
 
+    def _paint_note_annotation(self, painter: QPainter, annot: NoteAnnotData) -> None:
+        """Draw a fixed-size sticky-note icon at the note's anchor point."""
+        rect = self._note_widget_rect(annot)
+        fill = self._annotation_color(annot.color, opacity=max(0.3, annot.opacity)) or QColor(255, 235, 59)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        body = rect.adjusted(1, 1, -1, -1)
+        painter.setPen(QPen(QColor(90, 80, 0), 1))
+        painter.setBrush(QBrush(fill))
+        painter.drawRoundedRect(body, 3, 3)
+        # 折り返し（ドッグイヤー）。
+        fold = min(body.width(), body.height()) * 0.34
+        p_tr = body.topRight()
+        tri = [
+            QPointF(p_tr.x() - fold, p_tr.y()),
+            QPointF(p_tr.x(), p_tr.y() + fold),
+            QPointF(p_tr.x() - fold, p_tr.y() + fold),
+        ]
+        painter.setBrush(QBrush(QColor(0, 0, 0, 40)))
+        painter.drawPolygon(*tri)
+        # 本文がある印として横線を数本描く。
+        painter.setPen(QPen(QColor(70, 60, 0, 160), 1))
+        n_lines = 3 if annot.content.strip() else 1
+        for i in range(n_lines):
+            y = body.top() + body.height() * (0.4 + 0.2 * i)
+            painter.drawLine(QPointF(body.left() + 3, y), QPointF(body.right() - 3, y))
+        painter.restore()
+
     def _paint_shape_annotation(
         self,
         painter: QPainter,
@@ -1149,6 +1220,10 @@ class ZoomPageWidget(QWidget):
                 # マークアップは選択のみ（移動・リサイズ不可）。
                 if self._annotation_widget_rect(annot).contains(QPointF(pos)):
                     return annot, "select"
+            elif isinstance(annot, NoteAnnotData):
+                # 付箋は固定サイズアイコンのヒット領域で選択のみ。
+                if self._note_widget_rect(annot).contains(QPointF(pos)):
+                    return annot, "select"
             elif self._annotation_widget_rect(annot).contains(QPointF(pos)):
                 return annot, "move"
         return None, None
@@ -1327,7 +1402,7 @@ class ZoomPageWidget(QWidget):
         return "\n".join(lines)
 
     def _update_cursor(self, pos: QPoint) -> None:
-        if self.has_annotation_paste_mode():
+        if self.has_annotation_paste_mode() or self._note_create_mode:
             if self._point_in_pixmap(pos) is not None:
                 self.setCursor(Qt.CursorShape.CrossCursor)
             else:
@@ -1403,6 +1478,7 @@ class ZoomPageWidget(QWidget):
                     and self._inline_editor.isVisible()
                 )
                 is_markup = isinstance(annot, TextMarkupAnnotData)
+                is_note = isinstance(annot, NoteAnnotData)
                 if not is_being_edited:
                     if isinstance(annot, ShapeAnnotData):
                         self._paint_shape_annotation(
@@ -1413,14 +1489,17 @@ class ZoomPageWidget(QWidget):
                         )
                     elif is_markup:
                         self._paint_markup_annotation(painter, annot)
+                    elif is_note:
+                        self._paint_note_annotation(painter, annot)
                     else:
                         self._paint_annotation(painter, annot, annot_rect)
                 if annot.xref == self._selected_annotation_xref:
-                    if is_markup:
-                        # マークアップは選択枠（破線）のみ表示。ハンドルなし。
+                    if is_markup or is_note:
+                        # マークアップ・付箋は選択枠（破線）のみ。ハンドルなし。
+                        outline = self._note_widget_rect(annot) if is_note else annot_rect
                         painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine))
                         painter.setBrush(Qt.BrushStyle.NoBrush)
-                        painter.drawRect(annot_rect)
+                        painter.drawRect(outline.adjusted(-2, -2, 2, 2))
                         continue
                     painter.setPen(QPen(QColor(0, 120, 215), 1))
                     painter.setBrush(QBrush(QColor(255, 255, 255)))
@@ -1527,6 +1606,11 @@ class ZoomPageWidget(QWidget):
             if event.button() == Qt.MouseButton.LeftButton:
                 self.setFocus()
                 page_point = self._page_point_from_widget_pos(event.pos())
+                if self._note_create_mode:
+                    if page_point is not None:
+                        self.note_create_requested.emit((page_point.x(), page_point.y()))
+                    event.accept()
+                    return
                 if self.has_annotation_paste_mode():
                     if page_point is None:
                         self.cancel_annotation_paste_mode()
@@ -1706,9 +1790,68 @@ class ZoomPageWidget(QWidget):
                     self.update()
             else:
                 self._update_cursor(event.pos())
+                self._update_note_hover(event.pos())
         except Exception as e:
             logger.exception("Error in ZoomPageWidget.mouseMoveEvent")
         event.accept()
+
+    def _note_at(self, pos: QPoint) -> NoteAnnotData | None:
+        for annot in reversed(self._annotations):
+            if isinstance(annot, NoteAnnotData) and self._note_widget_rect(annot).contains(QPointF(pos)):
+                return annot
+        return None
+
+    def _update_note_hover(self, pos: QPoint) -> None:
+        """Show a small popup preview when hovering a sticky-note icon (A)."""
+        note = self._note_at(pos)
+        new_xref = note.xref if note is not None else None
+        if new_xref == self._hover_note_xref:
+            return
+        self._hover_note_xref = new_xref
+        if note is None:
+            self._hide_note_popup()
+            return
+        self._show_note_popup(note)
+
+    def _hide_note_popup(self) -> None:
+        if self._note_popup is not None:
+            self._note_popup.hide()
+            self._note_popup.deleteLater()
+            self._note_popup = None
+
+    def _show_note_popup(self, note: NoteAnnotData) -> None:
+        self._hide_note_popup()
+        text = (note.content or "").strip() or "（空のコメント）"
+        preview = text[:80] + ("…" if len(text) > 80 else "")
+        popup = QFrame(self)
+        popup.setObjectName("notePopup")
+        popup.setFrameShape(QFrame.Shape.StyledPanel)
+        popup.setStyleSheet(
+            "#notePopup { background-color: #fffbe6; border: 1px solid #b8a700; border-radius: 4px; }"
+            " QLabel { color: #333; padding: 4px 6px; }"
+        )
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(preview, popup)
+        label.setWordWrap(True)
+        label.setMaximumWidth(220)
+        layout.addWidget(label)
+        popup.adjustSize()
+        icon_rect = self._note_widget_rect(note)
+        x = int(icon_rect.right() + 6)
+        y = int(icon_rect.top())
+        if x + popup.width() > self.width():
+            x = int(icon_rect.left() - popup.width() - 6)
+        y = max(0, min(y, self.height() - popup.height()))
+        popup.move(max(0, x), y)
+        popup.show()
+        popup.raise_()
+        self._note_popup = popup
+
+    def leaveEvent(self, event) -> None:
+        self._hover_note_xref = None
+        self._hide_note_popup()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         try:
@@ -1984,6 +2127,15 @@ class PageEditWindow(QMainWindow):
         self._zoom_markup_color: tuple[float, float, float] = (1.0, 0.92, 0.23)
         self._zoom_markup_color_btn: QPushButton | None = None
         self._markup_buttons: dict[MarkupType, QToolButton] = {}
+        self._zoom_note_color: tuple[float, float, float] = (1.0, 0.92, 0.23)
+        self._zoom_note_color_btn: QPushButton | None = None
+        self._zoom_note_btn: QToolButton | None = None
+        self._zoom_note_editor: NoteContentEdit | None = None
+        self._zoom_note_list: QListWidget | None = None
+        self._note_create_mode = False
+        # 本文編集中の付箋 xref と、確定前の元本文（差分判定用）。
+        self._editing_note_xref: int | None = None
+        self._editing_note_original = ""
         self._thumb_size = PageThumbnail.THUMBNAIL_SIZE
         self._thumb_render_queue: deque[int] = deque()
         self._thumb_render_queue_set: set[int] = set()
@@ -2140,6 +2292,7 @@ class PageEditWindow(QMainWindow):
         )
         self._zoom_label.annotation_create_requested.connect(self._on_zoom_annotation_create_requested)
         self._zoom_label.shape_create_requested.connect(self._on_zoom_shape_create_requested)
+        self._zoom_label.note_create_requested.connect(self._on_note_create_requested)
         self._zoom_label.annotation_edit_requested.connect(self._on_zoom_annotation_edit_requested)
         self._zoom_label.annotation_text_committed.connect(self._on_zoom_annotation_text_committed)
         self._zoom_label.annotation_text_edit_cancelled.connect(self._on_zoom_annotation_text_edit_cancelled)
@@ -2273,6 +2426,32 @@ class PageEditWindow(QMainWindow):
         markup_row.addWidget(self._zoom_markup_color_btn)
         panel_layout.addLayout(markup_row)
         self._set_color_button_preview(self._zoom_markup_color_btn, self._zoom_markup_color)
+
+        # Sticky note (comment) tool
+        note_label = QLabel("付箋（コメント）")
+        panel_layout.addWidget(note_label)
+        note_row = QHBoxLayout()
+        self._zoom_note_btn = QToolButton()
+        self._zoom_note_btn.setText("ノート")
+        self._zoom_note_btn.setCheckable(True)
+        self._zoom_note_btn.setToolTip("付箋を追加（クリックで配置）")
+        self._zoom_note_btn.clicked.connect(self._on_note_btn_clicked)
+        note_row.addWidget(self._zoom_note_btn)
+        self._zoom_note_color_btn = QPushButton()
+        self._zoom_note_color_btn.setToolTip("付箋の色")
+        self._zoom_note_color_btn.clicked.connect(self._pick_note_color)
+        note_row.addWidget(self._zoom_note_color_btn)
+        note_row.addStretch(1)
+        panel_layout.addLayout(note_row)
+        self._set_color_button_preview(self._zoom_note_color_btn, self._zoom_note_color)
+
+        # 付箋本文エディタ（付箋選択時のみ表示）
+        self._zoom_note_editor = NoteContentEdit()
+        self._zoom_note_editor.setPlaceholderText("コメントを入力")
+        self._zoom_note_editor.setFixedHeight(80)
+        self._zoom_note_editor.commit_requested.connect(self._commit_note_editor_if_dirty)
+        panel_layout.addWidget(self._zoom_note_editor)
+        self._zoom_note_editor.hide()
 
         form = QFormLayout()
         self._zoom_annotation_width_spin = QSpinBox()
@@ -2463,6 +2642,14 @@ class PageEditWindow(QMainWindow):
         # FreeText-only widgets container references for visibility toggling
         self._zoom_freetext_only_widgets: list[QWidget] = []
 
+        # 現在ページの付箋一覧（B）。クリックで該当付箋を選択。
+        self._zoom_note_list_label = QLabel("このページの付箋")
+        panel_layout.addWidget(self._zoom_note_list_label)
+        self._zoom_note_list = QListWidget()
+        self._zoom_note_list.setMaximumHeight(140)
+        self._zoom_note_list.itemClicked.connect(self._on_note_list_item_clicked)
+        panel_layout.addWidget(self._zoom_note_list)
+
         panel_layout.addStretch()
         drawer_layout.addWidget(self._zoom_annotation_panel)
         zoom_content_layout.addWidget(self._zoom_annotation_drawer)
@@ -2474,6 +2661,7 @@ class PageEditWindow(QMainWindow):
         )
         self._bookmarks_panel.bookmarks_changed.connect(self._run_toc_update)
         self._bookmarks_panel.jump_requested.connect(self._jump_zoom_to_page)
+        self._bookmarks_panel.note_jump_requested.connect(self._on_bookmark_note_jump)
         self._bookmarks_panel.open_changed.connect(self._on_bookmarks_drawer_open_changed)
         # 開閉トグルはツールバーの「しおり」ボタンへ移設したため内蔵トグルを隠す
         self._bookmarks_panel.use_external_toggle()
@@ -2570,6 +2758,26 @@ class PageEditWindow(QMainWindow):
         if panel is None or not panel.is_open:
             return
         panel.load_entries(get_pdf_toc(self._pdf_path))
+        self._reload_bookmark_notes()
+
+    def _reload_bookmark_notes(self) -> None:
+        """しおりパネルに文書全体の付箋一覧を反映する。"""
+        panel = getattr(self, "_bookmarks_panel", None)
+        if panel is None or not panel.is_open:
+            return
+        notes = list_note_annots(self._pdf_path)
+        entries = [
+            (note.page_num + 1, note.xref, note.content or "")
+            for note in notes
+        ]
+        panel.set_annotation_notes(entries)
+
+    def _on_bookmark_note_jump(self, page_one_based: int, xref: int) -> None:
+        """しおりパネルの付箋ノードクリックで、該当ページへ移動し付箋を選択する。"""
+        self._jump_zoom_to_page(page_one_based)
+        note = self._find_zoom_annotation(xref)
+        if isinstance(note, NoteAnnotData):
+            self._set_selected_zoom_annotation(note, open_drawer=False)
 
     def _jump_zoom_to_page(self, page_one_based: int) -> None:
         """しおりクリック時に該当ページ(1始まり)へズーム移動する。"""
@@ -2618,6 +2826,7 @@ class PageEditWindow(QMainWindow):
         enabled = bool(enabled)
         if enabled:
             self._set_shape_create_mode(None)
+            self._set_note_create_mode(False)
         if self._zoom_label:
             if enabled:
                 self._zoom_label.cancel_annotation_paste_mode()
@@ -2660,15 +2869,16 @@ class PageEditWindow(QMainWindow):
             is_shape = isinstance(annotation, ShapeAnnotData)
             is_freetext = isinstance(annotation, FreeTextAnnotData)
             is_markup = isinstance(annotation, TextMarkupAnnotData)
+            is_note = isinstance(annotation, NoteAnnotData)
             has_selection = annotation is not None
 
             # 注釈未選択でも作成モード中は新規作成のデフォルト値を編集できるようにする。
             # 注釈選択中はその注釈の編集を優先するため、作成モードは無視する。
             create_mode = self._zoom_create_mode if not has_selection else None
             create_shape_type = create_mode if isinstance(create_mode, ShapeType) else None
-            # マークアップ選択時は専用の「文字装飾」行で色を編集するため、
+            # マークアップ・付箋選択時は専用の行で編集するため、
             # 汎用フォーム（幅/高さ/文字サイズ/各色など）は無効化する。
-            controls_active = (has_selection and not is_markup) or create_mode is not None
+            controls_active = (has_selection and not is_markup and not is_note) or create_mode is not None
 
             # 表示・有効化の判定は「選択中の注釈」または「作成対象」に基づく
             panel_shape_type = annotation.shape_type if is_shape else create_shape_type
@@ -2676,11 +2886,14 @@ class PageEditWindow(QMainWindow):
             is_line_shape = panel_shape_type == ShapeType.LINE
 
             # Toggle FreeText-only vs shape-only controls
-            self._zoom_annotation_fontsize_spin.setVisible(not panel_is_shape and not is_markup)
-            self._zoom_annotation_fontsize_label.setVisible(not panel_is_shape and not is_markup)
-            self._zoom_annotation_text_color_row.setVisible(not panel_is_shape and not is_markup)
+            hide_text_only = panel_is_shape or is_markup or is_note
+            self._zoom_annotation_fontsize_spin.setVisible(not hide_text_only)
+            self._zoom_annotation_fontsize_label.setVisible(not hide_text_only)
+            self._zoom_annotation_text_color_row.setVisible(not hide_text_only)
             # マークアップ用ツール行（色・タイプ）の選択状態を反映
             self._update_markup_controls(annotation if is_markup else None)
+            # 付箋本文エディタの表示・内容
+            self._update_note_editor(annotation if is_note else None)
             # 回転は既存図形の編集時のみ（新規は描画後に調整する）
             self._zoom_shape_rotation_row.setVisible(is_shape)
             # 矢印は LINE の選択時・作成時の両方で表示
@@ -2692,7 +2905,7 @@ class PageEditWindow(QMainWindow):
             # 幅/高さは描画で確定するため作成モードでは隠す。LINE は始点/終点で編集するので隠す。
             # それ以外（選択あり／完全未選択）は従来通り表示する（未選択時は無効化のみ）。
             hide_size = create_mode is not None or (is_shape and annotation.shape_type == ShapeType.LINE)
-            show_size = not hide_size and not is_markup
+            show_size = not hide_size and not is_markup and not is_note
             for sz_widget in (
                 self._zoom_annotation_width_spin,
                 self._zoom_annotation_width_label,
@@ -2889,6 +3102,26 @@ class PageEditWindow(QMainWindow):
         else:
             self._set_color_button_preview(self._zoom_markup_color_btn, self._zoom_markup_color)
 
+    def _update_note_editor(self, selected: object) -> None:
+        """付箋本文エディタの表示・内容・色見本を選択状態に合わせる。"""
+        if self._zoom_note_editor is None:
+            return
+        if isinstance(selected, NoteAnnotData):
+            self._editing_note_xref = selected.xref
+            self._editing_note_original = selected.content
+            with QSignalBlocker(self._zoom_note_editor):
+                if self._zoom_note_editor.toPlainText() != selected.content:
+                    self._zoom_note_editor.setPlainText(selected.content)
+            self._zoom_note_editor.show()
+            if self._zoom_note_color_btn is not None:
+                self._set_color_button_preview(self._zoom_note_color_btn, selected.color)
+        else:
+            self._editing_note_xref = None
+            self._editing_note_original = ""
+            self._zoom_note_editor.hide()
+            if self._zoom_note_color_btn is not None:
+                self._set_color_button_preview(self._zoom_note_color_btn, self._zoom_note_color)
+
     def _on_markup_btn_clicked(self, markup_type: MarkupType) -> None:
         selected = self._selected_zoom_annotation
         if isinstance(selected, TextMarkupAnnotData):
@@ -2996,6 +3229,163 @@ class PageEditWindow(QMainWindow):
         bar = self.statusBar() if hasattr(self, "statusBar") else None
         if bar is not None:
             bar.showMessage(message, 3000)
+
+    # --- Sticky note (comment) -------------------------------------------
+
+    def _set_note_create_mode(self, enabled: bool) -> None:
+        self._note_create_mode = bool(enabled)
+        if self._zoom_note_btn is not None:
+            with QSignalBlocker(self._zoom_note_btn):
+                self._zoom_note_btn.setChecked(enabled)
+        if self._zoom_label is not None:
+            self._zoom_label.set_note_create_mode(enabled)
+
+    def _on_note_btn_clicked(self, checked: bool) -> None:
+        if checked:
+            # 他の作成モード・選択を解除して付箋配置モードへ。
+            self._set_zoom_annotation_create_mode(False)
+            self._set_shape_create_mode(None)
+            if self._selected_zoom_annotation is not None:
+                self._set_selected_zoom_annotation(None)
+            self._set_note_create_mode(True)
+        else:
+            self._set_note_create_mode(False)
+
+    def _on_note_create_requested(self, point: object) -> None:
+        if self._zoom_page_num is None or not isinstance(point, tuple) or len(point) != 2:
+            return
+        template = NoteAnnotData(
+            page_num=self._zoom_page_num,
+            xref=0,
+            point=(float(point[0]), float(point[1])),
+            content="",
+            color=self._zoom_note_color,
+        )
+        state: dict[str, NoteAnnotData | None] = {"created": None}
+
+        def do_create() -> None:
+            state["created"] = create_note_annot(self._pdf_path, template)
+            self._selected_zoom_annotation = state["created"]
+            self._refresh_current_zoom_page(open_drawer=True)
+            # 配置後すぐ本文入力できるようフォーカス。
+            if self._zoom_note_editor is not None:
+                self._zoom_note_editor.setFocus()
+
+        def undo_create() -> None:
+            created = state["created"]
+            if created is not None:
+                delete_note_annot(self._pdf_path, created.page_num, created.xref)
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        # 連続配置はせず、配置したら作成モードを抜ける。
+        self._set_note_create_mode(False)
+        self._push_undoable("Create note", do_create, undo_create)
+
+    def _pick_note_color(self) -> None:
+        selected = self._selected_zoom_annotation
+        is_note = isinstance(selected, NoteAnnotData)
+        current = selected.color if is_note else self._zoom_note_color
+        color = QColorDialog.getColor(self._rgb_tuple_to_qcolor(current), self, "色を選択")
+        if not color.isValid():
+            return
+        rgb = self._qcolor_to_rgb_tuple(color)
+        self._zoom_note_color = rgb
+        if self._zoom_note_color_btn is not None:
+            self._set_color_button_preview(self._zoom_note_color_btn, rgb)
+        if is_note:
+            new_annotation = NoteAnnotData(
+                page_num=selected.page_num,
+                xref=selected.xref,
+                point=selected.point,
+                content=selected.content,
+                color=rgb,
+                icon=selected.icon,
+                opacity=selected.opacity,
+            )
+            self._run_zoom_note_replace(selected, new_annotation, "Update note color")
+
+    def _commit_note_editor_if_dirty(self) -> None:
+        if self._zoom_note_editor is None or self._editing_note_xref is None:
+            return
+        selected = self._selected_zoom_annotation
+        if not isinstance(selected, NoteAnnotData) or selected.xref != self._editing_note_xref:
+            return
+        text = self._zoom_note_editor.toPlainText()
+        if text == self._editing_note_original:
+            return
+        new_annotation = NoteAnnotData(
+            page_num=selected.page_num,
+            xref=selected.xref,
+            point=selected.point,
+            content=text,
+            color=selected.color,
+            icon=selected.icon,
+            opacity=selected.opacity,
+        )
+        self._editing_note_original = text
+        self._run_zoom_note_replace(selected, new_annotation, "Edit note text")
+
+    def _run_zoom_note_replace(
+        self,
+        old_annotation: NoteAnnotData,
+        new_annotation: NoteAnnotData,
+        description: str,
+    ) -> None:
+        state: dict[str, NoteAnnotData | None] = {"old": old_annotation, "new": None}
+
+        def do_replace() -> None:
+            state["new"] = replace_note_annot(
+                self._pdf_path,
+                old_annotation.page_num,
+                state["old"].xref,
+                new_annotation,
+            )
+            self._selected_zoom_annotation = state["new"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        def undo_replace() -> None:
+            state["old"] = replace_note_annot(
+                self._pdf_path,
+                old_annotation.page_num,
+                state["new"].xref,
+                state["old"],
+            )
+            self._selected_zoom_annotation = state["old"]
+            self._refresh_current_zoom_page(open_drawer=True)
+
+        self._push_undoable(description, do_replace, undo_replace)
+
+    def _update_note_list_widget(self) -> None:
+        """現在ページの付箋一覧（B）を更新する。"""
+        if self._zoom_note_list is None:
+            return
+        notes = [a for a in self._zoom_annotations if isinstance(a, NoteAnnotData)]
+        with QSignalBlocker(self._zoom_note_list):
+            self._zoom_note_list.clear()
+            for note in notes:
+                text = (note.content or "").strip().replace("\n", " ") or "（空のコメント）"
+                preview = text[:40] + ("…" if len(text) > 40 else "")
+                item = QListWidgetItem(preview)
+                item.setData(Qt.ItemDataRole.UserRole, note.xref)
+                self._zoom_note_list.addItem(item)
+                if (
+                    self._selected_zoom_annotation is not None
+                    and self._selected_zoom_annotation.xref == note.xref
+                ):
+                    self._zoom_note_list.setCurrentItem(item)
+        has_notes = bool(notes)
+        if self._zoom_note_list_label is not None:
+            self._zoom_note_list_label.setVisible(has_notes)
+        self._zoom_note_list.setVisible(has_notes)
+
+    def _on_note_list_item_clicked(self, item: object) -> None:
+        if item is None:
+            return
+        xref = item.data(Qt.ItemDataRole.UserRole)
+        note = self._find_zoom_annotation(xref)
+        if isinstance(note, NoteAnnotData):
+            self._set_selected_zoom_annotation(note, open_drawer=True)
 
     def _current_zoom_annotation_page_size(self) -> tuple[float, float]:
         if self._zoom_label:
@@ -3155,11 +3545,14 @@ class PageEditWindow(QMainWindow):
             self._render_zoom_page()
             if open_drawer and self._selected_zoom_annotation is not None:
                 self._set_zoom_annotation_drawer_open(True)
+        # しおりドロワーが開いていれば付箋一覧も更新する。
+        self._reload_bookmark_notes()
 
     def _on_zoom_annotation_selected(self, annotation: object) -> None:
         self._set_zoom_annotation_create_mode(False)
         self._set_shape_create_mode(None)
-        if isinstance(annotation, (FreeTextAnnotData, ShapeAnnotData, TextMarkupAnnotData)):
+        self._set_note_create_mode(False)
+        if isinstance(annotation, (FreeTextAnnotData, ShapeAnnotData, TextMarkupAnnotData, NoteAnnotData)):
             current = self._find_zoom_annotation(annotation.xref) or annotation
             self._set_selected_zoom_annotation(current, open_drawer=True)
         else:
@@ -3459,6 +3852,8 @@ class PageEditWindow(QMainWindow):
             self._set_shape_create_mode(None)
 
     def _set_shape_create_mode(self, shape_type: ShapeType | None) -> None:
+        if shape_type is not None:
+            self._set_note_create_mode(False)
         for st, btn in self._shape_buttons.items():
             with QSignalBlocker(btn):
                 btn.setChecked(st == shape_type)
@@ -3827,8 +4222,8 @@ class PageEditWindow(QMainWindow):
             return
         old_annotation = self._selected_zoom_annotation
 
-        if isinstance(old_annotation, TextMarkupAnnotData):
-            # マークアップは専用の「文字装飾」行でのみ編集する。
+        if isinstance(old_annotation, (TextMarkupAnnotData, NoteAnnotData)):
+            # マークアップ・付箋は専用の行でのみ編集する。
             return
 
         if isinstance(old_annotation, ShapeAnnotData):
@@ -3890,6 +4285,23 @@ class PageEditWindow(QMainWindow):
             self._push_undoable(
                 f"Delete {annot.markup_type.value}", do_delete_markup, undo_delete_markup
             )
+            return
+
+        if isinstance(annot, NoteAnnotData):
+            state = {"old": annot}
+
+            def do_delete_note() -> None:
+                delete_note_annot(self._pdf_path, state["old"].page_num, state["old"].xref)
+                self._selected_zoom_annotation = None
+                self._editing_note_xref = None
+                self._refresh_current_zoom_page()
+
+            def undo_delete_note() -> None:
+                state["old"] = create_note_annot(self._pdf_path, state["old"])
+                self._selected_zoom_annotation = state["old"]
+                self._refresh_current_zoom_page(open_drawer=True)
+
+            self._push_undoable("Delete note", do_delete_note, undo_delete_note)
             return
 
         if isinstance(annot, ShapeAnnotData):
@@ -4596,7 +5008,8 @@ class PageEditWindow(QMainWindow):
         freetext_annots = list_freetext_annots(self._pdf_path, self._zoom_page_num)
         shape_annots = list_shape_annots(self._pdf_path, self._zoom_page_num)
         markup_annots = list_markup_annots(self._pdf_path, self._zoom_page_num)
-        merged = freetext_annots + shape_annots + markup_annots
+        note_annots = list_note_annots(self._pdf_path, self._zoom_page_num)
+        merged = freetext_annots + shape_annots + markup_annots + note_annots
         xref_order = get_annot_xref_order(self._pdf_path, self._zoom_page_num)
         order_index = {x: i for i, x in enumerate(xref_order)}
         # PDF の /Annots 配列順（描画順）に並べ替え。未登録 xref は末尾に置く。
@@ -4615,6 +5028,7 @@ class PageEditWindow(QMainWindow):
         hit_rects = self._search_hits.get(self._zoom_page_num, [])
         self._zoom_label.set_search_hit_rects(hit_rects)
         self._set_selected_zoom_annotation(current_selection)
+        self._update_note_list_widget()
 
     def _on_zoom_link_clicked(self, link: dict) -> None:
         uri = link.get("uri")

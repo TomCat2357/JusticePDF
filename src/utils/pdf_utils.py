@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 JUSTICEPDF_FREETEXT_SUBJECT_PREFIX = "JusticePDF-FreeText:"
 JUSTICEPDF_SHAPE_SUBJECT_PREFIX = "JusticePDF-Shape:"
 JUSTICEPDF_MARKUP_SUBJECT_PREFIX = "JusticePDF-Markup:"
+JUSTICEPDF_NOTE_SUBJECT_PREFIX = "JusticePDF-Note:"
+# 付箋アイコンの公称サイズ（PDF ポイント）。ヒットテスト用の矩形に使う。
+NOTE_ICON_PDF_SIZE = 18.0
 
 
 class PdfWritePermissionError(PermissionError):
@@ -118,7 +121,31 @@ class TextMarkupAnnotData:
         return (x0, y0, x1, y1)
 
 
-AnyAnnotData = FreeTextAnnotData | ShapeAnnotData | TextMarkupAnnotData
+@dataclass(slots=True)
+class NoteAnnotData:
+    """A sticky-note (PDF Text) annotation: a collapsible comment icon.
+
+    ``point`` は付箋アイコン左上の表示座標。``content`` がコメント本文。
+    """
+
+    page_num: int
+    xref: int
+    point: tuple[float, float]
+    content: str
+    color: tuple[float, float, float]
+    icon: str = "Note"
+    opacity: float = 1.0
+    annotation_id: str = ""
+    subject: str = ""
+
+    @property
+    def rect(self) -> tuple[float, float, float, float]:
+        """Nominal icon rect (x0, y0, x1, y1) anchored at ``point``."""
+        x, y = self.point
+        return (x, y, x + NOTE_ICON_PDF_SIZE, y + NOTE_ICON_PDF_SIZE)
+
+
+AnyAnnotData = FreeTextAnnotData | ShapeAnnotData | TextMarkupAnnotData | NoteAnnotData
 
 
 @dataclass(slots=True)
@@ -1401,6 +1428,176 @@ def replace_markup_annot(
         _save_document_in_place(doc, pdf_path)
         if saved is None:
             raise RuntimeError("Failed to extract saved markup annotation")
+        return saved
+    finally:
+        doc.close()
+
+
+# --- Sticky note (comment) annotations -----------------------------------
+
+def _encode_note_metadata(data: "NoteAnnotData", *, page_rotation: int = 0) -> str:
+    payload: dict = {
+        "color": list(data.color),
+        "icon": data.icon,
+        "opacity": float(data.opacity),
+        "point": [float(data.point[0]), float(data.point[1])],
+        "page_rotation": int(page_rotation),
+    }
+    return JUSTICEPDF_NOTE_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
+
+
+def _decode_note_metadata(subject: str) -> dict | None:
+    if not subject or not subject.startswith(JUSTICEPDF_NOTE_SUBJECT_PREFIX):
+        return None
+    raw = subject[len(JUSTICEPDF_NOTE_SUBJECT_PREFIX):]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _add_note_annot_to_page(page: fitz.Page, data: "NoteAnnotData") -> fitz.Annot:
+    point = fitz.Point(data.point[0], data.point[1])
+    if page.rotation != 0:
+        point = point * page.derotation_matrix
+
+    existing_metadata = _decode_note_metadata(data.subject)
+    if existing_metadata is not None and "page_rotation" in existing_metadata:
+        creation_page_rotation = int(existing_metadata["page_rotation"])
+    else:
+        creation_page_rotation = page.rotation
+
+    annot = page.add_text_annot(point, data.content or "", icon=data.icon or "Note")
+    annot.set_colors(stroke=list(data.color))
+    annot.set_opacity(max(0.0, min(1.0, float(data.opacity))))
+    annot.update()
+    annot.set_info(content=data.content or "", subject=_encode_note_metadata(data, page_rotation=creation_page_rotation))
+    return annot
+
+
+def _extract_note_data(
+    doc: fitz.Document,
+    page_num: int,
+    annot: fitz.Annot,
+) -> "NoteAnnotData | None":
+    xref = annot.xref
+    info = annot.info
+    subject = info.get("subject", "")
+    metadata = _decode_note_metadata(subject)
+    if metadata is None:
+        return None
+
+    r = annot.rect
+    page = doc[page_num]
+    if page.rotation != 0:
+        r = fitz.Rect(r) * page.rotation_matrix
+    point = (float(r.x0), float(r.y0))
+
+    content = info.get("content", "") or ""
+    color = _normalize_color(metadata.get("color")) or (1.0, 0.92, 0.23)
+    icon = str(metadata.get("icon", "Note")) or "Note"
+
+    _, ca_value = doc.xref_get_key(xref, "CA")
+    if ca_value == "null":
+        opacity = float(metadata.get("opacity", 1.0))
+    else:
+        try:
+            opacity = float(ca_value)
+        except ValueError:
+            opacity = float(metadata.get("opacity", 1.0))
+
+    _, name_value = doc.xref_get_key(xref, "NM")
+    annotation_id = info.get("id") or (name_value if name_value != "null" else "")
+
+    return NoteAnnotData(
+        page_num=page_num,
+        xref=xref,
+        point=point,
+        content=content,
+        color=color,
+        icon=icon,
+        opacity=max(0.0, min(1.0, float(opacity))),
+        annotation_id=annotation_id,
+        subject=subject,
+    )
+
+
+def list_note_annots(pdf_path: str, page_num: int | None = None) -> list["NoteAnnotData"]:
+    """Return JusticePDF sticky-note annotations for one page or the whole document."""
+    results: list[NoteAnnotData] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            page_numbers = _page_numbers_for(doc, page_num)
+            if page_numbers is None:
+                return []
+
+            for pn in page_numbers:
+                page = doc[pn]
+                annots = page.annots(types=[fitz.PDF_ANNOT_TEXT])
+                if annots is None:
+                    continue
+                for annot in annots:
+                    note_data = _extract_note_data(doc, pn, annot)
+                    if note_data is not None:
+                        results.append(note_data)
+    except Exception:
+        logger.debug("list_note_annots failed: %s", pdf_path, exc_info=True)
+    return results
+
+
+def create_note_annot(pdf_path: str, data: "NoteAnnotData") -> "NoteAnnotData":
+    doc = fitz.open(pdf_path)
+    try:
+        if data.page_num < 0 or data.page_num >= len(doc):
+            raise IndexError(f"page out of range: {data.page_num}")
+        page = doc[data.page_num]
+        annot = _add_note_annot_to_page(page, data)
+        saved = _extract_note_data(doc, data.page_num, annot)
+        _save_document_in_place(doc, pdf_path)
+        if saved is None:
+            raise RuntimeError("Failed to extract saved note annotation")
+        return saved
+    finally:
+        doc.close()
+
+
+def delete_note_annot(pdf_path: str, page_num: int, xref: int) -> bool:
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            return False
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is None or annot.type[0] != fitz.PDF_ANNOT_TEXT:
+            return False
+        page.delete_annot(annot)
+        _save_document_in_place(doc, pdf_path)
+        return True
+    finally:
+        doc.close()
+
+
+def replace_note_annot(
+    pdf_path: str,
+    page_num: int,
+    xref: int,
+    data: "NoteAnnotData",
+) -> "NoteAnnotData":
+    """Replace a note annotation (content / color / position changes)."""
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            raise IndexError(f"page out of range: {page_num}")
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is not None:
+            page.delete_annot(annot)
+        replacement = _add_note_annot_to_page(page, data)
+        saved = _extract_note_data(doc, page_num, replacement)
+        _save_document_in_place(doc, pdf_path)
+        if saved is None:
+            raise RuntimeError("Failed to extract saved note annotation")
         return saved
     finally:
         doc.close()
