@@ -42,22 +42,27 @@ def main():
     if qss_path.exists():
         app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
 
-    # Explorer の右クリックから渡されたパスを振り分ける。
-    #   - 単一フォルダのみ -> そのフォルダを作業フォルダとして開く
-    #   - ファイルを含む    -> 既定の作業フォルダで起動し、起動後に取り込む
+    # Explorer の右クリックから渡されたパスを振り分ける。いずれも内容は既定の
+    # 作業フォルダ（~/Documents/PDFs）へ取り込む。
+    #   - 単一フォルダ -> フォルダごと PDFs へコピーし、コピー先「だけ」を開く
+    #                     （PDFs ライブラリ自体のウィンドウは開かない）
+    #   - ファイル等   -> PDFs ライブラリを開き、そこへ取り込む。フォルダを
+    #                     含む場合はコピー先も併せて開く
     arg_paths = [Path(p) for p in args.paths]
-    dirs = [p for p in arg_paths if p.is_dir()]
-    files = [p for p in arg_paths if p.is_file()]
 
-    if len(arg_paths) == 1 and dirs:
-        window = MainWindow(folder_path=str(dirs[0]))
+    if len(arg_paths) == 1 and arg_paths[0].is_dir():
+        window = MainWindow.open_external_folder(str(arg_paths[0]))
     else:
+        existing = [str(p) for p in arg_paths if p.exists()]
+        has_dir = any(p.is_dir() for p in arg_paths)
         window = MainWindow()
-        if files:
-            file_strs = [str(p) for p in files]
+        if existing:
             # イベントループ開始後に取り込む（ImportWorker はバックグラウンド
             # スレッド＋進捗ダイアログを使うため、show 後に遅延実行する）。
-            QTimer.singleShot(0, lambda: window.import_external_paths(file_strs))
+            QTimer.singleShot(
+                0,
+                lambda: window.import_external_paths(existing, open_imported_folders=has_dir),
+            )
     window.show()
 
     flags = window.windowFlags()

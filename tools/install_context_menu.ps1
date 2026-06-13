@@ -9,7 +9,8 @@
     Writes shell verbs under HKEY_CURRENT_USER so the current user can launch
     JusticePDF from Explorer's context menu:
       * .pdf files  -> import the PDF into the managed work folder
-      * folders     -> open that folder as the work directory
+      * folders     -> copy the whole folder into the managed work folder
+                       and open only that copy (no library window)
 
     The Japanese menu label is built from Unicode code points so this script
     stays pure-ASCII and is safe to run under Windows PowerShell 5.1 regardless
