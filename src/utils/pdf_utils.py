@@ -2074,6 +2074,76 @@ def get_page_words(pdf_path: str, page_num: int) -> list[tuple]:
         return []
 
 
+def get_page_chars(pdf_path: str, page_num: int) -> list[dict]:
+    """Extract character-level text with coordinates for a page.
+
+    Returns a flat list in reading order. Each entry::
+
+        {"c": str, "bbox": (x0, y0, x1, y1), "line_id": int,
+         "wmode": int, "dir": (cos, sin)}
+
+    Spaces are kept (needed to reproduce gaps faithfully); other control
+    characters are dropped. ``line_id`` increments globally across the page so
+    consecutive entries with the same id belong to the same line.
+    """
+    chars: list[dict] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            if page_num >= len(doc):
+                return []
+            page = doc[page_num]
+            raw = page.get_text("rawdict")
+            line_id = 0
+            for block in raw.get("blocks", []):
+                # type 0 = text block; skip image blocks (type 1).
+                if block.get("type", 0) != 0:
+                    continue
+                for line in block.get("lines", []):
+                    wmode = line.get("wmode", 0)
+                    direction = line.get("dir", (1.0, 0.0))
+                    has_char = False
+                    for span in line.get("spans", []):
+                        for ch in span.get("chars", []):
+                            text = ch.get("c", "")
+                            if not text:
+                                continue
+                            # Drop control characters but keep spaces.
+                            if text != " " and ord(text[0]) < 0x20:
+                                continue
+                            bbox = ch.get("bbox")
+                            if bbox is None:
+                                continue
+                            chars.append(
+                                {
+                                    "c": text,
+                                    "bbox": (
+                                        float(bbox[0]),
+                                        float(bbox[1]),
+                                        float(bbox[2]),
+                                        float(bbox[3]),
+                                    ),
+                                    "line_id": line_id,
+                                    "wmode": int(wmode),
+                                    "dir": (
+                                        float(direction[0]),
+                                        float(direction[1]),
+                                    ),
+                                }
+                            )
+                            has_char = True
+                    if has_char:
+                        line_id += 1
+            return chars
+    except Exception:
+        logger.debug(
+            "get_page_chars failed: pdf=%s page=%s",
+            pdf_path,
+            page_num,
+            exc_info=True,
+        )
+        return []
+
+
 def search_text_in_pdf(pdf_path: str, query: str) -> dict[int, list]:
     """Search query text across all pages.
 

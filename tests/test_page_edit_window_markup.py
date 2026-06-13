@@ -25,7 +25,7 @@ def _make_text_pdf(path, *, width: int = 320, height: int = 420) -> None:
 
 def _select_all_words(window) -> None:
     label = window._zoom_label
-    label._selected_word_indices = list(range(len(label._words)))
+    label._selected_char_indices = list(range(len(label._chars)))
 
 
 @pytest.mark.usefixtures("qtbot")
@@ -44,7 +44,15 @@ def test_markup_button_creates_highlight_from_selection(qtbot, tmp_path):
 
     markup = list_markup_annots(str(pdf_path), 0)[0]
     assert markup.markup_type == MarkupType.HIGHLIGHT
-    assert len(markup.quads) == len(window._zoom_label._words)
+    # Selection now merges per line into one clean bar; this text is a single line.
+    distinct_lines = len({ch["line_id"] for ch in window._zoom_label._chars})
+    assert len(markup.quads) == distinct_lines == 1
+    # The single quad spans the full width of the selected words.
+    qx0, _qy0, qx1, _qy1 = markup.quads[0]
+    word_x0 = min(w[0] for w in window._zoom_label._words)
+    word_x1 = max(w[2] for w in window._zoom_label._words)
+    assert qx0 == pytest.approx(word_x0, abs=1.0)
+    assert qx1 == pytest.approx(word_x1, abs=1.0)
 
 
 @pytest.mark.usefixtures("qtbot")
@@ -55,7 +63,7 @@ def test_markup_button_without_selection_does_not_create(qtbot, tmp_path):
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
 
-    window._zoom_label._selected_word_indices = []
+    window._zoom_label._selected_char_indices = []
     qtbot.mouseClick(window._markup_buttons[MarkupType.UNDERLINE], Qt.MouseButton.LeftButton)
     qtbot.wait(50)
     assert list_markup_annots(str(pdf_path), 0) == []
