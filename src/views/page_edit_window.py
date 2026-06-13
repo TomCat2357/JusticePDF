@@ -23,7 +23,8 @@ from PyQt6.QtGui import (
 )
 
 from src.utils.pdf_utils import (
-    get_page_thumbnail, get_page_pixmap, get_page_words, get_page_links,
+    get_page_thumbnail, get_page_pixmap, get_page_words, get_page_chars,
+    get_page_links,
     get_page_count, rotate_pages, remove_pages, reorder_pages, extract_pages,
     insert_pages, render_page_thumbnails_batch, FreeTextAnnotData,
     list_freetext_annots, create_freetext_annot, replace_freetext_annot,
@@ -419,6 +420,15 @@ class ZoomPageWidget(QWidget):
         self._links: list[dict] = []
         self._link_rects: list[QRectF | None] = []
         self._selected_word_indices: list[int] = []
+        # Character-level text-flow selection (anchor -> head in reading order).
+        self._chars: list[dict] = []
+        self._char_rects: list[QRectF] = []
+        self._char_line_ids: list[int] = []
+        # Per line_id: (first_char_idx, last_char_idx, x0, y0, x1, y1) in pixmap coords.
+        self._line_bounds: list[tuple[int, int, float, float, float, float]] = []
+        self._sel_anchor_char: int | None = None
+        self._sel_head_char: int | None = None
+        self._selected_char_indices: list[int] = []
         self._selection_origin: QPoint | None = None
         self._selection_rect: QRect | None = None
         self._selection_active = False
@@ -637,10 +647,11 @@ class ZoomPageWidget(QWidget):
         rect = self._annotation_widget_rect(annotation)
         self._inline_editor.setGeometry(rect.toRect())
 
-    def set_page(self, pixmap, words, links, annotations, zoom_factor: float, selected_annotation_xref: int | None = None) -> None:
+    def set_page(self, pixmap, words, links, annotations, zoom_factor: float, selected_annotation_xref: int | None = None, chars=None) -> None:
         self._pixmap = pixmap
         self._zoom_factor = zoom_factor or 1.0
         self._words = words or []
+        self._chars = chars or []
         self._links = links or []
         self._annotations = annotations or []
 
@@ -651,6 +662,32 @@ class ZoomPageWidget(QWidget):
                 continue
             x0, y0, x1, y1 = word[0], word[1], word[2], word[3]
             self._word_rects.append(QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale))
+
+        self._char_rects = []
+        self._char_line_ids = []
+        self._line_bounds = []
+        line_acc: dict[int, list[float]] = {}
+        for i, ch in enumerate(self._chars):
+            x0, y0, x1, y1 = ch["bbox"]
+            self._char_rects.append(
+                QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+            )
+            line_id = ch["line_id"]
+            self._char_line_ids.append(line_id)
+            # Accumulate per-line extents in pixmap coords: [first, last, x0, y0, x1, y1].
+            acc = line_acc.get(line_id)
+            if acc is None:
+                line_acc[line_id] = [i, i, x0 * scale, y0 * scale, x1 * scale, y1 * scale]
+            else:
+                acc[1] = i
+                acc[2] = min(acc[2], x0 * scale)
+                acc[3] = min(acc[3], y0 * scale)
+                acc[4] = max(acc[4], x1 * scale)
+                acc[5] = max(acc[5], y1 * scale)
+        self._line_bounds = [
+            (a[0], a[1], a[2], a[3], a[4], a[5])
+            for _lid, a in sorted(line_acc.items())
+        ]
 
         self._link_rects = []
         for link in self._links:
@@ -672,6 +709,9 @@ class ZoomPageWidget(QWidget):
         ]
 
         self._selected_word_indices = []
+        self._selected_char_indices = []
+        self._sel_anchor_char = None
+        self._sel_head_char = None
         self._selection_origin = None
         self._selection_rect = None
         self._selection_active = False
@@ -824,6 +864,76 @@ class ZoomPageWidget(QWidget):
                 return i
         return None
 
+    def _char_index_at(self, pos: QPoint, *, nearest: bool = False) -> int | None:
+        """Map a widget point to a character index in reading order.
+
+        With ``nearest=False`` only returns the char whose box contains the
+        point (or ``None``). With ``nearest=True`` always resolves to the
+        closest character on the nearest line (clamping to line end / page
+        edge), so drag selection follows text flow even past line ends.
+        """
+        if not self._char_rects:
+            return None
+        pix_pos = self._point_in_pixmap(pos)
+        if pix_pos is None:
+            if not nearest or not self._pixmap or self._pixmap.isNull():
+                return None
+            offset = self._pixmap_offset()
+            logical_size = self._pixmap.deviceIndependentSize()
+            px = min(max(pos.x() - offset.x(), 0.0), logical_size.width())
+            py = min(max(pos.y() - offset.y(), 0.0), logical_size.height())
+        else:
+            px, py = pix_pos.x(), pix_pos.y()
+
+        if not nearest:
+            for i, rect in enumerate(self._char_rects):
+                if rect.contains(QPointF(px, py)):
+                    return i
+            return None
+
+        if not self._line_bounds:
+            return None
+        # Pick the nearest line. Use the writing mode of the first line's first
+        # char to decide which axis runs along the line.
+        first_idx = self._line_bounds[0][0]
+        wmode = self._chars[first_idx].get("wmode", 0) if first_idx < len(self._chars) else 0
+        best_line = None
+        best_dist = None
+        for lb in self._line_bounds:
+            _f, _l, lx0, ly0, lx1, ly1 = lb
+            if wmode == 1:  # vertical: lines stack left/right, pick by x band
+                if lx0 <= px <= lx1:
+                    dist = 0.0
+                else:
+                    dist = lx0 - px if px < lx0 else px - lx1
+            else:  # horizontal: lines stack top/bottom, pick by y band
+                if ly0 <= py <= ly1:
+                    dist = 0.0
+                else:
+                    dist = ly0 - py if py < ly0 else py - ly1
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_line = lb
+        if best_line is None:
+            return None
+        f, l, lx0, ly0, lx1, ly1 = best_line
+        # Within the chosen line pick the char whose center is closest along the
+        # reading axis; clamp to the line's ends.
+        best_idx = f
+        best_cdist = None
+        for i in range(f, l + 1):
+            rect = self._char_rects[i]
+            if wmode == 1:
+                center = rect.center().y()
+                cdist = abs(center - py)
+            else:
+                center = rect.center().x()
+                cdist = abs(center - px)
+            if best_cdist is None or cdist < best_cdist:
+                best_cdist = cdist
+                best_idx = i
+        return best_idx
+
     def _annotation_by_xref(self, xref: int | None) -> FreeTextAnnotData | None:
         if xref is None:
             return None
@@ -945,15 +1055,27 @@ class ZoomPageWidget(QWidget):
         painter.restore()
 
     def selected_markup_quads(self) -> list[tuple[float, float, float, float]]:
-        """Return PDF-space quads (x0, y0, x1, y1) for the current text selection."""
+        """Return PDF-space quads (x0, y0, x1, y1) for the current text selection.
+
+        One quad per line-run: consecutive selected chars on the same line are
+        merged into a single horizontal (or vertical) bar.
+        """
         quads: list[tuple[float, float, float, float]] = []
-        for idx in sorted(self._selected_word_indices):
-            if idx >= len(self._words):
-                continue
-            word = self._words[idx]
-            if len(word) < 4:
-                continue
-            quads.append((float(word[0]), float(word[1]), float(word[2]), float(word[3])))
+        for run in self._selected_line_runs():
+            x0 = y0 = x1 = y1 = None
+            for idx in run:
+                if idx >= len(self._chars):
+                    continue
+                bx0, by0, bx1, by1 = self._chars[idx]["bbox"]
+                if x0 is None:
+                    x0, y0, x1, y1 = bx0, by0, bx1, by1
+                else:
+                    x0 = min(x0, bx0)
+                    y0 = min(y0, by0)
+                    x1 = max(x1, bx1)
+                    y1 = max(y1, by1)
+            if x0 is not None:
+                quads.append((float(x0), float(y0), float(x1), float(y1)))
         return quads
 
     def _paint_note_annotation(self, painter: QPainter, annot: NoteAnnotData) -> None:
@@ -1368,49 +1490,70 @@ class ZoomPageWidget(QWidget):
 
         return QRectF(QPointF(left, top), QPointF(right, bottom))
 
-    def _update_selection(self) -> None:
-        if not self._pixmap or self._pixmap.isNull() or self._selection_rect is None:
-            self._selected_word_indices = []
+    def _update_char_selection(self) -> None:
+        """Set selected chars to the reading-order run between anchor and head."""
+        anchor = self._sel_anchor_char
+        head = self._sel_head_char
+        if anchor is None or head is None or not self._chars:
+            self._selected_char_indices = []
             return
-        offset = self._pixmap_offset()
-        sel = QRectF(self._selection_rect.normalized())
-        sel.translate(-offset.x(), -offset.y())
-        logical_size = self._pixmap.deviceIndependentSize()
-        pix_bounds = QRectF(0, 0, logical_size.width(), logical_size.height())
-        sel = sel.intersected(pix_bounds)
-        if sel.isEmpty():
-            self._selected_word_indices = []
+        lo, hi = (anchor, head) if anchor <= head else (head, anchor)
+        lo = max(0, lo)
+        hi = min(len(self._chars) - 1, hi)
+        self._selected_char_indices = list(range(lo, hi + 1))
+
+    def _select_word_at_char(self, char_idx: int) -> None:
+        """Promote a single char to its enclosing word's char run (click-select)."""
+        if char_idx is None or char_idx >= len(self._char_rects):
+            self._selected_char_indices = [char_idx] if char_idx is not None else []
             return
-        selected = []
-        for i, rect in enumerate(self._word_rects):
-            if rect.intersects(sel):
-                selected.append(i)
-        self._selected_word_indices = selected
+        center = self._char_rects[char_idx].center()
+        word_rect = None
+        for wr in self._word_rects:
+            if wr.contains(center):
+                word_rect = wr
+                break
+        if word_rect is None:
+            self._selected_char_indices = [char_idx]
+            return
+        run = [i for i, cr in enumerate(self._char_rects) if word_rect.contains(cr.center())]
+        self._selected_char_indices = run or [char_idx]
+
+    def _selected_line_runs(self) -> list[list[int]]:
+        """Group selected char indices into per-line runs, preserving order."""
+        runs: list[list[int]] = []
+        current: list[int] = []
+        current_line = None
+        for idx in self._selected_char_indices:
+            if idx >= len(self._char_line_ids):
+                continue
+            line_id = self._char_line_ids[idx]
+            if current_line is None or line_id == current_line:
+                current.append(idx)
+                current_line = line_id
+            else:
+                runs.append(current)
+                current = [idx]
+                current_line = line_id
+        if current:
+            runs.append(current)
+        return runs
 
     def _selected_text(self) -> str:
-        if not self._selected_word_indices:
+        if not self._selected_char_indices:
             return ""
-        selected_words = [self._words[i] for i in self._selected_word_indices if i < len(self._words)]
-        selected_words.sort(key=lambda w: (w[5], w[6], w[7]) if len(w) > 7 else (0, 0, 0))
-        lines: list[str] = []
-        current_line: list[str] = []
-        current_key = None
-        for word in selected_words:
-            if len(word) < 5:
+        parts: list[str] = []
+        prev_line = None
+        for idx in self._selected_char_indices:
+            if idx >= len(self._chars):
                 continue
-            key = (word[5], word[6]) if len(word) > 6 else (0, 0)
-            if current_key is None:
-                current_key = key
-            if key != current_key:
-                if current_line:
-                    lines.append(" ".join(current_line))
-                current_line = [word[4]]
-                current_key = key
-            else:
-                current_line.append(word[4])
-        if current_line:
-            lines.append(" ".join(current_line))
-        return "\n".join(lines)
+            ch = self._chars[idx]
+            line_id = ch["line_id"]
+            if prev_line is not None and line_id != prev_line:
+                parts.append("\n")
+            parts.append(ch["c"])
+            prev_line = line_id
+        return "".join(parts)
 
     def _update_cursor(self, pos: QPoint) -> None:
         if self.has_annotation_paste_mode() or self._note_create_mode or self._callout_create_mode:
@@ -1453,13 +1596,19 @@ class ZoomPageWidget(QWidget):
                 for rect in self._search_hit_rects:
                     painter.drawRect(rect.translated(offset_pt))
 
-            if self._selected_word_indices:
+            if self._selected_char_indices:
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor(0, 120, 215, 80))
-                for idx in self._selected_word_indices:
-                    if idx < len(self._word_rects):
-                        rect = self._word_rects[idx].translated(QPointF(offset))
-                        painter.drawRect(rect)
+                offset_pt = QPointF(offset)
+                for run in self._selected_line_runs():
+                    merged: QRectF | None = None
+                    for idx in run:
+                        if idx >= len(self._char_rects):
+                            continue
+                        cr = self._char_rects[idx]
+                        merged = cr if merged is None else merged.united(cr)
+                    if merged is not None:
+                        painter.drawRect(merged.translated(offset_pt))
 
             for annot in self._annotations:
                 preview_rect: QRectF | None = None
@@ -1544,11 +1693,6 @@ class ZoomPageWidget(QWidget):
                         self._paint_annotation(painter, drag_annot, ghost_rect)
                     painter.restore()
 
-        if self._selection_rect is not None:
-            pen = QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(self._selection_rect.normalized())
         if self._annotation_create_preview_rect is not None:
             painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1652,6 +1796,9 @@ class ZoomPageWidget(QWidget):
                         self._selected_annotation_xref = None
                         self.annotation_selected.emit(None)
                     self._selected_word_indices = []
+                    self._selected_char_indices = []
+                    self._sel_anchor_char = None
+                    self._sel_head_char = None
                     self._selection_origin = None
                     self._selection_rect = None
                     self._selection_active = False
@@ -1705,11 +1852,16 @@ class ZoomPageWidget(QWidget):
                     self.annotation_selected.emit(None)
 
                 self._selection_origin = event.pos()
-                self._selection_rect = QRect(self._selection_origin, self._selection_origin)
+                self._selection_rect = None
                 self._pressed_link = self._link_at(event.pos())
                 self._selection_active = self._pressed_link is None
                 if self._selection_active:
-                    self._update_selection()
+                    # Anchor the caret now; the visible run is built once the
+                    # drag starts (or promoted to a word on a no-drag release).
+                    anchor = self._char_index_at(event.pos(), nearest=True)
+                    self._sel_anchor_char = anchor
+                    self._sel_head_char = anchor
+                    self._selected_char_indices = []
                 self.update()
         except Exception as e:
             logger.exception("Error in ZoomPageWidget.mousePressEvent")
@@ -1800,9 +1952,13 @@ class ZoomPageWidget(QWidget):
                     if (event.pos() - self._selection_origin).manhattanLength() >= QApplication.startDragDistance():
                         self._selection_active = True
                         self._pressed_link = None
+                        if self._sel_anchor_char is None:
+                            self._sel_anchor_char = self._char_index_at(
+                                self._selection_origin, nearest=True
+                            )
                 if self._selection_active:
-                    self._selection_rect = QRect(self._selection_origin, event.pos()).normalized()
-                    self._update_selection()
+                    self._sel_head_char = self._char_index_at(event.pos(), nearest=True)
+                    self._update_char_selection()
                     self.update()
             else:
                 self._update_cursor(event.pos())
@@ -1973,11 +2129,20 @@ class ZoomPageWidget(QWidget):
                     event.accept()
                     return
                 if self._selection_active:
-                    if self._selection_rect is not None:
-                        rect = self._selection_rect.normalized()
-                        if rect.width() < 3 and rect.height() < 3:
-                            idx = self._word_index_at(event.pos())
-                            self._selected_word_indices = [idx] if idx is not None else []
+                    no_drag = (
+                        self._selection_origin is not None
+                        and (event.pos() - self._selection_origin).manhattanLength()
+                        < QApplication.startDragDistance()
+                    )
+                    if no_drag:
+                        # Pure click: select the whole word at this point.
+                        idx = self._char_index_at(event.pos())
+                        if idx is None:
+                            idx = self._sel_anchor_char
+                        if idx is not None:
+                            self._select_word_at_char(idx)
+                        else:
+                            self._selected_char_indices = []
                     self._selection_rect = None
                     self._selection_active = False
                 else:
@@ -2107,7 +2272,7 @@ class PageEditWindow(QMainWindow):
         self._zoom_next_btn = None
         self._zoom_page_num = None
         self._zoom_factor = 1.0
-        self._zoom_text_cache: dict[int, tuple[list[tuple], list[dict]]] = {}
+        self._zoom_text_cache: dict[int, tuple[list[tuple], list[dict], list[dict]]] = {}
         self._zoom_annotations: list[FreeTextAnnotData] = []
         self._selected_zoom_annotation: FreeTextAnnotData | None = None
         # 注釈未選択でも新規作成のデフォルト値を編集できるよう、現在の作成モードを保持する。
@@ -5121,12 +5286,14 @@ class PageEditWindow(QMainWindow):
         pixmap.setDevicePixelRatio(dpr)
         words = []
         links = []
+        chars = []
         if self._zoom_page_num in self._zoom_text_cache:
-            words, links = self._zoom_text_cache[self._zoom_page_num]
+            words, links, chars = self._zoom_text_cache[self._zoom_page_num]
         else:
             words = get_page_words(self._pdf_path, self._zoom_page_num)
             links = get_page_links(self._pdf_path, self._zoom_page_num)
-            self._zoom_text_cache[self._zoom_page_num] = (words, links)
+            chars = get_page_chars(self._pdf_path, self._zoom_page_num)
+            self._zoom_text_cache[self._zoom_page_num] = (words, links, chars)
         freetext_annots = list_freetext_annots(self._pdf_path, self._zoom_page_num)
         shape_annots = list_shape_annots(self._pdf_path, self._zoom_page_num)
         markup_annots = list_markup_annots(self._pdf_path, self._zoom_page_num)
@@ -5146,6 +5313,7 @@ class PageEditWindow(QMainWindow):
             self._zoom_annotations,
             self._zoom_factor,
             current_selection.xref if current_selection else None,
+            chars=chars,
         )
         hit_rects = self._search_hits.get(self._zoom_page_num, [])
         self._zoom_label.set_search_hit_rects(hit_rects)

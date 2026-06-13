@@ -698,8 +698,8 @@ def test_zoom_copy_without_selected_annotation_still_copies_selected_text(qtbot,
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
 
-    assert len(window._zoom_label._words) >= 2
-    window._zoom_label._selected_word_indices = list(range(len(window._zoom_label._words)))
+    assert len(window._zoom_label._chars) >= len("hello world")
+    window._zoom_label._selected_char_indices = list(range(len(window._zoom_label._chars)))
     window._zoom_label.setFocus()
 
     clipboard = QApplication.clipboard()
@@ -708,3 +708,77 @@ def test_zoom_copy_without_selected_annotation_still_copies_selected_text(qtbot,
     qtbot.waitUntil(lambda: clipboard.text() == "hello world")
 
     assert window._copied_zoom_annotation is None
+
+
+def _char_widget_pos(window: PageEditWindow, idx: int) -> QPoint:
+    """Widget-space point at the center of char `idx` on the zoom label."""
+    label = window._zoom_label
+    offset = label._pixmap_offset()
+    center = label._char_rects[idx].center()
+    return QPoint(int(offset.x() + center.x()), int(offset.y() + center.y()))
+
+
+def _char_index_of(window: PageEditWindow, target: str, occurrence: int = 0) -> int:
+    label = window._zoom_label
+    seen = 0
+    for i, ch in enumerate(label._chars):
+        if ch["c"] == target:
+            if seen == occurrence:
+                return i
+            seen += 1
+    raise AssertionError(f"char {target!r} occurrence {occurrence} not found")
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_text_selection_flows_across_lines(qtbot, tmp_path):
+    pdf_path = tmp_path / "flow-select.pdf"
+    make_pdf(pdf_path)
+
+    doc = fitz.open(str(pdf_path))
+    page = doc[0]
+    page.insert_text((40, 80), "hello world")
+    page.insert_text((40, 110), "second line")
+    doc.saveIncr()
+    doc.close()
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+
+    # Drag from the start of "world" (line 0) to the "o" in "second" (line 1).
+    anchor = _char_index_of(window, "w")
+    head = _char_index_of(window, "o", occurrence=2)  # o in "second" (after world's o)
+    start_pos = _char_widget_pos(window, anchor)
+    end_pos = _char_widget_pos(window, head)
+
+    qtbot.mousePress(label, Qt.MouseButton.LeftButton, pos=start_pos)
+    qtbot.mouseMove(label, end_pos)
+    qtbot.mouseRelease(label, Qt.MouseButton.LeftButton, pos=end_pos)
+
+    # Reading-order flow: rest of line 0 + a newline + start of line 1 —
+    # NOT a rectangular region.
+    assert label._selected_text() == "world\nseco"
+    # One merged quad per line (clean horizontal bars), not per-glyph.
+    assert len(label.selected_markup_quads()) == 2
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_single_click_selects_word(qtbot, tmp_path):
+    pdf_path = tmp_path / "click-word.pdf"
+    make_pdf(pdf_path)
+
+    doc = fitz.open(str(pdf_path))
+    page = doc[0]
+    page.insert_text((40, 80), "hello world")
+    doc.saveIncr()
+    doc.close()
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+
+    pos = _char_widget_pos(window, _char_index_of(window, "o", occurrence=1))  # inside "world"
+    qtbot.mousePress(label, Qt.MouseButton.LeftButton, pos=pos)
+    qtbot.mouseRelease(label, Qt.MouseButton.LeftButton, pos=pos)
+
+    assert label._selected_text() == "world"
