@@ -32,6 +32,7 @@ from src.utils.pdf_utils import (
     rotate_pages, get_page_count, get_pdf_metadata_title, update_pdf_metadata_title,
     clear_pixmap_cache, clear_pixmap_cache_for_path, print_pdfs,
     export_pages_as_images, export_pdf_compressed, images_to_pdf, rasterize_pdf,
+    create_empty_pdf,
 )
 from src.views.export_dialog import ExportOptionsDialog
 from src.utils.constants import (
@@ -245,13 +246,19 @@ class MainWindow(QMainWindow):
         self._delete_btn.clicked.connect(self._on_delete)
         toolbar.addWidget(self._delete_btn)
 
+        # 名前変更（ファイル名 / PDF名）を 1 つのボタンに統合し、
+        # クリックでドロップダウンメニューを表示する。
         self._rename_btn = QPushButton("名前変更")
-        self._rename_btn.clicked.connect(self._on_rename)
+        self._rename_menu = QMenu(self._rename_btn)
+        self._rename_file_action = self._rename_menu.addAction("ファイル名")
+        self._rename_file_action.triggered.connect(self._on_rename)
+        self._rename_title_action = self._rename_menu.addAction("PDF名")
+        self._rename_title_action.triggered.connect(self._on_rename_pdf_title)
+        # フォルダを1つだけ選択しているときに現れる「フォルダ名」変更。
+        self._rename_folder_action = self._rename_menu.addAction("フォルダ名")
+        self._rename_folder_action.triggered.connect(self._on_rename_folder_selected)
+        self._rename_btn.setMenu(self._rename_menu)
         toolbar.addWidget(self._rename_btn)
-
-        self._title_btn = QPushButton("タイトル")
-        self._title_btn.clicked.connect(self._on_rename_pdf_title)
-        toolbar.addWidget(self._title_btn)
 
         self._merge_btn = QPushButton("結合")
         self._merge_btn.setToolTip(
@@ -274,22 +281,24 @@ class MainWindow(QMainWindow):
         self._import_btn.setMenu(self._import_menu)
         toolbar.addWidget(self._import_btn)
 
-        self._new_folder_btn = QPushButton("新規フォルダ")
-        self._new_folder_btn.clicked.connect(self._on_new_folder)
-        toolbar.addWidget(self._new_folder_btn)
+        # 新規作成（ファイル / フォルダ）を 1 つのボタンに統合し、
+        # クリックでドロップダウンメニューを表示する。
+        self._new_btn = QPushButton("新規作成")
+        self._new_menu = QMenu(self._new_btn)
+        new_file_action = self._new_menu.addAction("ファイル")
+        new_file_action.triggered.connect(self._on_new_file)
+        new_folder_action = self._new_menu.addAction("フォルダ")
+        new_folder_action.triggered.connect(self._on_new_folder)
+        self._new_btn.setMenu(self._new_menu)
+        toolbar.addWidget(self._new_btn)
 
         self._export_btn = QPushButton("エクスポート")
-        self._export_btn.setObjectName("primary")
         self._export_btn.clicked.connect(self._on_export)
         toolbar.addWidget(self._export_btn)
 
         self._print_btn = QPushButton("印刷")
         self._print_btn.clicked.connect(self._on_print)
         toolbar.addWidget(self._print_btn)
-
-        self._refresh_btn = QPushButton("更新")
-        self._refresh_btn.clicked.connect(self._on_refresh)
-        toolbar.addWidget(self._refresh_btn)
 
         toolbar.addSeparator()
 
@@ -339,17 +348,23 @@ class MainWindow(QMainWindow):
         busy = self._operation_in_progress
         has_selection = len(self._selected_cards) > 0
         has_deletable = has_selection or len(self._selected_folder_cards) > 0
-        has_any = len(self._cards) > 0
+        n_folders = len(self._selected_folder_cards)
+        n_files = len(self._selected_cards)
         self._delete_btn.setEnabled(has_deletable and not busy)
-        self._rename_btn.setEnabled(len(self._selected_cards) == 1 and not busy)
-        self._title_btn.setEnabled(len(self._selected_cards) == 1 and not busy)
+        # 名前変更: ファイル1つだけ、またはフォルダ1つだけ選択しているとき有効。
+        # 選択種別に応じてメニュー項目（ファイル名/PDF名 ↔ フォルダ名）を出し分ける。
+        one_file = n_files == 1 and n_folders == 0
+        one_folder = n_folders == 1 and n_files == 0
+        self._rename_file_action.setVisible(one_file)
+        self._rename_title_action.setVisible(one_file)
+        self._rename_folder_action.setVisible(one_folder)
+        self._rename_btn.setEnabled((one_file or one_folder) and not busy)
         self._rotate_btn.setEnabled(has_selection and not busy)
         self._undo_btn.setEnabled(self._undo_manager.can_undo() and not busy)
         self._redo_btn.setEnabled(self._undo_manager.can_redo() and not busy)
-        self._export_btn.setEnabled(has_any)
+        # エクスポート: ファイルまたはフォルダを1つ以上選択しているとき有効
+        self._export_btn.setEnabled((n_files >= 1 or n_folders >= 1) and not busy)
         # 結合: フォルダを1つ以上、またはファイルを2つ以上選択しているとき有効
-        n_folders = len(self._selected_folder_cards)
-        n_files = len(self._selected_cards)
         self._merge_btn.setEnabled((n_folders >= 1 or n_files >= 2) and not busy)
 
     def _begin_async_operation(self) -> None:
@@ -754,16 +769,22 @@ class MainWindow(QMainWindow):
         self._refresh_grid()
 
     def _sort_cards(self) -> None:
-        """Sort cards based on current sort order."""
+        """Sort cards based on current sort order.
+
+        フォルダはフォルダ同士、ファイルはファイル同士で並び替える
+        （グリッド表示はフォルダが先、次にファイルの順）。
+        """
         if self._sort_order == "name":
             self._cards.sort(key=lambda c: c.filename.lower(), reverse=not self._sort_ascending)
+            self._folder_cards.sort(key=lambda c: c.filename.lower(), reverse=not self._sort_ascending)
         elif self._sort_order == "date":
-            def get_mtime(card: PDFCard) -> float:
+            def get_mtime(path: str) -> float:
                 try:
-                    return os.path.getmtime(card.pdf_path)
+                    return os.path.getmtime(path)
                 except OSError:
                     return 0.0
-            self._cards.sort(key=get_mtime, reverse=not self._sort_ascending)
+            self._cards.sort(key=lambda c: get_mtime(c.pdf_path), reverse=not self._sort_ascending)
+            self._folder_cards.sort(key=lambda c: get_mtime(c.folder_path), reverse=not self._sort_ascending)
 
     def _get_visible_cards(self) -> list[PDFCard]:
         """Return cards currently visible in the scroll area viewport."""
@@ -1297,31 +1318,37 @@ class MainWindow(QMainWindow):
         # Fallback for non-Windows or when the native menu cannot be shown.
         from PyQt6.QtWidgets import QMenu
         menu = QMenu(self)
-        rename_action = menu.addAction("Rename")
-        delete_action = menu.addAction("Delete")
+        rename_action = menu.addAction("名前変更")
+        delete_action = menu.addAction("削除")
         chosen = menu.exec(global_pos)
         if chosen is rename_action:
             self._rename_folder(fc)
         elif chosen is delete_action:
             self._delete_folder(fc)
 
+    def _on_rename_folder_selected(self) -> None:
+        """ツールバー「名前変更→フォルダ名」から呼ばれ、選択中フォルダをリネームする。"""
+        if len(self._selected_folder_cards) != 1 or self._selected_cards:
+            return
+        self._rename_folder(self._selected_folder_cards[0])
+
     def _rename_folder(self, fc: FolderCard) -> None:
         old_path = fc.folder_path
         old_name = os.path.basename(old_path)
         new_name, ok = QInputDialog.getText(
-            self, "Rename Folder", "New folder name:", text=old_name
+            self, "フォルダ名の変更", "新しいフォルダ名:", text=old_name
         )
         if not ok or not new_name or new_name == old_name:
             return
         parent_dir = os.path.dirname(old_path)
         new_path = os.path.join(parent_dir, new_name)
         if os.path.exists(new_path):
-            QMessageBox.warning(self, "Rename Folder", f"'{new_name}' は既に存在します。")
+            QMessageBox.warning(self, "フォルダ名の変更", f"'{new_name}' は既に存在します。")
             return
         try:
             os.rename(old_path, new_path)
         except OSError as e:
-            QMessageBox.warning(self, "Rename Folder", f"リネームに失敗しました: {e}")
+            QMessageBox.warning(self, "フォルダ名の変更", f"リネームに失敗しました: {e}")
             return
 
         def do_rename() -> None:
@@ -1362,7 +1389,7 @@ class MainWindow(QMainWindow):
             return
 
         all_paths = folder_paths + pdf_paths
-        title = "Delete Folder" if folder_paths else "Delete"
+        title = "フォルダの削除" if folder_paths else "削除"
 
         # Phase A: immediate UI update
         self._register_internal_remove(all_paths)
@@ -1669,18 +1696,53 @@ class MainWindow(QMainWindow):
         self._active_worker = worker
         worker.start()
 
+    def _on_new_file(self) -> None:
+        """Create a new blank 1-page PDF in the current folder."""
+        dest = Path(str(ensure_unique_path(
+            self._work_dir, "新規ファイル.pdf", pattern="{stem}({i}){ext}"
+        )))
+        try:
+            create_empty_pdf(str(dest))
+        except Exception as e:
+            QMessageBox.warning(self, "新規ファイル", f"作成に失敗しました: {e}")
+            return
+
+        self._register_internal_add([str(dest)])
+
+        def undo_create() -> None:
+            if dest.exists():
+                try:
+                    send2trash(str(dest))
+                except Exception:
+                    pass
+
+        def redo_create() -> None:
+            if not dest.exists():
+                self._register_internal_add([str(dest)])
+                create_empty_pdf(str(dest))
+
+        self._undo_manager.add_action(UndoAction(
+            description=f"Create file {dest.name}",
+            undo_func=undo_create,
+            redo_func=redo_create,
+        ))
+
     def _on_new_folder(self) -> None:
-        name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
-        if not ok or not name:
-            return
-        dest = self._work_dir / name
+        """適当な既定名でフォルダを即作成する（後で「名前変更」でリネーム可能）。"""
+        # 既定名「新規フォルダ」。重複時は「新規フォルダ (2)」「(3)」… と採番する
+        # （Windows 日本語エクスプローラ準拠で開始番号は 2）。
+        base = "新規フォルダ"
+        dest = self._work_dir / base
         if dest.exists():
-            QMessageBox.warning(self, "New Folder", f"'{name}' は既に存在します。")
-            return
+            i = 2
+            while (self._work_dir / f"{base} ({i})").exists():
+                i += 1
+            dest = self._work_dir / f"{base} ({i})"
+        name = dest.name
         try:
             dest.mkdir(parents=True, exist_ok=False)
         except OSError as e:
-            QMessageBox.warning(self, "New Folder", f"作成に失敗しました: {e}")
+            QMessageBox.warning(self, "新規フォルダ", f"作成に失敗しました: {e}")
             return
 
         def undo_create() -> None:
@@ -1793,7 +1855,7 @@ class MainWindow(QMainWindow):
         dest_norm = self._normalize_path(str(dest_dir))
         # Refuse if moving folder into itself or its own descendant.
         if dest_norm == src_norm or dest_norm.startswith(src_norm + os.sep):
-            QMessageBox.warning(self, "Move Folder", "フォルダを自身の中に移動できません。")
+            QMessageBox.warning(self, "フォルダの移動", "フォルダを自身の中に移動できません。")
             return None
         base_name = os.path.basename(source.rstrip(os.sep)) or "folder"
         target = dest_dir / base_name
@@ -1819,7 +1881,7 @@ class MainWindow(QMainWindow):
                 source_parent_win._internal_removes.discard(src_norm)
             if dest_parent_win is not None:
                 dest_parent_win._internal_adds.discard(self._normalize_path(str(target)))
-            QMessageBox.warning(self, "Move Folder", f"フォルダの移動に失敗しました: {e}")
+            QMessageBox.warning(self, "フォルダの移動", f"フォルダの移動に失敗しました: {e}")
             return None
 
         if not is_copy and source_parent_win is not None:
@@ -2138,7 +2200,7 @@ class MainWindow(QMainWindow):
         card = self._selected_cards[0]
         old_name = card.filename
         new_name, ok = QInputDialog.getText(
-            self, "Rename", "New name:", text=old_name
+            self, "名前変更", "新しい名前:", text=old_name
         )
 
         if ok and new_name and new_name != old_name:
@@ -2183,7 +2245,7 @@ class MainWindow(QMainWindow):
         old_path = card.pdf_path
         old_title = get_pdf_metadata_title(old_path) or os.path.splitext(card.filename)[0]
         new_title, ok = QInputDialog.getText(
-            self, "Rename PDF Title", "New PDF title:", text=old_title
+            self, "PDFタイトルの変更", "新しいPDFタイトル:", text=old_title
         )
 
         if not ok or not new_title or new_title == old_title:
@@ -2215,18 +2277,18 @@ class MainWindow(QMainWindow):
 
     def _on_import(self) -> None:
         """Handle import action (files)."""
-        all_filter = _exts_to_filter("All importable files", _IMPORT_EXTS | _ZIP_EXTS)
+        all_filter = _exts_to_filter("インポート可能なすべてのファイル", _IMPORT_EXTS | _ZIP_EXTS)
         filters = [
             all_filter,
             _exts_to_filter("PDF", {".pdf"}),
             _exts_to_filter("Word", _WORD_EXTS),
             _exts_to_filter("Excel", _EXCEL_EXTS),
             _exts_to_filter("PowerPoint", _PPT_EXTS),
-            _exts_to_filter("Images", _IMAGE_EXTS),
+            _exts_to_filter("画像", _IMAGE_EXTS),
             _exts_to_filter("ZIP", _ZIP_EXTS),
-            "All files (*)",
+            "すべてのファイル (*)",
         ]
-        dialog = QFileDialog(self, "Import")
+        dialog = QFileDialog(self, "インポート")
         dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
         dialog.setNameFilters(filters)
         dialog.selectNameFilter(all_filter)
@@ -2238,7 +2300,7 @@ class MainWindow(QMainWindow):
     def _on_import_folder(self) -> None:
         """Handle import action for a folder (preserves nested structure)."""
         folder = QFileDialog.getExistingDirectory(
-            self, "Import Folder", str(Path.home())
+            self, "フォルダをインポート", str(Path.home())
         )
         if folder:
             self._import_paths([folder])
@@ -2338,7 +2400,7 @@ class MainWindow(QMainWindow):
         reported and skipped.
         """
         if self._operation_in_progress or self._active_import_worker is not None:
-            QMessageBox.information(self, "Import", "別のインポートが進行中です。完了までお待ちください。")
+            QMessageBox.information(self, "インポート", "別のインポートが進行中です。完了までお待ちください。")
             return
 
         root = Path(dest_root) if dest_root else Path(self._work_dir)
@@ -2539,16 +2601,26 @@ class MainWindow(QMainWindow):
     def _on_export(self) -> None:
         """Export the selected PDFs to a chosen folder.
 
-        If no PDFs are selected, a dialog prompts the user to make a
-        selection and the export is aborted. A dialog lets the user pick
-        format, DPI, quality, and compression settings before choosing the
-        output directory.
+        Files and/or folders may be selected together. Selected PDFs are
+        exported flat into the destination; selected folders are reproduced
+        with their directory structure, exporting only the ``.pdf`` files
+        inside (non-PDF files are ignored). If nothing is selected, a dialog
+        prompts the user to make a selection and the export is aborted. A
+        dialog lets the user pick format, DPI, quality, and compression
+        settings before choosing the output directory.
         """
-        if not self._selected_cards:
-            QMessageBox.information(self, "Export", "エクスポートするファイルを選択してください。")
+        if not self._selected_cards and not self._selected_folder_cards:
+            QMessageBox.information(
+                self, "エクスポート", "エクスポートするファイル・フォルダを選択してください。"
+            )
             return
 
-        targets = [c.pdf_path for c in self._selected_cards]
+        jobs = self._collect_export_jobs()
+        if not jobs:
+            QMessageBox.information(
+                self, "エクスポート", "エクスポートできる PDF がありませんでした。"
+            )
+            return
 
         dialog = ExportOptionsDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -2562,7 +2634,7 @@ class MainWindow(QMainWindow):
         fmt = options["format"]
         if fmt == "pdf":
             self._export_as_pdf(
-                targets, dst_dir,
+                jobs, dst_dir,
                 optimize_level=options["pdf_optimize_level"],
                 image_dpi=options["pdf_image_dpi"],
                 image_quality=options["pdf_image_quality"],
@@ -2571,13 +2643,42 @@ class MainWindow(QMainWindow):
             )
         else:
             self._export_as_images(
-                targets, dst_dir, fmt,
+                jobs, dst_dir, fmt,
                 dpi=options["dpi"], quality=options["jpeg_quality"],
             )
 
+    def _collect_export_jobs(self) -> list[tuple[str, str]]:
+        """Build ``(src_pdf_abs, rel_dst)`` jobs for the current selection.
+
+        - Selected PDF cards map to ``(path, basename)`` → flat at the export
+          destination root.
+        - Selected folder cards are walked recursively; only ``.pdf`` files are
+          included, with ``rel_dst`` preserving the folder structure
+          (``<folder>/<sub>/<file>.pdf``). Non-PDF files are skipped entirely,
+          and subfolders containing no PDFs produce no jobs (so empty dirs are
+          not created at the destination).
+
+        All jobs are collected before any writing happens, so exporting into a
+        directory under a source folder does not cause recursive copying.
+        """
+        jobs: list[tuple[str, str]] = []
+        for card in self._selected_cards:
+            jobs.append((card.pdf_path, os.path.basename(card.pdf_path)))
+        for fc in self._selected_folder_cards:
+            folder = fc.folder_path
+            parent = os.path.dirname(os.path.abspath(folder).rstrip(os.sep))
+            for root, _dirs, files in os.walk(folder):
+                for fname in files:
+                    if not fname.lower().endswith(".pdf"):
+                        continue
+                    src_full = os.path.join(root, fname)
+                    rel = os.path.relpath(src_full, parent)
+                    jobs.append((src_full, rel))
+        return jobs
+
     def _export_as_pdf(
         self,
-        targets: list[str],
+        jobs: list[tuple[str, str]],
         dst_dir: str,
         *,
         optimize_level: int = 0,
@@ -2586,7 +2687,12 @@ class MainWindow(QMainWindow):
         rasterize: bool = False,
         rasterize_format: str = "jpeg",
     ) -> None:
-        """Copy, optimize-export, or rasterize PDF files to the destination directory."""
+        """Copy, optimize-export, or rasterize PDF files to the destination directory.
+
+        ``jobs`` is a list of ``(src_pdf_abs, rel_dst)`` where ``rel_dst`` is the
+        path (relative to ``dst_dir``) to write to, preserving any folder
+        structure for folder exports.
+        """
         ok = 0
         failed: list[tuple[str, str]] = []
         # Aggregate before/after sizes for files that were actually
@@ -2595,14 +2701,17 @@ class MainWindow(QMainWindow):
         total_after = 0
         compressed_count = 0
 
-        for src in targets:
+        for src, rel in jobs:
             try:
                 if not os.path.exists(src):
                     failed.append((src, "元ファイルが見つかりません"))
                     continue
 
-                filename = os.path.basename(src)
-                dst_path = ensure_unique_path(dst_dir, filename, pattern="{stem}({i}){ext}")
+                parent = Path(dst_dir) / os.path.dirname(rel)
+                parent.mkdir(parents=True, exist_ok=True)
+                dst_path = ensure_unique_path(
+                    parent, os.path.basename(rel), pattern="{stem}({i}){ext}"
+                )
                 transformed = rasterize or optimize_level > 0
                 if rasterize:
                     rasterize_pdf(
@@ -2642,24 +2751,31 @@ class MainWindow(QMainWindow):
 
     def _export_as_images(
         self,
-        targets: list[str],
+        jobs: list[tuple[str, str]],
         dst_dir: str,
         fmt: str,
         *,
         dpi: int = 150,
         quality: int = 85,
     ) -> None:
-        """Export all pages of each target PDF as images."""
+        """Export all pages of each job's PDF as images.
+
+        ``jobs`` is a list of ``(src_pdf_abs, rel_dst)``; the page images are
+        written into the directory mirroring ``rel_dst``'s parent so folder
+        structure is preserved for folder exports.
+        """
         ok = 0
         failed: list[tuple[str, str]] = []
 
-        for src in targets:
+        for src, rel in jobs:
             try:
                 if not os.path.exists(src):
                     failed.append((src, "元ファイルが見つかりません"))
                     continue
+                parent = Path(dst_dir) / os.path.dirname(rel)
+                parent.mkdir(parents=True, exist_ok=True)
                 created = export_pages_as_images(
-                    src, dst_dir, fmt=fmt, dpi=dpi, quality=quality,
+                    src, str(parent), fmt=fmt, dpi=dpi, quality=quality,
                 )
                 ok += len(created)
             except Exception as e:
@@ -2712,7 +2828,7 @@ class MainWindow(QMainWindow):
             else [c.pdf_path for c in self._cards]
         )
         if not targets:
-            QMessageBox.information(self, "Print", "印刷対象のPDFがありません。")
+            QMessageBox.information(self, "印刷", "印刷対象のPDFがありません。")
             return
         print_pdfs(targets, self)
 

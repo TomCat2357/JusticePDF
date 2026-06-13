@@ -61,20 +61,17 @@ QToolBar QPushButton:hover     { background-color: #f1f1ee; }
 QToolBar QPushButton:pressed   { background-color: #e6e6e2; }
 QToolBar QPushButton:disabled  { color: #9ca3af; }
 QToolBar QPushButton:focus     { outline: none; }
+QToolBar QPushButton::menu-indicator {
+    width: 8px;
+    height: 8px;
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    right: 4px;
+}
 
-/* Primary / destructive accents (set via objectName in Python:
-     self._export_btn.setObjectName("primary")
+/* Destructive accent (set via objectName in Python:
      self._delete_btn.setObjectName("danger")
 */
-QToolBar QPushButton#primary {
-    background-color: #18181b;
-    color: #ffffff;
-    padding: 5px 12px;
-}
-QToolBar QPushButton#primary:hover    { background-color: #2a2a2f; }
-QToolBar QPushButton#primary:pressed  { background-color: #000000; }
-QToolBar QPushButton#primary:disabled { background-color: #d9d9d4; color: #ffffff; }
-
 QToolBar QPushButton#danger           { color: #b91c1c; }
 QToolBar QPushButton#danger:hover     { background-color: #fdecec; }
 QToolBar QPushButton#danger:disabled  { color: #d9b3b3; }

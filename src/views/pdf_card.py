@@ -92,7 +92,7 @@ class PDFCard(QFrame):
             self._thumbnail_label.setText("")
         else:
             self._thumbnail_label.setPixmap(QPixmap())
-            self._thumbnail_label.setText("(empty)")
+            self._thumbnail_label.setText("(空)")
 
         # Page count (avoid opening PDF twice)
         self._page_count = page_count

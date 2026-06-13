@@ -131,7 +131,7 @@ def test_refresh_button_refreshes_cards_and_open_page_windows(window_factory, mo
         staticmethod(lambda: [fake_window]),
     )
 
-    window._refresh_btn.click()
+    window._on_refresh()
 
     assert card_refreshes == paths
     assert fake_window.refresh_calls == 1

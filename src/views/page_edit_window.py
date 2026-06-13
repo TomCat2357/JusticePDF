@@ -1836,7 +1836,7 @@ class PageEditWindow(QMainWindow):
         QTimer.singleShot(0, self._load_pages)
 
     def _setup_ui(self) -> None:
-        self.setWindowTitle(f"JusticePDF - Edit: {os.path.basename(self._pdf_path)}")
+        self.setWindowTitle(f"JusticePDF - 編集:{os.path.basename(self._pdf_path)}")
         self.resize(800, 600)
         self.setAcceptDrops(True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -1881,7 +1881,7 @@ class PageEditWindow(QMainWindow):
         controls_layout = QHBoxLayout(zoom_controls)
         controls_layout.setContentsMargins(10, 10, 10, 10)
 
-        self._zoom_back_btn = QPushButton("Back")
+        self._zoom_back_btn = QPushButton("戻る")
         self._zoom_back_btn.clicked.connect(self._exit_zoom_view)
         controls_layout.addWidget(self._zoom_back_btn)
 
@@ -1987,7 +1987,7 @@ class PageEditWindow(QMainWindow):
         panel_layout = QVBoxLayout(self._zoom_annotation_panel)
         panel_layout.setContentsMargins(10, 10, 10, 10)
 
-        title = QLabel("FreeText")
+        title = QLabel("付箋")
         panel_layout.addWidget(title)
 
         action_row = QHBoxLayout()
@@ -2694,40 +2694,40 @@ class PageEditWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        self._undo_btn = QPushButton("Undo")
+        self._undo_btn = QPushButton("元に戻す")
         self._undo_btn.clicked.connect(self._on_undo)
         toolbar.addWidget(self._undo_btn)
 
-        self._redo_btn = QPushButton("Redo")
+        self._redo_btn = QPushButton("やり直し")
         self._redo_btn.clicked.connect(self._on_redo)
         toolbar.addWidget(self._redo_btn)
 
         toolbar.addSeparator()
 
-        self._delete_btn = QPushButton("Delete")
+        self._delete_btn = QPushButton("削除")
         self._delete_btn.setObjectName("danger")
         self._delete_btn.clicked.connect(self._on_delete)
         toolbar.addWidget(self._delete_btn)
 
-        self._rename_btn = QPushButton("Rename")
+        self._rename_btn = QPushButton("名前変更")
         self._rename_btn.clicked.connect(self._on_rename)
         toolbar.addWidget(self._rename_btn)
 
-        self._title_btn = QPushButton("Title")
+        self._title_btn = QPushButton("タイトル")
         self._title_btn.clicked.connect(self._on_rename_pdf_title)
         toolbar.addWidget(self._title_btn)
 
-        self._print_btn = QPushButton("Print")
+        self._print_btn = QPushButton("印刷")
         self._print_btn.clicked.connect(self._on_print)
         toolbar.addWidget(self._print_btn)
 
         toolbar.addSeparator()
 
-        self._rotate_btn = QPushButton("Rotate")
+        self._rotate_btn = QPushButton("回転")
         self._rotate_btn.clicked.connect(self._on_rotate)
         toolbar.addWidget(self._rotate_btn)
 
-        self._select_all_btn = QPushButton("Select All")
+        self._select_all_btn = QPushButton("すべて選択")
         self._select_all_btn.clicked.connect(self._on_select_all)
         toolbar.addWidget(self._select_all_btn)
 
@@ -4292,7 +4292,7 @@ class PageEditWindow(QMainWindow):
         old_path = self._pdf_path
         old_name = os.path.basename(old_path)
         new_name, ok = QInputDialog.getText(
-            self, "Rename", "New name:", text=old_name
+            self, "名前変更", "新しい名前:", text=old_name
         )
 
         if ok and new_name and new_name != old_name:
@@ -4315,7 +4315,7 @@ class PageEditWindow(QMainWindow):
                 else:
                     os.rename(old_path, new_path)
                     self._pdf_path = new_path
-                    self.setWindowTitle(f"JusticePDF - Edit: {new_name}")
+                    self.setWindowTitle(f"JusticePDF - 編集:{new_name}")
 
             def undo_rename() -> None:
                 main_window = _get_main_window()
@@ -4324,7 +4324,7 @@ class PageEditWindow(QMainWindow):
                 else:
                     os.rename(new_path, old_path)
                     self._pdf_path = old_path
-                    self.setWindowTitle(f"JusticePDF - Edit: {old_name}")
+                    self.setWindowTitle(f"JusticePDF - 編集:{old_name}")
 
             try:
                 do_rename()
@@ -4342,7 +4342,7 @@ class PageEditWindow(QMainWindow):
         old_name = os.path.basename(old_path)
         old_title = get_pdf_metadata_title(old_path) or os.path.splitext(old_name)[0]
         new_title, ok = QInputDialog.getText(
-            self, "Rename PDF Title", "New PDF title:", text=old_title
+            self, "PDFタイトルの変更", "新しいPDFタイトル:", text=old_title
         )
 
         if not ok or not new_title or new_title == old_title:
