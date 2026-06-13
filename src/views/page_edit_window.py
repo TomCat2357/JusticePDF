@@ -33,6 +33,7 @@ from src.utils.pdf_utils import (
     ShapeType, ShapeAnnotData, AnyAnnotData,
     list_shape_annots, create_shape_annot, replace_shape_annot,
     delete_shape_annot, create_bracket_pair,
+    create_callout, delete_annot_group,
     MarkupType, TextMarkupAnnotData,
     list_markup_annots, create_markup_annot, delete_markup_annot,
     replace_markup_annot,
@@ -366,6 +367,7 @@ class ZoomPageWidget(QWidget):
     annotation_create_requested = pyqtSignal(object)
     shape_create_requested = pyqtSignal(object, object, object)  # (ShapeType, start_pt_tuple, end_pt_tuple)
     note_create_requested = pyqtSignal(object)  # placement point tuple (page coords)
+    callout_create_requested = pyqtSignal(object)  # insertion target point tuple (page coords)
     annotation_edit_requested = pyqtSignal(object)
     annotation_text_committed = pyqtSignal(object, str)
     annotation_text_edit_cancelled = pyqtSignal()
@@ -459,6 +461,8 @@ class ZoomPageWidget(QWidget):
         self._note_create_mode = False
         self._hover_note_xref: int | None = None
         self._note_popup: QFrame | None = None
+        # 校正コールアウト配置モード（クリックで挿入位置を指定）。
+        self._callout_create_mode = False
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         # 右ドラッグを範囲指定に使うため、既定のコンテキストメニューを抑止する。
@@ -489,6 +493,11 @@ class ZoomPageWidget(QWidget):
 
     def set_note_create_mode(self, enabled: bool) -> None:
         self._note_create_mode = bool(enabled)
+        self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def set_callout_create_mode(self, enabled: bool) -> None:
+        self._callout_create_mode = bool(enabled)
         self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
         self.update()
 
@@ -1063,7 +1072,9 @@ class ZoomPageWidget(QWidget):
             from src.utils.pdf_utils import _compute_bracket_vertices
             # Compute bracket vertices in the local (unrotated) rect coordinate space
             local_rect = (paint_rect.left(), paint_rect.top(), paint_rect.right(), paint_rect.bottom())
-            verts = _compute_bracket_vertices(local_rect, shape.bracket_style, shape.bracket_side)
+            verts = _compute_bracket_vertices(
+                local_rect, shape.bracket_style, shape.bracket_side, shape.bracket_orientation
+            )
             poly = QPolygonF([QPointF(v[0], v[1]) for v in verts])
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawPolyline(poly)
@@ -1402,7 +1413,7 @@ class ZoomPageWidget(QWidget):
         return "\n".join(lines)
 
     def _update_cursor(self, pos: QPoint) -> None:
-        if self.has_annotation_paste_mode() or self._note_create_mode:
+        if self.has_annotation_paste_mode() or self._note_create_mode or self._callout_create_mode:
             if self._point_in_pixmap(pos) is not None:
                 self.setCursor(Qt.CursorShape.CrossCursor)
             else:
@@ -1609,6 +1620,11 @@ class ZoomPageWidget(QWidget):
                 if self._note_create_mode:
                     if page_point is not None:
                         self.note_create_requested.emit((page_point.x(), page_point.y()))
+                    event.accept()
+                    return
+                if self._callout_create_mode:
+                    if page_point is not None:
+                        self.callout_create_requested.emit((page_point.x(), page_point.y()))
                     event.accept()
                     return
                 if self.has_annotation_paste_mode():
@@ -2132,7 +2148,9 @@ class PageEditWindow(QMainWindow):
         self._zoom_note_btn: QToolButton | None = None
         self._zoom_note_editor: NoteContentEdit | None = None
         self._zoom_note_list: QListWidget | None = None
+        self._zoom_callout_btn: QToolButton | None = None
         self._note_create_mode = False
+        self._callout_create_mode = False
         # 本文編集中の付箋 xref と、確定前の元本文（差分判定用）。
         self._editing_note_xref: int | None = None
         self._editing_note_original = ""
@@ -2293,6 +2311,7 @@ class PageEditWindow(QMainWindow):
         self._zoom_label.annotation_create_requested.connect(self._on_zoom_annotation_create_requested)
         self._zoom_label.shape_create_requested.connect(self._on_zoom_shape_create_requested)
         self._zoom_label.note_create_requested.connect(self._on_note_create_requested)
+        self._zoom_label.callout_create_requested.connect(self._on_callout_create_requested)
         self._zoom_label.annotation_edit_requested.connect(self._on_zoom_annotation_edit_requested)
         self._zoom_label.annotation_text_committed.connect(self._on_zoom_annotation_text_committed)
         self._zoom_label.annotation_text_edit_cancelled.connect(self._on_zoom_annotation_text_edit_cancelled)
@@ -2441,6 +2460,12 @@ class PageEditWindow(QMainWindow):
         self._zoom_note_color_btn.setToolTip("付箋の色")
         self._zoom_note_color_btn.clicked.connect(self._pick_note_color)
         note_row.addWidget(self._zoom_note_color_btn)
+        self._zoom_callout_btn = QToolButton()
+        self._zoom_callout_btn.setText("校正")
+        self._zoom_callout_btn.setCheckable(True)
+        self._zoom_callout_btn.setToolTip("校正コールアウトを追加（挿入位置をクリック）")
+        self._zoom_callout_btn.clicked.connect(self._on_callout_btn_clicked)
+        note_row.addWidget(self._zoom_callout_btn)
         note_row.addStretch(1)
         panel_layout.addLayout(note_row)
         self._set_color_button_preview(self._zoom_note_color_btn, self._zoom_note_color)
@@ -2827,6 +2852,7 @@ class PageEditWindow(QMainWindow):
         if enabled:
             self._set_shape_create_mode(None)
             self._set_note_create_mode(False)
+            self._set_callout_create_mode(False)
         if self._zoom_label:
             if enabled:
                 self._zoom_label.cancel_annotation_paste_mode()
@@ -3387,6 +3413,74 @@ class PageEditWindow(QMainWindow):
         if isinstance(note, NoteAnnotData):
             self._set_selected_zoom_annotation(note, open_drawer=True)
 
+    # --- Proofreading callout --------------------------------------------
+
+    def _set_callout_create_mode(self, enabled: bool) -> None:
+        self._callout_create_mode = bool(enabled)
+        if self._zoom_callout_btn is not None:
+            with QSignalBlocker(self._zoom_callout_btn):
+                self._zoom_callout_btn.setChecked(enabled)
+        if self._zoom_label is not None:
+            self._zoom_label.set_callout_create_mode(enabled)
+
+    def _on_callout_btn_clicked(self, checked: bool) -> None:
+        if checked:
+            self._set_zoom_annotation_create_mode(False)
+            self._set_shape_create_mode(None)
+            self._set_note_create_mode(False)
+            if self._selected_zoom_annotation is not None:
+                self._set_selected_zoom_annotation(None)
+            self._set_callout_create_mode(True)
+        else:
+            self._set_callout_create_mode(False)
+
+    def _on_callout_create_requested(self, target: object) -> None:
+        if self._zoom_page_num is None or not isinstance(target, tuple) or len(target) != 2:
+            return
+        tx, ty = float(target[0]), float(target[1])
+        page_w, page_h = self._current_zoom_annotation_page_size()
+        # 本文ボックスは挿入位置の上に既定サイズで配置（はみ出しは内側へ寄せる）。
+        box_w, box_h = 160.0, 46.0
+        gap = 28.0
+        bx0 = tx - box_w / 2.0
+        by1 = ty - gap
+        by0 = by1 - box_h
+        if page_w > 0:
+            bx0 = max(2.0, min(bx0, page_w - box_w - 2.0))
+        if by0 < 2.0:
+            # 上に置けない場合は挿入位置の下へ。
+            by0 = ty + gap
+            by1 = by0 + box_h
+        text_rect = (bx0, by0, bx0 + box_w, by1)
+
+        state: dict[str, object] = {"members": None}
+
+        def do_create() -> None:
+            text_saved, _brace, _leader = create_callout(
+                self._pdf_path,
+                self._zoom_page_num,
+                text_rect=text_rect,
+                target_point=(tx, ty),
+                text="",
+            )
+            state["members"] = text_saved.group_id
+            self._selected_zoom_annotation = text_saved
+            self._refresh_current_zoom_page(open_drawer=True)
+            # 本文をすぐ入力できるよう FreeText インライン編集を開始。
+            current = self._find_zoom_annotation(text_saved.xref)
+            if isinstance(current, FreeTextAnnotData) and self._zoom_label is not None:
+                self._zoom_label.begin_annotation_text_edit(current)
+
+        def undo_create() -> None:
+            gid = state.get("members")
+            if gid:
+                delete_annot_group(self._pdf_path, self._zoom_page_num, str(gid))
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        self._set_callout_create_mode(False)
+        self._push_undoable("Create callout", do_create, undo_create)
+
     def _current_zoom_annotation_page_size(self) -> tuple[float, float]:
         if self._zoom_label:
             return self._zoom_label.page_size_points()
@@ -3552,6 +3646,7 @@ class PageEditWindow(QMainWindow):
         self._set_zoom_annotation_create_mode(False)
         self._set_shape_create_mode(None)
         self._set_note_create_mode(False)
+        self._set_callout_create_mode(False)
         if isinstance(annotation, (FreeTextAnnotData, ShapeAnnotData, TextMarkupAnnotData, NoteAnnotData)):
             current = self._find_zoom_annotation(annotation.xref) or annotation
             self._set_selected_zoom_annotation(current, open_drawer=True)
@@ -3854,6 +3949,7 @@ class PageEditWindow(QMainWindow):
     def _set_shape_create_mode(self, shape_type: ShapeType | None) -> None:
         if shape_type is not None:
             self._set_note_create_mode(False)
+            self._set_callout_create_mode(False)
         for st, btn in self._shape_buttons.items():
             with QSignalBlocker(btn):
                 btn.setChecked(st == shape_type)
@@ -4268,6 +4364,32 @@ class PageEditWindow(QMainWindow):
             return
         self._commit_inline_annotation_editor()
         annot = self._selected_zoom_annotation
+
+        # グループ（校正コールアウト等）はまとめて削除する。
+        group_id = getattr(annot, "group_id", "")
+        if group_id:
+            page_num = annot.page_num
+            members_ft = [a for a in list_freetext_annots(self._pdf_path, page_num) if a.group_id == group_id]
+            members_sh = [a for a in list_shape_annots(self._pdf_path, page_num) if a.group_id == group_id]
+            grp = {"ft": members_ft, "sh": members_sh}
+
+            def do_delete_group() -> None:
+                delete_annot_group(self._pdf_path, page_num, group_id)
+                self._selected_zoom_annotation = None
+                self._refresh_current_zoom_page()
+
+            def undo_delete_group() -> None:
+                restored = None
+                for data in grp["ft"]:
+                    restored = create_freetext_annot(self._pdf_path, data)
+                for data in grp["sh"]:
+                    s = create_shape_annot(self._pdf_path, data)
+                    restored = restored or s
+                self._selected_zoom_annotation = restored
+                self._refresh_current_zoom_page(open_drawer=True)
+
+            self._push_undoable("Delete callout", do_delete_group, undo_delete_group)
+            return
 
         if isinstance(annot, TextMarkupAnnotData):
             state = {"old": annot}
