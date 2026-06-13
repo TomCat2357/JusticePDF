@@ -35,6 +35,7 @@ from src.utils.pdf_utils import (
     create_empty_pdf,
 )
 from src.views.export_dialog import ExportOptionsDialog
+from src.views.print_dialog import PrintDialog
 from src.utils.constants import (
     WORD_EXTS as _WORD_EXTS,
     EXCEL_EXTS as _EXCEL_EXTS,
@@ -2381,6 +2382,17 @@ class MainWindow(QMainWindow):
             if os.path.splitext(src)[1].lower() in _OFFICE_EXTS
         )
 
+    def import_external_paths(self, paths: list[str]) -> None:
+        """Explorer の右クリックから渡されたファイル群を作業フォルダへ取り込む。
+
+        ``main.py`` がコマンドライン引数（``%1``）で受け取ったパスを起動後に
+        取り込むための公開エントリ。存在するパスだけを既存の ``_import_paths``
+        に流す。
+        """
+        valid = [p for p in paths if Path(p).exists()]
+        if valid:
+            self._import_paths(valid)
+
     def _import_paths(
         self,
         paths: list[str],
@@ -2830,7 +2842,10 @@ class MainWindow(QMainWindow):
         if not targets:
             QMessageBox.information(self, "印刷", "印刷対象のPDFがありません。")
             return
-        print_pdfs(targets, self)
+        dialog = PrintDialog(targets, self, current_index=None)
+        if dialog.exec() != PrintDialog.DialogCode.Accepted:
+            return
+        print_pdfs(targets, self, settings=dialog.get_settings(), printer=dialog.build_printer())
 
     def _on_rotate(self) -> None:
         """Handle rotate action."""

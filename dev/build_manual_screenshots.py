@@ -1,10 +1,10 @@
 """Generate screenshots used by JusticePDFの使い方.docx.
 
 Renders MainWindow / PageEditWindow / dialogs offscreen with sample PDFs
-and saves PNGs to ``tools/manual_assets``.
+and saves PNGs to ``dev/manual_assets``.
 
 Run:
-    uv run python tools\\build_manual_screenshots.py
+    uv run python dev\\build_manual_screenshots.py
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from src.views.export_dialog import ExportOptionsDialog
 from src.views.search_dialog import SearchDialog
 from src.models.undo_manager import UndoManager
 
-OUT_DIR = ROOT / "tools" / "manual_assets"
+OUT_DIR = Path(__file__).resolve().parent / "manual_assets"
 
 
 # ---------- Test doubles ----------

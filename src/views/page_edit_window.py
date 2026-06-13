@@ -10,7 +10,8 @@ from PyQt6.QtWidgets import (
     QToolBar, QPushButton, QScrollArea, QGridLayout,
     QInputDialog, QLabel, QFrame, QApplication, QRubberBand, QMessageBox,
     QToolButton, QSizePolicy, QPlainTextEdit, QFormLayout,
-    QSpinBox, QDoubleSpinBox, QColorDialog, QSlider, QCheckBox, QComboBox
+    QSpinBox, QDoubleSpinBox, QColorDialog, QSlider, QCheckBox, QComboBox,
+    QMenu
 )
 from PyQt6.QtCore import (
     Qt, QMimeData, QSize, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl,
@@ -347,12 +348,22 @@ class ZoomPageWidget(QWidget):
     annotation_paste_placement_requested = pyqtSignal(object)
     # Ctrl+ドラッグで複製: (annotation, new_rect_tuple, new_vertices_or_None)
     annotation_duplicate_requested = pyqtSignal(object, object, object)
+    # ビューのスクロール要求 (dx, dy: ピクセル)。中ボタンドラッグ / Ctrl+矢印で発火。
+    scroll_requested = pyqtSignal(int, int)
+    # 右ドラッグで指定した範囲（ページ座標 QRectF）への拡大要求。
+    zoom_region_requested = pyqtSignal(object)
 
     HANDLE_SIZE = 10
-    # 矢印キーによる注釈移動量（PDF ポイント）。通常 / 細かい移動。
+    # 矢印キーによる注釈移動量（PDF ポイント）。細かい / 通常 / 粗い移動。
     # 押下回数によらず一定ステップ（加速なし）。
+    # Alt/Shift=細かく、無修飾=通常、Ctrl=粗く。
     ANNOTATION_MOVE_STEP = 10.0
     ANNOTATION_MOVE_STEP_FINE = 1.0
+    ANNOTATION_MOVE_STEP_COARSE = 50.0
+    # 矢印キーで注釈未選択時にビューをスクロールする 1 ステップ（ピクセル）。
+    # 無修飾=通常スクロール、Ctrl=高速スクロール。
+    ZOOM_SCROLL_STEP = 80
+    ZOOM_SCROLL_STEP_FAST = 320
     # 矢印キー -> (dx, dy) の単位ベクトル（ページ座標は下方向が +y）。
     _ARROW_DELTAS = {
         Qt.Key.Key_Left: (-1.0, 0.0),
@@ -408,8 +419,17 @@ class ZoomPageWidget(QWidget):
         self._paste_drag_active = False
         self._search_hits_pdf: list[tuple[float, float, float, float]] = []
         self._search_hit_rects: list[QRectF] = []
+        # 中ボタンドラッグによるパン（つかんで移動）状態。
+        self._pan_active = False
+        self._pan_last_global: QPoint | None = None
+        # 右ドラッグによる範囲指定拡大（マーキーズーム）状態。
+        self._marquee_active = False
+        self._marquee_origin: QPoint | None = None
+        self._marquee_rect: QRect | None = None
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
+        # 右ドラッグを範囲指定に使うため、既定のコンテキストメニューを抑止する。
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
 
     def sizeHint(self):
         if self._pixmap and not self._pixmap.isNull():
@@ -697,6 +717,10 @@ class ZoomPageWidget(QWidget):
 
     def page_point_from_global_pos(self, global_pos: QPoint) -> QPointF | None:
         return self._page_point_from_widget_pos(self.mapFromGlobal(global_pos))
+
+    def widget_point_from_page_point(self, pt: QPointF) -> QPointF:
+        """Map a page-space point to this widget's pixel coordinates."""
+        return self._page_point_to_widget_point(pt)
 
     def _apply_shape_shift_constraint(
         self,
@@ -1394,6 +1418,11 @@ class ZoomPageWidget(QWidget):
             painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(preview_rect)
+        if self._marquee_rect is not None:
+            # 右ドラッグの範囲指定拡大プレビュー。
+            painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(0, 120, 215, 40))
+            painter.drawRect(self._marquee_rect.normalized())
 
     def wheelEvent(self, event) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -1410,6 +1439,27 @@ class ZoomPageWidget(QWidget):
 
     def mousePressEvent(self, event) -> None:
         try:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                # 中ボタンドラッグでつかんで移動（パン）。
+                self.setFocus()
+                self._pan_active = True
+                self._pan_last_global = event.globalPosition().toPoint()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.RightButton:
+                # 右ドラッグで範囲を指定し、その範囲を拡大表示。
+                # 注釈作成中・貼り付け中は通常操作を優先して無効化する。
+                if self._annotation_create_mode or self.has_annotation_paste_mode():
+                    event.accept()
+                    return
+                self.setFocus()
+                self._marquee_active = True
+                self._marquee_origin = event.pos()
+                self._marquee_rect = QRect(event.pos(), event.pos())
+                self.update()
+                event.accept()
+                return
             if event.button() == Qt.MouseButton.LeftButton:
                 self.setFocus()
                 page_point = self._page_point_from_widget_pos(event.pos())
@@ -1504,6 +1554,23 @@ class ZoomPageWidget(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         try:
+            if self._pan_active and (event.buttons() & Qt.MouseButton.MiddleButton):
+                cur = event.globalPosition().toPoint()
+                if self._pan_last_global is not None:
+                    # マウスの移動と逆方向にスクロールして紙をつかんで動かす感覚にする。
+                    self.scroll_requested.emit(
+                        self._pan_last_global.x() - cur.x(),
+                        self._pan_last_global.y() - cur.y(),
+                    )
+                self._pan_last_global = cur
+                event.accept()
+                return
+            if self._marquee_active and (event.buttons() & Qt.MouseButton.RightButton):
+                if self._marquee_origin is not None:
+                    self._marquee_rect = QRect(self._marquee_origin, event.pos()).normalized()
+                    self.update()
+                event.accept()
+                return
             if self.has_annotation_paste_mode() and self._paste_drag_active:
                 current_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
                 if current_page is not None:
@@ -1570,6 +1637,28 @@ class ZoomPageWidget(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         try:
+            if event.button() == Qt.MouseButton.MiddleButton and self._pan_active:
+                self._pan_active = False
+                self._pan_last_global = None
+                self._update_cursor(event.pos())
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.RightButton and self._marquee_active:
+                self._marquee_active = False
+                self._marquee_origin = None
+                rect = self._marquee_rect
+                self._marquee_rect = None
+                self.update()
+                # 十分な大きさの範囲が指定されたときだけ拡大する。
+                if rect is not None and rect.width() >= 5 and rect.height() >= 5:
+                    p0 = self._page_point_from_widget_pos(rect.topLeft(), clamp=True)
+                    p1 = self._page_point_from_widget_pos(rect.bottomRight(), clamp=True)
+                    if p0 is not None and p1 is not None:
+                        page_rect = QRectF(p0, p1).normalized()
+                        if page_rect.width() > 0 and page_rect.height() > 0:
+                            self.zoom_region_requested.emit(page_rect)
+                event.accept()
+                return
             if event.button() == Qt.MouseButton.LeftButton:
                 if self.has_annotation_paste_mode():
                     final_rect = self._paste_preview_rect
@@ -1695,19 +1784,29 @@ class ZoomPageWidget(QWidget):
             self.annotation_delete_requested.emit()
             event.accept()
             return
-        if (
-            event.key() in self._ARROW_DELTAS
-            and self._selected_annotation_xref is not None
-            and self._inline_editor is None
-        ):
+        if event.key() in self._ARROW_DELTAS and self._inline_editor is None:
             ux, uy = self._ARROW_DELTAS[event.key()]
-            # Alt（または Shift）押下時は細かく、それ以外は通常ステップで移動。
-            fine = bool(
-                event.modifiers()
-                & (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier)
-            )
-            step = self.ANNOTATION_MOVE_STEP_FINE if fine else self.ANNOTATION_MOVE_STEP
-            if self._move_selected_annotation(ux * step, uy * step):
+            mods = event.modifiers()
+            if self._selected_annotation_xref is not None:
+                # 注釈を移動。Alt/Shift=細かく、Ctrl=粗く、無修飾=通常ステップ。
+                if mods & (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier):
+                    step = self.ANNOTATION_MOVE_STEP_FINE
+                elif mods & Qt.KeyboardModifier.ControlModifier:
+                    step = self.ANNOTATION_MOVE_STEP_COARSE
+                else:
+                    step = self.ANNOTATION_MOVE_STEP
+                if self._move_selected_annotation(ux * step, uy * step):
+                    event.accept()
+                    return
+            else:
+                # 注釈未選択時は矢印でビューをスクロール。Ctrl で高速スクロール。
+                # QScrollArea 任せにせず自前で出し分け、Ctrl の加速を確実にする。
+                step = (
+                    self.ZOOM_SCROLL_STEP_FAST
+                    if mods & Qt.KeyboardModifier.ControlModifier
+                    else self.ZOOM_SCROLL_STEP
+                )
+                self.scroll_requested.emit(int(ux * step), int(uy * step))
                 event.accept()
                 return
         super().keyPressEvent(event)
@@ -1750,6 +1849,8 @@ class PageEditWindow(QMainWindow):
     ZOOM_MIN = 25
     ZOOM_MAX = 400
     ZOOM_STEP = 5
+    # 「100%」ボタンのドロップダウンに並べる倍率プリセット（25/100/400% は必須）。
+    ZOOM_PRESETS = (25, 50, 75, 100, 150, 200, 300, 400)
     PREVIEW_THUMB_MIN = 80
     PREVIEW_THUMB_MAX = 400
     PREVIEW_THUMB_STEP = 20
@@ -1766,6 +1867,7 @@ class PageEditWindow(QMainWindow):
         self._zoom_scroll = None
         self._zoom_label = None
         self._zoom_percent_label = None
+        self._zoom_reset_btn = None
         self._zoom_page_label = None
         self._zoom_prev_btn = None
         self._zoom_next_btn = None
@@ -1893,12 +1995,21 @@ class PageEditWindow(QMainWindow):
         self._zoom_in_btn.clicked.connect(self._on_zoom_in)
         controls_layout.addWidget(self._zoom_in_btn)
 
-        self._zoom_reset_btn = QPushButton("100%")
-        self._zoom_reset_btn.clicked.connect(self._on_zoom_reset)
+        # 「100%」ボタン。クリックすると倍率プリセットのドロップダウンが開く。
+        # ボタン表示は現在の倍率を反映する。
+        self._zoom_reset_btn = QToolButton()
+        self._zoom_reset_btn.setObjectName("zoomPreset")
+        self._zoom_reset_btn.setText("100%")
+        self._zoom_reset_btn.setToolTip("倍率を選択")
+        self._zoom_reset_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        zoom_preset_menu = QMenu(self._zoom_reset_btn)
+        for preset in self.ZOOM_PRESETS:
+            action = zoom_preset_menu.addAction(f"{preset}%")
+            action.triggered.connect(
+                lambda _checked=False, p=preset: self._set_zoom_percent(p)
+            )
+        self._zoom_reset_btn.setMenu(zoom_preset_menu)
         controls_layout.addWidget(self._zoom_reset_btn)
-
-        self._zoom_percent_label = QLabel("100%")
-        controls_layout.addWidget(self._zoom_percent_label)
 
         # ページ移動(◁ ▷)
         self._zoom_prev_btn = QToolButton()
@@ -1959,6 +2070,8 @@ class PageEditWindow(QMainWindow):
         self._zoom_label.annotation_paste_requested.connect(self._on_zoom_annotation_paste_requested)
         self._zoom_label.annotation_paste_placement_requested.connect(self._on_zoom_annotation_paste_placement_requested)
         self._zoom_label.annotation_duplicate_requested.connect(self._on_zoom_annotation_duplicate_requested)
+        self._zoom_label.scroll_requested.connect(self._on_zoom_scroll_requested)
+        self._zoom_label.zoom_region_requested.connect(self._on_zoom_region_requested)
         self._zoom_scroll.setWidget(self._zoom_label)
 
         zoom_content = QWidget()
@@ -4077,7 +4190,48 @@ class PageEditWindow(QMainWindow):
         self._zoom_factor = value / 100.0
         if self._zoom_percent_label:
             self._zoom_percent_label.setText(f"{value}%")
+        if self._zoom_reset_btn:
+            self._zoom_reset_btn.setText(f"{value}%")
         self._render_zoom_page()
+
+    def _on_zoom_scroll_requested(self, dx: int, dy: int) -> None:
+        # 中ボタンドラッグ / Ctrl+矢印からのビュースクロール要求を処理する。
+        if not self._zoom_scroll:
+            return
+        hbar = self._zoom_scroll.horizontalScrollBar()
+        vbar = self._zoom_scroll.verticalScrollBar()
+        hbar.setValue(hbar.value() + int(dx))
+        vbar.setValue(vbar.value() + int(dy))
+
+    def _on_zoom_region_requested(self, page_rect: object) -> None:
+        # 右ドラッグで指定された範囲がビューポートに収まる倍率へ拡大し、中央に表示する。
+        if not self._zoom_scroll or not self._zoom_label:
+            return
+        if (
+            not isinstance(page_rect, QRectF)
+            or page_rect.width() <= 0
+            or page_rect.height() <= 0
+        ):
+            return
+        viewport = self._zoom_scroll.viewport()
+        avail_w = max(1, viewport.width())
+        avail_h = max(1, viewport.height())
+        fit = min(avail_w / page_rect.width(), avail_h / page_rect.height())
+        percent = max(self.ZOOM_MIN, min(self.ZOOM_MAX, int(fit * 100)))
+        self._set_zoom_percent(percent)
+        center = page_rect.center()
+        # 倍率変更後のレイアウト確定を待ってから中央へスクロールする。
+        QTimer.singleShot(0, lambda: self._center_zoom_on_page_point(center))
+
+    def _center_zoom_on_page_point(self, page_pt: QPointF) -> None:
+        if not self._zoom_scroll or not self._zoom_label:
+            return
+        wp = self._zoom_label.widget_point_from_page_point(page_pt)
+        viewport = self._zoom_scroll.viewport()
+        hbar = self._zoom_scroll.horizontalScrollBar()
+        vbar = self._zoom_scroll.verticalScrollBar()
+        hbar.setValue(int(wp.x() - viewport.width() / 2))
+        vbar.setValue(int(wp.y() - viewport.height() / 2))
 
     def _on_zoom_wheel(self, step: int) -> None:
         current = int(self._zoom_factor * 100)
@@ -4090,9 +4244,6 @@ class PageEditWindow(QMainWindow):
     def _on_zoom_out(self) -> None:
         current = int(self._zoom_factor * 100)
         self._set_zoom_percent(current - self.ZOOM_STEP)
-
-    def _on_zoom_reset(self) -> None:
-        self._set_zoom_percent(100)
 
     def _on_zoom_prev_page(self) -> None:
         if self._zoom_page_num is None:
@@ -4372,7 +4523,12 @@ class PageEditWindow(QMainWindow):
 
     def _on_print(self) -> None:
         """Print the current PDF."""
-        print_pdfs([self._pdf_path], self)
+        from src.views.print_dialog import PrintDialog
+        current = self._zoom_page_num if (self._zoom_view and self._zoom_view.isVisible()) else None
+        dialog = PrintDialog([self._pdf_path], self, current_index=current)
+        if dialog.exec() != PrintDialog.DialogCode.Accepted:
+            return
+        print_pdfs([self._pdf_path], self, settings=dialog.get_settings(), printer=dialog.build_printer())
 
     def _on_rotate(self) -> None:
         # ズームビュー表示中の場合

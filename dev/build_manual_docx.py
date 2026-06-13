@@ -1,10 +1,10 @@
 """Generate JusticePDFの使い方.docx from scratch.
 
-Run after ``tools/build_manual_screenshots.py`` so screenshots exist
-under ``tools/manual_assets/``. Overwrites the existing docx.
+Run after ``dev/build_manual_screenshots.py`` so screenshots exist
+under ``dev/manual_assets/``. Overwrites the existing docx.
 
 Run:
-    uv run python tools\\build_manual_docx.py
+    uv run python dev\\build_manual_docx.py
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSETS = ROOT / "tools" / "manual_assets"
+ASSETS = Path(__file__).resolve().parent / "manual_assets"
 OUT_DOCX = ROOT / "JusticePDFの使い方.docx"
 
 
@@ -287,6 +287,10 @@ def build_doc() -> Document:
     )
     _bullet(doc, "PageUp / PageDown：前後のページへ")
     _bullet(doc, "Home / End：先頭・末尾のページへ")
+    _bullet(doc, "「100%」ボタン：クリックすると 25%〜400% の倍率プリセットをドロップダウンで選択")
+    _bullet(doc, "矢印キー：表示位置をスクロール。Ctrl + 矢印で大きく移動")
+    _bullet(doc, "マウス中ボタンでドラッグ：紙をつかむように表示位置を移動（パン）")
+    _bullet(doc, "マウス右ボタンでドラッグ：囲んだ範囲をビュー全体に拡大表示")
     _bullet(doc, "Back ボタン：拡大ビューを抜けて元の一覧に戻る")
     _img(doc, "06_zoom_view.png")
 
@@ -298,6 +302,7 @@ def build_doc() -> Document:
         "幅・高さ・線幅・透明度・文字サイズ・文字色・背景色・線色を細かく指定できます。",
     )
     _img(doc, "07_annotation_panel.png")
+    _bullet(doc, "注釈を選んで矢印キー：移動（通常10pt、Alt/Shiftで微調整1pt、Ctrlで粗く50pt）")
     _bullet(doc, "注釈を選んで Delete：削除")
     _bullet(doc, "Ctrl + ドラッグ：注釈を複製")
     _bullet(doc, "Ctrl + C / Ctrl + V：別ページへコピー＆ペースト")
