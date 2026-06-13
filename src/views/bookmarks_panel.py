@@ -31,6 +31,9 @@ from src.utils.pdf_utils import TocEntry
 logger = logging.getLogger(__name__)
 
 _PAGE_ROLE = Qt.ItemDataRole.UserRole
+# ノード種別: None=しおり, "note_group"=付箋グループ, "note"=付箋
+_NODE_KIND_ROLE = Qt.ItemDataRole.UserRole + 1
+_XREF_ROLE = Qt.ItemDataRole.UserRole + 2
 
 
 class BookmarksPanel(QFrame):
@@ -48,6 +51,7 @@ class BookmarksPanel(QFrame):
 
     bookmarks_changed = pyqtSignal(list, str)
     jump_requested = pyqtSignal(int)
+    note_jump_requested = pyqtSignal(int, int)  # (page 1始まり, 付箋 xref)
     open_changed = pyqtSignal(bool)
 
     DRAWER_WIDTH = 320
@@ -62,6 +66,8 @@ class BookmarksPanel(QFrame):
         self._loading = False
         self._suppress_item_changed = False
         self._current_page_provider: Callable[[], int] | None = None
+        # 付箋一覧（page 1始まり, xref, 冒頭テキスト）。set_annotation_notes で更新。
+        self._notes: list[tuple[int, int, str]] = []
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -150,9 +156,23 @@ class BookmarksPanel(QFrame):
         self._loading = True
         try:
             self._build_tree(entries)
+            self._rebuild_note_nodes()
         finally:
             self._loading = False
         self._update_button_states()
+
+    def set_annotation_notes(self, notes: list[tuple[int, int, str]]) -> None:
+        """付箋一覧（page 1始まり, xref, 冒頭テキスト）を反映する。
+
+        付箋があるページのみ、最寄りのしおりの下に「付箋」グループ（既定で畳む）を
+        作り、各付箋を子ノードとしてぶら下げる。
+        """
+        self._notes = list(notes)
+        self._loading = True
+        try:
+            self._rebuild_note_nodes()
+        finally:
+            self._loading = False
 
     @property
     def is_open(self) -> bool:
@@ -203,6 +223,9 @@ class BookmarksPanel(QFrame):
         out: list[TocEntry] = []
 
         def walk(item: QTreeWidgetItem, level: int) -> None:
+            # 付箋ノード（グループ・付箋）はしおりではないので TOC に含めない。
+            if item.data(0, _NODE_KIND_ROLE) is not None:
+                return
             title = item.text(0).strip() or "(無題)"
             page = item.data(0, _PAGE_ROLE)
             try:
@@ -216,6 +239,123 @@ class BookmarksPanel(QFrame):
         for i in range(self._tree.topLevelItemCount()):
             walk(self._tree.topLevelItem(i), 1)
         return out
+
+    # ------------------------------------------------------------------
+    # 付箋ノード（しおりにぶら下げる）
+    # ------------------------------------------------------------------
+    def _is_note_node(self, item: QTreeWidgetItem) -> bool:
+        return item.data(0, _NODE_KIND_ROLE) in ("note", "note_group")
+
+    def _iter_bookmark_items(self) -> list[QTreeWidgetItem]:
+        """しおり項目を表示順（プレオーダー）で返す。付箋ノードは除く。"""
+        result: list[QTreeWidgetItem] = []
+
+        def walk(item: QTreeWidgetItem) -> None:
+            if self._is_note_node(item):
+                return
+            result.append(item)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(self._tree.topLevelItemCount()):
+            walk(self._tree.topLevelItem(i))
+        return result
+
+    def _clear_note_nodes(self) -> None:
+        self._suppress_item_changed = True
+        try:
+            to_remove: list[QTreeWidgetItem] = []
+
+            def collect(item: QTreeWidgetItem) -> None:
+                for i in range(item.childCount()):
+                    child = item.child(i)
+                    if self._is_note_node(child):
+                        to_remove.append(child)
+                    else:
+                        collect(child)
+
+            for i in range(self._tree.topLevelItemCount()):
+                top = self._tree.topLevelItem(i)
+                if self._is_note_node(top):
+                    to_remove.append(top)
+                else:
+                    collect(top)
+
+            for item in to_remove:
+                parent = item.parent()
+                if parent is None:
+                    idx = self._tree.indexOfTopLevelItem(item)
+                    if idx >= 0:
+                        self._tree.takeTopLevelItem(idx)
+                else:
+                    parent.removeChild(item)
+        finally:
+            self._suppress_item_changed = False
+
+    def _nearest_bookmark_for_page(self, page: int) -> QTreeWidgetItem | None:
+        """page 以下で最も近い（表示順で最後の）しおり項目を返す。"""
+        target: QTreeWidgetItem | None = None
+        for item in self._iter_bookmark_items():
+            item_page = item.data(0, _PAGE_ROLE)
+            try:
+                item_page = int(item_page)
+            except (TypeError, ValueError):
+                continue
+            if item_page <= page:
+                target = item
+            else:
+                break
+        return target
+
+    def _make_note_group_item(self, count: int) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([f"📝 付箋 ({count})", ""])
+        item.setData(0, _NODE_KIND_ROLE, "note_group")
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        return item
+
+    def _make_note_item(self, page: int, xref: int, preview: str) -> QTreeWidgetItem:
+        text = preview.strip().replace("\n", " ") or "（空のコメント）"
+        if len(text) > 30:
+            text = text[:30] + "…"
+        item = QTreeWidgetItem([f"p.{page}: {text}", str(page)])
+        item.setData(0, _PAGE_ROLE, int(page))
+        item.setData(0, _NODE_KIND_ROLE, "note")
+        item.setData(0, _XREF_ROLE, int(xref))
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        return item
+
+    def _rebuild_note_nodes(self) -> None:
+        self._clear_note_nodes()
+        if not self._notes:
+            return
+        self._suppress_item_changed = True
+        try:
+            # ターゲットしおり（または None=トップレベル）ごとに付箋をまとめる。
+            grouped: dict[int, list[tuple[int, int, str]]] = {}
+            order: list[QTreeWidgetItem | None] = []
+            buckets: dict[int, QTreeWidgetItem | None] = {}
+            for page, xref, preview in sorted(self._notes, key=lambda n: (n[0], n[1])):
+                target = self._nearest_bookmark_for_page(page)
+                key = id(target) if target is not None else 0
+                if key not in grouped:
+                    grouped[key] = []
+                    buckets[key] = target
+                    order.append(target)
+                grouped[key].append((page, xref, preview))
+
+            for target in order:
+                key = id(target) if target is not None else 0
+                items = grouped[key]
+                group = self._make_note_group_item(len(items))
+                for page, xref, preview in items:
+                    group.addChild(self._make_note_item(page, xref, preview))
+                if target is None:
+                    self._tree.addTopLevelItem(group)
+                else:
+                    target.addChild(group)
+                group.setExpanded(False)  # 既定で畳む
+        finally:
+            self._suppress_item_changed = False
 
     def _make_item(self, title: str, page: int) -> QTreeWidgetItem:
         item = QTreeWidgetItem([title, str(page)])
@@ -235,6 +375,18 @@ class BookmarksPanel(QFrame):
     # ツリーイベント
     # ------------------------------------------------------------------
     def _on_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        kind = item.data(0, _NODE_KIND_ROLE)
+        if kind == "note_group":
+            item.setExpanded(not item.isExpanded())
+            return
+        if kind == "note":
+            page = item.data(0, _PAGE_ROLE)
+            xref = item.data(0, _XREF_ROLE)
+            try:
+                self.note_jump_requested.emit(int(page), int(xref))
+            except (TypeError, ValueError):
+                pass
+            return
         page = item.data(0, _PAGE_ROLE)
         try:
             self.jump_requested.emit(int(page))
@@ -242,6 +394,8 @@ class BookmarksPanel(QFrame):
             pass
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._is_note_node(item):
+            return
         if column == 0:
             self._tree.editItem(item, 0)
         elif column == 1:
@@ -268,6 +422,8 @@ class BookmarksPanel(QFrame):
     def _insert_sibling(self, item: QTreeWidgetItem) -> None:
         """選択項目の直後・同階層に挿入。未選択ならトップレベル末尾。"""
         selected = self._tree.currentItem()
+        if selected is not None and self._is_note_node(selected):
+            selected = None
         if selected is None:
             self._tree.addTopLevelItem(item)
             return
@@ -440,6 +596,14 @@ class BookmarksPanel(QFrame):
     # ------------------------------------------------------------------
     def _update_button_states(self) -> None:
         item = self._tree.currentItem()
+        # 付箋ノードはしおり編集の対象外。
+        if item is not None and self._is_note_node(item):
+            for btn in (
+                self._edit_btn, self._delete_btn, self._promote_btn,
+                self._demote_btn, self._up_btn, self._down_btn,
+            ):
+                btn.setEnabled(False)
+            return
         has_selection = item is not None
         for btn in (self._edit_btn, self._delete_btn):
             btn.setEnabled(has_selection)

@@ -22,6 +22,10 @@ from PyQt6.QtWidgets import QWidget
 logger = logging.getLogger(__name__)
 JUSTICEPDF_FREETEXT_SUBJECT_PREFIX = "JusticePDF-FreeText:"
 JUSTICEPDF_SHAPE_SUBJECT_PREFIX = "JusticePDF-Shape:"
+JUSTICEPDF_MARKUP_SUBJECT_PREFIX = "JusticePDF-Markup:"
+JUSTICEPDF_NOTE_SUBJECT_PREFIX = "JusticePDF-Note:"
+# 付箋アイコンの公称サイズ（PDF ポイント）。ヒットテスト用の矩形に使う。
+NOTE_ICON_PDF_SIZE = 18.0
 
 
 class PdfWritePermissionError(PermissionError):
@@ -48,6 +52,7 @@ class FreeTextAnnotData:
     annotation_id: str = ""
     subject: str = ""
     text_rotation: int = 0
+    group_id: str = ""
 
 
 class ShapeType(str, Enum):
@@ -75,6 +80,7 @@ class ShapeAnnotData:
     bracket_size: str = "medium"
     bracket_both_sides: bool = False
     bracket_side: str = "left"
+    bracket_orientation: str = "vertical"  # "vertical" | "horizontal"
     group_id: str = ""
     vertices: tuple[tuple[float, float], ...] = ()
     triangle_apex: tuple[float, float] = (0.5, 0.0)
@@ -82,7 +88,66 @@ class ShapeAnnotData:
     subject: str = ""
 
 
-AnyAnnotData = FreeTextAnnotData | ShapeAnnotData
+class MarkupType(str, Enum):
+    HIGHLIGHT = "highlight"
+    UNDERLINE = "underline"
+    STRIKEOUT = "strikeout"
+
+
+@dataclass(slots=True)
+class TextMarkupAnnotData:
+    """A text-anchored markup annotation (highlight / underline / strikeout).
+
+    ``quads`` は表示座標系（``get_page_words`` と同じ）の単語矩形の並び。
+    各要素は ``(x0, y0, x1, y1)``。
+    """
+
+    page_num: int
+    xref: int
+    quads: tuple[tuple[float, float, float, float], ...]
+    markup_type: MarkupType
+    color: tuple[float, float, float]
+    opacity: float = 1.0
+    annotation_id: str = ""
+    subject: str = ""
+
+    @property
+    def rect(self) -> tuple[float, float, float, float]:
+        """Bounding box (x0, y0, x1, y1) covering all quads."""
+        if not self.quads:
+            return (0.0, 0.0, 0.0, 0.0)
+        x0 = min(quad[0] for quad in self.quads)
+        y0 = min(quad[1] for quad in self.quads)
+        x1 = max(quad[2] for quad in self.quads)
+        y1 = max(quad[3] for quad in self.quads)
+        return (x0, y0, x1, y1)
+
+
+@dataclass(slots=True)
+class NoteAnnotData:
+    """A sticky-note (PDF Text) annotation: a collapsible comment icon.
+
+    ``point`` は付箋アイコン左上の表示座標。``content`` がコメント本文。
+    """
+
+    page_num: int
+    xref: int
+    point: tuple[float, float]
+    content: str
+    color: tuple[float, float, float]
+    icon: str = "Note"
+    opacity: float = 1.0
+    annotation_id: str = ""
+    subject: str = ""
+
+    @property
+    def rect(self) -> tuple[float, float, float, float]:
+        """Nominal icon rect (x0, y0, x1, y1) anchored at ``point``."""
+        x, y = self.point
+        return (x, y, x + NOTE_ICON_PDF_SIZE, y + NOTE_ICON_PDF_SIZE)
+
+
+AnyAnnotData = FreeTextAnnotData | ShapeAnnotData | TextMarkupAnnotData | NoteAnnotData
 
 
 @dataclass(slots=True)
@@ -443,6 +508,8 @@ def _encode_subject_metadata(data: FreeTextAnnotData, *, page_rotation: int = 0)
         "fontname": data.fontname,
         "page_rotation": int(page_rotation),
     }
+    if data.group_id:
+        payload["group_id"] = data.group_id
     return JUSTICEPDF_FREETEXT_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
 
 
@@ -584,6 +651,7 @@ def _extract_freetext_data(
         annotation_id=annotation_id,
         subject=subject,
         text_rotation=text_rotation,
+        group_id=str(metadata.get("group_id", "")),
     )
 
 
@@ -761,11 +829,55 @@ def _bracket_vertices_curly(
     return pts
 
 
+def _bracket_vertices_horizontal(
+    rect: tuple[float, float, float, float],
+    style: str = "curly",
+    side: str = "left",
+    n: int = 20,
+) -> list[tuple[float, float]]:
+    """横向きの括弧頂点。
+
+    側面 ``side`` は突起の向き: "left"=上向き(y0側), "right"=下向き(y1側)。
+    縦向きの実装を x/y 入れ替えで再利用する。
+    """
+    x0, y0, x1, y1 = rect
+    w = x1 - x0
+    h = y1 - y0
+    if style == "square":
+        hook = min(h * 0.4, 8.0)
+        if side == "left":
+            return [(x0, y0 + hook), (x0, y0), (x1, y0), (x1, y0 + hook)]
+        return [(x0, y1 - hook), (x0, y1), (x1, y1), (x1, y1 - hook)]
+    depth = min(h * 0.4, 14.0 if style == "curly" else 12.0)
+    pts: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        t = i / n
+        x = x0 + t * w
+        if style == "round":
+            angle = math.pi * t - math.pi / 2
+            d = depth * (1.0 - math.cos(angle)) / 2.0
+        else:  # curly
+            if t <= 0.5:
+                s = t / 0.5
+                d = depth * (1.0 - math.cos(math.pi * s)) / 2.0
+            else:
+                s = (t - 0.5) / 0.5
+                d = depth * (1.0 + math.cos(math.pi * s)) / 2.0
+        if side == "left":
+            pts.append((x, y0 + depth - d))
+        else:
+            pts.append((x, y1 - depth + d))
+    return pts
+
+
 def _compute_bracket_vertices(
     rect: tuple[float, float, float, float],
     style: str = "square",
     side: str = "left",
+    orientation: str = "vertical",
 ) -> list[tuple[float, float]]:
+    if orientation == "horizontal":
+        return _bracket_vertices_horizontal(rect, style, side)
     if style == "round":
         return _bracket_vertices_round(rect, side)
     elif style == "curly":
@@ -806,7 +918,9 @@ def _compute_shape_vertices(data: ShapeAnnotData) -> list[tuple[float, float]]:
     elif data.shape_type == ShapeType.TRIANGLE:
         pts = _triangle_vertices(rect, data.triangle_apex)
     elif data.shape_type == ShapeType.BRACKET:
-        pts = _compute_bracket_vertices(rect, data.bracket_style, data.bracket_side)
+        pts = _compute_bracket_vertices(
+            rect, data.bracket_style, data.bracket_side, data.bracket_orientation
+        )
     else:
         pts = _rectangle_vertices(rect)
 
@@ -825,6 +939,8 @@ def _encode_shape_metadata(data: ShapeAnnotData, *, page_rotation: int = 0) -> s
         "original_rect": list(data.rect),
         "page_rotation": int(page_rotation),
     }
+    if data.group_id:
+        payload["group_id"] = data.group_id
     if data.shape_type == ShapeType.LINE:
         payload["arrow_start"] = data.arrow_start
         payload["arrow_end"] = data.arrow_end
@@ -835,8 +951,7 @@ def _encode_shape_metadata(data: ShapeAnnotData, *, page_rotation: int = 0) -> s
         payload["bracket_size"] = data.bracket_size
         payload["bracket_both_sides"] = data.bracket_both_sides
         payload["bracket_side"] = data.bracket_side
-        if data.group_id:
-            payload["group_id"] = data.group_id
+        payload["bracket_orientation"] = data.bracket_orientation
     if data.shape_type == ShapeType.TRIANGLE:
         payload["triangle_apex"] = [float(data.triangle_apex[0]), float(data.triangle_apex[1])]
     return JUSTICEPDF_SHAPE_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
@@ -992,6 +1107,7 @@ def _extract_shape_data(
     bracket_size = str(metadata.get("bracket_size", "medium"))
     bracket_both_sides = bool(metadata.get("bracket_both_sides", False))
     bracket_side = str(metadata.get("bracket_side", "left"))
+    bracket_orientation = str(metadata.get("bracket_orientation", "vertical"))
     group_id = str(metadata.get("group_id", ""))
     triangle_apex_raw = metadata.get("triangle_apex")
     triangle_apex: tuple[float, float] = (0.5, 0.0)
@@ -1019,6 +1135,7 @@ def _extract_shape_data(
         bracket_size=bracket_size,
         bracket_both_sides=bracket_both_sides,
         bracket_side=bracket_side,
+        bracket_orientation=bracket_orientation,
         group_id=group_id,
         vertices=vertices,
         triangle_apex=triangle_apex,
@@ -1169,6 +1286,505 @@ def create_bracket_pair(
         if left_saved is None or right_saved is None:
             raise RuntimeError("Failed to extract saved bracket annotations")
         return left_saved, right_saved
+    finally:
+        doc.close()
+
+
+# --- Proofreading callout (text + horizontal brace + leader) -------------
+
+def create_callout(
+    pdf_path: str,
+    page_num: int,
+    text_rect: tuple[float, float, float, float],
+    target_point: tuple[float, float],
+    *,
+    text: str = "",
+    text_color: tuple[float, float, float] = (0.85, 0.0, 0.0),
+    fill_color: tuple[float, float, float] | None = (1.0, 1.0, 0.85),
+    fontsize: float = 14.0,
+    stroke_color: tuple[float, float, float] = (0.85, 0.0, 0.0),
+    stroke_width: float = 1.5,
+    opacity: float = 1.0,
+    bracket_style: str = "curly",
+) -> tuple[FreeTextAnnotData, ShapeAnnotData, ShapeAnnotData]:
+    """校正用の挿入コールアウトを作る。
+
+    本文ボックス（FreeText）＋ 横向き波括弧（BRACKET, horizontal）＋
+    挿入位置を指す引き出し線（LINE）を、共通の ``group_id`` で生成する。
+    """
+    gid = uuid.uuid4().hex[:12]
+    tx0, ty0, tx1, ty1 = text_rect
+    tx, ty = float(target_point[0]), float(target_point[1])
+    cx = (tx0 + tx1) / 2.0
+    brace_depth = 14.0
+
+    # ターゲットが本文ボックスより下なら下向き、そうでなければ上向きに括弧を置く。
+    if ty >= ty1:
+        by0 = ty1 + 2.0
+        by1 = by0 + brace_depth
+        brace_side = "right"  # 突起=下向き
+        tip = (cx, by1)
+    else:
+        by1 = ty0 - 2.0
+        by0 = by1 - brace_depth
+        brace_side = "left"  # 突起=上向き
+        tip = (cx, by0)
+    brace_rect = (tx0, by0, tx1, by1)
+
+    text_data = FreeTextAnnotData(
+        page_num=page_num, xref=0, rect=text_rect,
+        content=text, fontsize=fontsize,
+        text_color=text_color, fill_color=fill_color,
+        border_color=stroke_color, border_width=1.0,
+        opacity=opacity, group_id=gid,
+    )
+    brace_data = ShapeAnnotData(
+        page_num=page_num, xref=0, rect=brace_rect,
+        shape_type=ShapeType.BRACKET,
+        stroke_color=stroke_color, fill_color=None,
+        stroke_width=stroke_width, opacity=opacity,
+        bracket_style=bracket_style, bracket_side=brace_side,
+        bracket_orientation="horizontal", group_id=gid,
+    )
+
+    sx, sy = tip
+    lx0, lx1 = (sx, tx) if sx <= tx else (tx, sx)
+    ly0, ly1 = (sy, ty) if sy <= ty else (ty, sy)
+    lw = max(lx1 - lx0, 1e-6)
+    lh = max(ly1 - ly0, 1e-6)
+    leader_rect = (lx0, ly0, lx1, ly1)
+    vertices = (
+        ((sx - lx0) / lw, (sy - ly0) / lh),
+        ((tx - lx0) / lw, (ty - ly0) / lh),
+    )
+    leader_data = ShapeAnnotData(
+        page_num=page_num, xref=0, rect=leader_rect,
+        shape_type=ShapeType.LINE,
+        stroke_color=stroke_color, fill_color=None,
+        stroke_width=stroke_width, opacity=opacity,
+        arrow_start=False, arrow_end=True,
+        vertices=vertices, group_id=gid,
+    )
+
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            raise IndexError(f"page out of range: {page_num}")
+        page = doc[page_num]
+        leader_annot = _add_shape_annot_to_page(page, leader_data)
+        leader_saved = _extract_shape_data(doc, page_num, leader_annot)
+        brace_annot = _add_shape_annot_to_page(page, brace_data)
+        brace_saved = _extract_shape_data(doc, page_num, brace_annot)
+        text_annot = _add_freetext_annot_to_page(page, text_data)
+        text_saved = _extract_freetext_data(doc, page_num, text_annot)
+        _save_document_in_place(doc, pdf_path)
+        if text_saved is None or brace_saved is None or leader_saved is None:
+            raise RuntimeError("Failed to extract saved callout annotations")
+        return text_saved, brace_saved, leader_saved
+    finally:
+        doc.close()
+
+
+def list_annot_group(pdf_path: str, page_num: int, group_id: str) -> list[int]:
+    """指定 group_id を持つ注釈（FreeText/Shape）の xref 一覧を返す。"""
+    if not group_id:
+        return []
+    xrefs: list[int] = []
+    for annot in list_freetext_annots(pdf_path, page_num):
+        if annot.group_id == group_id:
+            xrefs.append(annot.xref)
+    for annot in list_shape_annots(pdf_path, page_num):
+        if annot.group_id == group_id:
+            xrefs.append(annot.xref)
+    return xrefs
+
+
+def delete_annot_group(pdf_path: str, page_num: int, group_id: str) -> int:
+    """指定 group_id の注釈をまとめて削除し、削除数を返す。"""
+    if not group_id:
+        return 0
+    doc = fitz.open(pdf_path)
+    deleted = 0
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            return 0
+        page = doc[page_num]
+        for annot in list(page.annots() or []):
+            subject = annot.info.get("subject", "")
+            metadata = _decode_subject_metadata(subject) or _decode_shape_metadata(subject)
+            if metadata is not None and str(metadata.get("group_id", "")) == group_id:
+                page.delete_annot(annot)
+                deleted += 1
+        if deleted:
+            _save_document_in_place(doc, pdf_path)
+        return deleted
+    finally:
+        doc.close()
+
+
+# --- Text markup annotations (highlight / underline / strikeout) ---------
+
+_MARKUP_TYPE_TO_PDF = {
+    MarkupType.HIGHLIGHT: fitz.PDF_ANNOT_HIGHLIGHT,
+    MarkupType.UNDERLINE: fitz.PDF_ANNOT_UNDERLINE,
+    MarkupType.STRIKEOUT: fitz.PDF_ANNOT_STRIKE_OUT,
+}
+_MARKUP_ANNOT_TYPES = list(_MARKUP_TYPE_TO_PDF.values())
+
+
+def _encode_markup_metadata(data: TextMarkupAnnotData, *, page_rotation: int = 0) -> str:
+    payload: dict = {
+        "markup_type": data.markup_type.value,
+        "color": list(data.color),
+        "opacity": float(data.opacity),
+        "quads": [[float(c) for c in quad] for quad in data.quads],
+        "page_rotation": int(page_rotation),
+    }
+    return JUSTICEPDF_MARKUP_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
+
+
+def _decode_markup_metadata(subject: str) -> dict | None:
+    if not subject or not subject.startswith(JUSTICEPDF_MARKUP_SUBJECT_PREFIX):
+        return None
+    raw = subject[len(JUSTICEPDF_MARKUP_SUBJECT_PREFIX):]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _add_markup_annot_to_page(page: fitz.Page, data: TextMarkupAnnotData) -> fitz.Annot:
+    quads: list[fitz.Quad] = []
+    for rect in data.quads:
+        quad = fitz.Rect(*rect).quad
+        if page.rotation != 0:
+            quad = quad * page.derotation_matrix
+        quads.append(quad)
+    if not quads:
+        raise ValueError("markup annotation requires at least one quad")
+
+    existing_metadata = _decode_markup_metadata(data.subject)
+    if existing_metadata is not None and "page_rotation" in existing_metadata:
+        creation_page_rotation = int(existing_metadata["page_rotation"])
+    else:
+        creation_page_rotation = page.rotation
+
+    pdf_type = _MARKUP_TYPE_TO_PDF[data.markup_type]
+    if pdf_type == fitz.PDF_ANNOT_HIGHLIGHT:
+        annot = page.add_highlight_annot(quads=quads)
+    elif pdf_type == fitz.PDF_ANNOT_UNDERLINE:
+        annot = page.add_underline_annot(quads=quads)
+    else:
+        annot = page.add_strikeout_annot(quads=quads)
+
+    annot.set_colors(stroke=list(data.color))
+    annot.set_opacity(max(0.0, min(1.0, float(data.opacity))))
+    annot.update()
+    annot.set_info(subject=_encode_markup_metadata(data, page_rotation=creation_page_rotation))
+    return annot
+
+
+def _extract_markup_data(
+    doc: fitz.Document,
+    page_num: int,
+    annot: fitz.Annot,
+) -> TextMarkupAnnotData | None:
+    xref = annot.xref
+    info = annot.info
+    subject = info.get("subject", "")
+    metadata = _decode_markup_metadata(subject)
+    if metadata is None:
+        return None
+
+    try:
+        markup_type = MarkupType(metadata["markup_type"])
+    except (KeyError, ValueError):
+        return None
+
+    quads_raw = metadata.get("quads")
+    quads: list[tuple[float, float, float, float]] = []
+    if isinstance(quads_raw, list):
+        for quad in quads_raw:
+            if isinstance(quad, list) and len(quad) == 4:
+                quads.append(tuple(float(c) for c in quad))
+    if not quads:
+        return None
+
+    color = _normalize_color(metadata.get("color")) or (1.0, 1.0, 0.0)
+
+    _, ca_value = doc.xref_get_key(xref, "CA")
+    if ca_value == "null":
+        opacity = float(metadata.get("opacity", 1.0))
+    else:
+        try:
+            opacity = float(ca_value)
+        except ValueError:
+            opacity = float(metadata.get("opacity", 1.0))
+
+    _, name_value = doc.xref_get_key(xref, "NM")
+    annotation_id = info.get("id") or (name_value if name_value != "null" else "")
+
+    return TextMarkupAnnotData(
+        page_num=page_num,
+        xref=xref,
+        quads=tuple(quads),
+        markup_type=markup_type,
+        color=color,
+        opacity=max(0.0, min(1.0, float(opacity))),
+        annotation_id=annotation_id,
+        subject=subject,
+    )
+
+
+def list_markup_annots(pdf_path: str, page_num: int | None = None) -> list[TextMarkupAnnotData]:
+    """Return JusticePDF text-markup annotations for one page or the whole document."""
+    results: list[TextMarkupAnnotData] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            page_numbers = _page_numbers_for(doc, page_num)
+            if page_numbers is None:
+                return []
+
+            for pn in page_numbers:
+                page = doc[pn]
+                annots = page.annots(types=_MARKUP_ANNOT_TYPES)
+                if annots is None:
+                    continue
+                for annot in annots:
+                    markup_data = _extract_markup_data(doc, pn, annot)
+                    if markup_data is not None:
+                        results.append(markup_data)
+    except Exception:
+        logger.debug("list_markup_annots failed: %s", pdf_path, exc_info=True)
+    return results
+
+
+def create_markup_annot(pdf_path: str, data: TextMarkupAnnotData) -> TextMarkupAnnotData:
+    doc = fitz.open(pdf_path)
+    try:
+        if data.page_num < 0 or data.page_num >= len(doc):
+            raise IndexError(f"page out of range: {data.page_num}")
+        page = doc[data.page_num]
+        annot = _add_markup_annot_to_page(page, data)
+        saved = _extract_markup_data(doc, data.page_num, annot)
+        _save_document_in_place(doc, pdf_path)
+        if saved is None:
+            raise RuntimeError("Failed to extract saved markup annotation")
+        return saved
+    finally:
+        doc.close()
+
+
+def delete_markup_annot(pdf_path: str, page_num: int, xref: int) -> bool:
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            return False
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is None:
+            return False
+        if annot.type[0] not in _MARKUP_ANNOT_TYPES:
+            return False
+        page.delete_annot(annot)
+        _save_document_in_place(doc, pdf_path)
+        return True
+    finally:
+        doc.close()
+
+
+def replace_markup_annot(
+    pdf_path: str,
+    page_num: int,
+    xref: int,
+    data: TextMarkupAnnotData,
+) -> TextMarkupAnnotData:
+    """Replace a markup annotation (used for color / opacity changes)."""
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            raise IndexError(f"page out of range: {page_num}")
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is not None:
+            page.delete_annot(annot)
+        replacement = _add_markup_annot_to_page(page, data)
+        saved = _extract_markup_data(doc, page_num, replacement)
+        _save_document_in_place(doc, pdf_path)
+        if saved is None:
+            raise RuntimeError("Failed to extract saved markup annotation")
+        return saved
+    finally:
+        doc.close()
+
+
+# --- Sticky note (comment) annotations -----------------------------------
+
+def _encode_note_metadata(data: "NoteAnnotData", *, page_rotation: int = 0) -> str:
+    payload: dict = {
+        "color": list(data.color),
+        "icon": data.icon,
+        "opacity": float(data.opacity),
+        "point": [float(data.point[0]), float(data.point[1])],
+        "page_rotation": int(page_rotation),
+    }
+    return JUSTICEPDF_NOTE_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
+
+
+def _decode_note_metadata(subject: str) -> dict | None:
+    if not subject or not subject.startswith(JUSTICEPDF_NOTE_SUBJECT_PREFIX):
+        return None
+    raw = subject[len(JUSTICEPDF_NOTE_SUBJECT_PREFIX):]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _add_note_annot_to_page(page: fitz.Page, data: "NoteAnnotData") -> fitz.Annot:
+    point = fitz.Point(data.point[0], data.point[1])
+    if page.rotation != 0:
+        point = point * page.derotation_matrix
+
+    existing_metadata = _decode_note_metadata(data.subject)
+    if existing_metadata is not None and "page_rotation" in existing_metadata:
+        creation_page_rotation = int(existing_metadata["page_rotation"])
+    else:
+        creation_page_rotation = page.rotation
+
+    annot = page.add_text_annot(point, data.content or "", icon=data.icon or "Note")
+    annot.set_colors(stroke=list(data.color))
+    annot.set_opacity(max(0.0, min(1.0, float(data.opacity))))
+    annot.update()
+    annot.set_info(content=data.content or "", subject=_encode_note_metadata(data, page_rotation=creation_page_rotation))
+    return annot
+
+
+def _extract_note_data(
+    doc: fitz.Document,
+    page_num: int,
+    annot: fitz.Annot,
+) -> "NoteAnnotData | None":
+    xref = annot.xref
+    info = annot.info
+    subject = info.get("subject", "")
+    metadata = _decode_note_metadata(subject)
+    if metadata is None:
+        return None
+
+    r = annot.rect
+    page = doc[page_num]
+    if page.rotation != 0:
+        r = fitz.Rect(r) * page.rotation_matrix
+    point = (float(r.x0), float(r.y0))
+
+    content = info.get("content", "") or ""
+    color = _normalize_color(metadata.get("color")) or (1.0, 0.92, 0.23)
+    icon = str(metadata.get("icon", "Note")) or "Note"
+
+    _, ca_value = doc.xref_get_key(xref, "CA")
+    if ca_value == "null":
+        opacity = float(metadata.get("opacity", 1.0))
+    else:
+        try:
+            opacity = float(ca_value)
+        except ValueError:
+            opacity = float(metadata.get("opacity", 1.0))
+
+    _, name_value = doc.xref_get_key(xref, "NM")
+    annotation_id = info.get("id") or (name_value if name_value != "null" else "")
+
+    return NoteAnnotData(
+        page_num=page_num,
+        xref=xref,
+        point=point,
+        content=content,
+        color=color,
+        icon=icon,
+        opacity=max(0.0, min(1.0, float(opacity))),
+        annotation_id=annotation_id,
+        subject=subject,
+    )
+
+
+def list_note_annots(pdf_path: str, page_num: int | None = None) -> list["NoteAnnotData"]:
+    """Return JusticePDF sticky-note annotations for one page or the whole document."""
+    results: list[NoteAnnotData] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            page_numbers = _page_numbers_for(doc, page_num)
+            if page_numbers is None:
+                return []
+
+            for pn in page_numbers:
+                page = doc[pn]
+                annots = page.annots(types=[fitz.PDF_ANNOT_TEXT])
+                if annots is None:
+                    continue
+                for annot in annots:
+                    note_data = _extract_note_data(doc, pn, annot)
+                    if note_data is not None:
+                        results.append(note_data)
+    except Exception:
+        logger.debug("list_note_annots failed: %s", pdf_path, exc_info=True)
+    return results
+
+
+def create_note_annot(pdf_path: str, data: "NoteAnnotData") -> "NoteAnnotData":
+    doc = fitz.open(pdf_path)
+    try:
+        if data.page_num < 0 or data.page_num >= len(doc):
+            raise IndexError(f"page out of range: {data.page_num}")
+        page = doc[data.page_num]
+        annot = _add_note_annot_to_page(page, data)
+        saved = _extract_note_data(doc, data.page_num, annot)
+        _save_document_in_place(doc, pdf_path)
+        if saved is None:
+            raise RuntimeError("Failed to extract saved note annotation")
+        return saved
+    finally:
+        doc.close()
+
+
+def delete_note_annot(pdf_path: str, page_num: int, xref: int) -> bool:
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            return False
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is None or annot.type[0] != fitz.PDF_ANNOT_TEXT:
+            return False
+        page.delete_annot(annot)
+        _save_document_in_place(doc, pdf_path)
+        return True
+    finally:
+        doc.close()
+
+
+def replace_note_annot(
+    pdf_path: str,
+    page_num: int,
+    xref: int,
+    data: "NoteAnnotData",
+) -> "NoteAnnotData":
+    """Replace a note annotation (content / color / position changes)."""
+    doc = fitz.open(pdf_path)
+    try:
+        if page_num < 0 or page_num >= len(doc):
+            raise IndexError(f"page out of range: {page_num}")
+        page = doc[page_num]
+        annot = page.load_annot(xref)
+        if annot is not None:
+            page.delete_annot(annot)
+        replacement = _add_note_annot_to_page(page, data)
+        saved = _extract_note_data(doc, page_num, replacement)
+        _save_document_in_place(doc, pdf_path)
+        if saved is None:
+            raise RuntimeError("Failed to extract saved note annotation")
+        return saved
     finally:
         doc.close()
 
