@@ -19,13 +19,27 @@ param(
 $ErrorActionPreference = 'Stop'
 $verb = 'JusticePDFOpen'
 
+Write-Host 'Removing JusticePDF context menu entries...'
+
+# Per-extension verbs: enumerate every SystemFileAssociations\<ext> and drop the
+# verb wherever it exists. This removes all registered file types (PDF + Office
+# + images) regardless of which extension list was used at install time.
+$sfaRoot = 'HKCU:\Software\Classes\SystemFileAssociations'
+if (Test-Path $sfaRoot) {
+    Get-ChildItem -Path $sfaRoot -ErrorAction SilentlyContinue | ForEach-Object {
+        $key = Join-Path $_.PSPath "shell\$verb"
+        if (Test-Path $key) {
+            Remove-Item -Path $key -Recurse -Force
+            Write-Host "  removed: $($_.PSChildName) -> $verb"
+        }
+    }
+}
+
+# Folder and folder-background verbs.
 $targets = @(
-    "HKCU:\Software\Classes\SystemFileAssociations\.pdf\shell\$verb",
     "HKCU:\Software\Classes\Directory\shell\$verb",
     "HKCU:\Software\Classes\Directory\Background\shell\$verb"
 )
-
-Write-Host 'Removing JusticePDF context menu entries...'
 foreach ($key in $targets) {
     if (Test-Path $key) {
         Remove-Item -Path $key -Recurse -Force

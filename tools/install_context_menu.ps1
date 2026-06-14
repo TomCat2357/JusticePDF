@@ -2,15 +2,24 @@
 <#
 .SYNOPSIS
     Register the "JusticePDF de hiraku" (JusticePDFで開く) right-click context
-    menu entry for PDF files and folders. Per-user (HKCU) only -- NO admin
-    rights required.
+    menu entry for PDF / Office / image files and folders. Per-user (HKCU)
+    only -- NO admin rights required.
 
 .DESCRIPTION
     Writes shell verbs under HKEY_CURRENT_USER so the current user can launch
     JusticePDF from Explorer's context menu:
-      * .pdf files  -> import the PDF into the managed work folder
-      * folders     -> copy the whole folder into the managed work folder
-                       and open only that copy (no library window)
+      * .pdf files          -> import the PDF into the managed work folder
+      * Office files         -> convert to PDF, then import
+        (Word .doc/.docx/.docm, Excel .xls/.xlsx/.xlsm, PowerPoint .ppt/.pptx)
+      * image files          -> convert to PDF, then import
+        (.png/.jpg/.jpeg/.bmp/.tiff/.tif/.gif/.jp2/.jpx/.ppm/.pgm/.pbm/.pnm/.pam/.svg)
+      * folders              -> copy the whole folder into the managed work folder
+                                and open only that copy (no library window)
+
+    The list of file extensions is read from src/utils/constants.py
+    (IMPORT_EXTS, the single source of truth) so it never drifts from what the
+    app can actually import. A static fallback list is used if python.exe
+    cannot be located.
 
     The Japanese menu label is built from Unicode code points so this script
     stays pure-ASCII and is safe to run under Windows PowerShell 5.1 regardless
@@ -100,6 +109,44 @@ $cmdFile = '"' + $pythonw + '" "' + $launcher + '" "%1"'
 $cmdDir  = $cmdFile
 $cmdBg   = '"' + $pythonw + '" "' + $launcher + '" "%V"'
 
+# --- Resolve the importable file extensions ----------------------------------
+# Single source of truth: IMPORT_EXTS in src/utils/constants.py. Query it via
+# python.exe (sibling of the pythonw.exe found above); fall back to a static
+# list (kept in sync with constants.py) when python.exe is unavailable, e.g. a
+# pythonw-only portable build.
+function Get-ImportExtensions {
+    param([Parameter(Mandatory)] [string]$Pythonw, [Parameter(Mandatory)] [string]$Root)
+
+    $python = $Pythonw -replace 'pythonw\.exe$', 'python.exe'
+    if (Test-Path $python) {
+        try {
+            # Use single-quoted python string literals + chr(10): PowerShell
+            # strips embedded double quotes when building a native command line.
+            $code = "import sys; sys.path.insert(0, r'$Root'); " +
+                    'from src.utils.constants import IMPORT_EXTS; ' +
+                    'print(chr(10).join(sorted(IMPORT_EXTS)))'
+            $out = & $python -c $code 2>$null
+            if ($LASTEXITCODE -eq 0 -and $out) {
+                $list = @($out -split "`r?`n" | Where-Object { $_ -match '^\.\w+$' })
+                if ($list.Count -gt 0) {
+                    Write-Host "Extensions  : from constants.py ($($list.Count))"
+                    return $list
+                }
+            }
+        } catch { }
+    }
+    # Fallback -- keep in sync with IMPORT_EXTS in src/utils/constants.py.
+    Write-Host 'Extensions  : static fallback (could not query constants.py)'
+    return @(
+        '.pdf',
+        '.doc', '.docx', '.docm',
+        '.xls', '.xlsx', '.xlsm',
+        '.ppt', '.pptx',
+        '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.gif',
+        '.jp2', '.jpx', '.ppm', '.pgm', '.pbm', '.pnm', '.pam', '.svg'
+    )
+}
+
 # --- Helper: create a shell verb under a given base key ----------------------
 function New-ShellVerb {
     param(
@@ -117,8 +164,12 @@ function New-ShellVerb {
 
 Write-Host 'Registering JusticePDF context menu (HKCU, no admin needed)...'
 
-# PDF files: add a verb for all .pdf without changing the default association.
-New-ShellVerb -BaseKey 'HKCU:\Software\Classes\SystemFileAssociations\.pdf\shell' -Command $cmdFile
+# Importable files: add the verb per extension (PDF + Office + images) without
+# changing any default file association.
+$extensions = Get-ImportExtensions -Pythonw $pythonw -Root $root
+foreach ($ext in $extensions) {
+    New-ShellVerb -BaseKey "HKCU:\Software\Classes\SystemFileAssociations\$ext\shell" -Command $cmdFile
+}
 
 # Folders.
 New-ShellVerb -BaseKey 'HKCU:\Software\Classes\Directory\shell' -Command $cmdDir

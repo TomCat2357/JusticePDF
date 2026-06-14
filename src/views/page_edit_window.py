@@ -2442,7 +2442,7 @@ class PageEditWindow(QMainWindow):
         controls_layout.addWidget(self._zoom_next_btn)
 
         # オブジェクト(付箋)/しおり ドロワー開閉(右端の内蔵トグルから移設)
-        self._zoom_object_btn = QPushButton("オブジェクト")
+        self._zoom_object_btn = QPushButton("アノテーション")
         self._zoom_object_btn.setCheckable(True)
         self._zoom_object_btn.setToolTip("付箋編集")
         self._zoom_object_btn.clicked.connect(self._toggle_zoom_annotation_drawer)
