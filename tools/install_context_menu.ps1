@@ -16,6 +16,10 @@
       * folders              -> copy the whole folder into the managed work folder
                                 and open only that copy (no library window)
 
+    This only ADDS a right-click verb; it never changes any default file
+    association. To make JusticePDF a selectable "default app" (Open with ->
+    Always), use tools\set_default_app.ps1 instead.
+
     The list of file extensions is read from src/utils/constants.py
     (IMPORT_EXTS, the single source of truth) so it never drifts from what the
     app can actually import. A static fallback list is used if python.exe
