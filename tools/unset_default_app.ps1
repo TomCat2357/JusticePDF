@@ -48,6 +48,13 @@ if (Test-Path $progIdKey) {
     Write-Host "  removed: $progIdKey"
 }
 
+# Remove the Applications entry for the launcher exe (friendly-name handler).
+$appKey = 'HKCU:\Software\Classes\Applications\JusticePDF.exe'
+if (Test-Path $appKey) {
+    Remove-Item -Path $appKey -Recurse -Force
+    Write-Host "  removed: $appKey"
+}
+
 Write-Host 'Done.'
 Write-Host 'If JusticePDF was confirmed as the DEFAULT for some types, change those'
 Write-Host 'from Settings -> Default apps (Windows protects that choice).'

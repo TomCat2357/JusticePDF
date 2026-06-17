@@ -13,7 +13,11 @@
     supported part:
 
       1. Creates a shared ProgID "JusticePDF.AssocFile" under HKCU with an
-         open command that launches the app (reusing tools/justicepdf_open.pyw).
+         open command that launches the app. If a built JusticePDF.exe is found
+         next to the app, it is used as the command (so Windows shows the
+         friendly name "JusticePDF" with an icon -- build it via
+         tools/build_launcher_exe.ps1). Otherwise it falls back to
+         pythonw.exe + tools/justicepdf_open.pyw.
       2. Adds that ProgID to each importable extension's OpenWithProgids list so
          JusticePDF appears under "Open with -> Choose another app".
 
@@ -68,8 +72,19 @@ if (-not (Test-Path $launcher)) {
     throw "Launcher not found: $launcher"
 }
 
-# Locate pythonw.exe. Works both for a normal .venv checkout and for a portable
-# build that bundles Python (relocated venv, embeddable runtime, etc.).
+# Prefer a built launcher exe (JusticePDF.exe) so Windows shows the app as
+# "JusticePDF" (with an icon) instead of "Python". Build it with
+# tools\build_launcher_exe.ps1. Falls back to pythonw.exe + the .pyw launcher.
+$exe = @(
+    'JusticePDF.exe',
+    '..\..\JusticePDF.exe'
+) | ForEach-Object { Join-Path $root $_ } |
+    Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($exe) { $exe = (Resolve-Path -LiteralPath $exe).Path }
+
+# Locate pythonw.exe -- still needed to query IMPORT_EXTS, and as the launch
+# command when no exe was built. Works for a normal .venv checkout and for a
+# portable build that bundles Python (relocated venv, embeddable runtime, etc.).
 if ($Pythonw) {
     if (-not (Test-Path $Pythonw)) { throw "Specified -Pythonw not found: $Pythonw" }
     $pythonw = (Resolve-Path -LiteralPath $Pythonw).Path
@@ -99,13 +114,15 @@ if ($Pythonw) {
                     -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($found) { $pythonw = $found.FullName }
     }
-    if (-not $pythonw) {
-        throw "pythonw.exe not found under $root.`nPass it explicitly: -Pythonw <path>\pythonw.exe"
-    }
     # Normalize (collapse any ..\ segments) so the registry command is clean.
-    $pythonw = (Resolve-Path -LiteralPath $pythonw).Path
+    if ($pythonw) { $pythonw = (Resolve-Path -LiteralPath $pythonw).Path }
 }
-Write-Host "Using python : $pythonw"
+
+if (-not $exe -and -not $pythonw) {
+    throw "Neither JusticePDF.exe nor pythonw.exe found under $root.`nBuild the exe (tools\build_launcher_exe.ps1) or pass -Pythonw <path>\pythonw.exe"
+}
+if ($exe)     { Write-Host "Using exe    : $exe" }
+if ($pythonw) { Write-Host "Using python : $pythonw" }
 
 # --- ProgID details ----------------------------------------------------------
 $progId    = 'JusticePDF.AssocFile'
@@ -114,7 +131,12 @@ $progIdKey = "HKCU:\Software\Classes\$progId"
 $typeName  = 'JusticePDF ' + [char]0x6587 + [char]0x66F8
 
 # Command line stored in the registry (paths + %1 each individually quoted).
-$cmdOpen = '"' + $pythonw + '" "' + $launcher + '" "%1"'
+# The exe self-locates pythonw at runtime; the fallback runs the .pyw directly.
+if ($exe) {
+    $cmdOpen = '"' + $exe + '" "%1"'
+} else {
+    $cmdOpen = '"' + $pythonw + '" "' + $launcher + '" "%1"'
+}
 
 # Resolve the icon (explicit -Icon, else tools\justicepdf.ico if present).
 if (-not $Icon) {
@@ -132,10 +154,10 @@ if ($Icon) {
 # list (kept in sync with constants.py) when python.exe is unavailable, e.g. a
 # pythonw-only portable build.
 function Get-ImportExtensions {
-    param([Parameter(Mandatory)] [string]$Pythonw, [Parameter(Mandatory)] [string]$Root)
+    param([AllowEmptyString()] [string]$Pythonw, [Parameter(Mandatory)] [string]$Root)
 
     $python = $Pythonw -replace 'pythonw\.exe$', 'python.exe'
-    if (Test-Path $python) {
+    if ($Pythonw -and (Test-Path $python)) {
         try {
             # Use single-quoted python string literals + chr(10): PowerShell
             # strips embedded double quotes when building a native command line.
@@ -179,13 +201,30 @@ New-Item -Path $progIdKey -Force | Out-Null
 Set-Item -Path $progIdKey -Value $typeName            # (Default) = friendly type name
 New-Item -Path $cmdKey -Force | Out-Null
 Set-Item -Path $cmdKey -Value $cmdOpen                # (Default) = command line
-if ($Icon) {
+# DefaultIcon: explicit -Icon wins; otherwise borrow the exe's embedded icon.
+$iconSpec = $null
+if     ($Icon) { $iconSpec = '"' + $Icon + '",0' }
+elseif ($exe)  { $iconSpec = '"' + $exe  + '",0' }
+if ($iconSpec) {
     $iconKey = Join-Path $progIdKey 'DefaultIcon'
     New-Item -Path $iconKey -Force | Out-Null
-    Set-Item -Path $iconKey -Value ('"' + $Icon + '",0')
-    Write-Host "  icon        : $Icon"
+    Set-Item -Path $iconKey -Value $iconSpec
+    Write-Host "  icon        : $iconSpec"
 }
 Write-Host "  registered  : $progIdKey"
+
+# When launched via the exe, also register it as an Application so the "Open
+# with" chooser shows the friendly name "JusticePDF" (from the exe's version
+# resource) rather than the underlying interpreter.
+if ($exe) {
+    $appKey = "HKCU:\Software\Classes\Applications\$(Split-Path -Leaf $exe)"
+    $appCmd = Join-Path $appKey 'shell\open\command'
+    New-Item -Path $appCmd -Force | Out-Null
+    Set-Item -Path $appCmd -Value $cmdOpen
+    New-ItemProperty -Path $appKey -Name 'FriendlyAppName' -Value 'JusticePDF' `
+        -PropertyType String -Force | Out-Null
+    Write-Host "  registered  : $appKey"
+}
 
 # --- Offer the ProgID for each extension via OpenWithProgids -----------------
 foreach ($ext in $extensions) {
