@@ -15,6 +15,7 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+JusticePDF.exe
 .Python
 build/
 develop-eggs/

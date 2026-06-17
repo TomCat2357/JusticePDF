@@ -127,6 +127,46 @@ python -m src.main
 
 ---
 
+## 既定のアプリとして設定する（Windows）
+
+PDF などをダブルクリックしたときに JusticePDF で開く「**既定のアプリ（通常使うアプリ）**」
+として登録できます。**管理者権限は不要（HKCU のみ）**で、Python 同梱のポータブルビルド
+（`python\pythonw.exe` 同梱）にも対応します。
+
+```powershell
+# （任意・推奨）専用ランチャー JusticePDF.exe をビルド
+#   一覧での表示名が「Python」ではなく「JusticePDF」になり、アイコンも付きます。
+#   Windows 同梱の .NET の C# コンパイラを使うため、追加インストール・管理者権限は不要。
+powershell -ExecutionPolicy Bypass -File tools\build_launcher_exe.ps1
+
+# JusticePDF を「プログラムから開く」候補として登録
+#   JusticePDF.exe があれば自動で利用し、無ければ pythonw.exe + ランチャーで代替。
+powershell -ExecutionPolicy Bypass -File tools\set_default_app.ps1
+
+# 解除
+powershell -ExecutionPolicy Bypass -File tools\unset_default_app.ps1
+```
+
+> `JusticePDF.exe` は実行時にアプリ直下の `.venv` / 同梱 `python\` から `pythonw.exe` を
+> 探して起動するため、Python 同梱のポータブル配布でもそのまま動きます（ビルド成果物の
+> ため Git 管理外）。アイコンを付けたい場合は `-Icon app.ico` を両スクリプトに渡すか、
+> `tools\justicepdf.ico` を置けば自動採用されます。
+
+登録後、**実際に既定へ確定する操作はユーザー自身が行う必要があります**（Windows 10/11 は
+拡張子の既定ハンドラ `UserChoice` をハッシュで保護しており、スクリプトから無言で強制設定
+できないため）。
+
+1. PDF を右クリック →「プログラムから開く」→「別のプログラムを選択」
+2. **JusticePDF** を選ぶ
+3. 「常にこのアプリを使って .pdf ファイルを開く」にチェック →「OK」
+4. 拡張子ごとに繰り返すか、設定 →「既定のアプリ」からまとめて設定
+
+> 対象拡張子は `src/utils/constants.py` の `IMPORT_EXTS`（PDF / Office / 画像）を参照します。
+> 右クリックの「JusticePDFで開く」メニューだけ追加したい場合は
+> `tools\install_context_menu.ps1` を使ってください（こちらは関連付けを変更しません）。
+
+---
+
 ## プロジェクト構成
 
 ```
