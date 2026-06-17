@@ -1,58 +1,61 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Register the "JusticePDF de hiraku" (JusticePDFで開く) right-click context
-    menu entry for PDF / Office / image files and folders. Per-user (HKCU)
-    only -- NO admin rights required.
+    Register JusticePDF as a selectable "default app" (Open with -> Always)
+    for PDF / Office / image files. Per-user (HKCU) only -- NO admin rights
+    required.
 
 .DESCRIPTION
-    Writes shell verbs under HKEY_CURRENT_USER so the current user can launch
-    JusticePDF from Explorer's context menu:
-      * .pdf files          -> import the PDF into the managed work folder
-      * Office files         -> convert to PDF, then import
-        (Word .doc/.docx/.docm, Excel .xls/.xlsx/.xlsm, PowerPoint .ppt/.pptx)
-      * image files          -> convert to PDF, then import
-        (.png/.jpg/.jpeg/.bmp/.tiff/.tif/.gif/.jp2/.jpx/.ppm/.pgm/.pbm/.pnm/.pam/.svg)
-      * folders              -> copy the whole folder into the managed work folder
-                                and open only that copy (no library window)
+    Windows 10/11 protects the per-extension default handler
+    (HKCU\...\<ext>\UserChoice) with a hash, so a script CANNOT silently force
+    itself to become the default app (third-party tools that forge the hash are
+    unsupported by Microsoft and break across OS updates). This script does the
+    supported part:
 
-    This only ADDS a right-click verb; it never changes any default file
-    association. To make JusticePDF a selectable "default app" (Open with ->
-    Always), use tools\set_default_app.ps1 instead.
+      1. Creates a shared ProgID "JusticePDF.AssocFile" under HKCU with an
+         open command that launches the app (reusing tools/justicepdf_open.pyw).
+      2. Adds that ProgID to each importable extension's OpenWithProgids list so
+         JusticePDF appears under "Open with -> Choose another app".
+
+    The USER then makes it the default by right-clicking a file ->
+    "Open with" -> "Choose another app" -> JusticePDF -> tick
+    "Always use this app to open .<ext> files".
+
+    This is distinct from tools/install_context_menu.ps1, which only adds a
+    right-click "JusticePDF de hiraku" verb and never touches associations.
 
     The list of file extensions is read from src/utils/constants.py
     (IMPORT_EXTS, the single source of truth) so it never drifts from what the
     app can actually import. A static fallback list is used if python.exe
     cannot be located.
 
-    The Japanese menu label is built from Unicode code points so this script
-    stays pure-ASCII and is safe to run under Windows PowerShell 5.1 regardless
-    of file encoding.
+    The script stays pure-ASCII so it is safe to run under Windows PowerShell
+    5.1 regardless of file encoding.
 
 .PARAMETER Pythonw
     Path to the pythonw.exe that should run the app. If omitted, the script
     auto-detects it under the app root (handles a normal .venv checkout and a
     portable build that bundles Python, e.g. python\pythonw.exe).
 
-.PARAMETER Background
-    Also add the entry to the folder-background context menu (right-click on
-    empty space inside a folder). Uses %V as the target path.
+.PARAMETER Icon
+    Path to an .ico file used as the DefaultIcon for the JusticePDF file type.
+    If omitted, the script looks for tools\justicepdf.ico; if neither exists,
+    no DefaultIcon is set (Windows shows a generic icon).
 
-.PARAMETER ClassicMenu
-    Also restore the Windows 11 classic (full) context menu so the entry shows
-    at the top level instead of under "Show more options". Per-user, no admin.
-    Requires an Explorer restart to take effect.
+.PARAMETER Extensions
+    Explicit list of extensions (e.g. '.pdf', '.png') to register. Defaults to
+    IMPORT_EXTS from src/utils/constants.py.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\install_context_menu.ps1
+    powershell -ExecutionPolicy Bypass -File tools\set_default_app.ps1
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\install_context_menu.ps1 -Background -ClassicMenu
+    powershell -ExecutionPolicy Bypass -File tools\set_default_app.ps1 -Extensions '.pdf'
 #>
 [CmdletBinding()]
 param(
     [string]$Pythonw,
-    [switch]$Background,
-    [switch]$ClassicMenu
+    [string]$Icon,
+    [string[]]$Extensions
 )
 
 $ErrorActionPreference = 'Stop'
@@ -104,14 +107,24 @@ if ($Pythonw) {
 }
 Write-Host "Using python : $pythonw"
 
-# Menu label: "JusticePDF" + U+3067 U+958B U+304F  ("de hiraku")
-$label   = 'JusticePDF' + [char]0x3067 + [char]0x958B + [char]0x304F
-$verb    = 'JusticePDFOpen'
+# --- ProgID details ----------------------------------------------------------
+$progId    = 'JusticePDF.AssocFile'
+$progIdKey = "HKCU:\Software\Classes\$progId"
+# Friendly file-type name: "JusticePDF" + U+6587 U+66F8 ("bunsho" = document)
+$typeName  = 'JusticePDF ' + [char]0x6587 + [char]0x66F8
 
 # Command line stored in the registry (paths + %1 each individually quoted).
-$cmdFile = '"' + $pythonw + '" "' + $launcher + '" "%1"'
-$cmdDir  = $cmdFile
-$cmdBg   = '"' + $pythonw + '" "' + $launcher + '" "%V"'
+$cmdOpen = '"' + $pythonw + '" "' + $launcher + '" "%1"'
+
+# Resolve the icon (explicit -Icon, else tools\justicepdf.ico if present).
+if (-not $Icon) {
+    $defaultIco = Join-Path $PSScriptRoot 'justicepdf.ico'
+    if (Test-Path $defaultIco) { $Icon = $defaultIco }
+}
+if ($Icon) {
+    if (-not (Test-Path $Icon)) { throw "Specified -Icon not found: $Icon" }
+    $Icon = (Resolve-Path -LiteralPath $Icon).Path
+}
 
 # --- Resolve the importable file extensions ----------------------------------
 # Single source of truth: IMPORT_EXTS in src/utils/constants.py. Query it via
@@ -151,49 +164,46 @@ function Get-ImportExtensions {
     )
 }
 
-# --- Helper: create a shell verb under a given base key ----------------------
-function New-ShellVerb {
-    param(
-        [Parameter(Mandatory)] [string]$BaseKey,   # e.g. HKCU:\Software\Classes\Directory\shell
-        [Parameter(Mandatory)] [string]$Command
-    )
-    $verbKey = Join-Path $BaseKey $verb
-    $cmdKey  = Join-Path $verbKey 'command'
-    New-Item -Path $verbKey -Force | Out-Null
-    Set-Item -Path $verbKey -Value $label          # (Default) = menu label
-    New-Item -Path $cmdKey -Force | Out-Null
-    Set-Item -Path $cmdKey -Value $Command         # (Default) = command line
-    Write-Host "  registered: $verbKey"
+if ($Extensions -and $Extensions.Count -gt 0) {
+    $extensions = @($Extensions | ForEach-Object { if ($_ -like '.*') { $_ } else { ".$_" } })
+    Write-Host "Extensions  : from -Extensions ($($extensions.Count))"
+} else {
+    $extensions = Get-ImportExtensions -Pythonw $pythonw -Root $root
 }
 
-Write-Host 'Registering JusticePDF context menu (HKCU, no admin needed)...'
+# --- Register the ProgID -----------------------------------------------------
+Write-Host 'Registering JusticePDF as a default-app candidate (HKCU, no admin needed)...'
 
-# Importable files: add the verb per extension (PDF + Office + images) without
-# changing any default file association.
-$extensions = Get-ImportExtensions -Pythonw $pythonw -Root $root
+$cmdKey  = Join-Path $progIdKey 'shell\open\command'
+New-Item -Path $progIdKey -Force | Out-Null
+Set-Item -Path $progIdKey -Value $typeName            # (Default) = friendly type name
+New-Item -Path $cmdKey -Force | Out-Null
+Set-Item -Path $cmdKey -Value $cmdOpen                # (Default) = command line
+if ($Icon) {
+    $iconKey = Join-Path $progIdKey 'DefaultIcon'
+    New-Item -Path $iconKey -Force | Out-Null
+    Set-Item -Path $iconKey -Value ('"' + $Icon + '",0')
+    Write-Host "  icon        : $Icon"
+}
+Write-Host "  registered  : $progIdKey"
+
+# --- Offer the ProgID for each extension via OpenWithProgids -----------------
 foreach ($ext in $extensions) {
-    New-ShellVerb -BaseKey "HKCU:\Software\Classes\SystemFileAssociations\$ext\shell" -Command $cmdFile
-}
-
-# Folders.
-New-ShellVerb -BaseKey 'HKCU:\Software\Classes\Directory\shell' -Command $cmdDir
-
-# Optional: folder background (empty area inside a folder).
-if ($Background) {
-    New-ShellVerb -BaseKey 'HKCU:\Software\Classes\Directory\Background\shell' -Command $cmdBg
-}
-
-# Optional: Windows 11 classic full context menu (per-user).
-if ($ClassicMenu) {
-    $clsid = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'
-    New-Item -Path $clsid -Force | Out-Null
-    Set-Item -Path $clsid -Value ''                # empty default value enables it
-    Write-Host '  classic context menu enabled (restart Explorer to apply):'
-    Write-Host '    Stop-Process -Name explorer -Force   # Explorer auto-restarts'
+    $owp = "HKCU:\Software\Classes\$ext\OpenWithProgids"
+    New-Item -Path $owp -Force | Out-Null
+    # Value name = ProgID, empty data (REG_SZ ""), per the OpenWithProgids spec.
+    New-ItemProperty -Path $owp -Name $progId -Value '' -PropertyType String -Force | Out-Null
+    Write-Host "  open-with   : $ext -> $progId"
 }
 
 Write-Host ''
-Write-Host 'Done.'
-Write-Host 'On Windows 11 the entry appears under "Show more options" (Shift+right-click)'
-Write-Host 'unless you re-run with -ClassicMenu and restart Explorer.'
-Write-Host 'To remove: tools\uninstall_context_menu.ps1'
+Write-Host 'Done. JusticePDF is now offered as an "Open with" choice.'
+Write-Host ''
+Write-Host 'To make it the DEFAULT app (Windows protects this step, so it must be'
+Write-Host 'done by you -- it cannot be forced silently by a script):'
+Write-Host '  1. Right-click a .pdf file -> "Open with" -> "Choose another app".'
+Write-Host '  2. Pick JusticePDF.'
+Write-Host '  3. Tick "Always use this app to open .pdf files", then OK.'
+Write-Host '  (Repeat per extension, or set it from Settings -> Default apps.)'
+Write-Host ''
+Write-Host 'To remove: tools\unset_default_app.ps1'
