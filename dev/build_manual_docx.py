@@ -154,6 +154,114 @@ def build_doc() -> Document:
     _img(doc, "19_install_extract_button.png")
     _para(doc, "※展開には数分かかります。")
 
+    _h2(doc, "Windows 統合設定（setup_all）")
+    _para(
+        doc,
+        "ZIP を展開しただけでも「run_justice_gui.cmd」から起動できますが、"
+        "以下の統合設定を行うと Windows への組み込みがより快適になります。"
+        "すべてユーザー単位の設定（HKCU）で、管理者権限は不要です。",
+    )
+    _para(
+        doc,
+        "展開したフォルダをエクスプローラーで開き、アドレスバーに"
+        " PowerShell と入力して Enter を押します（または「ファイル」タブ →「Windows PowerShell を開く」）。"
+        "表示された PowerShell ウィンドウで次のコマンドを実行してください：",
+    )
+
+    # コードブロック風の段落
+    code_para = doc.add_paragraph()
+    code_para.style = "No Spacing"
+    run = code_para.add_run(
+        "powershell -ExecutionPolicy Bypass -File tools\\setup_all.ps1"
+    )
+    run.font.name = "Courier New"
+    run.font.size = Pt(10)
+    _para(doc)  # spacer
+
+    _para(
+        doc,
+        "このコマンドは以下の 2 つのステップを順番に実行します：",
+    )
+
+    SETUP_STEPS = [
+        ("ステップ 1：右クリックメニューの追加",
+         "エクスプローラーで PDF・Office 文書・画像ファイル・フォルダを右クリックすると"
+         "「JusticePDFで開く」が現れるようになります（Windows 11 では「その他のオプション」内）。"),
+        ("ステップ 2：デスクトップショートカットの作成",
+         "デスクトップに「JusticePDF」ショートカットを作成します（アイコンを自動生成）。"
+         "グローバルホットキー Ctrl+Alt+J が割り当てられ、どこからでもJusticePDFを起動できます。"),
+    ]
+
+    for title, desc in SETUP_STEPS:
+        p = doc.add_paragraph(style="List Bullet")
+        r = p.add_run(title + "：")
+        r.bold = True
+        p.add_run(desc)
+
+    _para(doc)
+
+    _para(doc, "【主なオプション】")
+
+    SETUP_OPTIONS = [
+        ("-StartMenu",
+         "デスクトップに加え、スタートメニューにもショートカットを作成します。"
+         "タスクバーへのピン留めが容易になります。"),
+        ("-Background",
+         "フォルダ内の何もない場所を右クリックしたときにも「JusticePDFで開く」を表示します。"),
+        ("-ClassicMenu",
+         "Windows 11 のクラシックコンテキストメニューを有効化し、"
+         "「その他のオプション」を開かなくてもトップレベルに「JusticePDFで開く」を表示します。"
+         "適用には Explorer の再起動が必要です。"),
+        ("-SkipShortcut",
+         "ステップ 2（デスクトップショートカット）をスキップします。"),
+        ("-Hotkey \"Ctrl+Alt+J\"",
+         "ショートカットのホットキーを変更します（デフォルトは Ctrl+Alt+J）。"),
+        ("-ContinueOnError",
+         "いずれかのステップが失敗しても残りのステップを続行します。"),
+    ]
+
+    table2 = doc.add_table(rows=1, cols=2)
+    table2.style = "Light Grid Accent 1"
+    hdr2 = table2.rows[0].cells
+    hdr2[0].text = "オプション"
+    hdr2[1].text = "説明"
+    for c in hdr2:
+        for p in c.paragraphs:
+            for r in p.runs:
+                r.bold = True
+        _set_cell_shading(c, "E7E5FF")
+    for opt, desc in SETUP_OPTIONS:
+        row = table2.add_row().cells
+        row[0].text = opt
+        row[1].text = desc
+    widths2 = [Cm(4.5), Cm(11.5)]
+    for row in table2.rows:
+        for c, w in zip(row.cells, widths2):
+            c.width = w
+
+    _para(doc)
+
+    _para(
+        doc,
+        "例：右クリックにクラシックメニューでトップ表示＋スタートメニューにも登録する場合：",
+    )
+    code_para2 = doc.add_paragraph()
+    code_para2.style = "No Spacing"
+    run2 = code_para2.add_run(
+        "powershell -ExecutionPolicy Bypass -File tools\\setup_all.ps1 "
+        "-Background -ClassicMenu -StartMenu"
+    )
+    run2.font.name = "Courier New"
+    run2.font.size = Pt(10)
+    _para(doc)
+
+    _para(
+        doc,
+        "※ タスクバーへのピン留めは Windows の制限により自動化できません。"
+        "デスクトップの「JusticePDF」ショートカットを右クリック →「タスクバーにピン留めする」"
+        "（Windows 11 では「その他のオプションを表示」→「タスクバーにピン留めする」）で手動で行ってください。",
+    )
+
     # 3. 使い方
     _h1(doc, "３　使い方")
 
