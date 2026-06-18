@@ -42,8 +42,8 @@ def main():
     if qss_path.exists():
         app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
 
-    # Explorer の右クリックから渡されたパスを振り分ける。いずれも内容は既定の
-    # 作業フォルダ（~/Documents/PDFs）へ取り込む。
+    # Explorer の右クリックから渡されたパスを振り分ける。いずれも内容は
+    # 設定で指定した作業フォルダ（既定は ~/Documents/PDFs）へ取り込む。
     #   - 単一フォルダ -> フォルダごと PDFs へコピーし、コピー先「だけ」を開く
     #                     （PDFs ライブラリ自体のウィンドウは開かない）
     #   - ファイル等   -> PDFs ライブラリを開き、そこへ取り込む。フォルダを
