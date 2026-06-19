@@ -1028,9 +1028,52 @@ class ZoomPageWidget(QWidget):
             round(max(0.0, min(1.0, opacity)) * 255),
         )
 
+    def _paint_callout_leader(
+        self, painter: QPainter, annot: FreeTextAnnotData, rect: QRectF
+    ) -> None:
+        """校正吹き出しの引き出し線（しっぽ）＋矢印を画面キャンバスに描く。
+
+        保存 PDF 側 (pdf_utils._add_freetext_annot_to_page) は callout=点列 +
+        line_end=OPEN_ARROW で引き出し線を描くが、編集キャンバスでは描かれて
+        いなかった。ここで本文ボックスから挿入位置 (callout_target) へ向かう線と
+        先端の矢印を描き、保存 PDF と見た目をそろえる。
+
+        引き出し線はテキスト回転の影響を受けないウィジェット絶対座標で描く必要が
+        あるため、_paint_annotation の回転変換より前に呼ぶこと。接続点 (box_attach)
+        は渡された rect から再計算するので、ドラッグゴースト/貼り付けプレビューでも
+        箱に追従する。
+        """
+        if not annot.callout_line or annot.callout_target is None:
+            return
+        target = self._page_point_to_widget_point(QPointF(*annot.callout_target))
+        # _callout_box_attach と同じ規則: ターゲットがボックスより下なら下辺、
+        # そうでなければ上辺の中央に接続する。
+        if target.y() >= rect.bottom():
+            attach = QPointF(rect.center().x(), rect.bottom())
+        else:
+            attach = QPointF(rect.center().x(), rect.top())
+        line_color = self._annotation_color(annot.border_color, opacity=annot.opacity)
+        if line_color is None:
+            line_color = self._annotation_color(annot.text_color, opacity=annot.opacity)
+        if line_color is None:
+            return
+        pen_width = max(1.0, float(annot.border_width) * self._zoom_factor)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(line_color)
+        pen.setWidthF(pen_width)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(attach, target)
+        self._draw_arrow_heads(painter, attach, target, pen_width, False, True)
+        painter.restore()
+
     def _paint_annotation(self, painter: QPainter, annot: FreeTextAnnotData, rect: QRectF) -> None:
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        # 引き出し線（しっぽ）は回転変換より前にウィジェット絶対座標で描く。
+        self._paint_callout_leader(painter, annot, rect)
 
         text_rot = annot.text_rotation % 360
         if text_rot:
