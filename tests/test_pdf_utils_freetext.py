@@ -189,6 +189,90 @@ def test_freetext_create_and_replace_keep_richtext_appearance_data(tmp_path):
     assert "border:0px solid transparent" in style_value
 
 
+def test_freetext_font_key_uses_primary_family_not_sans_serif():
+    """CSS フォールバック列の 'sans-serif' を Times と誤認しないこと。"""
+    from src.utils.constants import freetext_font_key
+
+    assert freetext_font_key('Helvetica, "Yu Gothic", Meiryo, sans-serif') == "Helv"
+    assert freetext_font_key('"Times New Roman", "Yu Mincho", serif') == "TiRo"
+    assert freetext_font_key("Courier, monospace") == "Cour"
+    assert freetext_font_key("Helvetica") == "Helv"
+    assert freetext_font_key(None) == "Helv"
+
+
+def test_freetext_style_has_shared_lineheight_inset_and_cjk_fallback(tmp_path):
+    """保存される /DS・/RD が Acrobat 整合用の共有レイアウト値を含むこと。"""
+    from src.utils.constants import (
+        FREETEXT_LINE_HEIGHT,
+        FREETEXT_TEXT_INSET_PT,
+    )
+
+    pdf_path = tmp_path / "shared-layout.pdf"
+    make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 240, 130),
+            content="個人情報が事業者に行く旨付記する",
+            fontsize=14,
+            text_color=(1.0, 0.0, 0.0),
+            fill_color=None,
+            border_color=None,
+            border_width=0,
+            opacity=1.0,
+        ),
+    )
+
+    with fitz.open(str(pdf_path)) as doc:
+        _, style_value = doc.xref_get_key(created.xref, "DS")
+        rd_kind, rd_value = doc.xref_get_key(created.xref, "RD")
+
+    assert f"line-height:{FREETEXT_LINE_HEIGHT:g}" in style_value
+    # 基本フェイスは Helvetica、CJK フォールバックを後続に持つ。
+    assert "font-family:Helvetica" in style_value
+    assert "Yu Gothic" in style_value
+    # 枠線なしなので /RD は基本余白そのもの。
+    assert rd_kind == "array"
+    rd_nums = [float(v) for v in rd_value.strip("[]").split()]
+    assert rd_nums == [FREETEXT_TEXT_INSET_PT] * 4
+
+    # フォント名はメタデータ経由でラウンドトリップする。
+    listed = list_freetext_annots(str(pdf_path), 0)
+    assert listed[0].fontname == "Helv"
+
+
+def test_freetext_rd_accounts_for_border_half(tmp_path):
+    """枠線がある場合、/Rect は border/2 内側に寄るので /RD はその分を差し引く。"""
+    from src.utils.constants import FREETEXT_TEXT_INSET_PT
+
+    pdf_path = tmp_path / "rd-border.pdf"
+    make_pdf(pdf_path)
+
+    created = create_freetext_annot(
+        str(pdf_path),
+        FreeTextAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(40, 50, 240, 130),
+            content="bordered",
+            fontsize=14,
+            text_color=(0.0, 0.0, 0.0),
+            fill_color=None,
+            border_color=(0.0, 0.0, 0.0),
+            border_width=2,
+            opacity=1.0,
+        ),
+    )
+
+    with fitz.open(str(pdf_path)) as doc:
+        _, rd_value = doc.xref_get_key(created.xref, "RD")
+    rd_nums = [float(v) for v in rd_value.strip("[]").split()]
+    assert rd_nums == [FREETEXT_TEXT_INSET_PT + 1.0] * 4
+
+
 def test_freetext_create_with_empty_content_generates_visible_border_appearance(tmp_path):
     pdf_path = tmp_path / "empty-border-appearance.pdf"
     make_pdf(pdf_path, width=300, height=300)

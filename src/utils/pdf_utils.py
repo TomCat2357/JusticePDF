@@ -18,6 +18,13 @@ from PyQt6.QtGui import QPainter, QPixmap, QImage, QPageLayout
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
 from PyQt6.QtWidgets import QWidget
 
+from src.utils.constants import (
+    FREETEXT_LINE_HEIGHT,
+    FREETEXT_TEXT_INSET_PT,
+    freetext_css_font_family,
+    freetext_font_key,
+)
+
 
 logger = logging.getLogger(__name__)
 JUSTICEPDF_FREETEXT_SUBJECT_PREFIX = "JusticePDF-FreeText:"
@@ -461,6 +468,8 @@ def _parse_da(da_value: str) -> tuple[str, float, tuple[float, float, float]]:
 
 
 def _pdf_font_to_css(fontname: str) -> str:
+    # base-14 タグ → Acrobat が認識する基本フェイス名。font-family の
+    # フォールバック列(CJK 含む)は freetext_css_font_family() が組み立てる。
     name = (fontname or "Helv").lower()
     if "cour" in name:
         return "Courier"
@@ -470,12 +479,9 @@ def _pdf_font_to_css(fontname: str) -> str:
 
 
 def _css_font_to_pdf(fontname: str | None) -> str:
-    name = (fontname or "").lower()
-    if "cour" in name:
-        return "Cour"
-    if "times" in name or "serif" in name:
-        return "TiRo"
-    return "Helv"
+    # CSS のフォールバック列 ("Helvetica, 'Yu Gothic', sans-serif" 等) でも
+    # 先頭(主)ファミリで判定する(共有ロジック)。
+    return freetext_font_key(fontname)
 
 
 def _extract_text_from_rc(rc_value: str) -> str:
@@ -516,7 +522,8 @@ def _encode_subject_metadata(data: FreeTextAnnotData, *, page_rotation: int = 0)
 def _build_richtext_style(data: FreeTextAnnotData) -> str:
     parts = [
         f"font-size:{max(1.0, float(data.fontsize)):g}pt",
-        f"font-family:{_pdf_font_to_css(data.fontname)}",
+        f"font-family:{freetext_css_font_family(data.fontname)}",
+        f"line-height:{FREETEXT_LINE_HEIGHT:g}",
         f"color:{_color_to_css(data.text_color)}",
         "margin:0",
         "padding:0",
@@ -708,6 +715,15 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         opacity=opacity,
     )
     annot.set_info(subject=_encode_subject_metadata(data, page_rotation=creation_page_rotation))
+    # テキストの内側余白を /RD (RectDifferences) で明示し、Acrobat の本文配置を
+    # キャンバス側の余白と一致させる。/Rect は枠線がある場合 border/2 だけ内側に
+    # 移動済みなので、その分を差し引いて /RD を決める。/RD は /Rect を変えないため
+    # rect のラウンドトリップには影響しない。update() が /RD を [0 0 0 0] に
+    # 戻すので、必ず最後に設定する。
+    rd = FREETEXT_TEXT_INSET_PT + effective_border_width / 2.0
+    if rd > 0:
+        doc = page.parent
+        doc.xref_set_key(annot.xref, "RD", f"[{rd:g} {rd:g} {rd:g} {rd:g}]")
     return annot
 
 
@@ -2311,21 +2327,17 @@ def merge_pdfs_in_place(
     pdf_paths: list[str],
     *,
     insert_at: int | None = None,
-    add_file_bookmarks: bool = False,
 ) -> None:
     """Merge PDFs into an existing destination file in place.
 
     If insert_at is None, append to end. Otherwise insert sequentially starting at insert_at.
     Uses incremental save when possible; falls back to full save to temp.
 
-    add_file_bookmarks=True のとき、挿入した各ファイルの開始ページにファイル名のしおりを
-    level 1 で付け、各ファイルが元々持つしおりはその子として残す。
-    insert_at は None(末尾追加)または 0(先頭挿入)のときのみしおりを付与する。
-
-    結合先(dest)が既にファイル名しおりを持つ場合(=過去に重ねた結果)は、それを
-    再ネストせずそのままの階層で残す。これにより1ファイルずつ繰り返し重ねても
-    ファイル名しおりは常にフラット(全ファイルが level 1)に保たれ、重ねた順番で
-    階層が深くなることがない。
+    しおりは「フラットな単純引継ぎ」: 結合先(dest)自身の TOC と、挿入する各ファイルが
+    元々持つ TOC を、ページ番号だけオフセットして連結する(各エントリの level はそのまま
+    保持)。ファイル名の親しおりは付けないので、1ファイルずつ繰り返し重ねても階層は深く
+    ならず、内部の親子関係(例: 章とその節)はそのまま引き継がれる。
+    insert_at は None(末尾追加)または 0(先頭挿入)のときのみしおりを書き込む。
     """
     if not pdf_paths:
         return
@@ -2333,7 +2345,7 @@ def merge_pdfs_in_place(
     dest_doc = fitz.open(dest_path)
     try:
         dest_orig_count = len(dest_doc)
-        dest_orig_toc = dest_doc.get_toc(simple=True) if add_file_bookmarks else []
+        dest_orig_toc = dest_doc.get_toc(simple=True)
         source_entries: list[TocEntry] = []
         if insert_at is None:
             start = dest_orig_count
@@ -2342,12 +2354,10 @@ def merge_pdfs_in_place(
                     continue
                 with fitz.open(path) as src_doc:
                     count = len(src_doc)
-                    sub = src_doc.get_toc(simple=True) if add_file_bookmarks else []
+                    sub = src_doc.get_toc(simple=True)
                     dest_doc.insert_pdf(src_doc)
-                if add_file_bookmarks and count > 0:
-                    source_entries.extend(
-                        _file_toc_entries(_file_bookmark_title(path), start, sub)
-                    )
+                if count > 0 and sub:
+                    source_entries.extend(_offset_toc_entries(sub, start))
                 start += count
             dest_start = 0
         else:
@@ -2357,33 +2367,21 @@ def merge_pdfs_in_place(
                     continue
                 with fitz.open(path) as src_doc:
                     count = len(src_doc)
-                    sub = src_doc.get_toc(simple=True) if add_file_bookmarks else []
+                    sub = src_doc.get_toc(simple=True)
                     dest_doc.insert_pdf(src_doc, start_at=idx)
-                if add_file_bookmarks and count > 0:
-                    source_entries.extend(
-                        _file_toc_entries(_file_bookmark_title(path), idx, sub)
-                    )
+                if count > 0 and sub:
+                    source_entries.extend(_offset_toc_entries(sub, idx))
                 idx += count
             total_inserted = idx - insert_at
             # 先頭挿入(insert_at==0)のとき、結合先の元ページは挿入分だけ後ろへずれる
             dest_start = total_inserted if insert_at == 0 else 0
 
-        # しおり付与は insert_at が None / 0 のときのみ(結合先ページが連続するケース)
-        if add_file_bookmarks and insert_at in (None, 0):
+        # しおり書き込みは insert_at が None / 0 のときのみ(結合先ページが連続するケース)
+        if insert_at in (None, 0):
             entries = list(source_entries)
-            if dest_orig_count > 0:
-                if dest_orig_toc:
-                    # 既存しおり(過去のファイル名しおり等)は再ネストせずそのまま残す
-                    entries.extend(_offset_toc_entries(dest_orig_toc, dest_start))
-                else:
-                    # しおりが無い素のファイルなら dest 自身に level 1 を1つだけ付ける
-                    entries.append(
-                        TocEntry(
-                            level=1,
-                            title=_file_bookmark_title(dest_path),
-                            page=dest_start + 1,
-                        )
-                    )
+            if dest_orig_count > 0 and dest_orig_toc:
+                # 結合先の既存しおりも level はそのまま、ページだけずらして引き継ぐ
+                entries.extend(_offset_toc_entries(dest_orig_toc, dest_start))
             if entries:
                 # ページ順に並べ替え(安定ソートなので同ページ内の親→子順は保たれる)
                 entries.sort(key=lambda e: e.page)
@@ -2402,6 +2400,8 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
     - フォルダはしおりの見出し(その階層)になり、中身(.pdf とサブフォルダ)を名前順に
       子として再帰的に並べる。入れ子フォルダはさらに深い階層になる。
     - フォルダ見出しは、その配下で最初に現れるページを指す。
+    - ファイルはファイル名の見出しになり、そのファイルが元々持つしおりを子として
+      ぶら下げる(内部の階層もそのまま保持)。
     - PDF ページを1ページも含まないフォルダは見出しごと省略する。
     - 戻り値は結合したページ総数。0 のとき出力ファイルは作成されない。
     """
@@ -2425,7 +2425,8 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
             title = os.path.basename(os.path.normpath(path)) or path
             return [TocEntry(level=level, title=title, page=start0 + 1), *child_entries]
 
-        # ファイル(.pdf のみ)
+        # ファイル(.pdf のみ): ファイル名を見出し(level)に、ファイルが元々持つしおりは
+        # その子(level + 内部level)としてページをオフセットしてぶら下げる。
         if not path.lower().endswith(".pdf"):
             return []
         try:
@@ -2434,11 +2435,21 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
                 if count == 0:
                     return []
                 start0 = len(output_doc)
+                sub = src_doc.get_toc(simple=True)
                 output_doc.insert_pdf(src_doc)
         except Exception:
             logger.warning("結合をスキップしました(開けません): %s", path)
             return []
-        return [TocEntry(level=level, title=_file_bookmark_title(path), page=start0 + 1)]
+        entries = [TocEntry(level=level, title=_file_bookmark_title(path), page=start0 + 1)]
+        for sub_level, sub_title, sub_page in sub:
+            entries.append(
+                TocEntry(
+                    level=level + int(sub_level),
+                    title=str(sub_title),
+                    page=int(sub_page) + start0,
+                )
+            )
+        return entries
 
     try:
         entries: list[TocEntry] = []

@@ -48,5 +48,8 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# Dev calibration output (throwaway samples)
+dev/calibration_out/
+
 # Claude
 .claude/
