@@ -7,8 +7,7 @@ from src.utils.pdf_utils import (
     ShapeAnnotData,
     ShapeType,
     create_callout,
-    delete_annot_group,
-    list_annot_group,
+    delete_freetext_annot,
     list_freetext_annots,
     list_shape_annots,
 )
@@ -18,11 +17,11 @@ from tests.helpers import make_pdf
 pytestmark = pytest.mark.usefixtures("qapp")
 
 
-def test_create_callout_builds_grouped_text_brace_leader(tmp_path):
+def test_create_callout_builds_single_freetext(tmp_path):
     pdf_path = tmp_path / "callout.pdf"
     make_pdf(pdf_path, width=400, height=500)
 
-    text_data, brace, leader = create_callout(
+    text_data = create_callout(
         str(pdf_path),
         0,
         text_rect=(60.0, 60.0, 220.0, 110.0),
@@ -30,60 +29,76 @@ def test_create_callout_builds_grouped_text_brace_leader(tmp_path):
         text="ここに「至」を挿入",
     )
 
-    assert text_data.group_id
-    gid = text_data.group_id
-    assert brace.group_id == gid
-    assert leader.group_id == gid
-
-    # 種類の確認
+    # 単一の FreeText コールアウトとして生成される。
     assert isinstance(text_data, FreeTextAnnotData)
     assert text_data.content == "ここに「至」を挿入"
-    assert isinstance(brace, ShapeAnnotData) and brace.shape_type == ShapeType.BRACKET
-    assert brace.bracket_orientation == "horizontal"
-    assert isinstance(leader, ShapeAnnotData) and leader.shape_type == ShapeType.LINE
-    assert leader.arrow_end is True
+    assert len(text_data.callout_line) == 2
+    assert text_data.callout_target == (300.0, 260.0)
+    # 先端は挿入位置、末尾は本文ボックスへの接続点。
+    assert text_data.callout_line[0] == (300.0, 260.0)
 
-    # ディスク上に3つの注釈（FreeText 1 + Shape 2）。
+    # ディスク上には FreeText が 1 つだけ。図形オブジェクトは作られない。
     fts = list_freetext_annots(str(pdf_path), 0)
     shapes = list_shape_annots(str(pdf_path), 0)
     assert len(fts) == 1
-    assert len(shapes) == 2
+    assert len(shapes) == 0
 
 
-def test_list_and_delete_annot_group(tmp_path):
+def test_callout_roundtrips_after_reopen(tmp_path):
+    pdf_path = tmp_path / "callout-roundtrip.pdf"
+    make_pdf(pdf_path, width=400, height=500)
+
+    text_rect = (60.0, 60.0, 220.0, 110.0)
+    create_callout(
+        str(pdf_path),
+        0,
+        text_rect=text_rect,
+        target_point=(300.0, 260.0),
+        text="挿入",
+    )
+
+    # 再オープンしてもコールアウト点列・本文ボックス枠・矢印が保持される。
+    listed = list_freetext_annots(str(pdf_path), 0)
+    assert len(listed) == 1
+    saved = listed[0]
+    assert len(saved.callout_line) == 2
+    assert saved.callout_target == (300.0, 260.0)
+    # annot.rect の拡張に引きずられず、本文ボックス枠が復元される。
+    assert saved.rect == pytest.approx(text_rect, abs=0.5)
+
+
+def test_callout_can_be_deleted_as_single_object(tmp_path):
     pdf_path = tmp_path / "callout-del.pdf"
     make_pdf(pdf_path, width=400, height=500)
 
-    text_data, _brace, _leader = create_callout(
+    text_data = create_callout(
         str(pdf_path),
         0,
         text_rect=(60.0, 60.0, 220.0, 110.0),
         target_point=(300.0, 260.0),
         text="挿入",
     )
-    gid = text_data.group_id
 
-    xrefs = list_annot_group(str(pdf_path), 0, gid)
-    assert len(xrefs) == 3
-
-    deleted = delete_annot_group(str(pdf_path), 0, gid)
-    assert deleted == 3
+    assert delete_freetext_annot(str(pdf_path), 0, text_data.xref) is True
     assert list_freetext_annots(str(pdf_path), 0) == []
     assert list_shape_annots(str(pdf_path), 0) == []
 
 
-def test_callout_target_above_text_uses_upward_brace(tmp_path):
+def test_callout_target_above_text_attaches_to_box_top(tmp_path):
     pdf_path = tmp_path / "callout-up.pdf"
     make_pdf(pdf_path, width=400, height=500)
 
-    _text, brace, _leader = create_callout(
+    text_rect = (60.0, 300.0, 220.0, 350.0)
+    text_data = create_callout(
         str(pdf_path),
         0,
-        text_rect=(60.0, 300.0, 220.0, 350.0),
+        text_rect=text_rect,
         target_point=(140.0, 80.0),  # 本文より上
     )
-    # 突起は上向き（side="left"）
-    assert brace.bracket_side == "left"
+    # ターゲットが上にあるので接続点は本文ボックスの上辺中央。
+    box_attach = text_data.callout_line[1]
+    assert box_attach[0] == pytest.approx((text_rect[0] + text_rect[2]) / 2.0)
+    assert box_attach[1] == pytest.approx(text_rect[1], abs=0.5)
 
 
 def test_horizontal_bracket_roundtrips(tmp_path):
