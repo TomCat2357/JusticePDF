@@ -6,6 +6,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 from PyQt6.QtWidgets import (
@@ -106,6 +107,11 @@ class MainWindow(QMainWindow):
         self._pending_rename_new_to_old: dict[str, str] = {}
         self._pending_rename_removed: set[str] = set()
         self._pending_rename_added: set[str] = set()
+        # 内部操作で busy 登録した時刻（正規化パス -> time.monotonic()）。
+        # watchdog イベントを取りこぼしても、TTL を過ぎた登録は reconcile の
+        # 除外対象から外し、ディスク差分での再同期を再開させる（恒久ズレ防止）。
+        self._busy_since: dict[str, float] = {}
+        self._BUSY_TTL_SEC = 6.0
         self._preview_thumb_size = PDFCard.THUMBNAIL_SIZE
         self._preview_card_ratio = PDFCard.CARD_WIDTH / PDFCard.THUMBNAIL_SIZE
         self._preview_card_width = int(round(self._preview_thumb_size * self._preview_card_ratio))
@@ -137,7 +143,7 @@ class MainWindow(QMainWindow):
         # Low-frequency backstop poll for missed watchdog events (bulk copies,
         # cloud-synced folders, AV interference). Runs only while visible.
         self._reconcile_poll_timer = QTimer(self)
-        self._reconcile_poll_timer.setInterval(4000)
+        self._reconcile_poll_timer.setInterval(2000)
         self._reconcile_poll_timer.timeout.connect(self._maybe_poll_reconcile)
         self._reconcile_poll_timer.start()
 
@@ -448,19 +454,28 @@ class MainWindow(QMainWindow):
 
     def _register_internal_add(self, paths: list[str]) -> None:
         """Mark paths as internally added to avoid clearing undo history."""
+        now = time.monotonic()
         for path in paths:
-            self._internal_adds.add(self._normalize_path(path))
+            norm = self._normalize_path(path)
+            self._internal_adds.add(norm)
+            self._busy_since[norm] = now
 
     def _register_internal_remove(self, paths: list[str]) -> None:
         """Mark paths as internally removed to avoid clearing undo history."""
+        now = time.monotonic()
         for path in paths:
-            self._internal_removes.add(self._normalize_path(path))
+            norm = self._normalize_path(path)
+            self._internal_removes.add(norm)
+            self._busy_since[norm] = now
 
     def _track_pending_rename(self, old_path: str, new_path: str) -> None:
         old_norm = self._normalize_path(old_path)
         new_norm = self._normalize_path(new_path)
         self._pending_rename_old_to_new[old_norm] = new_norm
         self._pending_rename_new_to_old[new_norm] = old_norm
+        now = time.monotonic()
+        self._busy_since[old_norm] = now
+        self._busy_since[new_norm] = now
 
     def _finalize_pending_rename(self, old_norm: str, new_norm: str) -> None:
         if old_norm in self._pending_rename_removed and new_norm in self._pending_rename_added:
@@ -685,7 +700,9 @@ class MainWindow(QMainWindow):
             except OSError:
                 continue
 
-        busy = (
+        now = time.monotonic()
+        ttl = self._BUSY_TTL_SEC
+        raw_busy = (
             self._internal_adds
             | self._internal_removes
             | set(self._pending_rename_old_to_new.keys())
@@ -693,6 +710,15 @@ class MainWindow(QMainWindow):
             | self._pending_rename_removed
             | self._pending_rename_added
         )
+        # まだ新しい登録のみ busy 扱い。TTL を過ぎたものは watchdog イベントが
+        # 来なかった（クラウド/ネットワーク/AV）とみなし reconcile に処理させる。
+        # reconcile は冪等なので再処理は安全。期限切れでもパス自体は
+        # _internal_*/rename dict に残し（_busy_since の刻印だけ消す）、遅延 watchdog
+        # イベント到来時に undo 履歴の誤消去を防ぐ。
+        busy = {p for p in raw_busy if (now - self._busy_since.get(p, 0.0)) < ttl}
+        for p in list(self._busy_since):
+            if p not in raw_busy or (now - self._busy_since[p]) >= ttl:
+                self._busy_since.pop(p, None)
 
         changed = False
 
