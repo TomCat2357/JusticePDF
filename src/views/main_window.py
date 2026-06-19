@@ -28,7 +28,6 @@ from src.views.view_helpers import (
 )
 from src.controllers.folder_watcher import FolderWatcher
 from src.models.undo_manager import UndoManager, UndoAction
-from src.utils import app_settings
 from src.utils.pdf_utils import (
     PdfWritePermissionError,
     rotate_pages, get_page_count, get_pdf_metadata_title, update_pdf_metadata_title,
@@ -143,8 +142,7 @@ class MainWindow(QMainWindow):
         self._reconcile_poll_timer.start()
 
         # Setup working directory
-        # ルートウィンドウ(folder_path=None)の既定は設定の PDFs フォルダ。
-        self._work_dir = Path(folder_path) if folder_path else app_settings.get_pdfs_dir()
+        self._work_dir = Path(folder_path) if folder_path else Path.home() / "Documents" / "PDFs"
         self._is_root_window = folder_path is None
         self._work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -188,8 +186,7 @@ class MainWindow(QMainWindow):
     def _create_watcher(self, folder: str) -> FolderWatcher:
         """Create a FolderWatcher for *folder* with all signals connected.
 
-        Shared by __init__ and _switch_work_dir so the signal wiring stays in
-        one place.
+        Keeps the signal wiring in one place.
         """
         watcher = FolderWatcher(folder)
         watcher.file_added.connect(self._on_file_added)
@@ -199,75 +196,21 @@ class MainWindow(QMainWindow):
         watcher.folder_removed.connect(self._on_folder_removed)
         return watcher
 
-    def _on_open_settings(self) -> None:
-        """Open the settings dialog and apply changes."""
-        from src.views.settings_dialog import SettingsDialog
-
-        dialog = SettingsDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        new_dir = dialog.resolved_pdfs_dir
-        if new_dir is None:
-            return
-        # PDFs フォルダはルートウィンドウの作業フォルダ。子フォルダを表示している
-        # ウィンドウから設定を開いても、切り替えるのはルートウィンドウ。
-        root = next(
-            (w for w in MainWindow._instances if getattr(w, "_is_root_window", False)),
-            self if self._is_root_window else None,
-        )
-        if root is not None:
-            root._switch_work_dir(new_dir)
-            root.raise_()
-            root.activateWindow()
-
-    def _switch_work_dir(self, new_dir: Path) -> None:
-        """Re-point this window to *new_dir*, reloading its contents.
-
-        Existing files are left in place — only what this window displays
-        changes. Used when the PDFs-folder setting is changed at runtime.
-        """
-        if self._normalize_path(str(new_dir)) == self._normalize_path(str(self._work_dir)):
-            return
-
-        # Stop watching the old folder.
-        self._watcher.stop()
-
-        # Dispose of all current cards / folder cards and clear selection.
-        self._clear_selection()
-        for card in self._cards[:]:
-            card.deleteLater()
-        self._cards = []
-        for fc in self._folder_cards[:]:
-            fc.deleteLater()
-        self._folder_cards = []
-        self._selected_folder_cards = []
-
-        # Re-point and ensure the new folder exists.
-        self._work_dir = Path(new_dir)
-        self._work_dir.mkdir(parents=True, exist_ok=True)
-
-        # Start watching and load the new folder.
-        self._watcher = self._create_watcher(str(self._work_dir))
-        self._watcher.start()
-        self._load_existing_files()
-        self._refresh_grid()
-        self._update_button_states()
-
     @classmethod
     def open_external_folder(cls, source_dir: str) -> "MainWindow":
         """Open a folder launched from Explorer's「JusticePDFで開く」.
 
-        The folder is copied into the configured PDFs library (default
-        ``~/Documents/PDFs``) under a non-colliding name and that copy becomes
-        this window's work dir; the
-        folder's contents are imported into it once the event loop starts.
+        The folder is copied into the PDFs library (``~/Documents/PDFs``)
+        under a non-colliding name and that copy becomes this window's work
+        dir; the folder's contents are imported into it once the event loop
+        starts.
 
         Only this single window opens — the work dir is the copy itself, so
         there is no separate PDFs-library window.  (This differs from importing
         a file, which lands flat in the library window, and from a mixed
         file+folder launch, which still needs the library window as host.)
         """
-        library = app_settings.get_pdfs_dir()
+        library = Path.home() / "Documents" / "PDFs"
         library.mkdir(parents=True, exist_ok=True)
         folder_name = os.path.basename(os.path.abspath(source_dir).rstrip(os.sep)) or "folder"
         dest = Path(str(ensure_unique_path(library, folder_name, pattern="{stem}({i}){ext}")))
@@ -424,15 +367,6 @@ class MainWindow(QMainWindow):
             lambda: self._apply_sort("date", False))
         self._sort_btn.setMenu(self._sort_menu)
         toolbar.addWidget(self._sort_btn)
-
-        toolbar.addSeparator()
-
-        self._settings_btn = QPushButton("設定")
-        self._settings_btn.setToolTip(
-            "PDFsフォルダの場所や、重ねたときのしおり生成を設定します"
-        )
-        self._settings_btn.clicked.connect(self._on_open_settings)
-        toolbar.addWidget(self._settings_btn)
 
         self._update_button_states()
 
@@ -1134,9 +1068,6 @@ class MainWindow(QMainWindow):
         if self._operation_in_progress:
             return
 
-        # ファイル名しおりを付けるかは設定に従う(undo/redo でも同じ値を使う)。
-        add_bm = app_settings.get_merge_add_bookmarks()
-
         # Snapshot grid order and selection before mutation
         old_paths = [c.pdf_path for c in self._cards]
         pre_selected_paths = [c.pdf_path for c in self._selected_cards]
@@ -1200,7 +1131,7 @@ class MainWindow(QMainWindow):
                 backups[p] = str(dst)
 
             # Merge PDFs
-            merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path], add_file_bookmarks=add_bm)
+            merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path])
 
             # Trash merged-away files (batch)
             send2trash(trash_paths)
@@ -1225,7 +1156,7 @@ class MainWindow(QMainWindow):
                 card.refresh()
 
             def do_merge_sync() -> None:
-                merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path], add_file_bookmarks=add_bm)
+                merge_pdfs_in_place(merge_dest_path, source_paths[1:] + [target_path])
                 self._register_internal_remove(trash_paths)
                 send2trash(trash_paths)
                 self._rebuild_cards_from_paths(new_paths)
@@ -3639,9 +3570,6 @@ class MainWindow(QMainWindow):
         import tempfile
         import shutil
 
-        # ファイル名しおりを付けるかは設定に従う(undo/redo でも同じ値を使う)。
-        add_bm = app_settings.get_merge_add_bookmarks()
-
         source_paths = source_paths_str.split('|')
         target_path = target_card.pdf_path
 
@@ -3652,8 +3580,8 @@ class MainWindow(QMainWindow):
 
         try:
             # Merge: source pages first, then target pages
-            merge_pdfs_in_place(target_path, source_paths, insert_at=0, add_file_bookmarks=add_bm)
-            
+            merge_pdfs_in_place(target_path, source_paths, insert_at=0)
+
             target_card.refresh()
             
             # Select target card
@@ -3667,7 +3595,7 @@ class MainWindow(QMainWindow):
                 target_card.refresh()
             
             def redo_copy_merge():
-                merge_pdfs_in_place(target_path, source_paths, insert_at=0, add_file_bookmarks=add_bm)
+                merge_pdfs_in_place(target_path, source_paths, insert_at=0)
                 target_card.refresh()
             
             self._undo_manager.add_action(UndoAction(

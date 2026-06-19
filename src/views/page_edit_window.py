@@ -19,7 +19,9 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices, QPixmap,
-    QBrush, QCursor, QPolygonF, QGuiApplication, QAction
+    QBrush, QCursor, QPolygonF, QGuiApplication, QAction,
+    QTextDocument, QTextOption, QTextCursor, QTextBlockFormat,
+    QAbstractTextDocumentLayout, QPalette,
 )
 
 from src.utils.pdf_utils import (
@@ -45,6 +47,46 @@ from src.utils.pdf_utils import (
     search_text_in_pdf,
     TocEntry, get_pdf_toc, update_pdf_toc,
 )
+from src.utils.constants import (
+    FREETEXT_LINE_HEIGHT,
+    FREETEXT_TEXT_INSET_PT,
+    freetext_canvas_font_families,
+)
+
+
+def _apply_block_line_height(document: "QTextDocument") -> None:
+    """文書の全ブロックに共有の行間係数(FREETEXT_LINE_HEIGHT)を適用する。
+
+    キャンバスのプレビュー描画とインラインエディタ、保存 PDF の /DS line-height を
+    そろえるための共通処理。"""
+    cursor = QTextCursor(document)
+    cursor.select(QTextCursor.SelectionType.Document)
+    block_format = QTextBlockFormat()
+    block_format.setLineHeight(
+        FREETEXT_LINE_HEIGHT * 100.0,
+        QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
+    )
+    cursor.mergeBlockFormat(block_format)
+
+
+def _build_freetext_document(text: str, font: "QFont", text_width: float) -> "QTextDocument":
+    """テキストボックス本文を描画するための QTextDocument を組み立てる。
+
+    インラインエディタ(QPlainTextEdit)と同じ折り返し・行間で描画することで、
+    編集中と非編集時の見た目を一致させる。"""
+    document = QTextDocument()
+    document.setDocumentMargin(0)
+    document.setDefaultFont(font)
+    option = QTextOption()
+    option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    option.setAlignment(Qt.AlignmentFlag.AlignLeft)
+    document.setDefaultTextOption(option)
+    document.setPlainText(text)
+    document.setTextWidth(max(0.0, text_width))
+    _apply_block_line_height(document)
+    return document
+
+
 def _pixel_size_to_pointf(pixel_size: int) -> float:
     # Convert pixel size to a point size so QFont.pointSize() stays positive.
     # setPixelSize() invalidates pointSize (-1), which triggers a Qt warning
@@ -580,12 +622,15 @@ class ZoomPageWidget(QWidget):
         editor.setFrameStyle(QFrame.Shape.NoFrame)
         editor.setContentsMargins(0, 0, 0, 0)
         effective_border_width = annotation.border_width if annotation.border_color is not None else 0.0
-        text_inset_px = max(0, round(effective_border_width * 2.0 * self._zoom_factor))
-        editor.setViewportMargins(text_inset_px, text_inset_px, text_inset_px, 0)
+        # キャンバス描画(_paint_annotation)・保存 PDF(/RD)と同じ内側余白を四辺に適用。
+        text_inset_px = max(0, round((FREETEXT_TEXT_INSET_PT + effective_border_width) * self._zoom_factor))
+        editor.setViewportMargins(text_inset_px, text_inset_px, text_inset_px, text_inset_px)
         editor.document().setDocumentMargin(0)
         font = editor.font()
         font.setPointSizeF(_pixel_size_to_pointf(pixel_size))
+        font.setFamilies(list(freetext_canvas_font_families(annotation.fontname)))
         editor.setFont(font)
+        _apply_block_line_height(editor.document())
         self._inline_editor = editor
         self._editing_annotation_xref = annotation.xref
         self._editing_annotation_original_text = annotation.content
@@ -645,10 +690,14 @@ class ZoomPageWidget(QWidget):
             f"{round(annotation.text_color[2] * 255)}, "
             f"{round(opacity * 255)})"
         )
+        # スタイルシートがフォントを既定値にリセットしても、キャンバスと同じ
+        # フォントで編集できるよう font-family も明示する(行間はブロック書式で適用)。
+        family_css = ", ".join(f'"{fam}"' for fam in freetext_canvas_font_families(annotation.fontname))
         return (
             "QPlainTextEdit {"
             f"background-color: {fill_css};"
             f"color: {text_css};"
+            f"font-family: {family_css};"
             f"font-size: {max(1, int(pixel_size))}px;"
             "border: 0px solid transparent;"
             "padding: 0px;"
@@ -1018,22 +1067,24 @@ class ZoomPageWidget(QWidget):
             font = painter.font()
             pixel_size = max(10, round(annot.fontsize * self._zoom_factor))
             font.setPointSizeF(_pixel_size_to_pointf(pixel_size))
-            painter.setFont(font)
+            # フォントファミリ・内側余白・行間を保存時(Acrobat 表示)と共有して
+            # 折り返し位置と位置をそろえる。本文は QPlainTextEdit と同じ
+            # QTextDocument で描画し、編集中と非編集時の見た目も一致させる。
+            font.setFamilies(list(freetext_canvas_font_families(annot.fontname)))
             text_color = self._annotation_color(annot.text_color, opacity=annot.opacity)
-            if text_color is not None:
-                painter.setPen(text_color)
             effective_border_width = annot.border_width if annot.border_color is not None else 0.0
-            text_inset = effective_border_width * 2.0 * self._zoom_factor
-            text_rect = paint_rect.adjusted(text_inset, text_inset, -text_inset, 0) if text_inset > 0 else paint_rect
-            painter.drawText(
-                text_rect,
-                int(
-                    Qt.AlignmentFlag.AlignLeft
-                    | Qt.AlignmentFlag.AlignTop
-                    | Qt.TextFlag.TextWordWrap
-                ),
-                annot.content,
-            )
+            text_inset = (FREETEXT_TEXT_INSET_PT + effective_border_width) * self._zoom_factor
+            text_rect = paint_rect.adjusted(text_inset, text_inset, -text_inset, -text_inset)
+            if text_rect.width() > 0 and text_rect.height() > 0:
+                document = _build_freetext_document(annot.content, font, text_rect.width())
+                painter.save()
+                painter.translate(text_rect.topLeft())
+                painter.setClipRect(QRectF(0, 0, text_rect.width(), text_rect.height()))
+                ctx = QAbstractTextDocumentLayout.PaintContext()
+                if text_color is not None:
+                    ctx.palette.setColor(QPalette.ColorRole.Text, text_color)
+                document.documentLayout().draw(painter, ctx)
+                painter.restore()
 
         painter.restore()
 
