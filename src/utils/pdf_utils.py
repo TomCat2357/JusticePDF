@@ -60,6 +60,11 @@ class FreeTextAnnotData:
     subject: str = ""
     text_rotation: int = 0
     group_id: str = ""
+    # 校正コールアウト用。非空なら FreeTextCallout（本文ボックス＋引き出し線＋矢印）として描画する。
+    # 表示座標系の点列 [target, box_attach]（先端＝挿入位置、末尾＝ボックス接続点）。
+    callout_line: tuple[tuple[float, float], ...] = ()
+    # 引き出し線の先端＝挿入位置（callout_line[0] と同じ）。利便性のために保持する。
+    callout_target: tuple[float, float] | None = None
 
 
 class ShapeType(str, Enum):
@@ -516,6 +521,11 @@ def _encode_subject_metadata(data: FreeTextAnnotData, *, page_rotation: int = 0)
     }
     if data.group_id:
         payload["group_id"] = data.group_id
+    if data.callout_line:
+        # コールアウト時は annot.rect が引き出し線を含むよう拡張されるため、
+        # 本文ボックス枠とコールアウト点列を明示保存して復元時に使う。
+        payload["callout_line"] = [[float(x), float(y)] for x, y in data.callout_line]
+        payload["text_rect"] = [float(v) for v in data.rect]
     return JUSTICEPDF_FREETEXT_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
 
 
@@ -643,6 +653,23 @@ def _extract_freetext_data(
     creation_rotation = int(metadata.get("page_rotation", 0))
     text_rotation = (page.rotation - creation_rotation) % 360
 
+    # 校正コールアウト: コールアウト点列と本文ボックス枠を復元する。
+    # annot.rect は引き出し線を含むよう拡張されるため、保存済みの text_rect で上書きする。
+    callout_line: tuple[tuple[float, float], ...] = ()
+    callout_target: tuple[float, float] | None = None
+    callout_raw = metadata.get("callout_line")
+    if isinstance(callout_raw, list):
+        pts: list[tuple[float, float]] = []
+        for p in callout_raw:
+            if isinstance(p, list) and len(p) >= 2:
+                pts.append((float(p[0]), float(p[1])))
+        if pts:
+            callout_line = tuple(pts)
+            callout_target = pts[0]
+    text_rect = metadata.get("text_rect")
+    if isinstance(text_rect, list) and len(text_rect) == 4:
+        rect = tuple(float(v) for v in text_rect)
+
     return FreeTextAnnotData(
         page_num=page_num,
         xref=xref,
@@ -659,6 +686,8 @@ def _extract_freetext_data(
         subject=subject,
         text_rotation=text_rotation,
         group_id=str(metadata.get("group_id", "")),
+        callout_line=callout_line,
+        callout_target=callout_target,
     )
 
 
@@ -690,6 +719,15 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         creation_page_rotation = int(existing_metadata["page_rotation"])
     else:
         creation_page_rotation = page.rotation
+    # 校正コールアウト: 表示座標のコールアウト点列を（ページ回転時は）派生座標へ変換して渡す。
+    callout_kwargs: dict[str, object] = {}
+    if data.callout_line:
+        callout_pts = list(data.callout_line)
+        if page.rotation != 0:
+            m = page.derotation_matrix
+            callout_pts = [tuple(fitz.Point(p) * m) for p in callout_pts]
+        callout_kwargs["callout"] = [fitz.Point(p) for p in callout_pts]
+        callout_kwargs["line_end"] = fitz.PDF_ANNOT_LE_OPEN_ARROW
     annot = page.add_freetext_annot(
         rect,
         data.content,
@@ -702,6 +740,7 @@ def _add_freetext_annot_to_page(page: fitz.Page, data: FreeTextAnnotData) -> fit
         rotate=creation_page_rotation,
         richtext=True,
         style=_build_richtext_style(data),
+        **callout_kwargs,
     )
     annot.set_border(width=effective_border_width)
     _fix_rc_leading_whitespace(page.parent, annot.xref)
@@ -1309,7 +1348,21 @@ def create_bracket_pair(
         doc.close()
 
 
-# --- Proofreading callout (text + horizontal brace + leader) -------------
+# --- Proofreading callout (single FreeTextCallout: text box + leader arrow) -
+
+def _callout_box_attach(
+    text_rect: tuple[float, float, float, float],
+    target_point: tuple[float, float],
+) -> tuple[float, float]:
+    """本文ボックスから引き出し線を出す接続点（ボックス上辺/下辺の中央）を返す。
+
+    ターゲットがボックスより下なら下辺、そうでなければ上辺の中央に接続する。
+    """
+    tx0, ty0, tx1, ty1 = text_rect
+    cx = (tx0 + tx1) / 2.0
+    ty = float(target_point[1])
+    return (cx, ty1) if ty >= ty1 else (cx, ty0)
+
 
 def create_callout(
     pdf_path: str,
@@ -1325,64 +1378,25 @@ def create_callout(
     stroke_width: float = 1.5,
     opacity: float = 1.0,
     bracket_style: str = "curly",
-) -> tuple[FreeTextAnnotData, ShapeAnnotData, ShapeAnnotData]:
+) -> FreeTextAnnotData:
     """校正用の挿入コールアウトを作る。
 
-    本文ボックス（FreeText）＋ 横向き波括弧（BRACKET, horizontal）＋
-    挿入位置を指す引き出し線（LINE）を、共通の ``group_id`` で生成する。
-    """
-    gid = uuid.uuid4().hex[:12]
-    tx0, ty0, tx1, ty1 = text_rect
-    tx, ty = float(target_point[0]), float(target_point[1])
-    cx = (tx0 + tx1) / 2.0
-    brace_depth = 14.0
+    本文ボックス＋挿入位置を指す矢印付き引き出し線を、PDF ネイティブの
+    FreeTextCallout（単一の FreeText 注釈）として 1 個生成する。
 
-    # ターゲットが本文ボックスより下なら下向き、そうでなければ上向きに括弧を置く。
-    if ty >= ty1:
-        by0 = ty1 + 2.0
-        by1 = by0 + brace_depth
-        brace_side = "right"  # 突起=下向き
-        tip = (cx, by1)
-    else:
-        by1 = ty0 - 2.0
-        by0 = by1 - brace_depth
-        brace_side = "left"  # 突起=上向き
-        tip = (cx, by0)
-    brace_rect = (tx0, by0, tx1, by1)
+    ``bracket_style`` は後方互換のため引数として受け付けるが使用しない。
+    """
+    tx, ty = float(target_point[0]), float(target_point[1])
+    box_attach = _callout_box_attach(text_rect, (tx, ty))
+    callout_line = ((tx, ty), box_attach)
 
     text_data = FreeTextAnnotData(
         page_num=page_num, xref=0, rect=text_rect,
         content=text, fontsize=fontsize,
         text_color=text_color, fill_color=fill_color,
-        border_color=stroke_color, border_width=1.0,
-        opacity=opacity, group_id=gid,
-    )
-    brace_data = ShapeAnnotData(
-        page_num=page_num, xref=0, rect=brace_rect,
-        shape_type=ShapeType.BRACKET,
-        stroke_color=stroke_color, fill_color=None,
-        stroke_width=stroke_width, opacity=opacity,
-        bracket_style=bracket_style, bracket_side=brace_side,
-        bracket_orientation="horizontal", group_id=gid,
-    )
-
-    sx, sy = tip
-    lx0, lx1 = (sx, tx) if sx <= tx else (tx, sx)
-    ly0, ly1 = (sy, ty) if sy <= ty else (ty, sy)
-    lw = max(lx1 - lx0, 1e-6)
-    lh = max(ly1 - ly0, 1e-6)
-    leader_rect = (lx0, ly0, lx1, ly1)
-    vertices = (
-        ((sx - lx0) / lw, (sy - ly0) / lh),
-        ((tx - lx0) / lw, (ty - ly0) / lh),
-    )
-    leader_data = ShapeAnnotData(
-        page_num=page_num, xref=0, rect=leader_rect,
-        shape_type=ShapeType.LINE,
-        stroke_color=stroke_color, fill_color=None,
-        stroke_width=stroke_width, opacity=opacity,
-        arrow_start=False, arrow_end=True,
-        vertices=vertices, group_id=gid,
+        border_color=stroke_color, border_width=max(1.0, float(stroke_width)),
+        opacity=opacity,
+        callout_line=callout_line, callout_target=(tx, ty),
     )
 
     doc = fitz.open(pdf_path)
@@ -1390,16 +1404,12 @@ def create_callout(
         if page_num < 0 or page_num >= len(doc):
             raise IndexError(f"page out of range: {page_num}")
         page = doc[page_num]
-        leader_annot = _add_shape_annot_to_page(page, leader_data)
-        leader_saved = _extract_shape_data(doc, page_num, leader_annot)
-        brace_annot = _add_shape_annot_to_page(page, brace_data)
-        brace_saved = _extract_shape_data(doc, page_num, brace_annot)
         text_annot = _add_freetext_annot_to_page(page, text_data)
         text_saved = _extract_freetext_data(doc, page_num, text_annot)
         _save_document_in_place(doc, pdf_path)
-        if text_saved is None or brace_saved is None or leader_saved is None:
-            raise RuntimeError("Failed to extract saved callout annotations")
-        return text_saved, brace_saved, leader_saved
+        if text_saved is None:
+            raise RuntimeError("Failed to extract saved callout annotation")
+        return text_saved
     finally:
         doc.close()
 
