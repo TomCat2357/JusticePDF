@@ -36,7 +36,7 @@ from src.utils.pdf_utils import (
     ShapeType, ShapeAnnotData, AnyAnnotData,
     list_shape_annots, create_shape_annot, replace_shape_annot,
     delete_shape_annot, create_bracket_pair,
-    create_callout, delete_annot_group,
+    create_callout, delete_annot_group, _callout_box_attach,
     MarkupType, TextMarkupAnnotData,
     list_markup_annots, create_markup_annot, delete_markup_annot,
     replace_markup_annot,
@@ -3755,17 +3755,17 @@ class PageEditWindow(QMainWindow):
             by1 = by0 + box_h
         text_rect = (bx0, by0, bx0 + box_w, by1)
 
-        state: dict[str, object] = {"members": None}
+        state: dict[str, object] = {"xref": None}
 
         def do_create() -> None:
-            text_saved, _brace, _leader = create_callout(
+            text_saved = create_callout(
                 self._pdf_path,
                 self._zoom_page_num,
                 text_rect=text_rect,
                 target_point=(tx, ty),
                 text="",
             )
-            state["members"] = text_saved.group_id
+            state["xref"] = text_saved.xref
             self._selected_zoom_annotation = text_saved
             self._refresh_current_zoom_page(open_drawer=True)
             # 本文をすぐ入力できるよう FreeText インライン編集を開始。
@@ -3774,9 +3774,9 @@ class PageEditWindow(QMainWindow):
                 self._zoom_label.begin_annotation_text_edit(current)
 
         def undo_create() -> None:
-            gid = state.get("members")
-            if gid:
-                delete_annot_group(self._pdf_path, self._zoom_page_num, str(gid))
+            xref = state.get("xref")
+            if xref is not None:
+                delete_freetext_annot(self._pdf_path, self._zoom_page_num, int(xref))
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
@@ -3802,6 +3802,13 @@ class PageEditWindow(QMainWindow):
             y1 = y0 + height
         border_width = float(self._zoom_annotation_border_width_spin.value()) if self._zoom_annotation_border_width_spin else base.border_width
         border_color = None if border_width <= 0 else self._zoom_annotation_border_color
+        # 校正コールアウトはターゲット（挿入位置）を固定し、本文ボックスの新枠に
+        # 合わせて引き出し線の接続点を再計算する。
+        callout_line: tuple[tuple[float, float], ...] = ()
+        callout_target = base.callout_target
+        if base.callout_line and callout_target is not None:
+            box_attach = _callout_box_attach((x0, y0, x1, y1), callout_target)
+            callout_line = (callout_target, box_attach)
         return FreeTextAnnotData(
             page_num=base.page_num,
             xref=base.xref,
@@ -3816,6 +3823,8 @@ class PageEditWindow(QMainWindow):
             fontname=base.fontname,
             annotation_id=base.annotation_id,
             subject="",
+            callout_line=callout_line,
+            callout_target=callout_target,
         )
 
     def _setup_toolbar(self) -> None:
@@ -3923,6 +3932,8 @@ class PageEditWindow(QMainWindow):
             fontname=annotation.fontname,
             annotation_id=annotation.annotation_id,
             subject=annotation.subject,
+            callout_line=annotation.callout_line,
+            callout_target=annotation.callout_target,
         )
 
     def _commit_inline_annotation_editor(self) -> None:
@@ -3982,6 +3993,8 @@ class PageEditWindow(QMainWindow):
             fontname=current.fontname,
             annotation_id=current.annotation_id,
             subject="",
+            callout_line=current.callout_line,
+            callout_target=current.callout_target,
         )
         self._zoom_annotation_text_commit_in_progress = True
         try:
@@ -4121,20 +4134,32 @@ class PageEditWindow(QMainWindow):
             )
             return
 
+        src_ft = self._copied_zoom_annotation
+        # 校正コールアウトを貼り付ける場合、ボックスの移動量だけ挿入位置もずらして
+        # コールアウト全体を平行移動させる。
+        callout_line: tuple[tuple[float, float], ...] = ()
+        callout_target = None
+        if src_ft.callout_line and src_ft.callout_target is not None:
+            dx = new_rect[0] - src_ft.rect[0]
+            dy = new_rect[1] - src_ft.rect[1]
+            callout_target = (src_ft.callout_target[0] + dx, src_ft.callout_target[1] + dy)
+            callout_line = (callout_target, _callout_box_attach(new_rect, callout_target))
         paste_data_ft = FreeTextAnnotData(
             page_num=self._zoom_page_num,
             xref=0,
             rect=new_rect,
-            content=self._copied_zoom_annotation.content,
-            fontsize=self._copied_zoom_annotation.fontsize,
-            text_color=self._copied_zoom_annotation.text_color,
-            fill_color=self._copied_zoom_annotation.fill_color,
-            border_color=self._copied_zoom_annotation.border_color,
-            border_width=self._copied_zoom_annotation.border_width,
-            opacity=self._copied_zoom_annotation.opacity,
-            fontname=self._copied_zoom_annotation.fontname,
+            content=src_ft.content,
+            fontsize=src_ft.fontsize,
+            text_color=src_ft.text_color,
+            fill_color=src_ft.fill_color,
+            border_color=src_ft.border_color,
+            border_width=src_ft.border_width,
+            opacity=src_ft.opacity,
+            fontname=src_ft.fontname,
             annotation_id="",
             subject="",
+            callout_line=callout_line,
+            callout_target=callout_target,
         )
         state: dict[str, FreeTextAnnotData | None] = {"created": None}
 
@@ -4203,6 +4228,14 @@ class PageEditWindow(QMainWindow):
         if not isinstance(annotation, FreeTextAnnotData):
             return
         src_ft = annotation
+        # 校正コールアウトの複製はボックスの移動量だけ挿入位置もずらす。
+        dup_callout_line: tuple[tuple[float, float], ...] = ()
+        dup_callout_target = None
+        if src_ft.callout_line and src_ft.callout_target is not None:
+            dx = new_rect[0] - src_ft.rect[0]
+            dy = new_rect[1] - src_ft.rect[1]
+            dup_callout_target = (src_ft.callout_target[0] + dx, src_ft.callout_target[1] + dy)
+            dup_callout_line = (dup_callout_target, _callout_box_attach(new_rect, dup_callout_target))
         dup_ft = FreeTextAnnotData(
             page_num=self._zoom_page_num, xref=0, rect=new_rect,
             content=src_ft.content, fontsize=src_ft.fontsize,
@@ -4210,6 +4243,7 @@ class PageEditWindow(QMainWindow):
             border_color=src_ft.border_color, border_width=src_ft.border_width,
             opacity=src_ft.opacity, fontname=src_ft.fontname,
             annotation_id="", subject="",
+            callout_line=dup_callout_line, callout_target=dup_callout_target,
         )
         state_ft: dict[str, FreeTextAnnotData | None] = {"created": None}
 
@@ -4836,6 +4870,13 @@ class PageEditWindow(QMainWindow):
         if not isinstance(annotation, FreeTextAnnotData):
             return
         old_annotation = self._find_zoom_annotation(annotation.xref) or annotation
+        # 校正コールアウト: 挿入位置（target）は固定し、本文ボックスの新枠に
+        # 合わせて引き出し線の接続点を再計算する（移動でも target を指したまま追従）。
+        callout_line: tuple[tuple[float, float], ...] = ()
+        callout_target = old_annotation.callout_target
+        if old_annotation.callout_line and callout_target is not None:
+            box_attach = _callout_box_attach(new_rect, callout_target)
+            callout_line = (callout_target, box_attach)
         new_annotation = FreeTextAnnotData(
             page_num=old_annotation.page_num,
             xref=old_annotation.xref,
@@ -4850,6 +4891,8 @@ class PageEditWindow(QMainWindow):
             fontname=old_annotation.fontname,
             annotation_id=old_annotation.annotation_id,
             subject=old_annotation.subject if mode == "move" else "",
+            callout_line=callout_line,
+            callout_target=callout_target,
         )
         if old_annotation.rect == new_annotation.rect:
             return
