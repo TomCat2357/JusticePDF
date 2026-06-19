@@ -993,7 +993,10 @@ def _line_ending_code(arrow: bool) -> int:
 def _add_shape_annot_to_page(page: fitz.Page, data: ShapeAnnotData) -> fitz.Annot:
     opacity = max(0.0, min(1.0, float(data.opacity)))
     stroke_width = max(0.0, float(data.stroke_width))
-    stroke = list(data.stroke_color) if data.stroke_color is not None else None
+    # 透明枠（stroke_color is None）は stroke=[] を渡して /C [] を明示書き込みする。
+    # stroke=None だと PyMuPDF は /C キーを書かず、MuPDF の外観生成器が
+    # Square/Circle/Line の既定枠色（赤）を焼き込んでしまう（印刷時に赤線が出る不具合）。
+    stroke = list(data.stroke_color) if data.stroke_color is not None else []
     fill = list(data.fill_color) if data.fill_color is not None else None
     rect = data.rect
     cx = (rect[0] + rect[2]) / 2
