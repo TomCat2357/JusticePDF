@@ -3108,6 +3108,11 @@ class PageEditWindow(QMainWindow):
             self._zoom_object_btn.setEnabled(not enable)
         if getattr(self, "_zoom_spread_btn", None) is not None:
             self._zoom_spread_btn.setChecked(enable)
+        # 見開き中はしおりを閲覧/ジャンプ専用にし、回転・削除ボタンを無効化する。
+        panel = getattr(self, "_bookmarks_panel", None)
+        if panel is not None:
+            panel.set_read_only(enable)
+        self._update_button_states()
         self._render_zoom()
 
     def _on_bookmarks_drawer_open_changed(self, is_open: bool) -> None:
@@ -3891,13 +3896,16 @@ class PageEditWindow(QMainWindow):
         self._delete_btn.clicked.connect(self._on_delete)
         toolbar.addWidget(self._delete_btn)
 
+        # 名前変更(ファイル名 / PDF名)を 1 つのボタンに統合し、クリックで
+        # ドロップダウンメニューを表示する(ファイル一覧モードと見た目・挙動を統一)。
         self._rename_btn = QPushButton("名前変更")
-        self._rename_btn.clicked.connect(self._on_rename)
+        self._rename_menu = QMenu(self._rename_btn)
+        self._rename_file_action = self._rename_menu.addAction("ファイル名")
+        self._rename_file_action.triggered.connect(self._on_rename)
+        self._rename_title_action = self._rename_menu.addAction("PDF名")
+        self._rename_title_action.triggered.connect(self._on_rename_pdf_title)
+        self._rename_btn.setMenu(self._rename_menu)
         toolbar.addWidget(self._rename_btn)
-
-        self._title_btn = QPushButton("タイトル")
-        self._title_btn.clicked.connect(self._on_rename_pdf_title)
-        toolbar.addWidget(self._title_btn)
 
         self._print_btn = QPushButton("印刷")
         self._print_btn.clicked.connect(self._on_print)
@@ -4995,10 +5003,11 @@ class PageEditWindow(QMainWindow):
             and self._zoom_view.isVisible()
             and self._zoom_page_num is not None
         )
-        can_edit_pages = has_selection or zoom_active
+        # 見開き表示(閲覧専用)中はページ編集(回転・削除)を不可にする。
+        spread = getattr(self, "_zoom_spread_mode", False)
+        can_edit_pages = (has_selection or zoom_active) and not spread
         self._delete_btn.setEnabled(can_edit_pages)
         self._rename_btn.setEnabled(True)
-        self._title_btn.setEnabled(True)
         self._rotate_btn.setEnabled(can_edit_pages)
         self._undo_btn.setEnabled(self._undo_manager.can_undo())
         self._redo_btn.setEnabled(self._undo_manager.can_redo())
@@ -5332,6 +5341,9 @@ class PageEditWindow(QMainWindow):
             self._zoom_spread_btn.setChecked(False)
         if getattr(self, "_zoom_object_btn", None) is not None:
             self._zoom_object_btn.setEnabled(True)
+        panel = getattr(self, "_bookmarks_panel", None)
+        if panel is not None:
+            panel.set_read_only(False)
 
     def _open_zoom_view(self, page_num: int) -> None:
         self._commit_inline_annotation_editor()
@@ -5705,6 +5717,9 @@ class PageEditWindow(QMainWindow):
         self._update_button_states()
 
     def _on_delete(self) -> None:
+        # 見開き表示(閲覧専用)中は削除不可(Delete キーのショートカット対策)。
+        if getattr(self, "_zoom_spread_mode", False):
+            return
         # ズームビュー表示中の場合
         if self._zoom_view and self._zoom_view.isVisible():
             if self._selected_zoom_annotation is not None:
@@ -5839,6 +5854,9 @@ class PageEditWindow(QMainWindow):
         print_pdfs([self._pdf_path], self, settings=dialog.get_settings(), printer=dialog.build_printer())
 
     def _on_rotate(self) -> None:
+        # 見開き表示(閲覧専用)中は回転不可(R キーのショートカット対策)。
+        if getattr(self, "_zoom_spread_mode", False):
+            return
         # ズームビュー表示中の場合
         if self._zoom_view and self._zoom_view.isVisible():
             self._rotate_zoom_page()

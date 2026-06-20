@@ -25,6 +25,34 @@ def test_build_tree_roundtrip():
     assert panel._tree_to_entries() == _entries()
 
 
+def test_read_only_disables_all_edit_buttons():
+    panel = BookmarksPanel()
+    panel.load_entries(_entries())
+    edit_buttons = (
+        panel._add_current_btn, panel._add_btn, panel._edit_btn,
+        panel._delete_btn, panel._promote_btn, panel._demote_btn,
+        panel._up_btn, panel._down_btn,
+    )
+
+    # 閲覧専用ONで作成系を含む全編集ボタンが無効化される。
+    panel.set_read_only(True)
+    assert panel._read_only is True
+    assert all(not btn.isEnabled() for btn in edit_buttons)
+
+    # ダブルクリックでのインライン編集も起きない(クリックのジャンプは別経路)。
+    first = panel._tree.topLevelItem(0)
+    captured = []
+    panel.bookmarks_changed.connect(lambda e, d: captured.append(d))
+    panel._on_item_double_clicked(first, 0)
+    assert captured == []
+
+    # 閲覧専用OFFで作成ボタンが復帰する。
+    panel.set_read_only(False)
+    assert panel._read_only is False
+    assert panel._add_current_btn.isEnabled() is True
+    assert panel._add_btn.isEnabled() is True
+
+
 def test_demote_makes_child_of_prev_sibling():
     panel = BookmarksPanel()
     panel.load_entries(_entries())
