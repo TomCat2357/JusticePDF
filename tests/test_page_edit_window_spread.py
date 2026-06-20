@@ -42,6 +42,43 @@ def test_spread_toggle_sets_view_only_and_label(qtbot, tmp_path):
 
 
 @pytest.mark.usefixtures("qtbot")
+def test_spread_disables_rotate_delete_and_bookmark_edit(qtbot, tmp_path):
+    pdf_path = tmp_path / "spread-readonly.pdf"
+    make_pdf(pdf_path, pages=4)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    # 拡大ビュー(単ページ)では回転・削除が有効。
+    assert window._rotate_btn.isEnabled() is True
+    assert window._delete_btn.isEnabled() is True
+
+    window._toggle_zoom_spread_view()
+
+    # 見開き中は回転・削除ボタンが無効化される。
+    assert window._rotate_btn.isEnabled() is False
+    assert window._delete_btn.isEnabled() is False
+    # しおりパネルは閲覧専用(作成系も無効)。
+    panel = window._bookmarks_panel
+    assert panel._read_only is True
+    assert panel._add_current_btn.isEnabled() is False
+    assert panel._add_btn.isEnabled() is False
+
+    # ショートカット相当のハンドラ直接呼び出しでもページは変化しない(no-op)。
+    window._on_rotate()
+    window._on_delete()
+    assert window._zoom_spread_mode is True
+    assert window._zoom_page_label.text() == "1-2 / 4"
+
+    window._toggle_zoom_spread_view()
+
+    # 見開きを抜けると回転・削除・しおり作成が復帰する。
+    assert window._rotate_btn.isEnabled() is True
+    assert window._delete_btn.isEnabled() is True
+    assert panel._read_only is False
+    assert panel._add_current_btn.isEnabled() is True
+
+
+@pytest.mark.usefixtures("qtbot")
 def test_spread_next_prev_step_by_two(qtbot, tmp_path):
     pdf_path = tmp_path / "spread-nav.pdf"
     make_pdf(pdf_path, pages=4)

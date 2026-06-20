@@ -65,6 +65,9 @@ class BookmarksPanel(QFrame):
         self._collapsed_width = 32
         self._loading = False
         self._suppress_item_changed = False
+        # 閲覧専用(見開き表示)モード。True の間は編集系ボタンを全て無効化し、
+        # ジャンプ/閲覧のみ可能にする。
+        self._read_only = False
         self._current_page_provider: Callable[[], int] | None = None
         # 付箋一覧（page 1始まり, xref, 冒頭テキスト）。set_annotation_notes で更新。
         self._notes: list[tuple[int, int, str]] = []
@@ -150,6 +153,14 @@ class BookmarksPanel(QFrame):
     def set_current_page_provider(self, provider: Callable[[], int]) -> None:
         """現在表示中のページ(1始まり)を返す callable を登録する。"""
         self._current_page_provider = provider
+
+    def set_read_only(self, read_only: bool) -> None:
+        """閲覧専用(見開き表示)時に編集系ボタンを全て無効化する。
+
+        ツリーのクリックによるジャンプ/閲覧は引き続き可能。
+        """
+        self._read_only = bool(read_only)
+        self._update_button_states()
 
     def load_entries(self, entries: list[TocEntry]) -> None:
         """しおり一覧でツリーを再構築する(オンディスクの真値で同期)。"""
@@ -394,6 +405,9 @@ class BookmarksPanel(QFrame):
             pass
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        # 閲覧専用中はダブルクリックでの改名/ページ編集を抑止(クリックのジャンプは可)。
+        if self._read_only:
+            return
         if self._is_note_node(item):
             return
         if column == 0:
@@ -595,6 +609,18 @@ class BookmarksPanel(QFrame):
     # ボタン状態
     # ------------------------------------------------------------------
     def _update_button_states(self) -> None:
+        # 閲覧専用(見開き表示)中は、作成系も含めた全編集ボタンを無効化する。
+        if self._read_only:
+            for btn in (
+                self._add_current_btn, self._add_btn, self._edit_btn,
+                self._delete_btn, self._promote_btn, self._demote_btn,
+                self._up_btn, self._down_btn,
+            ):
+                btn.setEnabled(False)
+            return
+        # 通常モードでは作成ボタンは常時有効(選択非依存)。閲覧専用からの復帰を保証する。
+        self._add_current_btn.setEnabled(True)
+        self._add_btn.setEnabled(True)
         item = self._tree.currentItem()
         # 付箋ノードはしおり編集の対象外。
         if item is not None and self._is_note_node(item):
