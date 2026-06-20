@@ -2387,6 +2387,26 @@ class ZoomPageWidget(QWidget):
             self.cancel_annotation_paste_mode()
 
 
+class _AnnotRef:
+    """論理的に同じ注釈の「現在の xref」を共有保持する可変ハンドル。
+
+    注釈の移動・リサイズ・テキスト編集は PDF 上で「古い注釈を削除して
+    新規に作り直す」ため xref が変わる。貼り付け/作成/複製の Undo は
+    作成時点の xref を固定で握っているとここで取り残され、後から
+    「xref ... is not an annot of this page」で失敗する。
+
+    そこで論理的に同じ注釈を指す全ての Undo/Redo アクションがこの 1 個の
+    ハンドルを共有し、置換のたびにここだけ更新する。こうすると Undo は
+    常に「いま生きている xref」を対象にできる。
+    """
+
+    __slots__ = ("page_num", "xref")
+
+    def __init__(self, page_num: int, xref: int):
+        self.page_num = page_num
+        self.xref = xref
+
+
 class PageEditWindow(QMainWindow):
     """Window for editing pages within a PDF."""
 
@@ -2424,6 +2444,10 @@ class PageEditWindow(QMainWindow):
         # None=非作成 / "freetext"=FreeText新規 / ShapeType=図形新規
         self._zoom_create_mode: ShapeType | str | None = None
         self._copied_zoom_annotation: AnyAnnotData | None = None
+        # 論理注釈 → 現在の xref を共有するハンドルのレジストリ。キーは「現在の xref」。
+        # 置換(move/resize/edit)で xref が回るたびに更新し、貼り付け/作成/複製/削除の
+        # Undo が常に生きている xref を対象にできるようにする。詳細は _AnnotRef 参照。
+        self._annot_refs: dict[int, _AnnotRef] = {}
         self._zoom_annotation_drawer = None
         self._zoom_annotation_panel = None
         self._zoom_annotation_toggle_btn = None
@@ -3531,18 +3555,23 @@ class PageEditWindow(QMainWindow):
             color=self._zoom_markup_color,
             opacity=self._markup_default_opacity(markup_type),
         )
-        state: dict[str, TextMarkupAnnotData | None] = {"created": None}
+        ref: _AnnotRef | None = None
 
         def do_create() -> None:
-            state["created"] = create_markup_annot(self._pdf_path, template)
-            self._selected_zoom_annotation = state["created"]
+            nonlocal ref
+            created = create_markup_annot(self._pdf_path, template)
+            if ref is None:
+                ref = self._register_annot_ref(created.page_num, created.xref)
+            else:
+                self._rebind_annot_ref(ref, created.page_num, created.xref)
+            self._selected_zoom_annotation = created
             # set_page() refreshes and clears the text selection.
             self._refresh_current_zoom_page(open_drawer=True)
 
         def undo_create() -> None:
-            created = state["created"]
-            if created is not None:
-                delete_markup_annot(self._pdf_path, created.page_num, created.xref)
+            if ref is not None:
+                delete_markup_annot(self._pdf_path, ref.page_num, ref.xref)
+                self._release_annot_ref(ref)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
@@ -3577,25 +3606,23 @@ class PageEditWindow(QMainWindow):
         description: str,
     ) -> None:
         state: dict[str, TextMarkupAnnotData | None] = {"old": old_annotation, "new": None}
+        ref: _AnnotRef | None = None
 
         def do_replace() -> None:
-            state["new"] = replace_markup_annot(
-                self._pdf_path,
-                old_annotation.page_num,
-                state["old"].xref,
-                new_annotation,
-            )
-            self._selected_zoom_annotation = state["new"]
+            nonlocal ref
+            if ref is None:
+                ref = self._annot_ref_for(old_annotation.page_num, old_annotation.xref)
+            saved = replace_markup_annot(self._pdf_path, ref.page_num, ref.xref, new_annotation)
+            self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+            state["new"] = saved
+            self._selected_zoom_annotation = saved
             self._refresh_current_zoom_page(open_drawer=True)
 
         def undo_replace() -> None:
-            state["old"] = replace_markup_annot(
-                self._pdf_path,
-                old_annotation.page_num,
-                state["new"].xref,
-                state["old"],
-            )
-            self._selected_zoom_annotation = state["old"]
+            saved = replace_markup_annot(self._pdf_path, ref.page_num, ref.xref, state["old"])
+            self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+            state["old"] = saved
+            self._selected_zoom_annotation = saved
             self._refresh_current_zoom_page(open_drawer=True)
 
         self._push_undoable(description, do_replace, undo_replace)
@@ -3637,20 +3664,25 @@ class PageEditWindow(QMainWindow):
             content="",
             color=self._zoom_note_color,
         )
-        state: dict[str, NoteAnnotData | None] = {"created": None}
+        ref: _AnnotRef | None = None
 
         def do_create() -> None:
-            state["created"] = create_note_annot(self._pdf_path, template)
-            self._selected_zoom_annotation = state["created"]
+            nonlocal ref
+            created = create_note_annot(self._pdf_path, template)
+            if ref is None:
+                ref = self._register_annot_ref(created.page_num, created.xref)
+            else:
+                self._rebind_annot_ref(ref, created.page_num, created.xref)
+            self._selected_zoom_annotation = created
             self._refresh_current_zoom_page(open_drawer=True)
             # 配置後すぐ本文入力できるようフォーカス。
             if self._zoom_note_editor is not None:
                 self._zoom_note_editor.setFocus()
 
         def undo_create() -> None:
-            created = state["created"]
-            if created is not None:
-                delete_note_annot(self._pdf_path, created.page_num, created.xref)
+            if ref is not None:
+                delete_note_annot(self._pdf_path, ref.page_num, ref.xref)
+                self._release_annot_ref(ref)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
@@ -3709,25 +3741,23 @@ class PageEditWindow(QMainWindow):
         description: str,
     ) -> None:
         state: dict[str, NoteAnnotData | None] = {"old": old_annotation, "new": None}
+        ref: _AnnotRef | None = None
 
         def do_replace() -> None:
-            state["new"] = replace_note_annot(
-                self._pdf_path,
-                old_annotation.page_num,
-                state["old"].xref,
-                new_annotation,
-            )
-            self._selected_zoom_annotation = state["new"]
+            nonlocal ref
+            if ref is None:
+                ref = self._annot_ref_for(old_annotation.page_num, old_annotation.xref)
+            saved = replace_note_annot(self._pdf_path, ref.page_num, ref.xref, new_annotation)
+            self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+            state["new"] = saved
+            self._selected_zoom_annotation = saved
             self._refresh_current_zoom_page(open_drawer=True)
 
         def undo_replace() -> None:
-            state["old"] = replace_note_annot(
-                self._pdf_path,
-                old_annotation.page_num,
-                state["new"].xref,
-                state["old"],
-            )
-            self._selected_zoom_annotation = state["old"]
+            saved = replace_note_annot(self._pdf_path, ref.page_num, ref.xref, state["old"])
+            self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+            state["old"] = saved
+            self._selected_zoom_annotation = saved
             self._refresh_current_zoom_page(open_drawer=True)
 
         self._push_undoable(description, do_replace, undo_replace)
@@ -3803,9 +3833,10 @@ class PageEditWindow(QMainWindow):
             by1 = by0 + box_h
         text_rect = (bx0, by0, bx0 + box_w, by1)
 
-        state: dict[str, object] = {"xref": None}
+        ref: _AnnotRef | None = None
 
         def do_create() -> None:
+            nonlocal ref
             text_saved = create_callout(
                 self._pdf_path,
                 self._zoom_page_num,
@@ -3813,7 +3844,10 @@ class PageEditWindow(QMainWindow):
                 target_point=(tx, ty),
                 text="",
             )
-            state["xref"] = text_saved.xref
+            if ref is None:
+                ref = self._register_annot_ref(text_saved.page_num, text_saved.xref)
+            else:
+                self._rebind_annot_ref(ref, text_saved.page_num, text_saved.xref)
             self._selected_zoom_annotation = text_saved
             self._refresh_current_zoom_page(open_drawer=True)
             # 本文をすぐ入力できるよう FreeText インライン編集を開始。
@@ -3822,9 +3856,9 @@ class PageEditWindow(QMainWindow):
                 self._zoom_label.begin_annotation_text_edit(current)
 
         def undo_create() -> None:
-            xref = state.get("xref")
-            if xref is not None:
-                delete_freetext_annot(self._pdf_path, self._zoom_page_num, int(xref))
+            if ref is not None:
+                delete_freetext_annot(self._pdf_path, ref.page_num, ref.xref)
+                self._release_annot_ref(ref)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
@@ -4107,6 +4141,46 @@ class PageEditWindow(QMainWindow):
         ))
         return True
 
+    # --- Annotation xref handles ------------------------------------------
+    # 注釈の移動・編集は delete+recreate で xref を回す。論理的に同じ注釈を指す
+    # Undo/Redo クロージャは下の 3 ヘルパーで 1 個の _AnnotRef を共有し、置換のたびに
+    # ハンドルだけを張り替えることで、貼り付け/作成/複製/削除の Undo が常に
+    # 「いま生きている xref」を対象にできるようにする。
+
+    def _register_annot_ref(self, page_num: int, xref: int) -> _AnnotRef:
+        """新規作成した注釈のハンドルを登録して返す。"""
+        ref = _AnnotRef(page_num, xref)
+        self._annot_refs[xref] = ref
+        return ref
+
+    def _annot_ref_for(self, page_num: int, xref: int) -> _AnnotRef:
+        """xref に対応する既存ハンドルを返す。無ければ新規登録して返す。
+
+        既に他アクション(貼り付け等)が作ったハンドルがあれば同じオブジェクトを
+        共有し、無ければ(ディスク読込の既存注釈など)その場で登録する。
+        """
+        return self._annot_refs.get(xref) or self._register_annot_ref(page_num, xref)
+
+    def _rebind_annot_ref(self, ref: _AnnotRef, page_num: int, xref: int) -> None:
+        """置換で xref が変わったとき、同じハンドルを新しい xref に張り替える。
+
+        同一オブジェクトを更新するため、このハンドルを共有する全アクションへ
+        新しい xref が伝播する。
+        """
+        self._annot_refs.pop(ref.xref, None)
+        ref.page_num = page_num
+        ref.xref = xref
+        self._annot_refs[xref] = ref
+
+    def _release_annot_ref(self, ref: _AnnotRef | None) -> None:
+        """注釈が削除されたとき、ハンドルをレジストリから外す。
+
+        ハンドルオブジェクト自体は他アクションがまだ握っている可能性があるため
+        破棄せず、Redo/再作成時に _rebind_annot_ref で復帰できるようにしておく。
+        """
+        if ref is not None:
+            self._annot_refs.pop(ref.xref, None)
+
     def _handle_file_operation_error(self, error: Exception, pdf_path: str, action: str) -> None:
         logger.warning("%s failed for %s", action, pdf_path)
         logger.debug("%s failed for %s", action, pdf_path, exc_info=True)
@@ -4166,17 +4240,22 @@ class PageEditWindow(QMainWindow):
                 triangle_apex=src.triangle_apex,
                 annotation_id="", subject="",
             )
-            state_shape: dict[str, ShapeAnnotData | None] = {"created": None}
+            ref_shape: _AnnotRef | None = None
 
             def do_paste_shape() -> None:
-                state_shape["created"] = create_shape_annot(self._pdf_path, paste_data)
-                self._selected_zoom_annotation = state_shape["created"]
+                nonlocal ref_shape
+                created = create_shape_annot(self._pdf_path, paste_data)
+                if ref_shape is None:
+                    ref_shape = self._register_annot_ref(created.page_num, created.xref)
+                else:
+                    self._rebind_annot_ref(ref_shape, created.page_num, created.xref)
+                self._selected_zoom_annotation = created
                 self._refresh_current_zoom_page(open_drawer=True)
 
             def undo_paste_shape() -> None:
-                created = state_shape["created"]
-                if created is not None:
-                    delete_shape_annot(self._pdf_path, created.page_num, created.xref)
+                if ref_shape is not None:
+                    delete_shape_annot(self._pdf_path, ref_shape.page_num, ref_shape.xref)
+                    self._release_annot_ref(ref_shape)
                 self._selected_zoom_annotation = None
                 self._refresh_current_zoom_page()
 
@@ -4212,17 +4291,22 @@ class PageEditWindow(QMainWindow):
             callout_line=callout_line,
             callout_target=callout_target,
         )
-        state: dict[str, FreeTextAnnotData | None] = {"created": None}
+        ref: _AnnotRef | None = None
 
         def do_paste() -> None:
-            state["created"] = create_freetext_annot(self._pdf_path, paste_data_ft)
-            self._selected_zoom_annotation = state["created"]
+            nonlocal ref
+            created = create_freetext_annot(self._pdf_path, paste_data_ft)
+            if ref is None:
+                ref = self._register_annot_ref(created.page_num, created.xref)
+            else:  # redo: 同じハンドルを作り直した新 xref に張り替える
+                self._rebind_annot_ref(ref, created.page_num, created.xref)
+            self._selected_zoom_annotation = created
             self._refresh_current_zoom_page(open_drawer=True)
 
         def undo_paste() -> None:
-            created = state["created"]
-            if created is not None:
-                delete_freetext_annot(self._pdf_path, created.page_num, created.xref)
+            if ref is not None:
+                delete_freetext_annot(self._pdf_path, ref.page_num, ref.xref)
+                self._release_annot_ref(ref)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
@@ -4257,17 +4341,22 @@ class PageEditWindow(QMainWindow):
                 triangle_apex=src.triangle_apex,
                 annotation_id="", subject="",
             )
-            state_shape: dict[str, ShapeAnnotData | None] = {"created": None}
+            ref_shape: _AnnotRef | None = None
 
             def do_dup_shape() -> None:
-                state_shape["created"] = create_shape_annot(self._pdf_path, dup_data)
-                self._selected_zoom_annotation = state_shape["created"]
+                nonlocal ref_shape
+                created = create_shape_annot(self._pdf_path, dup_data)
+                if ref_shape is None:
+                    ref_shape = self._register_annot_ref(created.page_num, created.xref)
+                else:
+                    self._rebind_annot_ref(ref_shape, created.page_num, created.xref)
+                self._selected_zoom_annotation = created
                 self._refresh_current_zoom_page(open_drawer=True)
 
             def undo_dup_shape() -> None:
-                created = state_shape["created"]
-                if created is not None:
-                    delete_shape_annot(self._pdf_path, created.page_num, created.xref)
+                if ref_shape is not None:
+                    delete_shape_annot(self._pdf_path, ref_shape.page_num, ref_shape.xref)
+                    self._release_annot_ref(ref_shape)
                 self._selected_zoom_annotation = None
                 self._refresh_current_zoom_page()
 
@@ -4296,17 +4385,22 @@ class PageEditWindow(QMainWindow):
             annotation_id="", subject="",
             callout_line=dup_callout_line, callout_target=dup_callout_target,
         )
-        state_ft: dict[str, FreeTextAnnotData | None] = {"created": None}
+        ref_ft: _AnnotRef | None = None
 
         def do_dup_ft() -> None:
-            state_ft["created"] = create_freetext_annot(self._pdf_path, dup_ft)
-            self._selected_zoom_annotation = state_ft["created"]
+            nonlocal ref_ft
+            created = create_freetext_annot(self._pdf_path, dup_ft)
+            if ref_ft is None:
+                ref_ft = self._register_annot_ref(created.page_num, created.xref)
+            else:
+                self._rebind_annot_ref(ref_ft, created.page_num, created.xref)
+            self._selected_zoom_annotation = created
             self._refresh_current_zoom_page(open_drawer=True)
 
         def undo_dup_ft() -> None:
-            created = state_ft["created"]
-            if created is not None:
-                delete_freetext_annot(self._pdf_path, created.page_num, created.xref)
+            if ref_ft is not None:
+                delete_freetext_annot(self._pdf_path, ref_ft.page_num, ref_ft.xref)
+                self._release_annot_ref(ref_ft)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
@@ -4421,17 +4515,22 @@ class PageEditWindow(QMainWindow):
             vertices=vertices,
             triangle_apex=triangle_apex,
         )
-        state: dict[str, ShapeAnnotData | None] = {"created": None}
+        ref: _AnnotRef | None = None
 
         def do_create() -> None:
-            state["created"] = create_shape_annot(self._pdf_path, template)
-            self._selected_zoom_annotation = state["created"]
+            nonlocal ref
+            created = create_shape_annot(self._pdf_path, template)
+            if ref is None:
+                ref = self._register_annot_ref(created.page_num, created.xref)
+            else:
+                self._rebind_annot_ref(ref, created.page_num, created.xref)
+            self._selected_zoom_annotation = created
             self._refresh_current_zoom_page(open_drawer=True)
 
         def undo_create() -> None:
-            created = state["created"]
-            if created is not None:
-                delete_shape_annot(self._pdf_path, created.page_num, created.xref)
+            if ref is not None:
+                delete_shape_annot(self._pdf_path, ref.page_num, ref.xref)
+                self._release_annot_ref(ref)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
@@ -4444,10 +4543,12 @@ class PageEditWindow(QMainWindow):
         stroke_width = max(1.0, float(self._zoom_annotation_border_width_spin.value())) if self._zoom_annotation_border_width_spin else 1.0
         opacity = (float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else 1.0
 
-        state: dict[str, tuple[ShapeAnnotData, ShapeAnnotData] | None] = {"pair": None}
+        ref0: _AnnotRef | None = None
+        ref1: _AnnotRef | None = None
 
         def do_create() -> None:
-            state["pair"] = create_bracket_pair(
+            nonlocal ref0, ref1
+            pair = create_bracket_pair(
                 self._pdf_path,
                 rect_tuple,
                 self._zoom_page_num,
@@ -4457,14 +4558,20 @@ class PageEditWindow(QMainWindow):
                 stroke_width=stroke_width,
                 opacity=opacity,
             )
-            self._selected_zoom_annotation = state["pair"][0]
+            if ref0 is None:
+                ref0 = self._register_annot_ref(pair[0].page_num, pair[0].xref)
+                ref1 = self._register_annot_ref(pair[1].page_num, pair[1].xref)
+            else:
+                self._rebind_annot_ref(ref0, pair[0].page_num, pair[0].xref)
+                self._rebind_annot_ref(ref1, pair[1].page_num, pair[1].xref)
+            self._selected_zoom_annotation = pair[0]
             self._refresh_current_zoom_page(open_drawer=True)
 
         def undo_create() -> None:
-            pair = state["pair"]
-            if pair is not None:
-                delete_shape_annot(self._pdf_path, pair[0].page_num, pair[0].xref)
-                delete_shape_annot(self._pdf_path, pair[1].page_num, pair[1].xref)
+            for ref in (ref0, ref1):
+                if ref is not None:
+                    delete_shape_annot(self._pdf_path, ref.page_num, ref.xref)
+                    self._release_annot_ref(ref)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
@@ -4479,25 +4586,23 @@ class PageEditWindow(QMainWindow):
         if not self._zoom_annotation_text_commit_in_progress:
             self._commit_inline_annotation_editor()
         state = {"old": old_annotation, "new": None}
+        ref: _AnnotRef | None = None
 
         def do_replace() -> None:
-            state["new"] = replace_shape_annot(
-                self._pdf_path,
-                old_annotation.page_num,
-                state["old"].xref,
-                new_annotation,
-            )
-            self._selected_zoom_annotation = state["new"]
+            nonlocal ref
+            if ref is None:
+                ref = self._annot_ref_for(old_annotation.page_num, old_annotation.xref)
+            saved = replace_shape_annot(self._pdf_path, ref.page_num, ref.xref, new_annotation)
+            self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+            state["new"] = saved
+            self._selected_zoom_annotation = saved
             self._refresh_current_zoom_page(open_drawer=True)
 
         def undo_replace() -> None:
-            state["old"] = replace_shape_annot(
-                self._pdf_path,
-                old_annotation.page_num,
-                state["new"].xref,
-                state["old"],
-            )
-            self._selected_zoom_annotation = state["old"]
+            saved = replace_shape_annot(self._pdf_path, ref.page_num, ref.xref, state["old"])
+            self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+            state["old"] = saved
+            self._selected_zoom_annotation = saved
             self._refresh_current_zoom_page(open_drawer=True)
 
         self._push_undoable(description, do_replace, undo_replace)
@@ -4646,20 +4751,25 @@ class PageEditWindow(QMainWindow):
             border_width=border_width,
             opacity=opacity,
         )
-        state: dict[str, FreeTextAnnotData | None] = {"created": None}
+        ref: _AnnotRef | None = None
 
         def do_create() -> None:
-            state["created"] = create_freetext_annot(self._pdf_path, template)
-            self._selected_zoom_annotation = state["created"]
+            nonlocal ref
+            created = create_freetext_annot(self._pdf_path, template)
+            if ref is None:
+                ref = self._register_annot_ref(created.page_num, created.xref)
+            else:
+                self._rebind_annot_ref(ref, created.page_num, created.xref)
+            self._selected_zoom_annotation = created
             self._refresh_current_zoom_page(open_drawer=True)
             if self._zoom_label and self._selected_zoom_annotation is not None:
                 current = self._find_zoom_annotation(self._selected_zoom_annotation.xref) or self._selected_zoom_annotation
                 self._zoom_label.begin_annotation_text_edit(current)
 
         def undo_create() -> None:
-            created = state["created"]
-            if created is not None:
-                delete_freetext_annot(self._pdf_path, created.page_num, created.xref)
+            if ref is not None:
+                delete_freetext_annot(self._pdf_path, ref.page_num, ref.xref)
+                self._release_annot_ref(ref)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
@@ -4674,25 +4784,23 @@ class PageEditWindow(QMainWindow):
         if not self._zoom_annotation_text_commit_in_progress:
             self._commit_inline_annotation_editor()
         state = {"old": old_annotation, "new": None}
+        ref: _AnnotRef | None = None
 
         def do_replace() -> None:
-            state["new"] = replace_freetext_annot(
-                self._pdf_path,
-                old_annotation.page_num,
-                state["old"].xref,
-                new_annotation,
-            )
-            self._selected_zoom_annotation = state["new"]
+            nonlocal ref
+            if ref is None:
+                ref = self._annot_ref_for(old_annotation.page_num, old_annotation.xref)
+            saved = replace_freetext_annot(self._pdf_path, ref.page_num, ref.xref, new_annotation)
+            self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+            state["new"] = saved
+            self._selected_zoom_annotation = saved
             self._refresh_current_zoom_page(open_drawer=True)
 
         def undo_replace() -> None:
-            state["old"] = replace_freetext_annot(
-                self._pdf_path,
-                old_annotation.page_num,
-                state["new"].xref,
-                state["old"],
-            )
-            self._selected_zoom_annotation = state["old"]
+            saved = replace_freetext_annot(self._pdf_path, ref.page_num, ref.xref, state["old"])
+            self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+            state["old"] = saved
+            self._selected_zoom_annotation = saved
             self._refresh_current_zoom_page(open_drawer=True)
 
         self._push_undoable(
@@ -4759,19 +4867,37 @@ class PageEditWindow(QMainWindow):
             members_ft = [a for a in list_freetext_annots(self._pdf_path, page_num) if a.group_id == group_id]
             members_sh = [a for a in list_shape_annots(self._pdf_path, page_num) if a.group_id == group_id]
             grp = {"ft": members_ft, "sh": members_sh}
+            grp_refs: dict[str, list] = {"ft": [], "sh": []}
 
             def do_delete_group() -> None:
+                # 削除前に各メンバーの共有ハンドルを控え、削除後にレジストリから外す。
+                grp_refs["ft"] = [self._annot_refs.get(m.xref) for m in grp["ft"]]
+                grp_refs["sh"] = [self._annot_refs.get(m.xref) for m in grp["sh"]]
                 delete_annot_group(self._pdf_path, page_num, group_id)
+                for ref_list in grp_refs.values():
+                    for ref in ref_list:
+                        self._release_annot_ref(ref)
                 self._selected_zoom_annotation = None
                 self._refresh_current_zoom_page()
 
             def undo_delete_group() -> None:
                 restored = None
-                for data in grp["ft"]:
-                    restored = create_freetext_annot(self._pdf_path, data)
-                for data in grp["sh"]:
+                new_ft = []
+                for data, ref in zip(grp["ft"], grp_refs["ft"]):
+                    created = create_freetext_annot(self._pdf_path, data)
+                    if ref is not None:
+                        self._rebind_annot_ref(ref, created.page_num, created.xref)
+                    new_ft.append(created)
+                    restored = created
+                new_sh = []
+                for data, ref in zip(grp["sh"], grp_refs["sh"]):
                     s = create_shape_annot(self._pdf_path, data)
+                    if ref is not None:
+                        self._rebind_annot_ref(ref, s.page_num, s.xref)
+                    new_sh.append(s)
                     restored = restored or s
+                # 再作成後の xref を保持し、Redo 時のハンドル控えを正しく取れるようにする。
+                grp["ft"], grp["sh"] = new_ft, new_sh
                 self._selected_zoom_annotation = restored
                 self._refresh_current_zoom_page(open_drawer=True)
 
@@ -4780,15 +4906,22 @@ class PageEditWindow(QMainWindow):
 
         if isinstance(annot, TextMarkupAnnotData):
             state = {"old": annot}
+            ref: _AnnotRef | None = None
 
             def do_delete_markup() -> None:
-                delete_markup_annot(self._pdf_path, state["old"].page_num, state["old"].xref)
+                nonlocal ref
+                if ref is None:
+                    ref = self._annot_ref_for(state["old"].page_num, state["old"].xref)
+                delete_markup_annot(self._pdf_path, ref.page_num, ref.xref)
+                self._release_annot_ref(ref)
                 self._selected_zoom_annotation = None
                 self._refresh_current_zoom_page()
 
             def undo_delete_markup() -> None:
-                state["old"] = create_markup_annot(self._pdf_path, state["old"])
-                self._selected_zoom_annotation = state["old"]
+                recreated = create_markup_annot(self._pdf_path, state["old"])
+                self._rebind_annot_ref(ref, recreated.page_num, recreated.xref)
+                state["old"] = recreated
+                self._selected_zoom_annotation = recreated
                 self._refresh_current_zoom_page(open_drawer=True)
 
             self._push_undoable(
@@ -4798,16 +4931,23 @@ class PageEditWindow(QMainWindow):
 
         if isinstance(annot, NoteAnnotData):
             state = {"old": annot}
+            ref: _AnnotRef | None = None
 
             def do_delete_note() -> None:
-                delete_note_annot(self._pdf_path, state["old"].page_num, state["old"].xref)
+                nonlocal ref
+                if ref is None:
+                    ref = self._annot_ref_for(state["old"].page_num, state["old"].xref)
+                delete_note_annot(self._pdf_path, ref.page_num, ref.xref)
+                self._release_annot_ref(ref)
                 self._selected_zoom_annotation = None
                 self._editing_note_xref = None
                 self._refresh_current_zoom_page()
 
             def undo_delete_note() -> None:
-                state["old"] = create_note_annot(self._pdf_path, state["old"])
-                self._selected_zoom_annotation = state["old"]
+                recreated = create_note_annot(self._pdf_path, state["old"])
+                self._rebind_annot_ref(ref, recreated.page_num, recreated.xref)
+                state["old"] = recreated
+                self._selected_zoom_annotation = recreated
                 self._refresh_current_zoom_page(open_drawer=True)
 
             self._push_undoable("Delete note", do_delete_note, undo_delete_note)
@@ -4815,15 +4955,22 @@ class PageEditWindow(QMainWindow):
 
         if isinstance(annot, ShapeAnnotData):
             state = {"old": annot}
+            ref: _AnnotRef | None = None
 
             def do_delete_shape() -> None:
-                delete_shape_annot(self._pdf_path, state["old"].page_num, state["old"].xref)
+                nonlocal ref
+                if ref is None:
+                    ref = self._annot_ref_for(state["old"].page_num, state["old"].xref)
+                delete_shape_annot(self._pdf_path, ref.page_num, ref.xref)
+                self._release_annot_ref(ref)
                 self._selected_zoom_annotation = None
                 self._refresh_current_zoom_page()
 
             def undo_delete_shape() -> None:
-                state["old"] = create_shape_annot(self._pdf_path, state["old"])
-                self._selected_zoom_annotation = state["old"]
+                recreated = create_shape_annot(self._pdf_path, state["old"])
+                self._rebind_annot_ref(ref, recreated.page_num, recreated.xref)
+                state["old"] = recreated
+                self._selected_zoom_annotation = recreated
                 self._refresh_current_zoom_page(open_drawer=True)
 
             self._push_undoable(
@@ -4832,15 +4979,22 @@ class PageEditWindow(QMainWindow):
             return
 
         state = {"old": annot}
+        ref: _AnnotRef | None = None
 
         def do_delete() -> None:
-            delete_freetext_annot(self._pdf_path, state["old"].page_num, state["old"].xref)
+            nonlocal ref
+            if ref is None:
+                ref = self._annot_ref_for(state["old"].page_num, state["old"].xref)
+            delete_freetext_annot(self._pdf_path, ref.page_num, ref.xref)
+            self._release_annot_ref(ref)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
         def undo_delete() -> None:
-            state["old"] = create_freetext_annot(self._pdf_path, state["old"])
-            self._selected_zoom_annotation = state["old"]
+            recreated = create_freetext_annot(self._pdf_path, state["old"])
+            self._rebind_annot_ref(ref, recreated.page_num, recreated.xref)
+            state["old"] = recreated
+            self._selected_zoom_annotation = recreated
             self._refresh_current_zoom_page(open_drawer=True)
 
         self._push_undoable(
