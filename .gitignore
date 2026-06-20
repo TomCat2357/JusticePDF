@@ -7,7 +7,7 @@ env/
 *.lnk
 *.doc*
 *.png
-
+*.ico
 # Python cache
 __pycache__/
 *.py[cod]
