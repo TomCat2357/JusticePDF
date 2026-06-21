@@ -2717,6 +2717,12 @@ class PageEditWindow(QMainWindow):
         self._zoom_spread_btn.clicked.connect(self._toggle_zoom_spread_view)
         controls_layout.addWidget(self._zoom_spread_btn)
 
+        # PDF 内テキスト検索 (Ctrl+F と同じ)
+        self._zoom_search_btn = QPushButton("検索")
+        self._zoom_search_btn.setToolTip("PDF 内のテキストを検索 (Ctrl+F)")
+        self._zoom_search_btn.clicked.connect(self._on_open_search)
+        controls_layout.addWidget(self._zoom_search_btn)
+
         controls_layout.addStretch()
 
         self._zoom_page_label = QLabel("")
@@ -4040,6 +4046,13 @@ class PageEditWindow(QMainWindow):
         self._select_all_btn = QPushButton("すべて選択")
         self._select_all_btn.clicked.connect(self._on_select_all)
         toolbar.addWidget(self._select_all_btn)
+
+        toolbar.addSeparator()
+
+        self._search_btn = QPushButton("検索")
+        self._search_btn.setToolTip("PDF 内のテキストを検索 (Ctrl+F)")
+        self._search_btn.clicked.connect(self._on_open_search)
+        toolbar.addWidget(self._search_btn)
 
         self._update_button_states()
 
