@@ -407,6 +407,8 @@ class ZoomPageWidget(QWidget):
     annotation_geometry_changed = pyqtSignal(object, object, str)
     # LINE 端点ドラッグ専用：(annotation, new_rect_tuple, new_vertices, mode)
     shape_geometry_changed_with_vertices = pyqtSignal(object, object, object, str)
+    # 校正コールアウトのさきっぽ（挿入位置）ドラッグ専用：(annotation, new_target_tuple)
+    callout_target_changed = pyqtSignal(object, object)
     annotation_create_requested = pyqtSignal(object)
     shape_create_requested = pyqtSignal(object, object, object)  # (ShapeType, start_pt_tuple, end_pt_tuple)
     note_create_requested = pyqtSignal(object)  # placement point tuple (page coords)
@@ -491,6 +493,8 @@ class ZoomPageWidget(QWidget):
         self._pending_annotation_rect: QRectF | None = None
         self._drag_base_vertices: tuple[tuple[float, float], ...] | None = None
         self._pending_line_vertices: tuple[tuple[float, float], ...] | None = None
+        # 校正コールアウトのさきっぽドラッグ中の暫定先端位置（ページ座標）
+        self._pending_callout_target: tuple[float, float] | None = None
         self._drag_moved = False
         self._drag_copy_mode = False
         self._inline_editor: AnnotationTextEdit | None = None
@@ -792,6 +796,7 @@ class ZoomPageWidget(QWidget):
         self._pending_annotation_rect = None
         self._drag_base_vertices = None
         self._pending_line_vertices = None
+        self._pending_callout_target = None
         self._drag_moved = False
         self._clear_annotation_create_drag()
         self._paste_preview_rect = None
@@ -1045,7 +1050,15 @@ class ZoomPageWidget(QWidget):
         """
         if not annot.callout_line or annot.callout_target is None:
             return
-        target = self._page_point_to_widget_point(QPointF(*annot.callout_target))
+        # さきっぽドラッグ中はこの注釈だけ暫定先端位置で引き出し線を描く。
+        target_pt = annot.callout_target
+        if (
+            self._drag_mode == "callout_tip"
+            and annot.xref == self._drag_annotation_xref
+            and self._pending_callout_target is not None
+        ):
+            target_pt = self._pending_callout_target
+        target = self._page_point_to_widget_point(QPointF(target_pt[0], target_pt[1]))
         # _callout_box_attach と同じ規則: ターゲットがボックスより下なら下辺、
         # そうでなければ上辺の中央に接続する。
         if target.y() >= rect.bottom():
@@ -1372,6 +1385,26 @@ class ZoomPageWidget(QWidget):
             for name, point in positions.items()
         }
 
+    def _callout_tip_handle_rect(
+        self,
+        annot: FreeTextAnnotData,
+        target_override: tuple[float, float] | None = None,
+    ) -> QRectF | None:
+        """校正コールアウトのさきっぽ（挿入位置）のハンドル矩形を返す。
+
+        callout を持たない FreeText では None。target_override を渡すとドラッグ中の
+        暫定先端位置でハンドルを描ける。
+        """
+        if not isinstance(annot, FreeTextAnnotData) or not annot.callout_line:
+            return None
+        target = target_override if target_override is not None else annot.callout_target
+        if target is None:
+            return None
+        center = self._page_point_to_widget_point(QPointF(target[0], target[1]))
+        size = float(self.HANDLE_SIZE)
+        half = size / 2.0
+        return QRectF(center.x() - half, center.y() - half, size, size)
+
     def _line_endpoints_in_widget(
         self,
         shape: ShapeAnnotData,
@@ -1451,6 +1484,15 @@ class ZoomPageWidget(QWidget):
                 for handle, handle_rect in self._line_handle_rects(selected).items():
                     if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
                         return selected, handle
+            elif isinstance(selected, FreeTextAnnotData) and selected.callout_line:
+                # 校正コールアウト: さきっぽハンドルを本文ボックスのハンドルより優先判定。
+                tip_rect = self._callout_tip_handle_rect(selected)
+                if tip_rect is not None and tip_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
+                    return selected, "callout_tip"
+                selected_rect = self._annotation_widget_rect(selected)
+                for handle, handle_rect in self._handle_rects(selected_rect).items():
+                    if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
+                        return selected, handle
             elif isinstance(selected, (FreeTextAnnotData, ShapeAnnotData)):
                 # マークアップ（quad ベース）はリサイズ・移動ハンドルを持たない。
                 selected_rect = self._annotation_widget_rect(selected)
@@ -1476,6 +1518,7 @@ class ZoomPageWidget(QWidget):
     def _cursor_for_handle(self, handle: str | None) -> Qt.CursorShape:
         mapping = {
             "move": Qt.CursorShape.SizeAllCursor,
+            "callout_tip": Qt.CursorShape.SizeAllCursor,
             "n": Qt.CursorShape.SizeVerCursor,
             "s": Qt.CursorShape.SizeVerCursor,
             "e": Qt.CursorShape.SizeHorCursor,
@@ -1791,6 +1834,19 @@ class ZoomPageWidget(QWidget):
                         handle_iter = self._handle_rects(annot_rect).values()
                     for handle_rect in handle_iter:
                         painter.drawRect(handle_rect)
+                    # 校正コールアウト: さきっぽ（挿入位置）のハンドルを丸で描く。
+                    if isinstance(annot, FreeTextAnnotData) and annot.callout_line:
+                        tip_override = (
+                            self._pending_callout_target
+                            if (
+                                self._drag_mode == "callout_tip"
+                                and annot.xref == self._drag_annotation_xref
+                            )
+                            else None
+                        )
+                        tip_handle = self._callout_tip_handle_rect(annot, tip_override)
+                        if tip_handle is not None:
+                            painter.drawEllipse(tip_handle)
 
             if (
                 self._drag_copy_mode
@@ -1954,13 +2010,20 @@ class ZoomPageWidget(QWidget):
                     self._drag_origin_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
                     self._drag_base_rect = self._rect_tuple_to_qrectf(annot.rect)
                     self._pending_annotation_rect = QRectF(self._drag_base_rect)
-                    if isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
+                    if handle == "callout_tip" and isinstance(annot, FreeTextAnnotData):
+                        # さきっぽドラッグ: 本文ボックスは不変。先端位置だけを更新する。
+                        self._drag_base_vertices = None
+                        self._pending_line_vertices = None
+                        self._pending_callout_target = annot.callout_target
+                    elif isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
                         base_verts = tuple(tuple(v) for v in annot.vertices) if annot.vertices else ()
                         self._drag_base_vertices = base_verts
                         self._pending_line_vertices = base_verts
+                        self._pending_callout_target = None
                     else:
                         self._drag_base_vertices = None
                         self._pending_line_vertices = None
+                        self._pending_callout_target = None
                     self._drag_moved = False
                     self._drag_copy_mode = ctrl_copy
                     self.update()
@@ -2057,7 +2120,20 @@ class ZoomPageWidget(QWidget):
             if event.buttons() & Qt.MouseButton.LeftButton and self._drag_mode is not None:
                 current_page = self._page_point_from_widget_pos(event.pos(), clamp=True)
                 if current_page is not None:
-                    if self._drag_mode in ("ep_start", "ep_end"):
+                    if self._drag_mode == "callout_tip":
+                        new_target = (current_page.x(), current_page.y())
+                        self._pending_callout_target = new_target
+                        base = self._annotation_by_xref(self._drag_annotation_xref)
+                        base_target = base.callout_target if base is not None else None
+                        if base_target is None:
+                            self._drag_moved = True
+                        else:
+                            self._drag_moved = (
+                                abs(new_target[0] - base_target[0]) > 0.01
+                                or abs(new_target[1] - base_target[1]) > 0.01
+                            )
+                        self.update()
+                    elif self._drag_mode in ("ep_start", "ep_end"):
                         line_updated = self._drag_updated_line(current_page)
                         if line_updated is not None:
                             new_rect, new_vertices = line_updated
@@ -2220,9 +2296,17 @@ class ZoomPageWidget(QWidget):
                     annot = self._annotation_by_xref(self._drag_annotation_xref)
                     final_rect = self._pending_annotation_rect or self._drag_base_rect
                     final_vertices = self._pending_line_vertices
+                    final_callout_target = self._pending_callout_target
                     drag_mode = self._drag_mode
                     copy_mode = self._drag_copy_mode
-                    if annot is not None and final_rect is not None and self._drag_moved:
+                    if (
+                        annot is not None
+                        and drag_mode == "callout_tip"
+                        and final_callout_target is not None
+                        and self._drag_moved
+                    ):
+                        self.callout_target_changed.emit(annot, final_callout_target)
+                    elif annot is not None and final_rect is not None and self._drag_moved:
                         if copy_mode and drag_mode == "move":
                             self.annotation_duplicate_requested.emit(
                                 annot,
@@ -2254,6 +2338,7 @@ class ZoomPageWidget(QWidget):
                     self._pending_annotation_rect = None
                     self._drag_base_vertices = None
                     self._pending_line_vertices = None
+                    self._pending_callout_target = None
                     self._drag_moved = False
                     self._drag_copy_mode = False
                     self.update()
@@ -2651,6 +2736,7 @@ class PageEditWindow(QMainWindow):
         self._zoom_label.shape_geometry_changed_with_vertices.connect(
             self._on_zoom_shape_geometry_changed_with_vertices
         )
+        self._zoom_label.callout_target_changed.connect(self._on_zoom_callout_target_changed)
         self._zoom_label.annotation_create_requested.connect(self._on_zoom_annotation_create_requested)
         self._zoom_label.shape_create_requested.connect(self._on_zoom_shape_create_requested)
         self._zoom_label.note_create_requested.connect(self._on_note_create_requested)
@@ -5103,6 +5189,50 @@ class PageEditWindow(QMainWindow):
             return
         description = "Move FreeText" if mode == "move" else "Resize FreeText"
         self._run_zoom_annotation_replace(old_annotation, new_annotation, description)
+
+    def _on_zoom_callout_target_changed(self, annotation: object, target: object) -> None:
+        """校正コールアウトのさきっぽ（挿入位置）だけを移動する。本文ボックスは不変。"""
+        if not isinstance(annotation, FreeTextAnnotData):
+            return
+        if not isinstance(target, (tuple, list)) or len(target) != 2:
+            return
+        try:
+            new_target = (float(target[0]), float(target[1]))
+        except (TypeError, ValueError):
+            return
+        old_annotation = self._find_zoom_annotation(annotation.xref) or annotation
+        if not old_annotation.callout_line:
+            return
+        # 本文ボックスは固定し、新しい先端から接続点だけ再計算する。
+        new_rect = old_annotation.rect
+        box_attach = _callout_box_attach(new_rect, new_target)
+        callout_line = (new_target, box_attach)
+        old_target = old_annotation.callout_target
+        if old_target is not None and (
+            abs(new_target[0] - old_target[0]) < 0.01
+            and abs(new_target[1] - old_target[1]) < 0.01
+        ):
+            return
+        new_annotation = FreeTextAnnotData(
+            page_num=old_annotation.page_num,
+            xref=old_annotation.xref,
+            rect=new_rect,
+            content=old_annotation.content,
+            fontsize=old_annotation.fontsize,
+            text_color=old_annotation.text_color,
+            fill_color=old_annotation.fill_color,
+            border_color=old_annotation.border_color,
+            border_width=old_annotation.border_width,
+            opacity=old_annotation.opacity,
+            fontname=old_annotation.fontname,
+            annotation_id=old_annotation.annotation_id,
+            subject=old_annotation.subject,
+            text_rotation=old_annotation.text_rotation,
+            group_id=old_annotation.group_id,
+            callout_line=callout_line,
+            callout_target=new_target,
+        )
+        self._run_zoom_annotation_replace(old_annotation, new_annotation, "Move callout pointer")
 
     def _on_zoom_shape_geometry_changed_with_vertices(
         self, annotation: object, rect: object, vertices: object, mode: str

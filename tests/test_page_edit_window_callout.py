@@ -107,6 +107,98 @@ def test_callout_move_keeps_target_fixed(qtbot, tmp_path):
     assert len(list_shape_annots(str(pdf_path), 0)) == 0
 
 
+@pytest.mark.usefixtures("qtbot")
+def test_callout_tip_drag_moves_target_only(qtbot, tmp_path):
+    """さきっぽ（挿入位置）だけを動かすと target が更新され、本文ボックスは不変。"""
+    pdf_path = tmp_path / "callout-tip-move.pdf"
+    make_pdf(pdf_path, width=400, height=500)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    window._on_callout_btn_clicked(True)
+    window._on_callout_create_requested((200.0, 300.0))
+    qtbot.waitUntil(lambda: len(list_freetext_annots(str(pdf_path), 0)) == 1)
+
+    annot = list_freetext_annots(str(pdf_path), 0)[0]
+    rect_before = annot.rect
+    new_target = (120.0, 150.0)
+    # さきっぽドラッグ確定に相当するハンドラを直接呼ぶ。
+    window._on_zoom_callout_target_changed(annot, new_target)
+    qtbot.waitUntil(
+        lambda: list_freetext_annots(str(pdf_path), 0)[0].callout_target
+        == pytest.approx(new_target, abs=0.5)
+    )
+
+    moved = list_freetext_annots(str(pdf_path), 0)[0]
+    # 先端は新しい位置、本文ボックスは変わらない。
+    assert moved.callout_target == pytest.approx(new_target, abs=0.5)
+    assert moved.rect == pytest.approx(rect_before, abs=0.5)
+    # 引き出し線の先端は target、コールアウトは 1 個のまま。
+    assert moved.callout_line[0] == pytest.approx(new_target, abs=0.5)
+    assert len(list_freetext_annots(str(pdf_path), 0)) == 1
+    assert len(list_shape_annots(str(pdf_path), 0)) == 0
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_callout_tip_drag_attaches_to_correct_box_side(qtbot, tmp_path):
+    """さきっぽを本文ボックスの上側へ動かすと接続点が上辺へ切り替わる。"""
+    pdf_path = tmp_path / "callout-tip-side.pdf"
+    make_pdf(pdf_path, width=400, height=500)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    window._on_callout_btn_clicked(True)
+    # デフォルト配置では本文ボックスは挿入位置の上に来るので接続点は下辺。
+    window._on_callout_create_requested((200.0, 300.0))
+    qtbot.waitUntil(lambda: len(list_freetext_annots(str(pdf_path), 0)) == 1)
+
+    annot = list_freetext_annots(str(pdf_path), 0)[0]
+    box_top = min(annot.rect[1], annot.rect[3])
+    # 先端を本文ボックスより上へ移動 → 接続点は上辺中央へ。
+    new_target = (annot.rect[0], box_top - 80.0)
+    window._on_zoom_callout_target_changed(annot, new_target)
+    qtbot.waitUntil(
+        lambda: list_freetext_annots(str(pdf_path), 0)[0].callout_target
+        == pytest.approx(new_target, abs=0.5)
+    )
+
+    moved = list_freetext_annots(str(pdf_path), 0)[0]
+    attach = moved.callout_line[1]
+    new_box_top = min(moved.rect[1], moved.rect[3])
+    # 接続点 y は本文ボックスの上辺に一致する。
+    assert attach[1] == pytest.approx(new_box_top, abs=1.0)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_callout_tip_drag_undo(qtbot, tmp_path):
+    """さきっぽ移動を Undo すると元の target / callout_line に戻る。"""
+    pdf_path = tmp_path / "callout-tip-undo.pdf"
+    make_pdf(pdf_path, width=400, height=500)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    original = _make_one_callout(window, qtbot, pdf_path)
+    target_before = original.callout_target
+
+    window._on_zoom_callout_target_changed(original, (120.0, 150.0))
+    qtbot.waitUntil(
+        lambda: list_freetext_annots(str(pdf_path), 0)[0].callout_target
+        == pytest.approx((120.0, 150.0), abs=0.5)
+    )
+
+    window._undo_manager.undo()
+    qtbot.waitUntil(
+        lambda: list_freetext_annots(str(pdf_path), 0)[0].callout_target
+        == pytest.approx(target_before, abs=0.5)
+    )
+    restored = list_freetext_annots(str(pdf_path), 0)[0]
+    assert restored.callout_line[0] == pytest.approx(target_before, abs=0.5)
+    assert len(list_freetext_annots(str(pdf_path), 0)) == 1
+
+
 def _make_one_callout(window, qtbot, pdf_path):
     """吹き出しを 1 個作り、開いたインライン編集を閉じて返す。"""
     window._on_callout_btn_clicked(True)
