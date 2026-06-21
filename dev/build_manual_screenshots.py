@@ -29,8 +29,19 @@ from PyQt6.QtWidgets import QApplication, QToolBar
 from src.views import main_window, pdf_card
 from src.views import page_edit_window as page_edit_window_module
 from src.views.export_dialog import ExportOptionsDialog
+from src.views.print_dialog import PrintDialog
 from src.views.search_dialog import SearchDialog
 from src.models.undo_manager import UndoManager
+from src.utils.pdf_utils import (
+    get_page_words,
+    create_markup_annot,
+    create_note_annot,
+    create_callout,
+    TextMarkupAnnotData,
+    NoteAnnotData,
+    MarkupType,
+)
+from PyQt6.QtWidgets import QPushButton
 
 OUT_DIR = Path(__file__).resolve().parent / "manual_assets"
 
@@ -314,6 +325,217 @@ def scene_export_dialog() -> None:
     dlg.close()
 
 
+# ---------- Toolbar dropdown menus ----------
+
+def _grab_menu(menu) -> "object":
+    """Pop a QMenu offscreen so it lays out, then grab it as a pixmap."""
+    menu.popup(QPoint(-10000, -10000))
+    QApplication.processEvents()
+    pix = menu.grab()
+    menu.hide()
+    return pix
+
+
+def _save_toolbar_menu(work_dir: Path, button_attr: str, menu_attr: str,
+                       out_name: str, *, select_card: bool = True,
+                       select_folder: bool = False) -> None:
+    """Composite the toolbar with one dropdown menu opened under its button."""
+    from PyQt6.QtGui import QPixmap, QPainter
+    print(f"[scene] {out_name}")
+    win = build_main_window(work_dir)
+    # Selecting an item enables the context-dependent menu actions.
+    if select_card and win._cards:
+        win._cards[0].set_selected(True)
+        win._selected_cards.append(win._cards[0])
+    if select_folder and win._folder_cards:
+        win._folder_cards[0].set_selected(True)
+        win._selected_folder_cards.append(win._folder_cards[0])
+    win._update_button_states()
+    QApplication.processEvents()
+
+    toolbar = win.findChild(QToolBar)
+    button = getattr(win, button_attr)
+    menu = getattr(win, menu_attr)
+    tb_pix = toolbar.grab()
+    menu_pix = _grab_menu(menu)
+    # Button x-position within the toolbar.
+    bx = button.mapTo(toolbar, QPoint(0, 0)).x()
+
+    gap = 2
+    width = max(tb_pix.width(), bx + menu_pix.width() + 2)
+    height = tb_pix.height() + gap + menu_pix.height() + 2
+    comp = QPixmap(width, height)
+    comp.fill(Qt.GlobalColor.white)
+    painter = QPainter(comp)
+    painter.drawPixmap(0, 0, tb_pix)
+    painter.drawPixmap(bx, tb_pix.height() + gap, menu_pix)
+    painter.end()
+    out = OUT_DIR / out_name
+    comp.save(str(out))
+    print(f"  saved {out.name}  ({comp.width()}x{comp.height()})")
+    win.close()
+
+
+# ---------- Print dialog ----------
+
+def scene_print_dialog(pdf_path: Path) -> None:
+    print("[scene] 24_print_dialog")
+    dlg = PrintDialog([str(pdf_path)], current_index=0)
+    dlg.resize(820, 520)
+    dlg.show()
+    QApplication.processEvents()
+    for _ in range(20):
+        QApplication.processEvents()
+    _save(dlg, "24_print_dialog.png")
+    dlg.close()
+
+
+# ---------- Zoom-view extras: spread / bookmarks / annotations ----------
+
+def scene_spread_view(pdf_path: Path) -> None:
+    print("[scene] 25_spread_view")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._thumbnails:
+        pew.close()
+        return
+    pew._open_zoom_view(0)
+    QApplication.processEvents()
+    pew._toggle_zoom_spread_view()
+    for _ in range(12):
+        QApplication.processEvents()
+    _save(pew, "25_spread_view.png")
+    pew.close()
+
+
+def scene_bookmarks_panel(pdf_path: Path) -> None:
+    print("[scene] 26_bookmarks_panel")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._thumbnails:
+        pew.close()
+        return
+    pew._open_zoom_view(0)
+    QApplication.processEvents()
+    pew._toggle_bookmarks_drawer()
+    pew._reload_bookmarks_tree()
+    for _ in range(12):
+        QApplication.processEvents()
+    _save(pew, "26_bookmarks_panel.png")
+    pew.close()
+
+
+def _open_annotated_zoom(pdf_path: Path):
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._thumbnails:
+        pew.close()
+        return None
+    pew._open_zoom_view(0)
+    QApplication.processEvents()
+    pew._set_zoom_annotation_drawer_open(True)
+    for _ in range(12):
+        QApplication.processEvents()
+    return pew
+
+
+def scene_markup(pdf_path: Path) -> None:
+    print("[scene] 27_markup")
+    pew = _open_annotated_zoom(pdf_path)
+    if pew is None:
+        return
+    _save(pew, "27_markup.png")
+    pew.close()
+
+
+def scene_note(pdf_path: Path) -> None:
+    print("[scene] 28_note")
+    pew = _open_annotated_zoom(pdf_path)
+    if pew is None:
+        return
+    # Pop the hover preview so the note's content bubble is visible.
+    notes = [a for a in pew._zoom_annotations if isinstance(a, NoteAnnotData)]
+    if notes:
+        try:
+            pew._zoom_label._show_note_popup(notes[0])
+        except Exception as exc:  # pragma: no cover - best-effort
+            print(f"  ! note popup failed: {exc}")
+    QApplication.processEvents()
+    _save(pew, "28_note.png")
+    pew.close()
+
+
+def scene_callout(pdf_path: Path) -> None:
+    print("[scene] 29_callout")
+    pew = _open_annotated_zoom(pdf_path)
+    if pew is None:
+        return
+    _save(pew, "29_callout.png")
+    pew.close()
+
+
+# ---------- Annotated sample PDFs ----------
+
+def _words_on_lines(pdf_path: Path):
+    """Group page-0 words into lines (by y) and return [(y, [word_rects])]."""
+    words = get_page_words(str(pdf_path), 0)
+    lines: dict[int, list] = {}
+    for w in words:
+        x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
+        text = w[4] if len(w) > 4 else ""
+        if not str(text).strip():
+            continue
+        key = round(y0)
+        lines.setdefault(key, []).append((x0, y0, x1, y1))
+    return [(y, lines[y]) for y in sorted(lines)]
+
+
+def _make_markup_pdf(src_pdf: Path, dst_pdf: Path) -> None:
+    """Copy ``src_pdf`` and bake highlight / underline / strikeout on page 0."""
+    shutil.copy2(src_pdf, dst_pdf)
+    lines = _words_on_lines(dst_pdf)
+    # Skip the title/page-number lines near the top; markup the body lines.
+    body = [ln for ln in lines if ln[0] > 140]
+    styles = [
+        (MarkupType.HIGHLIGHT, (1.0, 0.92, 0.23)),   # yellow
+        (MarkupType.UNDERLINE, (0.85, 0.0, 0.0)),     # red
+        (MarkupType.STRIKEOUT, (0.0, 0.45, 0.85)),    # blue
+    ]
+    for (markup_type, color), (_, rects) in zip(styles, body):
+        quads = tuple(rects)
+        if not quads:
+            continue
+        create_markup_annot(
+            str(dst_pdf),
+            TextMarkupAnnotData(
+                page_num=0, xref=0, quads=quads,
+                markup_type=markup_type, color=color, opacity=1.0,
+            ),
+        )
+
+
+def _make_note_pdf(src_pdf: Path, dst_pdf: Path) -> None:
+    """Copy ``src_pdf`` and bake a sticky-note comment on page 0."""
+    shutil.copy2(src_pdf, dst_pdf)
+    create_note_annot(
+        str(dst_pdf),
+        NoteAnnotData(
+            page_num=0, xref=0, point=(430.0, 150.0),
+            content="ここの数字を要確認。\n担当：山田",
+            color=(1.0, 0.85, 0.2), icon="Note", opacity=1.0,
+        ),
+    )
+
+
+def _make_callout_pdf(src_pdf: Path, dst_pdf: Path) -> None:
+    """Copy ``src_pdf`` and bake a proofreading callout on page 0."""
+    shutil.copy2(src_pdf, dst_pdf)
+    create_callout(
+        str(dst_pdf),
+        page_num=0,
+        text_rect=(330.0, 250.0, 520.0, 300.0),
+        target_point=(250.0, 200.0),
+        text="「ご」を補う",
+    )
+
+
 # ---------- Reused install screenshots ----------
 
 INSTALL_REUSE_MAP = {
@@ -387,6 +609,16 @@ def main() -> None:
         scene_folder_selection(work_dir)
         scene_multi_window(work_dir, work_dir2)
 
+        # Toolbar dropdown menus (composited under their buttons).
+        _save_toolbar_menu(work_dir, "_import_btn", "_import_menu",
+                           "20_import_menu.png")
+        _save_toolbar_menu(work_dir, "_new_btn", "_new_menu",
+                           "21_new_menu.png")
+        _save_toolbar_menu(work_dir, "_sort_btn", "_sort_menu",
+                           "22_sort_menu.png")
+        _save_toolbar_menu(work_dir, "_rename_btn", "_rename_menu",
+                           "23_rename_menu.png")
+
         # Use a multi-page PDF for page-edit / zoom shots.
         proposal_pdf = work_dir / "提案書.pdf"
         scene_page_edit_grid(proposal_pdf)
@@ -395,6 +627,48 @@ def main() -> None:
 
         scene_search_dialog()
         scene_export_dialog()
+        scene_print_dialog(proposal_pdf)
+
+        # Spread view + bookmark panel (bookmarks PDF carries a TOC + a note).
+        scene_spread_view(proposal_pdf)
+        bookmarks_pdf = work_dir / "_bookmarks_demo.pdf"
+        shutil.copy2(proposal_pdf, bookmarks_pdf)
+        try:
+            import fitz as _fitz
+            _bdoc = _fitz.open(str(bookmarks_pdf))
+            _bdoc.set_toc([
+                [1, "提案書", 1],
+                [2, "背景と目的", 1],
+                [1, "提案内容", 2],
+                [2, "スケジュール", 3],
+                [1, "見積条件", 5],
+            ])
+            _bdoc.saveIncr()
+            _bdoc.close()
+        except Exception as exc:
+            print(f"  ! set_toc failed: {exc}")
+        create_note_annot(
+            str(bookmarks_pdf),
+            NoteAnnotData(
+                page_num=2, xref=0, point=(430.0, 150.0),
+                content="この章は要見直し", color=(1.0, 0.85, 0.2),
+                icon="Note", opacity=1.0,
+            ),
+        )
+        scene_bookmarks_panel(bookmarks_pdf)
+
+        # Baked-annotation demos: markup / sticky note / proofreading callout.
+        markup_pdf = work_dir / "_markup_demo.pdf"
+        _make_markup_pdf(proposal_pdf, markup_pdf)
+        scene_markup(markup_pdf)
+
+        note_pdf = work_dir / "_note_demo.pdf"
+        _make_note_pdf(proposal_pdf, note_pdf)
+        scene_note(note_pdf)
+
+        callout_pdf = work_dir / "_callout_demo.pdf"
+        _make_callout_pdf(proposal_pdf, callout_pdf)
+        scene_callout(callout_pdf)
 
         copy_install_images()
 
