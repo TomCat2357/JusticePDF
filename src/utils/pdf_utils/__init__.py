@@ -146,7 +146,6 @@ from .pages import (
     get_pdf_toc,
     insert_pages,
     merge_paths_to_pdf,
-    merge_pdfs,
     merge_pdfs_in_place,
     normalize_toc,
     remove_pages,
