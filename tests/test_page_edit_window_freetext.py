@@ -785,15 +785,15 @@ def test_zoom_single_click_selects_word(qtbot, tmp_path):
 
 
 @pytest.mark.usefixtures("qtbot")
-def test_fontsize_spin_defaults_to_11(qtbot, tmp_path):
-    # 未保存の QSettings(conftest で分離済み)では既定 11pt で始まる。
+def test_fontsize_spin_defaults_to_14(qtbot, tmp_path):
+    # 未保存の QSettings(conftest で分離済み)では既定 14pt(吹き出しと共通)で始まる。
     pdf_path = tmp_path / "fontsize-default.pdf"
     make_pdf(pdf_path)
 
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
 
-    assert window._zoom_annotation_fontsize_spin.value() == 11
+    assert window._zoom_annotation_fontsize_spin.value() == 14
 
 
 @pytest.mark.usefixtures("qtbot")
