@@ -1,10 +1,8 @@
 # src/views/main_window.py
 """Main window for JusticePDF application."""
 import os
-import sys
 import logging
 import shutil
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -1088,8 +1086,6 @@ class MainWindow(QMainWindow):
         Export is NOT an undoable action and should not affect undo history.
         """
         from src.utils.pdf_utils import merge_pdfs_in_place
-        import tempfile
-        from pathlib import Path
 
         if self._operation_in_progress:
             return
@@ -1596,8 +1592,6 @@ class MainWindow(QMainWindow):
         - 結合後、元のファイル/フォルダはゴミ箱へ移動する(Undo で復元可)。
         - 出力は現在のフォルダに「結合_<最初の項目名>.pdf」として自動命名する。
         """
-        import tempfile
-        from pathlib import Path
         from src.utils.pdf_utils import merge_paths_to_pdf
 
         if self._operation_in_progress:
@@ -2191,9 +2185,6 @@ class MainWindow(QMainWindow):
             # Folders involved → no undo (backup is impractical for large trees)
             self._delete_selected_folders(also_pdfs=has_pdfs)
             return
-
-        import tempfile
-        from pathlib import Path
 
         paths = [card.pdf_path for card in self._selected_cards]
         old_paths = [c.pdf_path for c in self._cards]
@@ -3485,9 +3476,6 @@ class MainWindow(QMainWindow):
         
         Creates copies of source PDFs and inserts them at drop position.
         """
-        import shutil
-        from pathlib import Path
-        
         source_paths = source_paths_str.split('|')
         target_idx = self._get_drop_index(drop_pos)
         if target_idx == -1:
@@ -3593,8 +3581,6 @@ class MainWindow(QMainWindow):
         Source files remain unchanged.
         """
         from src.utils.pdf_utils import merge_pdfs_in_place
-        import tempfile
-        import shutil
 
         source_paths = source_paths_str.split('|')
         target_path = target_card.pdf_path
@@ -3638,9 +3624,6 @@ class MainWindow(QMainWindow):
             # Rollback on error
             shutil.copy2(backup_path, target_path)
             raise
-        finally:
-            # Keep backup for undo; it will be cleaned up eventually
-            pass
 
     def _get_card_at_pos(self, pos):
         """Return the card at the given container position, if any."""
@@ -3722,10 +3705,7 @@ class MainWindow(QMainWindow):
         is always saved to that directory as a new PDF — regardless of
         drop position — and no existing card is merged into.
         """
-        import tempfile
-        import shutil
         from src.utils.pdf_utils import extract_pages, remove_pages, insert_pages
-        from PyQt6.QtWidgets import QApplication
         from src.views.page_edit_window import PageEditWindow
 
         logger.debug(f"_handle_page_extraction called with data={data}, drop_pos={drop_pos}")

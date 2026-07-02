@@ -1,7 +1,7 @@
 """PDF card widget for displaying PDF files."""
 import os
 from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel, QApplication, QWidget
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QUrl
+from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QUrl
 from PyQt6.QtGui import QDrag, QPixmap
 
 from src.views.view_helpers import apply_drag_pixmap

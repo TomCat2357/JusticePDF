@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
     QInputDialog, QLabel, QFrame, QApplication, QRubberBand, QMessageBox,
-    QToolButton, QSizePolicy, QPlainTextEdit, QFormLayout,
+    QToolButton, QPlainTextEdit, QFormLayout,
     QSpinBox, QDoubleSpinBox, QColorDialog, QSlider, QCheckBox, QComboBox,
     QMenu, QListWidget, QListWidgetItem
 )
@@ -2046,7 +2046,7 @@ class ZoomPageWidget(QWidget):
                     self._sel_head_char = anchor
                     self._selected_char_indices = []
                 self.update()
-        except Exception as e:
+        except Exception:
             logger.exception("Error in ZoomPageWidget.mousePressEvent")
         event.accept()
 
@@ -2167,7 +2167,7 @@ class ZoomPageWidget(QWidget):
             else:
                 self._update_cursor(event.pos())
                 self._update_note_hover(event.pos())
-        except Exception as e:
+        except Exception:
             logger.exception("Error in ZoomPageWidget.mouseMoveEvent")
         event.accept()
 
@@ -2367,7 +2367,7 @@ class ZoomPageWidget(QWidget):
                 self._selection_origin = None
                 self._pressed_link = None
                 self.update()
-        except Exception as e:
+        except Exception:
             logger.exception("Error in ZoomPageWidget.mouseReleaseEvent")
         event.accept()
 
@@ -2535,7 +2535,6 @@ class PageEditWindow(QMainWindow):
         self._annot_refs: dict[int, _AnnotRef] = {}
         self._zoom_annotation_drawer = None
         self._zoom_annotation_panel = None
-        self._zoom_annotation_toggle_btn = None
         self._zoom_annotation_open = False
         # 見開き表示(2ページ並べ・閲覧専用)モードのON/OFF。
         self._zoom_spread_mode = False
@@ -2771,15 +2770,6 @@ class PageEditWindow(QMainWindow):
         drawer_layout = QHBoxLayout(self._zoom_annotation_drawer)
         drawer_layout.setContentsMargins(0, 0, 0, 0)
         drawer_layout.setSpacing(0)
-
-        # 開閉トグルはツールバーの「アノテーション」ボタンへ移設したため内蔵ボタンは隠す
-        self._zoom_annotation_toggle_btn = QToolButton()
-        self._zoom_annotation_toggle_btn.setText("◀")
-        self._zoom_annotation_toggle_btn.setToolTip("付箋編集")
-        self._zoom_annotation_toggle_btn.clicked.connect(self._toggle_zoom_annotation_drawer)
-        self._zoom_annotation_toggle_btn.setFixedWidth(32)
-        self._zoom_annotation_toggle_btn.hide()
-        drawer_layout.addWidget(self._zoom_annotation_toggle_btn)
 
         self._zoom_annotation_panel = QWidget()
         panel_layout = QVBoxLayout(self._zoom_annotation_panel)
@@ -3186,8 +3176,6 @@ class PageEditWindow(QMainWindow):
             self._zoom_annotation_panel.setVisible(self._zoom_annotation_open)
         if self._zoom_annotation_drawer:
             self._zoom_annotation_drawer.setFixedWidth(320 if self._zoom_annotation_open else 0)
-        if self._zoom_annotation_toggle_btn:
-            self._zoom_annotation_toggle_btn.setText("▶" if self._zoom_annotation_open else "◀")
         if getattr(self, "_zoom_object_btn", None) is not None:
             self._zoom_object_btn.setChecked(self._zoom_annotation_open)
         # 横幅を確保するため、付箋ドロワーを開いたらしおりドロワーを閉じる
