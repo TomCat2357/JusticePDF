@@ -2616,6 +2616,11 @@ class PageEditWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        self._build_page_grid(layout)
+        self._build_zoom_view(layout)
+
+    def _build_page_grid(self, layout: QVBoxLayout) -> None:
+        """ページサムネイル一覧(グリッド)と選択・ドロップ表示部品を組み立てる。"""
         self._grid_scroll = QScrollArea()
         self._grid_scroll.setWidgetResizable(True)
         self._grid_scroll.viewport().installEventFilter(self)
@@ -2642,10 +2647,31 @@ class PageEditWindow(QMainWindow):
         # Rubber band for selection
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self._container)
 
+    def _build_zoom_view(self, layout: QVBoxLayout) -> None:
+        """拡大表示ビュー(操作バー+キャンバス+付箋/しおりドロワー)を組み立てる。"""
         self._zoom_view = QWidget()
         zoom_layout = QVBoxLayout(self._zoom_view)
         zoom_layout.setContentsMargins(0, 0, 0, 0)
 
+        zoom_layout.addWidget(self._build_zoom_controls())
+
+        zoom_content = QWidget()
+        zoom_content_layout = QHBoxLayout(zoom_content)
+        zoom_content_layout.setContentsMargins(0, 0, 0, 0)
+        zoom_content_layout.setSpacing(0)
+        zoom_content_layout.addWidget(self._build_zoom_canvas(), 1)
+        zoom_content_layout.addWidget(self._build_annotation_drawer())
+        zoom_content_layout.addWidget(self._build_bookmarks_panel())
+
+        zoom_layout.addWidget(zoom_content, 1)
+        self._set_zoom_annotation_drawer_open(False)
+        self._set_selected_zoom_annotation(None)
+
+        layout.addWidget(self._zoom_view)
+        self._zoom_view.hide()
+
+    def _build_zoom_controls(self) -> QWidget:
+        """拡大表示上部の操作バー(戻る/倍率/ページ移動/各ドロワー/検索)を組み立てる。"""
         zoom_controls = QWidget()
         controls_layout = QHBoxLayout(zoom_controls)
         controls_layout.setContentsMargins(10, 10, 10, 10)
@@ -2726,8 +2752,10 @@ class PageEditWindow(QMainWindow):
         self._zoom_page_label = QLabel("")
         controls_layout.addWidget(self._zoom_page_label)
 
-        zoom_layout.addWidget(zoom_controls)
+        return zoom_controls
 
+    def _build_zoom_canvas(self) -> QScrollArea:
+        """拡大表示キャンバス(ZoomPageWidget)とそのシグナル配線を組み立てる。"""
         self._zoom_scroll = QScrollArea()
         self._zoom_scroll.setWidgetResizable(True)
         self._zoom_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -2756,13 +2784,10 @@ class PageEditWindow(QMainWindow):
         self._zoom_label.scroll_requested.connect(self._on_zoom_scroll_requested)
         self._zoom_label.zoom_region_requested.connect(self._on_zoom_region_requested)
         self._zoom_scroll.setWidget(self._zoom_label)
+        return self._zoom_scroll
 
-        zoom_content = QWidget()
-        zoom_content_layout = QHBoxLayout(zoom_content)
-        zoom_content_layout.setContentsMargins(0, 0, 0, 0)
-        zoom_content_layout.setSpacing(0)
-        zoom_content_layout.addWidget(self._zoom_scroll, 1)
-
+    def _build_annotation_drawer(self) -> QFrame:
+        """付箋編集ドロワー(作成ツール群+プロパティフォーム)を組み立てる。"""
         self._zoom_annotation_drawer = QFrame()
         self._zoom_annotation_drawer.setObjectName("annotationDrawer")
         self._zoom_annotation_drawer.setFrameShape(QFrame.Shape.StyledPanel)
@@ -2777,6 +2802,30 @@ class PageEditWindow(QMainWindow):
         title = QLabel("付箋")
         panel_layout.addWidget(title)
 
+        self._build_annotation_actions(panel_layout)
+        self._build_shape_tools(panel_layout)
+        self._build_markup_tools(panel_layout)
+        self._build_note_tools(panel_layout)
+        self._build_annotation_form(panel_layout)
+        self._build_shape_option_rows(panel_layout)
+
+        # FreeText-only widgets container references for visibility toggling
+        self._zoom_freetext_only_widgets: list[QWidget] = []
+
+        # 現在ページの付箋一覧（B）。クリックで該当付箋を選択。
+        self._zoom_note_list_label = QLabel("このページの付箋")
+        panel_layout.addWidget(self._zoom_note_list_label)
+        self._zoom_note_list = QListWidget()
+        self._zoom_note_list.setMaximumHeight(140)
+        self._zoom_note_list.itemClicked.connect(self._on_note_list_item_clicked)
+        panel_layout.addWidget(self._zoom_note_list)
+
+        panel_layout.addStretch()
+        drawer_layout.addWidget(self._zoom_annotation_panel)
+        return self._zoom_annotation_drawer
+
+    def _build_annotation_actions(self, panel_layout: QVBoxLayout) -> None:
+        """付箋の新規/削除と重なり順操作のボタン列を組み立てる。"""
         action_row = QHBoxLayout()
         self._zoom_annotation_new_btn = QPushButton("新規")
         self._zoom_annotation_new_btn.setCheckable(True)
@@ -2822,7 +2871,8 @@ class PageEditWindow(QMainWindow):
         order_row.addWidget(self._zoom_annotation_order_front_btn)
         panel_layout.addLayout(order_row)
 
-        # Shape creation buttons
+    def _build_shape_tools(self, panel_layout: QVBoxLayout) -> None:
+        """図形作成ボタン列を組み立てる。"""
         shape_label = QLabel("図形")
         panel_layout.addWidget(shape_label)
         shape_row = QHBoxLayout()
@@ -2845,7 +2895,8 @@ class PageEditWindow(QMainWindow):
             self._shape_buttons[shape_type] = btn
         panel_layout.addLayout(shape_row)
 
-        # Text markup (highlight / underline / strikeout)
+    def _build_markup_tools(self, panel_layout: QVBoxLayout) -> None:
+        """文字装飾(ハイライト/下線/取り消し線)ボタン列を組み立てる。"""
         markup_label = QLabel("文字装飾")
         panel_layout.addWidget(markup_label)
         markup_row = QHBoxLayout()
@@ -2870,7 +2921,8 @@ class PageEditWindow(QMainWindow):
         panel_layout.addLayout(markup_row)
         self._set_color_button_preview(self._zoom_markup_color_btn, self._zoom_markup_color)
 
-        # Sticky note (comment) tool
+    def _build_note_tools(self, panel_layout: QVBoxLayout) -> None:
+        """付箋(コメント)/校正コールアウトのツール列と本文エディタを組み立てる。"""
         note_label = QLabel("付箋（コメント）")
         panel_layout.addWidget(note_label)
         note_row = QHBoxLayout()
@@ -2902,6 +2954,8 @@ class PageEditWindow(QMainWindow):
         panel_layout.addWidget(self._zoom_note_editor)
         self._zoom_note_editor.hide()
 
+    def _build_annotation_form(self, panel_layout: QVBoxLayout) -> None:
+        """サイズ/文字サイズ/線幅/透明度/色のプロパティフォームを組み立てる。"""
         form = QFormLayout()
         self._zoom_annotation_width_spin = QSpinBox()
         self._zoom_annotation_width_spin.setRange(1, 5000)
@@ -2973,7 +3027,8 @@ class PageEditWindow(QMainWindow):
             )
         )
 
-        # --- Shape-specific controls ---
+    def _build_shape_option_rows(self, panel_layout: QVBoxLayout) -> None:
+        """図形種別ごとの追加オプション行(回転/線/括弧/三角形)を組み立てる。"""
         # Rotation
         self._zoom_shape_rotation_row = QWidget()
         rot_layout = QHBoxLayout(self._zoom_shape_rotation_row)
@@ -3088,22 +3143,8 @@ class PageEditWindow(QMainWindow):
         panel_layout.addWidget(self._zoom_shape_triangle_options)
         self._zoom_shape_triangle_options.hide()
 
-        # FreeText-only widgets container references for visibility toggling
-        self._zoom_freetext_only_widgets: list[QWidget] = []
-
-        # 現在ページの付箋一覧（B）。クリックで該当付箋を選択。
-        self._zoom_note_list_label = QLabel("このページの付箋")
-        panel_layout.addWidget(self._zoom_note_list_label)
-        self._zoom_note_list = QListWidget()
-        self._zoom_note_list.setMaximumHeight(140)
-        self._zoom_note_list.itemClicked.connect(self._on_note_list_item_clicked)
-        panel_layout.addWidget(self._zoom_note_list)
-
-        panel_layout.addStretch()
-        drawer_layout.addWidget(self._zoom_annotation_panel)
-        zoom_content_layout.addWidget(self._zoom_annotation_drawer)
-
-        # しおり(アウトライン)編集ドロワー
+    def _build_bookmarks_panel(self) -> "BookmarksPanel":
+        """しおり(アウトライン)編集ドロワーを組み立てる。"""
         self._bookmarks_panel = BookmarksPanel()
         self._bookmarks_panel.set_current_page_provider(
             lambda: (self._zoom_page_num or 0) + 1
@@ -3114,14 +3155,7 @@ class PageEditWindow(QMainWindow):
         self._bookmarks_panel.open_changed.connect(self._on_bookmarks_drawer_open_changed)
         # 開閉トグルはツールバーの「しおり」ボタンへ移設したため内蔵トグルを隠す
         self._bookmarks_panel.use_external_toggle()
-        zoom_content_layout.addWidget(self._bookmarks_panel)
-
-        zoom_layout.addWidget(zoom_content, 1)
-        self._set_zoom_annotation_drawer_open(False)
-        self._set_selected_zoom_annotation(None)
-
-        layout.addWidget(self._zoom_view)
-        self._zoom_view.hide()
+        return self._bookmarks_panel
 
     def _build_labeled_color_row(
         self,
