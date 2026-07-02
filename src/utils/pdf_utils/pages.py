@@ -152,33 +152,6 @@ def create_empty_pdf(pdf_path: str) -> None:
 
 
 
-def merge_pdfs(
-    output_path: str, pdf_paths: list[str], *, add_file_bookmarks: bool = False
-) -> None:
-    """Merge multiple PDFs into one.
-
-    add_file_bookmarks=True のとき、結合した各ファイルの開始ページにファイル名の
-    しおり(アウトライン)を level 1 で付け、各ファイルが元々持つしおりはその子として残す。
-    ファイル名しおりは常にフラット(全ファイルが level 1)に並ぶ。
-    """
-    output_doc = fitz.open()
-    entries: list[TocEntry] = []
-    start = 0
-    for path in pdf_paths:
-        with fitz.open(path) as src_doc:
-            count = len(src_doc)
-            sub = src_doc.get_toc(simple=True) if add_file_bookmarks else []
-            output_doc.insert_pdf(src_doc)
-        if add_file_bookmarks and count > 0:
-            entries.extend(_file_toc_entries(_file_bookmark_title(path), start, sub))
-        start += count
-    if add_file_bookmarks and entries:
-        entries = normalize_toc(entries, page_count=len(output_doc))
-        output_doc.set_toc([[e.level, e.title, e.page] for e in entries])
-    output_doc.save(output_path)
-    output_doc.close()
-
-
 def merge_pdfs_in_place(
     dest_path: str,
     pdf_paths: list[str],
