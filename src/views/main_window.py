@@ -430,6 +430,25 @@ class MainWindow(QMainWindow):
         QApplication.restoreOverrideCursor()
         self._update_button_states()
 
+    def _run_file_operation(
+        self,
+        do_io: Callable[[], object],
+        on_success: Callable,
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        """Run blocking I/O on a FileOperationWorker with standard wiring.
+
+        各ファイル操作(結合/削除など)で同一だったワーカー生成〜起動処理の共通化。
+        on_success/on_error 側が undo 登録と _end_async_operation() を行う。
+        """
+        worker = FileOperationWorker(do_io, parent=self)
+        worker.finished.connect(on_success)
+        worker.error.connect(on_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        self._active_worker = worker
+        worker.start()
+
     def _debug_undo_state(self, reason: str) -> None:
         log_undo_state(
             logger=logger,
@@ -1222,13 +1241,7 @@ class MainWindow(QMainWindow):
             else:
                 self._handle_file_operation_error(exc, merge_dest_path, "マージ")
 
-        worker = FileOperationWorker(_do_io, parent=self)
-        worker.finished.connect(_on_success)
-        worker.error.connect(_on_error)
-        worker.finished.connect(worker.deleteLater)
-        worker.error.connect(worker.deleteLater)
-        self._active_worker = worker
-        worker.start()
+        self._run_file_operation(_do_io, _on_success, _on_error)
 
     def _on_folder_added(self, path: str) -> None:
         """Handle subfolder created on disk."""
@@ -1578,13 +1591,7 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, title, f"削除に失敗しました: {exc}")
 
-        worker = FileOperationWorker(_do_io, parent=self)
-        worker.finished.connect(_on_success)
-        worker.error.connect(_on_error)
-        worker.finished.connect(worker.deleteLater)
-        worker.error.connect(worker.deleteLater)
-        self._active_worker = worker
-        worker.start()
+        self._run_file_operation(_do_io, _on_success, _on_error)
 
     def _on_merge_selected(self) -> None:
         """選択したファイル・フォルダを1つのPDFに結合する。
@@ -1765,13 +1772,7 @@ class MainWindow(QMainWindow):
             self._end_async_operation()
             QMessageBox.warning(self, "結合", f"結合に失敗しました: {exc}")
 
-        worker = FileOperationWorker(_do_io, parent=self)
-        worker.finished.connect(_on_success)
-        worker.error.connect(_on_error)
-        worker.finished.connect(worker.deleteLater)
-        worker.error.connect(worker.deleteLater)
-        self._active_worker = worker
-        worker.start()
+        self._run_file_operation(_do_io, _on_success, _on_error)
 
     def _on_new_file(self) -> None:
         """Create a new blank 1-page PDF in the current folder."""
@@ -2258,13 +2259,7 @@ class MainWindow(QMainWindow):
                     build_trash_failure_message(paths[0], exc),
                 )
 
-        worker = FileOperationWorker(_do_io, parent=self)
-        worker.finished.connect(_on_success)
-        worker.error.connect(_on_error)
-        worker.finished.connect(worker.deleteLater)
-        worker.error.connect(worker.deleteLater)
-        self._active_worker = worker
-        worker.start()
+        self._run_file_operation(_do_io, _on_success, _on_error)
 
     def _on_rename(self) -> None:
         """Handle rename action."""
@@ -2820,54 +2815,46 @@ class MainWindow(QMainWindow):
         path (relative to ``dst_dir``) to write to, preserving any folder
         structure for folder exports.
         """
-        ok = 0
-        failed: list[tuple[str, str]] = []
         # Aggregate before/after sizes for files that were actually
         # compressed or rasterized (size changes); plain copies are excluded.
         total_before = 0
         total_after = 0
         compressed_count = 0
 
-        for src, rel in jobs:
-            try:
-                if not os.path.exists(src):
-                    failed.append((src, "元ファイルが見つかりません"))
-                    continue
-
-                parent = Path(dst_dir) / os.path.dirname(rel)
-                parent.mkdir(parents=True, exist_ok=True)
-                dst_path = ensure_unique_path(
-                    parent, os.path.basename(rel), pattern="{stem}({i}){ext}"
+        def _export_one(src: str, parent: Path, rel: str) -> int:
+            nonlocal total_before, total_after, compressed_count
+            dst_path = ensure_unique_path(
+                parent, os.path.basename(rel), pattern="{stem}({i}){ext}"
+            )
+            transformed = rasterize or optimize_level > 0
+            if rasterize:
+                rasterize_pdf(
+                    src, str(dst_path),
+                    dpi=image_dpi,
+                    image_format=rasterize_format,
+                    jpeg_quality=image_quality,
                 )
-                transformed = rasterize or optimize_level > 0
-                if rasterize:
-                    rasterize_pdf(
-                        src, str(dst_path),
-                        dpi=image_dpi,
-                        image_format=rasterize_format,
-                        jpeg_quality=image_quality,
-                    )
-                elif optimize_level > 0:
-                    export_pdf_compressed(
-                        src, str(dst_path),
-                        optimize_level=optimize_level,
-                        image_dpi=image_dpi,
-                        image_quality=image_quality,
-                    )
-                else:
-                    shutil.copy2(src, dst_path)
-                ok += 1
-                if transformed:
-                    # Best-effort size aggregation; failures here must not
-                    # turn a successful export into a reported failure.
-                    try:
-                        total_before += os.path.getsize(src)
-                        total_after += os.path.getsize(str(dst_path))
-                        compressed_count += 1
-                    except OSError:
-                        pass
-            except Exception as e:
-                failed.append((src, str(e)))
+            elif optimize_level > 0:
+                export_pdf_compressed(
+                    src, str(dst_path),
+                    optimize_level=optimize_level,
+                    image_dpi=image_dpi,
+                    image_quality=image_quality,
+                )
+            else:
+                shutil.copy2(src, dst_path)
+            if transformed:
+                # Best-effort size aggregation; failures here must not
+                # turn a successful export into a reported failure.
+                try:
+                    total_before += os.path.getsize(src)
+                    total_after += os.path.getsize(str(dst_path))
+                    compressed_count += 1
+                except OSError:
+                    pass
+            return 1
+
+        ok, failed = self._run_export_jobs(jobs, dst_dir, _export_one)
 
         self._show_export_result(
             ok, failed,
@@ -2891,9 +2878,29 @@ class MainWindow(QMainWindow):
         written into the directory mirroring ``rel_dst``'s parent so folder
         structure is preserved for folder exports.
         """
+        def _export_one(src: str, parent: Path, rel: str) -> int:
+            created = export_pages_as_images(
+                src, str(parent), fmt=fmt, dpi=dpi, quality=quality,
+            )
+            return len(created)
+
+        ok, failed = self._run_export_jobs(jobs, dst_dir, _export_one)
+
+        label = "ページ" if fmt != "pdf" else "件"
+        self._show_export_result(ok, failed, label=label)
+
+    def _run_export_jobs(
+        self,
+        jobs: list[tuple[str, str]],
+        dst_dir: str,
+        process: Callable[[str, Path, str], int],
+    ) -> tuple[int, list[tuple[str, str]]]:
+        """エクスポートジョブ共通ループ(存在チェック/出力先mkdir/失敗収集)。
+
+        process(src, parent_dir, rel) は成功件数の加算分を返す。
+        """
         ok = 0
         failed: list[tuple[str, str]] = []
-
         for src, rel in jobs:
             try:
                 if not os.path.exists(src):
@@ -2901,15 +2908,10 @@ class MainWindow(QMainWindow):
                     continue
                 parent = Path(dst_dir) / os.path.dirname(rel)
                 parent.mkdir(parents=True, exist_ok=True)
-                created = export_pages_as_images(
-                    src, str(parent), fmt=fmt, dpi=dpi, quality=quality,
-                )
-                ok += len(created)
+                ok += process(src, parent, rel)
             except Exception as e:
                 failed.append((src, str(e)))
-
-        label = "ページ" if fmt != "pdf" else "件"
-        self._show_export_result(ok, failed, label=label)
+        return ok, failed
 
     def _show_export_result(
         self,
@@ -3082,75 +3084,15 @@ class MainWindow(QMainWindow):
     def dragMoveEvent(self, event) -> None:
         """Handle drag move event - show drop indicator."""
         if event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
-            # Set drop action based on Ctrl key
-            modifiers = QApplication.keyboardModifiers()
-            if modifiers & Qt.KeyboardModifier.ControlModifier:
-                event.setDropAction(Qt.DropAction.CopyAction)
-            else:
-                event.setDropAction(Qt.DropAction.MoveAction)
-
-            event.acceptProposedAction()
-            drop_pos = self._container.mapFrom(self, event.position().toPoint())
-            target_card = self._get_card_at_pos(drop_pos)
-
-            # Check for merge mode on card center
-            if target_card:
-                # Locked cards cannot be merge targets
-                if target_card.is_locked:
-                    self._show_drop_indicator(drop_pos)
-                    return
-
-                card_rect = target_card.geometry()
-                edge_margin = card_rect.width() * 0.15  # 70% center = 15% edges
-
-                # Check self-drop exclusion
-                source_paths = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8').split('|')
-                if target_card.pdf_path not in source_paths:
-                    if drop_pos.x() > card_rect.left() + edge_margin and drop_pos.x() < card_rect.right() - edge_margin:
-                        # On card center - merge mode
-                        self._hide_drop_indicator()
-                        self._clear_all_drop_targets(except_card=target_card)
-                        target_card.set_drop_target(True)
-                        self._drop_indicator_index = -2  # Special value for merge
-                        return
-
-            # Show insert indicator
-            self._show_drop_indicator(drop_pos)
+            # 複数カードドラッグ: ドラッグ中の全カードが結合先から除外される
+            self._drag_move_show_indicator(
+                event, PDFCARD_MIME_TYPE, lambda data: data.split('|')
+            )
         elif event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
-            modifiers = QApplication.keyboardModifiers()
-            if modifiers & Qt.KeyboardModifier.ControlModifier:
-                event.setDropAction(Qt.DropAction.CopyAction)
-            else:
-                event.setDropAction(Qt.DropAction.MoveAction)
-
-            event.acceptProposedAction()
-            drop_pos = self._container.mapFrom(self, event.position().toPoint())
-            target_card = self._get_card_at_pos(drop_pos)
-
-            data = event.mimeData().data(PAGETHUMBNAIL_MIME_TYPE).data().decode('utf-8')
-            source_path = data.split('|')[0]
-
-            # Check for merge mode on card center
-            if target_card:
-                # Locked cards cannot be merge targets
-                if target_card.is_locked:
-                    self._show_drop_indicator(drop_pos)
-                    return
-
-                card_rect = target_card.geometry()
-                edge_margin = card_rect.width() * 0.15  # 70% center = 15% edges
-
-                if target_card.pdf_path != source_path:
-                    if drop_pos.x() > card_rect.left() + edge_margin and drop_pos.x() < card_rect.right() - edge_margin:
-                        # On card center - merge mode
-                        self._hide_drop_indicator()
-                        self._clear_all_drop_targets(except_card=target_card)
-                        target_card.set_drop_target(True)
-                        self._drop_indicator_index = -2
-                        return
-
-            # Show insert indicator
-            self._show_drop_indicator(drop_pos)
+            # ページサムネイルドラッグ: 抽出元PDFのみ結合先から除外される
+            self._drag_move_show_indicator(
+                event, PAGETHUMBNAIL_MIME_TYPE, lambda data: [data.split('|')[0]]
+            )
         elif event.mimeData().hasFormat(FOLDERCARD_MIME_TYPE):
             modifiers = QApplication.keyboardModifiers()
             if modifiers & Qt.KeyboardModifier.ControlModifier:
@@ -3164,6 +3106,52 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
             self._hide_drop_indicator()
             self._clear_all_drop_targets()
+
+    def _drag_move_show_indicator(
+        self,
+        event,
+        mime_type: str,
+        decode_excluded: Callable[[str], list[str]],
+    ) -> None:
+        """カード系ドラッグ中の表示更新(カード中央=結合モード/それ以外=挿入位置)。
+
+        decode_excluded は MIME ペイロード文字列から「結合先にできないパス」の
+        一覧を返す(自己ドロップ除外)。
+        """
+        # Set drop action based on Ctrl key
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            event.setDropAction(Qt.DropAction.CopyAction)
+        else:
+            event.setDropAction(Qt.DropAction.MoveAction)
+
+        event.acceptProposedAction()
+        drop_pos = self._container.mapFrom(self, event.position().toPoint())
+        target_card = self._get_card_at_pos(drop_pos)
+
+        # Check for merge mode on card center
+        if target_card:
+            # Locked cards cannot be merge targets
+            if target_card.is_locked:
+                self._show_drop_indicator(drop_pos)
+                return
+
+            card_rect = target_card.geometry()
+            edge_margin = card_rect.width() * 0.15  # 70% center = 15% edges
+
+            # Check self-drop exclusion
+            data = event.mimeData().data(mime_type).data().decode('utf-8')
+            if target_card.pdf_path not in decode_excluded(data):
+                if drop_pos.x() > card_rect.left() + edge_margin and drop_pos.x() < card_rect.right() - edge_margin:
+                    # On card center - merge mode
+                    self._hide_drop_indicator()
+                    self._clear_all_drop_targets(except_card=target_card)
+                    target_card.set_drop_target(True)
+                    self._drop_indicator_index = -2  # Special value for merge
+                    return
+
+        # Show insert indicator
+        self._show_drop_indicator(drop_pos)
 
     def _clear_all_drop_targets(self, except_card=None) -> None:
         """Turn off merge-highlight on every card (optionally skipping one)."""
