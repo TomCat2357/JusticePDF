@@ -17,8 +17,8 @@ from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QPoint, QRect
 from PyQt6.QtGui import QKeySequence
 from send2trash import send2trash
 
-from src.views.pdf_card import PDFCard, PDFCARD_MIME_TYPE
-from src.views.folder_card import FolderCard, FOLDERCARD_MIME_TYPE
+from src.views.pdf_card import PDFCard
+from src.views.folder_card import FolderCard
 from src.views.view_helpers import (
     clear_selection,
     log_undo_state,
@@ -44,6 +44,9 @@ from src.utils.constants import (
     IMAGE_EXTS as _IMAGE_EXTS,
     IMPORT_EXTS as _IMPORT_EXTS,
     ZIP_EXTS as _ZIP_EXTS,
+    PDFCARD_MIME_TYPE,
+    FOLDERCARD_MIME_TYPE,
+    PAGETHUMBNAIL_MIME_TYPE,
 )
 from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
@@ -3055,7 +3058,6 @@ class MainWindow(QMainWindow):
 
     def dragEnterEvent(self, event) -> None:
         """Handle drag enter event."""
-        from src.views.page_edit_window import PAGETHUMBNAIL_MIME_TYPE
 
         md = event.mimeData()
         if md.hasFormat(PDFCARD_MIME_TYPE):
@@ -3079,7 +3081,6 @@ class MainWindow(QMainWindow):
 
     def dragMoveEvent(self, event) -> None:
         """Handle drag move event - show drop indicator."""
-        from src.views.page_edit_window import PAGETHUMBNAIL_MIME_TYPE
         if event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
             # Set drop action based on Ctrl key
             modifiers = QApplication.keyboardModifiers()
@@ -3218,7 +3219,6 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, event) -> None:
         """Handle drop event."""
-        from src.views.page_edit_window import PAGETHUMBNAIL_MIME_TYPE
 
         logger.debug(f"MainWindow.dropEvent called, mimeData formats: {event.mimeData().formats()}")
         

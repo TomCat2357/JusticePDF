@@ -23,7 +23,6 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -35,6 +34,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from src.views.view_helpers import build_accept_cancel_box
 
 from src.utils.pdf_utils import (
     PrintSettings,
@@ -102,11 +103,7 @@ class PrintDialog(QDialog):
         cols.addLayout(self._build_preview(), 1)
 
         # Bottom buttons
-        btn_box = QDialogButtonBox()
-        self._ok_btn = btn_box.addButton("印刷", QDialogButtonBox.ButtonRole.AcceptRole)
-        btn_box.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
-        btn_box.accepted.connect(self.accept)
-        btn_box.rejected.connect(self.reject)
+        btn_box, self._ok_btn = build_accept_cancel_box(self, "印刷")
         outer.addWidget(btn_box)
 
         self._load_settings()

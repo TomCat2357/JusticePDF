@@ -7,11 +7,11 @@ from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QUrl, QTimer, QFileSystemWat
 from PyQt6.QtGui import QDrag, QPixmap
 
 from src.views.view_helpers import apply_drag_pixmap
-
-from src.views.pdf_card import PDFCARD_MIME_TYPE
-
-FOLDERCARD_MIME_TYPE = "application/x-pdfas-folder"
-PAGETHUMBNAIL_MIME_TYPE = "application/x-pdfas-page"
+from src.utils.constants import (
+    PDFCARD_MIME_TYPE,
+    FOLDERCARD_MIME_TYPE,
+    PAGETHUMBNAIL_MIME_TYPE,
+)
 
 
 class FolderCard(QFrame):
