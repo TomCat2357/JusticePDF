@@ -50,6 +50,8 @@ from src.utils.pdf_utils import (
 from src.utils.constants import (
     FREETEXT_LINE_HEIGHT,
     FREETEXT_TEXT_INSET_PT,
+    PAGETHUMBNAIL_MIME_TYPE,
+    PDFCARD_MIME_TYPE,
     freetext_canvas_font_families,
 )
 
@@ -130,9 +132,6 @@ from src.views.view_helpers import (
     viewport_width_or_fallback,
 )
 from src.utils.trash_utils import build_trash_failure_message
-
-PAGETHUMBNAIL_MIME_TYPE = "application/x-pdfas-page"
-PDFCARD_MIME_TYPE = "application/x-pdfas-card"
 
 logger = logging.getLogger(__name__)
 

@@ -6,8 +6,7 @@ from PyQt6.QtGui import QDrag, QPixmap
 
 from src.views.view_helpers import apply_drag_pixmap
 from src.utils.pdf_utils import get_pdf_card_info
-
-PDFCARD_MIME_TYPE = "application/x-pdfas-card"
+from src.utils.constants import PDFCARD_MIME_TYPE, FOLDERCARD_MIME_TYPE
 
 
 class PDFCard(QFrame):
@@ -253,7 +252,6 @@ class PDFCard(QFrame):
         data = '|'.join(selected_paths).encode('utf-8')
         mime_data.setData(PDFCARD_MIME_TYPE, data)
         if selected_folder_paths:
-            from src.views.folder_card import FOLDERCARD_MIME_TYPE
             mime_data.setData(FOLDERCARD_MIME_TYPE, '|'.join(selected_folder_paths).encode('utf-8'))
         urls = [QUrl.fromLocalFile(p) for p in selected_paths + selected_folder_paths if os.path.exists(p)]
         if urls:
