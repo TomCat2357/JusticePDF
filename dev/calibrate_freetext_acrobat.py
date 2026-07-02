@@ -4,6 +4,14 @@ JusticePDF のテキストボックスは PDF の FreeText アノテーション
 JusticePDF 自身の編集画面(Qt 手描き)と Acrobat の再レイアウト表示で、フォント・
 内側余白・行間が食い違い、折り返し位置や位置がずれる。
 
+外観モデル(なぜフォント埋め込みでは解決しないか):
+  FreeText の見た目は「/AP(外観ストリーム)= 開いた直後の表示」と
+  「/DA・/RC//DS = ビューアが編集時に外観を再生成する際の指示」の 2 層で決まる。
+  Acrobat は注釈に触れた瞬間に /DA・/RC からローカルフォントで /AP を作り直すため、
+  フォントを埋め込んでも編集された時点で破棄され、完全一致は原理的に不可能。
+  そこで本プロジェクトは非埋め込み base-14 + CJK フォールバックを両者で共有し、
+  constants.py の共有定数を本ハーネスで校正して「実用上ほぼ同じ」に近づける。
+
 このスクリプトは:
   1. サンプル文字列入りのテキストボックスを実際の FreeText として書き込んだ PDF を生成
      -> Acrobat で開いて「折り返し位置・上端からの位置・行間」を確認する。
@@ -49,7 +57,11 @@ from src.utils.constants import (
     freetext_canvas_font_families,
 )
 from src.utils.pdf_utils import FreeTextAnnotData, create_freetext_annot
-from src.views.page_edit_window import _build_freetext_document, _pixel_size_to_pointf
+from src.views.page_edit_window import (
+    _build_freetext_document,
+    _freetext_pixel_size,
+    _pixel_size_to_pointf,
+)
 
 OUT_DIR = Path(__file__).resolve().parent / "calibration_out"
 
@@ -95,7 +107,7 @@ def render_justicepdf_png(pdf_path: Path, png_path: Path) -> None:
         x0, y0, x1, y1 = (v * SCALE for v in rect)
         paint_rect = QRectF(x0, y0, x1 - x0, y1 - y0)
         font = painter.font()
-        pixel_size = max(10, round(fontsize * SCALE))
+        pixel_size = _freetext_pixel_size(fontsize, SCALE)
         font.setPointSizeF(_pixel_size_to_pointf(pixel_size))
         font.setFamilies(list(freetext_canvas_font_families("Helv")))
         inset = FREETEXT_TEXT_INSET_PT * SCALE  # 枠線なし前提
