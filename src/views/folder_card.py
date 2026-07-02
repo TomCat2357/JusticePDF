@@ -3,7 +3,7 @@ import os
 from PyQt6.QtWidgets import (
     QFrame, QVBoxLayout, QLabel, QApplication, QWidget, QStyle,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QUrl, QTimer, QFileSystemWatcher
+from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QUrl, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import QDrag, QPixmap
 
 from src.views.view_helpers import apply_drag_pixmap

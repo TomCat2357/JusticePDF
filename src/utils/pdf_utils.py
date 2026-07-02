@@ -1995,11 +1995,6 @@ def _render_page_pixmap(
         return QPixmap()
 
 
-def get_thumbnail(pdf_path: str, size: int = 128) -> QPixmap:
-    """Generate a thumbnail of the first page of a PDF."""
-    return _render_page_pixmap(pdf_path, 0, size=size)
-
-
 def get_page_count(pdf_path: str) -> int:
     """Get the number of pages in a PDF."""
     try:
