@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QMimeData, QSize, pyqtSignal, QPoint, QPointF, QRect, QRectF, QUrl,
-    QTimer, QEvent, QSignalBlocker
+    QTimer, QEvent, QSettings, QSignalBlocker
 )
 from PyQt6.QtGui import (
     QKeySequence, QDrag, QPainter, QColor, QPen, QDesktopServices, QPixmap,
@@ -85,6 +85,11 @@ def _build_freetext_document(text: str, font: "QFont", text_width: float) -> "QT
     document.setTextWidth(max(0.0, text_width))
     _apply_block_line_height(document)
     return document
+
+
+def _freetext_pixel_size(fontsize: float, zoom: float) -> int:
+    """FreeText の画面描画ピクセルサイズ。保存 PDF と比例させるため下限は 1px のみ。"""
+    return max(1, round(fontsize * zoom))
 
 
 def _pixel_size_to_pointf(pixel_size: int) -> float:
@@ -621,7 +626,7 @@ class ZoomPageWidget(QWidget):
         editor.commit_requested.connect(lambda text, annot=annotation: self._commit_inline_editor(annot, text))
         editor.cancel_requested.connect(self.cancel_annotation_text_edit)
         editor.delete_requested.connect(self.annotation_delete_requested)
-        pixel_size = max(10, round(annotation.fontsize * self._zoom_factor))
+        pixel_size = _freetext_pixel_size(annotation.fontsize, self._zoom_factor)
         editor.setStyleSheet(self._inline_editor_stylesheet(annotation, pixel_size))
         editor.setFrameStyle(QFrame.Shape.NoFrame)
         editor.setContentsMargins(0, 0, 0, 0)
@@ -1121,7 +1126,7 @@ class ZoomPageWidget(QWidget):
 
         if annot.content:
             font = painter.font()
-            pixel_size = max(10, round(annot.fontsize * self._zoom_factor))
+            pixel_size = _freetext_pixel_size(annot.fontsize, self._zoom_factor)
             font.setPointSizeF(_pixel_size_to_pointf(pixel_size))
             # フォントファミリ・内側余白・行間を保存時(Acrobat 表示)と共有して
             # 折り返し位置と位置をそろえる。本文は QPlainTextEdit と同じ
@@ -2928,6 +2933,11 @@ class PageEditWindow(QMainWindow):
 
         self._zoom_annotation_fontsize_spin = QSpinBox()
         self._zoom_annotation_fontsize_spin.setRange(6, 400)
+        # 前回テキストボックス作成時のサイズを引き継ぐ(未保存なら 14pt)。
+        # valueChanged 接続前に設定してフォーム変更ハンドラの誤発火を防ぐ。
+        self._zoom_annotation_fontsize_spin.setValue(
+            int(QSettings().value("freetext/fontsize", 14, type=int))
+        )
         self._zoom_annotation_fontsize_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
         self._zoom_annotation_fontsize_label = QLabel("文字サイズ")
         form.addRow(self._zoom_annotation_fontsize_label, self._zoom_annotation_fontsize_spin)
@@ -3929,6 +3939,9 @@ class PageEditWindow(QMainWindow):
 
         def do_create() -> None:
             nonlocal ref
+            # コールアウトは既定 14pt 固定(create_callout 側の既定値)。箱サイズ・
+            # gap が 14pt 前提のため、テキストボックスの freetext/fontsize 記憶とは
+            # 意図的に独立させている。
             text_saved = create_callout(
                 self._pdf_path,
                 self._zoom_page_num,
@@ -4828,6 +4841,8 @@ class PageEditWindow(QMainWindow):
             if self._zoom_annotation_fontsize_spin and self._zoom_annotation_fontsize_spin.value() > 0
             else 14.0
         )
+        # 作成に使ったサイズを記憶し、次回以降の新規テキストボックスの既定値にする。
+        QSettings().setValue("freetext/fontsize", int(round(fontsize)))
         border_width = (
             float(self._zoom_annotation_border_width_spin.value())
             if self._zoom_annotation_border_width_spin and self._zoom_annotation_border_width_spin.value() > 0

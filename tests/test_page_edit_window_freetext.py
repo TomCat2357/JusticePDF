@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import fitz
 import pytest
-from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtCore import QPoint, QSettings, Qt
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication
 
@@ -782,3 +782,47 @@ def test_zoom_single_click_selects_word(qtbot, tmp_path):
     qtbot.mouseRelease(label, Qt.MouseButton.LeftButton, pos=pos)
 
     assert label._selected_text() == "world"
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_fontsize_spin_defaults_to_14(qtbot, tmp_path):
+    # 未保存の QSettings(conftest で分離済み)では既定 14pt(吹き出しと共通)で始まる。
+    pdf_path = tmp_path / "fontsize-default.pdf"
+    make_pdf(pdf_path)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    assert window._zoom_annotation_fontsize_spin.value() == 14
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_created_freetext_uses_and_persists_spin_fontsize(qtbot, tmp_path):
+    pdf_path = tmp_path / "fontsize-persist.pdf"
+    make_pdf(pdf_path)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    qtbot.mouseClick(window._zoom_object_btn, Qt.MouseButton.LeftButton)
+    window._zoom_annotation_fontsize_spin.setValue(18)
+    qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
+    _drag_on_zoom_label(qtbot, window, (60, 80), (160, 150))
+    qtbot.waitUntil(lambda: len(list_freetext_annots(str(pdf_path), 0)) == 1)
+
+    assert list_freetext_annots(str(pdf_path), 0)[0].fontsize == 18.0
+    assert int(QSettings().value("freetext/fontsize", 0, type=int)) == 18
+
+    # 同一テスト内(同一 QSettings)で開いた新しいウィンドウは前回値を引き継ぐ。
+    other_pdf = tmp_path / "fontsize-persist-2.pdf"
+    make_pdf(other_pdf)
+    second = create_page_edit_window(qtbot, other_pdf)
+    open_zoom(second, qtbot)
+    assert second._zoom_annotation_fontsize_spin.value() == 18
+
+
+def test_freetext_pixel_size_has_no_floor():
+    # 画面描画サイズは保存 PDF と比例する(旧 10px 下限を持たない)。
+    assert page_edit_window_module._freetext_pixel_size(11, 0.5) == 6
+    assert page_edit_window_module._freetext_pixel_size(11, 1.0) == 11
+    assert page_edit_window_module._freetext_pixel_size(0.5, 0.5) == 1
