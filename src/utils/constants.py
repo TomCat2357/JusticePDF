@@ -31,8 +31,11 @@ PAGETHUMBNAIL_MIME_TYPE = "application/x-pdfas-page"
 #   (1) JusticePDF の編集画面 (Qt で手描き)
 #   (2) 保存 PDF を Acrobat が /RC リッチテキストから再レイアウトした表示
 # の 2 つで「フォント・内側余白・行間」が食い違い、折り返し位置や位置がずれる。
+# Acrobat は注釈を編集した瞬間に /DA・/RC からローカルフォントで外観を再生成する
+# ため、フォントを埋め込んでも破棄され、完全一致は原理的に不可能。そこで
 # 以下の定数を Qt 描画側 (page_edit_window) とリッチテキスト生成側 (pdf_utils)
-# の双方が参照することで、両者を一致させる。最終値は Acrobat 実機で校正する。
+# の双方が参照することで、両者を一致させる。最終値は Acrobat 実機で校正する
+# (dev/calibrate_freetext_acrobat.py 参照)。
 # (純 Python のみ。Qt/fitz には依存させない＝循環 import を避ける)
 
 # 箱の端〜テキストの内側余白(PDF ポイント)。四辺すべてに適用し、
