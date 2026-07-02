@@ -8,7 +8,6 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -18,6 +17,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from src.views.view_helpers import build_accept_cancel_box
 
 
 class ExportOptionsDialog(QDialog):
@@ -165,11 +166,7 @@ class ExportOptionsDialog(QDialog):
         self._raster_jpeg_radio.toggled.connect(self._update_controls)
 
         # Buttons
-        btn_box = QDialogButtonBox()
-        self._ok_btn = btn_box.addButton("エクスポート", QDialogButtonBox.ButtonRole.AcceptRole)
-        btn_box.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
-        btn_box.accepted.connect(self.accept)
-        btn_box.rejected.connect(self.reject)
+        btn_box, self._ok_btn = build_accept_cancel_box(self, "エクスポート")
         layout.addWidget(btn_box)
 
         # Wire format change

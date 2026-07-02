@@ -21,7 +21,6 @@ class UndoManager:
     def __init__(self, max_size: int = 100):
         self._undo_stack: deque[UndoAction] = deque(maxlen=max_size)
         self._redo_stack: list[UndoAction] = []
-        self._max_size = max_size
         self._listeners: list[Callable[[str], None]] = []
 
     def add_listener(self, callback: Callable[[str], None]) -> None:
@@ -81,13 +80,3 @@ class UndoManager:
 
     def redo_count(self) -> int:
         return len(self._redo_stack)
-
-    def get_undo_description(self) -> str | None:
-        if self._undo_stack:
-            return self._undo_stack[-1].description
-        return None
-
-    def get_redo_description(self) -> str | None:
-        if self._redo_stack:
-            return self._redo_stack[-1].description
-        return None
