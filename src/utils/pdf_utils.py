@@ -11,6 +11,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any, Callable
 
 import fitz
 from PyQt6.QtCore import Qt, QRect
@@ -496,17 +497,24 @@ def _extract_text_from_rc(rc_value: str) -> str:
     return html.unescape(text).strip()
 
 
-def _decode_subject_metadata(subject: str) -> dict[str, object] | None:
-    if not subject or not subject.startswith(JUSTICEPDF_FREETEXT_SUBJECT_PREFIX):
+def _decode_prefixed_json(prefix: str, subject: str) -> dict | None:
+    """Subject 文字列から prefix 付き JSON メタデータを取り出す(全アノテーション種共通)。"""
+    if not subject or not subject.startswith(prefix):
         return None
-    raw = subject[len(JUSTICEPDF_FREETEXT_SUBJECT_PREFIX):]
     try:
-        data = json.loads(raw)
+        data = json.loads(subject[len(prefix):])
     except json.JSONDecodeError:
         return None
-    if isinstance(data, dict):
-        return data
-    return None
+    return data if isinstance(data, dict) else None
+
+
+def _encode_prefixed_json(prefix: str, payload: dict) -> str:
+    """prefix 付き JSON メタデータ文字列を組み立てる(全アノテーション種共通)。"""
+    return prefix + json.dumps(payload, separators=(",", ":"))
+
+
+def _decode_subject_metadata(subject: str) -> dict[str, object] | None:
+    return _decode_prefixed_json(JUSTICEPDF_FREETEXT_SUBJECT_PREFIX, subject)
 
 
 def _encode_subject_metadata(data: FreeTextAnnotData, *, page_rotation: int = 0) -> str:
@@ -526,7 +534,7 @@ def _encode_subject_metadata(data: FreeTextAnnotData, *, page_rotation: int = 0)
         # 本文ボックス枠とコールアウト点列を明示保存して復元時に使う。
         payload["callout_line"] = [[float(x), float(y)] for x, y in data.callout_line]
         payload["text_rect"] = [float(v) for v in data.rect]
-    return JUSTICEPDF_FREETEXT_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
+    return _encode_prefixed_json(JUSTICEPDF_FREETEXT_SUBJECT_PREFIX, payload)
 
 
 def _build_richtext_style(data: FreeTextAnnotData) -> str:
@@ -1009,20 +1017,11 @@ def _encode_shape_metadata(data: ShapeAnnotData, *, page_rotation: int = 0) -> s
         payload["bracket_orientation"] = data.bracket_orientation
     if data.shape_type == ShapeType.TRIANGLE:
         payload["triangle_apex"] = [float(data.triangle_apex[0]), float(data.triangle_apex[1])]
-    return JUSTICEPDF_SHAPE_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
+    return _encode_prefixed_json(JUSTICEPDF_SHAPE_SUBJECT_PREFIX, payload)
 
 
 def _decode_shape_metadata(subject: str) -> dict | None:
-    if not subject or not subject.startswith(JUSTICEPDF_SHAPE_SUBJECT_PREFIX):
-        return None
-    raw = subject[len(JUSTICEPDF_SHAPE_SUBJECT_PREFIX):]
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(data, dict):
-        return data
-    return None
+    return _decode_prefixed_json(JUSTICEPDF_SHAPE_SUBJECT_PREFIX, subject)
 
 
 def _line_ending_code(arrow: bool) -> int:
@@ -1211,8 +1210,24 @@ def _page_numbers_for(doc: fitz.Document, page_num: int | None) -> range | list[
     return None
 
 
-def list_shape_annots(pdf_path: str, page_num: int | None = None) -> list[ShapeAnnotData]:
-    results: list[ShapeAnnotData] = []
+# --- 汎用アノテーション CRUD --------------------------------------------
+# shape / markup / note / freetext の list/create/delete/replace は
+# 「型フィルタ・ページへの追加関数・抽出関数」だけが異なる同一骨格のため、
+# 種別ごとの定義(_AnnotFamily)を渡して共通実装で処理する。
+
+
+@dataclass(frozen=True)
+class _AnnotFamily:
+    """アノテーション1種別分の CRUD 構成要素。"""
+
+    label: str  # ログ/エラーメッセージ用の種別名
+    types: list[int]  # 対象とする PDF アノテーション型コード
+    add_fn: Callable[[fitz.Page, Any], fitz.Annot]
+    extract_fn: Callable[[fitz.Document, int, fitz.Annot], Any]
+
+
+def _list_annots(family: _AnnotFamily, pdf_path: str, page_num: int | None) -> list:
+    results: list = []
     try:
         with fitz.open(pdf_path) as doc:
             page_numbers = _page_numbers_for(doc, page_num)
@@ -1221,44 +1236,42 @@ def list_shape_annots(pdf_path: str, page_num: int | None = None) -> list[ShapeA
 
             for pn in page_numbers:
                 page = doc[pn]
-                annots = page.annots(types=_SHAPE_ANNOT_TYPES)
+                annots = page.annots(types=family.types)
                 if annots is None:
                     continue
                 for annot in annots:
-                    shape_data = _extract_shape_data(doc, pn, annot)
-                    if shape_data is not None:
-                        results.append(shape_data)
+                    data = family.extract_fn(doc, pn, annot)
+                    if data is not None:
+                        results.append(data)
     except Exception:
-        logger.debug("list_shape_annots failed: %s", pdf_path, exc_info=True)
+        logger.debug("list_%s_annots failed: %s", family.label, pdf_path, exc_info=True)
     return results
 
 
-def create_shape_annot(pdf_path: str, data: ShapeAnnotData) -> ShapeAnnotData:
+def _create_annot(family: _AnnotFamily, pdf_path: str, data: Any) -> Any:
     doc = fitz.open(pdf_path)
     try:
         if data.page_num < 0 or data.page_num >= len(doc):
             raise IndexError(f"page out of range: {data.page_num}")
         page = doc[data.page_num]
-        annot = _add_shape_annot_to_page(page, data)
-        saved = _extract_shape_data(doc, data.page_num, annot)
+        annot = family.add_fn(page, data)
+        saved = family.extract_fn(doc, data.page_num, annot)
         _save_document_in_place(doc, pdf_path)
         if saved is None:
-            raise RuntimeError("Failed to extract saved shape annotation")
+            raise RuntimeError(f"Failed to extract saved {family.label} annotation")
         return saved
     finally:
         doc.close()
 
 
-def delete_shape_annot(pdf_path: str, page_num: int, xref: int) -> bool:
+def _delete_annot(family: _AnnotFamily, pdf_path: str, page_num: int, xref: int) -> bool:
     doc = fitz.open(pdf_path)
     try:
         if page_num < 0 or page_num >= len(doc):
             return False
         page = doc[page_num]
         annot = page.load_annot(xref)
-        if annot is None:
-            return False
-        if annot.type[0] not in _SHAPE_ANNOT_TYPES:
+        if annot is None or annot.type[0] not in family.types:
             return False
         page.delete_annot(annot)
         _save_document_in_place(doc, pdf_path)
@@ -1267,12 +1280,7 @@ def delete_shape_annot(pdf_path: str, page_num: int, xref: int) -> bool:
         doc.close()
 
 
-def replace_shape_annot(
-    pdf_path: str,
-    page_num: int,
-    xref: int,
-    data: ShapeAnnotData,
-) -> ShapeAnnotData:
+def _replace_annot(family: _AnnotFamily, pdf_path: str, page_num: int, xref: int, data: Any) -> Any:
     doc = fitz.open(pdf_path)
     try:
         if page_num < 0 or page_num >= len(doc):
@@ -1281,14 +1289,43 @@ def replace_shape_annot(
         annot = page.load_annot(xref)
         if annot is not None:
             page.delete_annot(annot)
-        replacement = _add_shape_annot_to_page(page, data)
-        saved = _extract_shape_data(doc, page_num, replacement)
+        replacement = family.add_fn(page, data)
+        saved = family.extract_fn(doc, page_num, replacement)
         _save_document_in_place(doc, pdf_path)
         if saved is None:
-            raise RuntimeError("Failed to extract saved shape annotation")
+            raise RuntimeError(f"Failed to extract saved {family.label} annotation")
         return saved
     finally:
         doc.close()
+
+
+_SHAPE_FAMILY = _AnnotFamily(
+    label="shape",
+    types=_SHAPE_ANNOT_TYPES,
+    add_fn=_add_shape_annot_to_page,
+    extract_fn=_extract_shape_data,
+)
+
+
+def list_shape_annots(pdf_path: str, page_num: int | None = None) -> list[ShapeAnnotData]:
+    return _list_annots(_SHAPE_FAMILY, pdf_path, page_num)
+
+
+def create_shape_annot(pdf_path: str, data: ShapeAnnotData) -> ShapeAnnotData:
+    return _create_annot(_SHAPE_FAMILY, pdf_path, data)
+
+
+def delete_shape_annot(pdf_path: str, page_num: int, xref: int) -> bool:
+    return _delete_annot(_SHAPE_FAMILY, pdf_path, page_num, xref)
+
+
+def replace_shape_annot(
+    pdf_path: str,
+    page_num: int,
+    xref: int,
+    data: ShapeAnnotData,
+) -> ShapeAnnotData:
+    return _replace_annot(_SHAPE_FAMILY, pdf_path, page_num, xref, data)
 
 
 def create_bracket_pair(
@@ -1399,19 +1436,7 @@ def create_callout(
         callout_line=callout_line, callout_target=(tx, ty),
     )
 
-    doc = fitz.open(pdf_path)
-    try:
-        if page_num < 0 or page_num >= len(doc):
-            raise IndexError(f"page out of range: {page_num}")
-        page = doc[page_num]
-        text_annot = _add_freetext_annot_to_page(page, text_data)
-        text_saved = _extract_freetext_data(doc, page_num, text_annot)
-        _save_document_in_place(doc, pdf_path)
-        if text_saved is None:
-            raise RuntimeError("Failed to extract saved callout annotation")
-        return text_saved
-    finally:
-        doc.close()
+    return _create_annot(_FREETEXT_FAMILY, pdf_path, text_data)
 
 
 def list_annot_group(pdf_path: str, page_num: int, group_id: str) -> list[int]:
@@ -1469,18 +1494,11 @@ def _encode_markup_metadata(data: TextMarkupAnnotData, *, page_rotation: int = 0
         "quads": [[float(c) for c in quad] for quad in data.quads],
         "page_rotation": int(page_rotation),
     }
-    return JUSTICEPDF_MARKUP_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
+    return _encode_prefixed_json(JUSTICEPDF_MARKUP_SUBJECT_PREFIX, payload)
 
 
 def _decode_markup_metadata(subject: str) -> dict | None:
-    if not subject or not subject.startswith(JUSTICEPDF_MARKUP_SUBJECT_PREFIX):
-        return None
-    raw = subject[len(JUSTICEPDF_MARKUP_SUBJECT_PREFIX):]
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+    return _decode_prefixed_json(JUSTICEPDF_MARKUP_SUBJECT_PREFIX, subject)
 
 
 def _add_markup_annot_to_page(page: fitz.Page, data: TextMarkupAnnotData) -> fitz.Annot:
@@ -1566,61 +1584,25 @@ def _extract_markup_data(
     )
 
 
+_MARKUP_FAMILY = _AnnotFamily(
+    label="markup",
+    types=_MARKUP_ANNOT_TYPES,
+    add_fn=_add_markup_annot_to_page,
+    extract_fn=_extract_markup_data,
+)
+
+
 def list_markup_annots(pdf_path: str, page_num: int | None = None) -> list[TextMarkupAnnotData]:
     """Return JusticePDF text-markup annotations for one page or the whole document."""
-    results: list[TextMarkupAnnotData] = []
-    try:
-        with fitz.open(pdf_path) as doc:
-            page_numbers = _page_numbers_for(doc, page_num)
-            if page_numbers is None:
-                return []
-
-            for pn in page_numbers:
-                page = doc[pn]
-                annots = page.annots(types=_MARKUP_ANNOT_TYPES)
-                if annots is None:
-                    continue
-                for annot in annots:
-                    markup_data = _extract_markup_data(doc, pn, annot)
-                    if markup_data is not None:
-                        results.append(markup_data)
-    except Exception:
-        logger.debug("list_markup_annots failed: %s", pdf_path, exc_info=True)
-    return results
+    return _list_annots(_MARKUP_FAMILY, pdf_path, page_num)
 
 
 def create_markup_annot(pdf_path: str, data: TextMarkupAnnotData) -> TextMarkupAnnotData:
-    doc = fitz.open(pdf_path)
-    try:
-        if data.page_num < 0 or data.page_num >= len(doc):
-            raise IndexError(f"page out of range: {data.page_num}")
-        page = doc[data.page_num]
-        annot = _add_markup_annot_to_page(page, data)
-        saved = _extract_markup_data(doc, data.page_num, annot)
-        _save_document_in_place(doc, pdf_path)
-        if saved is None:
-            raise RuntimeError("Failed to extract saved markup annotation")
-        return saved
-    finally:
-        doc.close()
+    return _create_annot(_MARKUP_FAMILY, pdf_path, data)
 
 
 def delete_markup_annot(pdf_path: str, page_num: int, xref: int) -> bool:
-    doc = fitz.open(pdf_path)
-    try:
-        if page_num < 0 or page_num >= len(doc):
-            return False
-        page = doc[page_num]
-        annot = page.load_annot(xref)
-        if annot is None:
-            return False
-        if annot.type[0] not in _MARKUP_ANNOT_TYPES:
-            return False
-        page.delete_annot(annot)
-        _save_document_in_place(doc, pdf_path)
-        return True
-    finally:
-        doc.close()
+    return _delete_annot(_MARKUP_FAMILY, pdf_path, page_num, xref)
 
 
 def replace_markup_annot(
@@ -1630,22 +1612,7 @@ def replace_markup_annot(
     data: TextMarkupAnnotData,
 ) -> TextMarkupAnnotData:
     """Replace a markup annotation (used for color / opacity changes)."""
-    doc = fitz.open(pdf_path)
-    try:
-        if page_num < 0 or page_num >= len(doc):
-            raise IndexError(f"page out of range: {page_num}")
-        page = doc[page_num]
-        annot = page.load_annot(xref)
-        if annot is not None:
-            page.delete_annot(annot)
-        replacement = _add_markup_annot_to_page(page, data)
-        saved = _extract_markup_data(doc, page_num, replacement)
-        _save_document_in_place(doc, pdf_path)
-        if saved is None:
-            raise RuntimeError("Failed to extract saved markup annotation")
-        return saved
-    finally:
-        doc.close()
+    return _replace_annot(_MARKUP_FAMILY, pdf_path, page_num, xref, data)
 
 
 # --- Sticky note (comment) annotations -----------------------------------
@@ -1658,18 +1625,11 @@ def _encode_note_metadata(data: "NoteAnnotData", *, page_rotation: int = 0) -> s
         "point": [float(data.point[0]), float(data.point[1])],
         "page_rotation": int(page_rotation),
     }
-    return JUSTICEPDF_NOTE_SUBJECT_PREFIX + json.dumps(payload, separators=(",", ":"))
+    return _encode_prefixed_json(JUSTICEPDF_NOTE_SUBJECT_PREFIX, payload)
 
 
 def _decode_note_metadata(subject: str) -> dict | None:
-    if not subject or not subject.startswith(JUSTICEPDF_NOTE_SUBJECT_PREFIX):
-        return None
-    raw = subject[len(JUSTICEPDF_NOTE_SUBJECT_PREFIX):]
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+    return _decode_prefixed_json(JUSTICEPDF_NOTE_SUBJECT_PREFIX, subject)
 
 
 def _add_note_annot_to_page(page: fitz.Page, data: "NoteAnnotData") -> fitz.Annot:
@@ -1738,59 +1698,25 @@ def _extract_note_data(
     )
 
 
+_NOTE_FAMILY = _AnnotFamily(
+    label="note",
+    types=[fitz.PDF_ANNOT_TEXT],
+    add_fn=_add_note_annot_to_page,
+    extract_fn=_extract_note_data,
+)
+
+
 def list_note_annots(pdf_path: str, page_num: int | None = None) -> list["NoteAnnotData"]:
     """Return JusticePDF sticky-note annotations for one page or the whole document."""
-    results: list[NoteAnnotData] = []
-    try:
-        with fitz.open(pdf_path) as doc:
-            page_numbers = _page_numbers_for(doc, page_num)
-            if page_numbers is None:
-                return []
-
-            for pn in page_numbers:
-                page = doc[pn]
-                annots = page.annots(types=[fitz.PDF_ANNOT_TEXT])
-                if annots is None:
-                    continue
-                for annot in annots:
-                    note_data = _extract_note_data(doc, pn, annot)
-                    if note_data is not None:
-                        results.append(note_data)
-    except Exception:
-        logger.debug("list_note_annots failed: %s", pdf_path, exc_info=True)
-    return results
+    return _list_annots(_NOTE_FAMILY, pdf_path, page_num)
 
 
 def create_note_annot(pdf_path: str, data: "NoteAnnotData") -> "NoteAnnotData":
-    doc = fitz.open(pdf_path)
-    try:
-        if data.page_num < 0 or data.page_num >= len(doc):
-            raise IndexError(f"page out of range: {data.page_num}")
-        page = doc[data.page_num]
-        annot = _add_note_annot_to_page(page, data)
-        saved = _extract_note_data(doc, data.page_num, annot)
-        _save_document_in_place(doc, pdf_path)
-        if saved is None:
-            raise RuntimeError("Failed to extract saved note annotation")
-        return saved
-    finally:
-        doc.close()
+    return _create_annot(_NOTE_FAMILY, pdf_path, data)
 
 
 def delete_note_annot(pdf_path: str, page_num: int, xref: int) -> bool:
-    doc = fitz.open(pdf_path)
-    try:
-        if page_num < 0 or page_num >= len(doc):
-            return False
-        page = doc[page_num]
-        annot = page.load_annot(xref)
-        if annot is None or annot.type[0] != fitz.PDF_ANNOT_TEXT:
-            return False
-        page.delete_annot(annot)
-        _save_document_in_place(doc, pdf_path)
-        return True
-    finally:
-        doc.close()
+    return _delete_annot(_NOTE_FAMILY, pdf_path, page_num, xref)
 
 
 def replace_note_annot(
@@ -1800,22 +1726,7 @@ def replace_note_annot(
     data: "NoteAnnotData",
 ) -> "NoteAnnotData":
     """Replace a note annotation (content / color / position changes)."""
-    doc = fitz.open(pdf_path)
-    try:
-        if page_num < 0 or page_num >= len(doc):
-            raise IndexError(f"page out of range: {page_num}")
-        page = doc[page_num]
-        annot = page.load_annot(xref)
-        if annot is not None:
-            page.delete_annot(annot)
-        replacement = _add_note_annot_to_page(page, data)
-        saved = _extract_note_data(doc, page_num, replacement)
-        _save_document_in_place(doc, pdf_path)
-        if saved is None:
-            raise RuntimeError("Failed to extract saved note annotation")
-        return saved
-    finally:
-        doc.close()
+    return _replace_annot(_NOTE_FAMILY, pdf_path, page_num, xref, data)
 
 
 def _get_page_annot_xref_order(doc: fitz.Document, page_num: int) -> list[int]:
@@ -2227,57 +2138,27 @@ def get_page_links(pdf_path: str, page_num: int) -> list[dict]:
         return []
 
 
+_FREETEXT_FAMILY = _AnnotFamily(
+    label="freetext",
+    types=[fitz.PDF_ANNOT_FREE_TEXT],
+    add_fn=_add_freetext_annot_to_page,
+    extract_fn=_extract_freetext_data,
+)
+
+
 def list_freetext_annots(pdf_path: str, page_num: int | None = None) -> list[FreeTextAnnotData]:
     """Return normalized FreeText annotations for one page or the whole document."""
-    results: list[FreeTextAnnotData] = []
-    try:
-        with fitz.open(pdf_path) as doc:
-            page_numbers = _page_numbers_for(doc, page_num)
-            if page_numbers is None:
-                return []
-
-            for pn in page_numbers:
-                page = doc[pn]
-                annots = page.annots(types=[fitz.PDF_ANNOT_FREE_TEXT])
-                if annots is None:
-                    continue
-                for annot in annots:
-                    results.append(_extract_freetext_data(doc, pn, annot))
-    except Exception:
-        logger.debug("list_freetext_annots failed: %s", pdf_path, exc_info=True)
-    return results
+    return _list_annots(_FREETEXT_FAMILY, pdf_path, page_num)
 
 
 def create_freetext_annot(pdf_path: str, data: FreeTextAnnotData) -> FreeTextAnnotData:
     """Create a new FreeText annotation and return the normalized saved form."""
-    doc = fitz.open(pdf_path)
-    try:
-        if data.page_num < 0 or data.page_num >= len(doc):
-            raise IndexError(f"page out of range: {data.page_num}")
-        page = doc[data.page_num]
-        annot = _add_freetext_annot_to_page(page, data)
-        saved = _extract_freetext_data(doc, data.page_num, annot)
-        _save_document_in_place(doc, pdf_path)
-        return saved
-    finally:
-        doc.close()
+    return _create_annot(_FREETEXT_FAMILY, pdf_path, data)
 
 
 def delete_freetext_annot(pdf_path: str, page_num: int, xref: int) -> bool:
     """Delete a FreeText annotation by page number and xref."""
-    doc = fitz.open(pdf_path)
-    try:
-        if page_num < 0 or page_num >= len(doc):
-            return False
-        page = doc[page_num]
-        annot = page.load_annot(xref)
-        if annot is None or annot.type[0] != fitz.PDF_ANNOT_FREE_TEXT:
-            return False
-        page.delete_annot(annot)
-        _save_document_in_place(doc, pdf_path)
-        return True
-    finally:
-        doc.close()
+    return _delete_annot(_FREETEXT_FAMILY, pdf_path, page_num, xref)
 
 
 def replace_freetext_annot(
@@ -2287,20 +2168,7 @@ def replace_freetext_annot(
     data: FreeTextAnnotData,
 ) -> FreeTextAnnotData:
     """Replace an existing FreeText annotation and return the saved replacement."""
-    doc = fitz.open(pdf_path)
-    try:
-        if page_num < 0 or page_num >= len(doc):
-            raise IndexError(f"page out of range: {page_num}")
-        page = doc[page_num]
-        annot = page.load_annot(xref)
-        if annot is not None:
-            page.delete_annot(annot)
-        replacement = _add_freetext_annot_to_page(page, data)
-        saved = _extract_freetext_data(doc, page_num, replacement)
-        _save_document_in_place(doc, pdf_path)
-        return saved
-    finally:
-        doc.close()
+    return _replace_annot(_FREETEXT_FAMILY, pdf_path, page_num, xref, data)
 
 
 def merge_pdfs(
