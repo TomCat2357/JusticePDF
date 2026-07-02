@@ -8,7 +8,7 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QMessageBox
 
 from src.utils.pdf_utils import get_pdf_toc
-from src.views import main_window, pdf_card
+from src.views import main_window, main_window_fileops, pdf_card
 from tests.helpers import FakeWatcher, make_pdf
 
 
@@ -34,7 +34,7 @@ def merge_window(monkeypatch, qtbot, tmp_path):
         else:
             Path(path).unlink()
 
-    monkeypatch.setattr(main_window, "send2trash", _fake_trash)
+    monkeypatch.setattr(main_window_fileops, "send2trash", _fake_trash)
 
     work_dir = tmp_path / "work"
     work_dir.mkdir()
