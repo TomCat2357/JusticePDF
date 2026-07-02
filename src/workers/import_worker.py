@@ -22,6 +22,9 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from src.utils.constants import (
     IMAGE_EXTS as _IMAGE_EXTS,
     OFFICE_EXTS as _OFFICE_EXTS,
+    WORD_EXTS as _WORD_EXTS,
+    EXCEL_EXTS as _EXCEL_EXTS,
+    PPT_EXTS as _PPT_EXTS,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,7 +55,7 @@ def _convert_via_office_com(src_path: str, dest_pdf_path: Path) -> None:
     abs_src = os.path.abspath(src_path)
     abs_dest = str(dest_pdf_path.resolve())
 
-    if ext in {".doc", ".docx", ".docm"}:
+    if ext in _WORD_EXTS:
         word = win32com.client.Dispatch("Word.Application")
         word.Visible = False
         try:
@@ -61,7 +64,7 @@ def _convert_via_office_com(src_path: str, dest_pdf_path: Path) -> None:
             doc.Close(False)
         finally:
             word.Quit()
-    elif ext in {".xls", ".xlsx", ".xlsm"}:
+    elif ext in _EXCEL_EXTS:
         excel = win32com.client.Dispatch("Excel.Application")
         excel.Visible = False
         try:
@@ -70,7 +73,7 @@ def _convert_via_office_com(src_path: str, dest_pdf_path: Path) -> None:
             wb.Close(False)
         finally:
             excel.Quit()
-    elif ext in {".ppt", ".pptx"}:
+    elif ext in _PPT_EXTS:
         ppt = win32com.client.Dispatch("PowerPoint.Application")
         try:
             presentation = ppt.Presentations.Open(abs_src, WithWindow=False)

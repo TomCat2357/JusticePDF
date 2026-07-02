@@ -13,6 +13,7 @@ from src.utils.pdf_utils import (
     get_page_count,
     list_freetext_annots,
 )
+from src.views import page_edit_annotations as page_edit_annotations_module
 from src.views import page_edit_window as page_edit_window_module
 from src.views.page_edit_window import PageEditWindow
 from tests.helpers import create_page_edit_window, make_pdf, open_zoom, page_click_pos
@@ -573,7 +574,7 @@ def test_zoom_text_edit_shows_warning_and_exits_editor_when_pdf_is_locked(qtbot,
     def _raise_locked(*_args, **_kwargs):
         raise PdfWritePermissionError(str(pdf_path))
 
-    monkeypatch.setattr(page_edit_window_module, "replace_freetext_annot", _raise_locked)
+    monkeypatch.setattr(page_edit_annotations_module, "replace_freetext_annot", _raise_locked)
     monkeypatch.setattr(
         page_edit_window_module.QMessageBox,
         "warning",

@@ -3,7 +3,6 @@ from __future__ import annotations
 from src.utils.pdf_utils import (
     get_pdf_toc,
     merge_paths_to_pdf,
-    merge_pdfs,
     merge_pdfs_in_place,
 )
 from tests.helpers import make_pdf
@@ -140,29 +139,6 @@ def test_merge_tocless_pdfs_produce_empty_toc(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# merge_pdfs: 新規ファイルへの結合(GUI 未使用。ファイル名しおりのオプションは維持)
-# ---------------------------------------------------------------------------
-
-
-def test_merge_pdfs_fresh_adds_bookmarks(tmp_path):
-    a = tmp_path / "a.pdf"
-    b = tmp_path / "b.pdf"
-    c = tmp_path / "c.pdf"
-    out = tmp_path / "out.pdf"
-    make_pdf(a, pages=2)
-    make_pdf(b, pages=3)
-    make_pdf(c, pages=1)
-
-    merge_pdfs(str(out), [str(a), str(b), str(c)], add_file_bookmarks=True)
-
-    toc = get_pdf_toc(str(out))
-    assert [(e.title, e.page) for e in toc] == [
-        ("a.pdf", 1),
-        ("b.pdf", 3),
-        ("c.pdf", 6),
-    ]
-
-
 # ---------------------------------------------------------------------------
 # merge_paths_to_pdf: 「結合」ボタン → ファイル名を親、フォルダ構成を反映した階層しおり
 #   各ファイル配下にはそのファイルが元々持つしおりを子としてネストする。

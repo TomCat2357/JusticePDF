@@ -7,7 +7,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QApplication
 
-from src.views import main_window, pdf_card
+from src.views import main_window, main_window_fileops, pdf_card
 from src.views import page_edit_window as page_edit_window_module
 from src.models.undo_manager import UndoManager
 from tests.helpers import FakeWatcher
@@ -155,7 +155,7 @@ def test_delete_shows_warning_when_file_is_in_use(window_factory, monkeypatch, t
     def _raise_locked(path: str) -> None:
         raise OSError(None, "OLE error 0x80270027", path, -2144927705)
 
-    monkeypatch.setattr(main_window, "send2trash", _raise_locked)
+    monkeypatch.setattr(main_window_fileops, "send2trash", _raise_locked)
     monkeypatch.setattr(
         main_window.QMessageBox,
         "warning",
@@ -229,7 +229,7 @@ def test_rename_pdf_title_shows_warning_when_file_is_in_use(window_factory, monk
         staticmethod(lambda *_args, **_kwargs: ("new title", True)),
     )
     monkeypatch.setattr(
-        main_window,
+        main_window_fileops,
         "update_pdf_metadata_title",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(main_window.PdfWritePermissionError(str(pdf_path))),
     )

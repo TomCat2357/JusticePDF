@@ -8,7 +8,13 @@ from typing import Protocol, TypeVar
 
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtGui import QAction, QColor, QDrag, QFont, QKeySequence, QPainter
-from PyQt6.QtWidgets import QAbstractButton, QScrollArea, QWidget
+from PyQt6.QtWidgets import (
+    QAbstractButton,
+    QDialog,
+    QDialogButtonBox,
+    QScrollArea,
+    QWidget,
+)
 
 Shortcut = QKeySequence | QKeySequence.StandardKey | str
 
@@ -117,3 +123,19 @@ def apply_drag_pixmap(
         painter.end()
     drag.setPixmap(pixmap)
     drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+
+
+def build_accept_cancel_box(
+    dialog: "QDialog", accept_label: str, *, cancel_label: str = "キャンセル"
+) -> tuple[QDialogButtonBox, QAbstractButton]:
+    """accept/reject に接続済みの日本語ラベル付きボタンボックスを作る。
+
+    戻り値は (ボタンボックス, accept ボタン)。accept ボタンはダイアログ側で
+    有効/無効の切り替えに使う。
+    """
+    btn_box = QDialogButtonBox()
+    ok_btn = btn_box.addButton(accept_label, QDialogButtonBox.ButtonRole.AcceptRole)
+    btn_box.addButton(cancel_label, QDialogButtonBox.ButtonRole.RejectRole)
+    btn_box.accepted.connect(dialog.accept)
+    btn_box.rejected.connect(dialog.reject)
+    return btn_box, ok_btn
