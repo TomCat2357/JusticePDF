@@ -119,6 +119,7 @@ from src.views.page_edit_widgets import (
     ZoomPageWidget,
     _apply_block_line_height,
     _build_freetext_document,
+    _freetext_pixel_size,
     _pixel_size_to_pointf,
 )
 

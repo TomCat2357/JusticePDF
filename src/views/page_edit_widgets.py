@@ -97,6 +97,11 @@ def _build_freetext_document(text: str, font: "QFont", text_width: float) -> "QT
     return document
 
 
+def _freetext_pixel_size(fontsize: float, zoom: float) -> int:
+    """FreeText の画面描画ピクセルサイズ。保存 PDF と比例させるため下限は 1px のみ。"""
+    return max(1, round(fontsize * zoom))
+
+
 def _pixel_size_to_pointf(pixel_size: int) -> float:
     # Convert pixel size to a point size so QFont.pointSize() stays positive.
     # setPixelSize() invalidates pointSize (-1), which triggers a Qt warning
@@ -593,7 +598,7 @@ class ZoomPageWidget(QWidget):
         editor.commit_requested.connect(lambda text, annot=annotation: self._commit_inline_editor(annot, text))
         editor.cancel_requested.connect(self.cancel_annotation_text_edit)
         editor.delete_requested.connect(self.annotation_delete_requested)
-        pixel_size = max(10, round(annotation.fontsize * self._zoom_factor))
+        pixel_size = _freetext_pixel_size(annotation.fontsize, self._zoom_factor)
         editor.setStyleSheet(self._inline_editor_stylesheet(annotation, pixel_size))
         editor.setFrameStyle(QFrame.Shape.NoFrame)
         editor.setContentsMargins(0, 0, 0, 0)
@@ -1093,7 +1098,7 @@ class ZoomPageWidget(QWidget):
 
         if annot.content:
             font = painter.font()
-            pixel_size = max(10, round(annot.fontsize * self._zoom_factor))
+            pixel_size = _freetext_pixel_size(annot.fontsize, self._zoom_factor)
             font.setPointSizeF(_pixel_size_to_pointf(pixel_size))
             # フォントファミリ・内側余白・行間を保存時(Acrobat 表示)と共有して
             # 折り返し位置と位置をそろえる。本文は QPlainTextEdit と同じ
