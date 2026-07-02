@@ -2933,10 +2933,10 @@ class PageEditWindow(QMainWindow):
 
         self._zoom_annotation_fontsize_spin = QSpinBox()
         self._zoom_annotation_fontsize_spin.setRange(6, 400)
-        # 前回テキストボックス作成時のサイズを引き継ぐ(未保存なら 11pt)。
+        # 前回テキストボックス作成時のサイズを引き継ぐ(未保存なら 14pt)。
         # valueChanged 接続前に設定してフォーム変更ハンドラの誤発火を防ぐ。
         self._zoom_annotation_fontsize_spin.setValue(
-            int(QSettings().value("freetext/fontsize", 11, type=int))
+            int(QSettings().value("freetext/fontsize", 14, type=int))
         )
         self._zoom_annotation_fontsize_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
         self._zoom_annotation_fontsize_label = QLabel("文字サイズ")
@@ -4839,7 +4839,7 @@ class PageEditWindow(QMainWindow):
         fontsize = (
             float(self._zoom_annotation_fontsize_spin.value())
             if self._zoom_annotation_fontsize_spin and self._zoom_annotation_fontsize_spin.value() > 0
-            else 11.0
+            else 14.0
         )
         # 作成に使ったサイズを記憶し、次回以降の新規テキストボックスの既定値にする。
         QSettings().setValue("freetext/fontsize", int(round(fontsize)))
