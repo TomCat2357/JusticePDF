@@ -5,6 +5,7 @@ import shutil
 import logging
 from collections import deque
 from collections.abc import Callable
+from enum import Enum, auto
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QPushButton, QScrollArea, QGridLayout,
@@ -134,6 +135,16 @@ from src.views.view_helpers import (
 from src.utils.trash_utils import build_trash_failure_message
 
 logger = logging.getLogger(__name__)
+
+
+class CreateMode(Enum):
+    """拡大表示での新規作成モード。常にいずれか1つだけが有効(相互排他)。"""
+
+    NONE = auto()
+    FREETEXT = auto()  # テキストボックス(付箋)の配置待ち
+    SHAPE = auto()  # 図形の配置待ち(種別は _zoom_create_mode が保持)
+    NOTE = auto()  # コメント付箋の配置待ち
+    CALLOUT = auto()  # 校正コールアウトの配置待ち
 
 
 class PageThumbnail(QFrame):
@@ -2568,8 +2579,7 @@ class PageEditWindow(QMainWindow):
         self._zoom_note_editor: NoteContentEdit | None = None
         self._zoom_note_list: QListWidget | None = None
         self._zoom_callout_btn: QToolButton | None = None
-        self._note_create_mode = False
-        self._callout_create_mode = False
+        self._create_mode = CreateMode.NONE
         # 本文編集中の付箋 xref と、確定前の元本文（差分判定用）。
         self._editing_note_xref: int | None = None
         self._editing_note_original = ""
@@ -3334,12 +3344,50 @@ class PageEditWindow(QMainWindow):
         ))
         self._update_button_states()
 
+    @property
+    def _note_create_mode(self) -> bool:
+        """テスト互換用の読み取り専用ミラー(状態は _create_mode が唯一の情報源)。"""
+        return self._create_mode is CreateMode.NOTE
+
+    @property
+    def _callout_create_mode(self) -> bool:
+        """テスト互換用の読み取り専用ミラー(状態は _create_mode が唯一の情報源)。"""
+        return self._create_mode is CreateMode.CALLOUT
+
+    def _activate_create_mode(
+        self, mode: CreateMode, shape_type: ShapeType | None = None
+    ) -> None:
+        """新規作成モードを切り替える単一の状態機械。
+
+        有効化するモード以外を必ず解除してから対象モードを有効化する。
+        各ボタンハンドラにコピペされていた相互排他の前処理を一元化したもの。
+        """
+        if mode is not CreateMode.FREETEXT:
+            self._set_zoom_annotation_create_mode(False)
+        if mode is not CreateMode.SHAPE:
+            self._set_shape_create_mode(None)
+        if mode is not CreateMode.NOTE:
+            self._set_note_create_mode(False)
+        if mode is not CreateMode.CALLOUT:
+            self._set_callout_create_mode(False)
+        if mode is CreateMode.FREETEXT:
+            self._set_zoom_annotation_create_mode(True)
+        elif mode is CreateMode.SHAPE:
+            self._set_shape_create_mode(shape_type)
+        elif mode in (CreateMode.NOTE, CreateMode.CALLOUT):
+            if self._selected_zoom_annotation is not None:
+                self._set_selected_zoom_annotation(None)
+            if mode is CreateMode.NOTE:
+                self._set_note_create_mode(True)
+            else:
+                self._set_callout_create_mode(True)
+
     def _set_zoom_annotation_create_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
         if enabled:
-            self._set_shape_create_mode(None)
-            self._set_note_create_mode(False)
-            self._set_callout_create_mode(False)
+            self._create_mode = CreateMode.FREETEXT
+        elif self._create_mode is CreateMode.FREETEXT:
+            self._create_mode = CreateMode.NONE
         if self._zoom_label:
             if enabled:
                 self._zoom_label.cancel_annotation_paste_mode()
@@ -3749,7 +3797,10 @@ class PageEditWindow(QMainWindow):
     # --- Sticky note (comment) -------------------------------------------
 
     def _set_note_create_mode(self, enabled: bool) -> None:
-        self._note_create_mode = bool(enabled)
+        if enabled:
+            self._create_mode = CreateMode.NOTE
+        elif self._create_mode is CreateMode.NOTE:
+            self._create_mode = CreateMode.NONE
         if self._zoom_note_btn is not None:
             with QSignalBlocker(self._zoom_note_btn):
                 self._zoom_note_btn.setChecked(enabled)
@@ -3757,15 +3808,8 @@ class PageEditWindow(QMainWindow):
             self._zoom_label.set_note_create_mode(enabled)
 
     def _on_note_btn_clicked(self, checked: bool) -> None:
-        if checked:
-            # 他の作成モード・選択を解除して付箋配置モードへ。
-            self._set_zoom_annotation_create_mode(False)
-            self._set_shape_create_mode(None)
-            if self._selected_zoom_annotation is not None:
-                self._set_selected_zoom_annotation(None)
-            self._set_note_create_mode(True)
-        else:
-            self._set_note_create_mode(False)
+        # 他の作成モード・選択を解除して付箋配置モードへ。
+        self._activate_create_mode(CreateMode.NOTE if checked else CreateMode.NONE)
 
     def _on_note_create_requested(self, point: object) -> None:
         if self._zoom_page_num is None or not isinstance(point, tuple) or len(point) != 2:
@@ -3909,7 +3953,10 @@ class PageEditWindow(QMainWindow):
     # --- Proofreading callout --------------------------------------------
 
     def _set_callout_create_mode(self, enabled: bool) -> None:
-        self._callout_create_mode = bool(enabled)
+        if enabled:
+            self._create_mode = CreateMode.CALLOUT
+        elif self._create_mode is CreateMode.CALLOUT:
+            self._create_mode = CreateMode.NONE
         if self._zoom_callout_btn is not None:
             with QSignalBlocker(self._zoom_callout_btn):
                 self._zoom_callout_btn.setChecked(enabled)
@@ -3917,15 +3964,7 @@ class PageEditWindow(QMainWindow):
             self._zoom_label.set_callout_create_mode(enabled)
 
     def _on_callout_btn_clicked(self, checked: bool) -> None:
-        if checked:
-            self._set_zoom_annotation_create_mode(False)
-            self._set_shape_create_mode(None)
-            self._set_note_create_mode(False)
-            if self._selected_zoom_annotation is not None:
-                self._set_selected_zoom_annotation(None)
-            self._set_callout_create_mode(True)
-        else:
-            self._set_callout_create_mode(False)
+        self._activate_create_mode(CreateMode.CALLOUT if checked else CreateMode.NONE)
 
     def _on_callout_create_requested(self, target: object) -> None:
         if self._zoom_page_num is None or not isinstance(target, tuple) or len(target) != 2:
@@ -4541,16 +4580,16 @@ class PageEditWindow(QMainWindow):
             self._set_shape_create_mode(None)
             return
         if checked:
-            self._set_zoom_annotation_create_mode(False)
-            self._set_shape_create_mode(shape_type)
+            self._activate_create_mode(CreateMode.SHAPE, shape_type)
             self._set_zoom_annotation_drawer_open(True)
         else:
             self._set_shape_create_mode(None)
 
     def _set_shape_create_mode(self, shape_type: ShapeType | None) -> None:
         if shape_type is not None:
-            self._set_note_create_mode(False)
-            self._set_callout_create_mode(False)
+            self._create_mode = CreateMode.SHAPE
+        elif self._create_mode is CreateMode.SHAPE:
+            self._create_mode = CreateMode.NONE
         for st, btn in self._shape_buttons.items():
             with QSignalBlocker(btn):
                 btn.setChecked(st == shape_type)
@@ -4828,10 +4867,8 @@ class PageEditWindow(QMainWindow):
         if not self._zoom_view or not self._zoom_view.isVisible() or self._zoom_page_num is None:
             self._set_zoom_annotation_create_mode(False)
             return
-        if checked:
-            self._set_shape_create_mode(None)
         self._set_zoom_annotation_drawer_open(True)
-        self._set_zoom_annotation_create_mode(checked)
+        self._activate_create_mode(CreateMode.FREETEXT if checked else CreateMode.NONE)
 
     def _on_zoom_annotation_create_requested(self, rect: object) -> None:
         if (
