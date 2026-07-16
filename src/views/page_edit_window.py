@@ -1875,6 +1875,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
     def dragMoveEvent(self, event) -> None:
         """Handle drag move event - show drop indicator."""
         if event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
+            data = event.mimeData().data(PAGETHUMBNAIL_MIME_TYPE).data().decode('utf-8')
+            source_pdf_path = data.split('|')[0]
+            if source_pdf_path == self._pdf_path and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                event.setDropAction(Qt.DropAction.CopyAction)
+            else:
+                event.setDropAction(Qt.DropAction.MoveAction)
             event.acceptProposedAction()
             drop_pos = self._container.mapFrom(self, event.position().toPoint())
             self._show_drop_indicator(drop_pos)
@@ -1966,8 +1972,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             logger.debug(f"PAGETHUMBNAIL drop: pdf_path={pdf_path}, page_nums={page_nums}, drop_pos={drop_pos}")
 
             if pdf_path == self._pdf_path:
-                logger.debug("Same file, calling _handle_page_reorder")
-                self._handle_page_reorder(page_nums, drop_pos)
+                is_copy = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+                if is_copy:
+                    logger.debug("Same file with Ctrl held, calling _handle_page_copy")
+                    self._handle_page_copy(page_nums, drop_pos)
+                else:
+                    logger.debug("Same file, calling _handle_page_reorder")
+                    self._handle_page_reorder(page_nums, drop_pos)
             else:
                 logger.debug("Different file, calling _handle_page_insert")
                 self._handle_page_insert(pdf_path, page_nums, drop_pos)
@@ -2024,6 +2035,44 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             self._load_pages()
 
         self._push_undoable("Reorder page", do_reorder, undo_reorder)
+
+    def _handle_page_copy(self, source_pages: list[int], drop_pos) -> None:
+        """Ctrl+ドラッグで同一PDF内のページを複製挿入する。"""
+        import tempfile
+
+        target_page = self._get_drop_page_index(drop_pos)
+        source_pages = sorted(set(source_pages))
+        if not source_pages or target_page == -1:
+            return
+
+        pdf_path = self._pdf_path
+        page_count = get_page_count(pdf_path)
+        insert_at = max(0, min(target_page, page_count))
+        copied_count = len(source_pages)
+
+        def do_copy():
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                if not extract_pages(pdf_path, tmp_path, source_pages):
+                    return
+                insert_pages(pdf_path, tmp_path, [insert_at] * copied_count)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            self._load_pages()
+            self._clear_selection()
+            for i in range(insert_at, insert_at + copied_count):
+                if i < len(self._thumbnails):
+                    self._thumbnails[i].set_selected(True)
+                    self._selected_thumbnails.append(self._thumbnails[i])
+            self._update_button_states()
+
+        def undo_copy():
+            remove_pages(pdf_path, list(range(insert_at, insert_at + copied_count)))
+            self._load_pages()
+
+        self._push_undoable("Copy page", do_copy, undo_copy)
 
     def _handle_page_insert(self, source_pdf_path: str, source_pages: list[int], drop_pos) -> None:
         import tempfile
