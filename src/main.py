@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QApplication
+from src.utils import order_store
 from src.views.main_window import MainWindow
 
 
@@ -41,6 +42,10 @@ def main():
     qss_path = Path(__file__).parent / "views" / "style.qss"
     if qss_path.exists():
         app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
+
+    # Drop stale/over-limit folder-order entries once per app launch (not per
+    # window — a single run can open many MainWindow instances).
+    order_store.prune()
 
     # Explorer の右クリックから渡されたパスを振り分ける。いずれも内容は
     # 設定で指定した作業フォルダ（既定は ~/Documents/PDFs）へ取り込む。
