@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMenu,
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QPoint, QRect
-from PyQt6.QtGui import QKeySequence
+from PyQt6.QtGui import QKeySequence, QActionGroup
 
 from src.views.pdf_card import PDFCard
 from src.views.folder_card import FolderCard
@@ -33,6 +33,7 @@ from src.views.view_helpers import (
 )
 from src.controllers.folder_watcher import FolderWatcher
 from src.models.undo_manager import UndoManager, UndoAction
+from src.utils import order_store
 from src.utils.pdf_utils import (
     PdfWritePermissionError,
     rotate_pages,
@@ -120,6 +121,14 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
         self._reconcile_timer.setSingleShot(True)
         self._reconcile_timer.setInterval(150)
         self._reconcile_timer.timeout.connect(self._reconcile_with_disk)
+
+        # Debounce persisting the folder order/sort mode (see order_store.py
+        # and docs/folder-order-persistence-plan.md).
+        self._order_dirty = False
+        self._order_save_timer = QTimer(self)
+        self._order_save_timer.setSingleShot(True)
+        self._order_save_timer.setInterval(500)
+        self._order_save_timer.timeout.connect(self._flush_order_save)
 
         # Low-frequency backstop poll for missed watchdog events (bulk copies,
         # cloud-synced folders, AV interference). Runs only while visible.
@@ -344,16 +353,28 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
         # クリックでドロップダウンメニューを表示する。
         self._sort_btn = QPushButton("並び替え")
         self._sort_menu = QMenu(self._sort_btn)
-        self._sort_menu.addAction("名前順（昇順）").triggered.connect(
-            lambda: self._apply_sort("name", True))
-        self._sort_menu.addAction("名前順（降順）").triggered.connect(
-            lambda: self._apply_sort("name", False))
-        self._sort_menu.addAction("日付順（昇順）").triggered.connect(
-            lambda: self._apply_sort("date", True))
-        self._sort_menu.addAction("日付順（降順）").triggered.connect(
-            lambda: self._apply_sort("date", False))
+        self._sort_action_group = QActionGroup(self)
+        self._sort_action_group.setExclusive(True)
+
+        def _add_sort_action(text: str, sort_type: str, ascending: bool):
+            action = self._sort_menu.addAction(text)
+            action.setCheckable(True)
+            action.triggered.connect(lambda: self._apply_sort(sort_type, ascending))
+            self._sort_action_group.addAction(action)
+            return action
+
+        self._sort_action_name_asc = _add_sort_action("名前順（昇順）", "name", True)
+        self._sort_action_name_desc = _add_sort_action("名前順（降順）", "name", False)
+        self._sort_action_date_asc = _add_sort_action("日付順（昇順）", "date", True)
+        self._sort_action_date_desc = _add_sort_action("日付順（降順）", "date", False)
+        self._sort_menu.addSeparator()
+        self._sort_action_manual = self._sort_menu.addAction("手動順")
+        self._sort_action_manual.setCheckable(True)
+        self._sort_action_manual.triggered.connect(self._apply_manual_sort)
+        self._sort_action_group.addAction(self._sort_action_manual)
         self._sort_btn.setMenu(self._sort_menu)
         toolbar.addWidget(self._sort_btn)
+        self._sync_sort_menu_state()
 
         self._update_button_states()
 
@@ -411,6 +432,10 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
     def _on_undo_manager_changed(self, reason: str) -> None:
         self._update_button_states()
         self._debug_undo_state(reason)
+        # Any action that pushes/undoes/redoes typically mutates card order
+        # (or the file set the manual order refers to); persist it. Harmless
+        # no-op writes (unchanged order) are cheap and debounced.
+        self._schedule_order_save()
 
     def _clear_undo_history(self) -> None:
         """Clear undo/redo history (for external file changes)."""
@@ -503,11 +528,59 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
 
 
     def _load_existing_files(self) -> None:
-        """Load existing subfolders and PDF files from the work directory."""
-        for folder_path in sorted(self._watcher.get_subfolders(), key=lambda p: os.path.basename(p).lower()):
-            self._add_folder_card(folder_path)
-        for pdf_path in self._watcher.get_pdf_files():
-            self._add_card(pdf_path)
+        """Load existing subfolders and PDF files from the work directory.
+
+        Restores the previously saved sort mode / manual order for this
+        folder, if any (see order_store.py and
+        docs/folder-order-persistence-plan.md §Phase 2). Falls back to the
+        pre-persistence defaults ("manual" order, disk listing) when there is
+        no saved entry or it is malformed.
+        """
+        entry = order_store.load_folder_order(self._work_dir)
+
+        sort_order = "manual"
+        sort_ascending = True
+        if entry is not None:
+            saved_sort_order = entry.get("sort_order")
+            if saved_sort_order in ("manual", "name", "date"):
+                sort_order = saved_sort_order
+            saved_ascending = entry.get("sort_ascending")
+            if isinstance(saved_ascending, bool):
+                sort_ascending = saved_ascending
+        self._sort_order = sort_order
+        self._sort_ascending = sort_ascending
+
+        disk_folders = list(self._watcher.get_subfolders())
+        disk_files = list(self._watcher.get_pdf_files())
+
+        if self._sort_order == "manual":
+            saved_subfolders = (entry or {}).get("manual_subfolders") or []
+            saved_files = (entry or {}).get("manual_files") or []
+            if not isinstance(saved_subfolders, list):
+                saved_subfolders = []
+            if not isinstance(saved_files, list):
+                saved_files = []
+
+            # merge_order() sorts disk-only names case-insensitively when the
+            # saved list is empty, which reproduces the pre-Phase-2 forced
+            # name sort for subfolders when no saved order exists yet.
+            folder_by_name = {os.path.basename(p): p for p in disk_folders}
+            file_by_name = {os.path.basename(p): p for p in disk_files}
+            ordered_folder_names = order_store.merge_order(list(folder_by_name), saved_subfolders)
+            ordered_file_names = order_store.merge_order(list(file_by_name), saved_files)
+
+            for name in ordered_folder_names:
+                self._add_folder_card(folder_by_name[name])
+            for name in ordered_file_names:
+                self._add_card(file_by_name[name])
+        else:
+            for folder_path in disk_folders:
+                self._add_folder_card(folder_path)
+            for pdf_path in disk_files:
+                self._add_card(pdf_path)
+            self._sort_cards()
+
+        self._sync_sort_menu_state()
         # Do not refresh here: at this point viewport width is often 0 and causes "initial-only" layout.
         # Initial refresh is triggered once after the window is shown (showEvent).
 
@@ -595,6 +668,43 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
     def _schedule_reconcile(self) -> None:
         """Debounced trigger for _reconcile_with_disk()."""
         self._reconcile_timer.start()
+
+    def _schedule_order_save(self) -> None:
+        """Debounced trigger for persisting the folder order/sort mode.
+
+        Marks the state dirty and (re)starts a single-shot timer so rapid
+        successive changes (e.g. multiple D&D moves) collapse into a single
+        write. See docs/folder-order-persistence-plan.md §1-5.
+        """
+        self._order_dirty = True
+        self._order_save_timer.start()
+
+    def _flush_order_save(self) -> None:
+        """Persist the current order/sort state immediately, if dirty.
+
+        Invariant (see docs/folder-order-persistence-plan.md §1-4): manual
+        order fields are only overwritten while ``_sort_order == "manual"``.
+        When a name/date sort is active, only the sort mode itself is saved
+        so a previously saved manual order survives switching back to it.
+        """
+        if not self._order_dirty:
+            return
+        self._order_dirty = False
+        self._order_save_timer.stop()
+
+        manual_files = None
+        manual_subfolders = None
+        if self._sort_order == "manual":
+            manual_files = [os.path.basename(c.pdf_path) for c in self._cards]
+            manual_subfolders = [os.path.basename(fc.folder_path) for fc in self._folder_cards]
+
+        order_store.save_folder_order(
+            self._work_dir,
+            manual_files=manual_files,
+            manual_subfolders=manual_subfolders,
+            sort_order=self._sort_order,
+            sort_ascending=self._sort_ascending,
+        )
 
     def _maybe_poll_reconcile(self) -> None:
         """Backstop poll: only scan the directory while the window is visible."""
@@ -696,6 +806,7 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
         if changed:
             self._update_button_states()
             self._grid_refresh_timer.start()
+            self._schedule_order_save()
 
     def _rebuild_cards_from_paths(self, paths: list[str]) -> None:
         """Rebuild PDFCards from a list of paths, reusing existing cards where possible.
@@ -1024,6 +1135,7 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
             return
         self._add_folder_card(path)
         self._grid_refresh_timer.start()
+        self._schedule_order_save()
 
     def _on_folder_removed(self, path: str) -> None:
         """Handle subfolder removed from disk."""
@@ -1034,6 +1146,7 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
                 return
         self._remove_folder_card(path)
         self._grid_refresh_timer.start()
+        self._schedule_order_save()
 
     def _on_folder_card_clicked(self, fc: FolderCard) -> None:
         modifiers = QApplication.keyboardModifiers()
@@ -1238,6 +1351,7 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
             self._clear_undo_history()
         new_card = self._add_card(path, insert_index=None)
         self._grid_refresh_timer.start()
+        self._schedule_order_save()
 
     def _on_file_removed(self, path: str) -> None:
         """Handle file removed from folder."""
@@ -1263,6 +1377,7 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
         self._remove_card(path)
         self._grid_refresh_timer.start()
         self._update_button_states()
+        self._schedule_order_save()
 
     def _on_file_modified(self, path: str) -> None:
         """Handle file modified.
@@ -1429,9 +1544,19 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
         self._update_button_states()
 
     def _apply_sort(self, sort_type: str, ascending: bool) -> None:
-        """Sort cards by the specified type/direction with undo support."""
-        # Store paths instead of widget references
+        """Sort cards by the specified type/direction with undo support.
+
+        Only the sort mode is persisted here (§1-4 of the design doc): a
+        previously saved manual order must survive switching to name/date
+        sorting so switching back to "manual" restores it.
+        """
+        # Store paths instead of widget references. _sort_cards() reorders
+        # _folder_cards too, so its pre-sort order must be captured and
+        # restored on undo/redo as well — otherwise undoing a name/date sort
+        # while sort_order returns to "manual" would persist the (still
+        # name-sorted) folder order as manual_subfolders, clobbering it.
         old_paths = [card.pdf_path for card in self._cards]
+        old_folder_paths = [fc.folder_path for fc in self._folder_cards]
         old_sort_order = self._sort_order
         old_ascending = self._sort_ascending
 
@@ -1440,19 +1565,34 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
 
         self._sort_cards()
         self._refresh_grid()
+        self._sync_sort_menu_state()
+        self._schedule_order_save()
         new_paths = [card.pdf_path for card in self._cards]
+        new_folder_paths = [fc.folder_path for fc in self._folder_cards]
+
+        def _reorder_folder_cards(paths: list[str]) -> None:
+            by_path = {fc.folder_path: fc for fc in self._folder_cards}
+            ordered = [by_path[p] for p in paths if p in by_path]
+            extra = [fc for fc in self._folder_cards if fc.folder_path not in paths]
+            self._folder_cards = ordered + extra
 
         def undo():
             self._rebuild_cards_from_paths(old_paths)
+            _reorder_folder_cards(old_folder_paths)
             self._sort_order = old_sort_order
             self._sort_ascending = old_ascending
             self._refresh_grid()
+            self._sync_sort_menu_state()
+            self._schedule_order_save()
 
         def redo():
             self._rebuild_cards_from_paths(new_paths)
+            _reorder_folder_cards(new_folder_paths)
             self._sort_order = sort_type
             self._sort_ascending = ascending
             self._refresh_grid()
+            self._sync_sort_menu_state()
+            self._schedule_order_save()
 
         self._undo_manager.add_action(UndoAction(
             description=f"Sort by {sort_type}",
@@ -1460,6 +1600,59 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
             redo_func=redo
         ))
         self._update_button_states()
+
+    def _apply_manual_sort(self) -> None:
+        """Switch to manual order, restoring the saved order from the store.
+
+        See docs/folder-order-persistence-plan.md §Phase 4. This is the only
+        UI entry point for returning to "manual" once a name/date sort has
+        been applied (D&D also sets it implicitly).
+        """
+        entry = order_store.load_folder_order(self._work_dir)
+        saved_files = (entry or {}).get("manual_files") or []
+        saved_subfolders = (entry or {}).get("manual_subfolders") or []
+        if not isinstance(saved_files, list):
+            saved_files = []
+        if not isinstance(saved_subfolders, list):
+            saved_subfolders = []
+
+        file_by_name = {os.path.basename(c.pdf_path): c for c in self._cards}
+        folder_by_name = {os.path.basename(fc.folder_path): fc for fc in self._folder_cards}
+        ordered_file_names = order_store.merge_order(list(file_by_name), saved_files)
+        ordered_folder_names = order_store.merge_order(list(folder_by_name), saved_subfolders)
+
+        self._sort_order = "manual"
+        self._cards = [file_by_name[n] for n in ordered_file_names]
+        self._folder_cards = [folder_by_name[n] for n in ordered_folder_names]
+        self._refresh_grid()
+        self._sync_sort_menu_state()
+        self._schedule_order_save()
+        self._update_button_states()
+
+    def _sync_sort_menu_state(self) -> None:
+        """Reflect the current sort mode/direction in the sort menu's checked state."""
+        actions = (
+            self._sort_action_name_asc,
+            self._sort_action_name_desc,
+            self._sort_action_date_asc,
+            self._sort_action_date_desc,
+            self._sort_action_manual,
+        )
+        for action in actions:
+            action.setChecked(False)
+
+        if self._sort_order == "manual":
+            self._sort_action_manual.setChecked(True)
+            return
+        mapping = {
+            ("name", True): self._sort_action_name_asc,
+            ("name", False): self._sort_action_name_desc,
+            ("date", True): self._sort_action_date_asc,
+            ("date", False): self._sort_action_date_desc,
+        }
+        action = mapping.get((self._sort_order, self._sort_ascending))
+        if action is not None:
+            action.setChecked(True)
 
 
     def _get_card_at_pos(self, pos):
@@ -1502,5 +1695,6 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
     def closeEvent(self, event) -> None:
         """Handle window close."""
         self._undo_manager.remove_listener(self._on_undo_manager_changed)
+        self._flush_order_save()
         self._watcher.stop()
         super().closeEvent(event)

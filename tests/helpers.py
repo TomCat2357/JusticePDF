@@ -1,6 +1,7 @@
 """テスト共通ヘルパー(テスト用PDF生成・FolderWatcher のフェイク等)。"""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import fitz
@@ -34,7 +35,11 @@ def make_pdf(
 
 
 class FakeWatcher(QObject):
-    """FolderWatcher の差し替え用フェイク(監視を行わない)。"""
+    """FolderWatcher の差し替え用フェイク(監視スレッドは起動しない)。
+
+    ``get_pdf_files``/``get_subfolders`` は実 ``FolderWatcher`` と同じく
+    ディスクを読む(_load_existing_files() の復元ロジックをテストできるように)。
+    """
 
     file_added = pyqtSignal(str)
     file_removed = pyqtSignal(str)
@@ -52,8 +57,28 @@ class FakeWatcher(QObject):
     def stop(self) -> None:
         pass
 
+    def get_pdf_files(self) -> list[str]:
+        try:
+            names = os.listdir(self._folder_path)
+        except OSError:
+            return []
+        return [
+            os.path.join(self._folder_path, name)
+            for name in names
+            if name.lower().endswith(".pdf")
+        ]
+
     def get_subfolders(self) -> list[str]:
-        return []
+        try:
+            names = os.listdir(self._folder_path)
+        except OSError:
+            return []
+        dirs = []
+        for name in names:
+            full = os.path.join(self._folder_path, name)
+            if os.path.isdir(full):
+                dirs.append(full)
+        return dirs
 
 
 def create_page_edit_window(qtbot, pdf_path) -> PageEditWindow:

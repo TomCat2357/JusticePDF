@@ -8,6 +8,8 @@ import pytest
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
+from src.utils import order_store
+
 
 @pytest.fixture(autouse=True)
 def _isolated_qsettings(tmp_path):
@@ -18,6 +20,12 @@ def _isolated_qsettings(tmp_path):
         QSettings.Scope.UserScope,
         str(tmp_path / "qsettings"),
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_order_store(tmp_path, monkeypatch):
+    """order_store の保存先をテストごとの一時ファイルへ向け、本番の %APPDATA% を汚さない。"""
+    monkeypatch.setattr(order_store, "DEFAULT_STORE_PATH", tmp_path / "folder_order.json")
 
 
 @pytest.fixture(autouse=True)
