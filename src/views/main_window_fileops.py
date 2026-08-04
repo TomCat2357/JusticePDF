@@ -786,11 +786,13 @@ class FileOpsMixin:
         if not is_copy and source_parent_win is not None:
             source_parent_win._remove_folder_card(source)
             source_parent_win._grid_refresh_timer.start()
+            source_parent_win._schedule_order_save()
 
         if dest_parent_win is not None:
             if dest_parent_win._get_folder_card_by_path(str(target)) is None:
                 dest_parent_win._add_folder_card(str(target))
             dest_parent_win._grid_refresh_timer.start()
+            dest_parent_win._schedule_order_save()
 
         return str(target)
     def _handle_pdf_write_permission_denied(self, error: PdfWritePermissionError) -> None:
