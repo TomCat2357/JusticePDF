@@ -306,6 +306,7 @@ class DragDropMixin:
             self._add_card(dest, insert_index=insert_index + offset)
         self._sort_order = "manual"
         self._refresh_grid()
+        self._schedule_order_save()
 
         def undo_move() -> None:
             for src, dest in actually_copied:
@@ -393,6 +394,7 @@ class DragDropMixin:
 
         self._sort_order = "manual"
         self._refresh_grid()
+        self._schedule_order_save()
 
         # Select moved cards
         self._clear_selection()
@@ -473,7 +475,8 @@ class DragDropMixin:
             
             self._sort_order = "manual"
             self._refresh_grid()
-            
+            self._schedule_order_save()
+
             # Select copied cards
             self._clear_selection()
             for card in copied_cards:
@@ -748,11 +751,13 @@ class DragDropMixin:
                         self._add_card(target_path, insert_index=insert_index)
                         self._sort_order = "manual"
                         self._refresh_grid()
+                        self._schedule_order_save()
                         _select_single_card(target_path)
                     else:
                         dest_win_for_add._add_card(target_path, insert_index=None)
                         dest_win_for_add._sort_order = "manual"
                         dest_win_for_add._refresh_grid()
+                        dest_win_for_add._schedule_order_save()
                 else:
                     logger.debug(f"Appending pages to target_card: {target_path}")
                     insert_pages(target_path, tmp_path, [0] * len(page_nums))
