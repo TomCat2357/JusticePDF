@@ -618,6 +618,12 @@ def main() -> None:
                            "22_sort_menu.png")
         _save_toolbar_menu(work_dir, "_rename_btn", "_rename_menu",
                            "23_rename_menu.png")
+        # 「結合・分解」は選択内容でメニュー項目が出し分けられるため、
+        # 両方の状態（フォルダ選択→結合／ファイル1つ選択→分解）を撮る。
+        _save_toolbar_menu(work_dir, "_merge_split_btn", "_merge_split_menu",
+                           "30_merge_menu.png", select_card=False, select_folder=True)
+        _save_toolbar_menu(work_dir, "_merge_split_btn", "_merge_split_menu",
+                           "31_split_menu.png", select_card=True, select_folder=False)
 
         # Use a multi-page PDF for page-edit / zoom shots.
         proposal_pdf = work_dir / "提案書.pdf"
