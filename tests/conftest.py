@@ -20,6 +20,9 @@ def _isolated_qsettings(tmp_path):
         QSettings.Scope.UserScope,
         str(tmp_path / "qsettings"),
     )
+    # setPath だけでは QSettings のプロセス内キャッシュ(format/scope/org/app が
+    # キー)に載った前テストの値が新しいパスへ漏れてくるため、明示的に消す。
+    QSettings().clear()
 
 
 @pytest.fixture(autouse=True)

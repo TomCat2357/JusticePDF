@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QToolBar,
     QPushButton,
+    QDialog,
     QScrollArea,
     QGridLayout,
     QInputDialog,
@@ -33,7 +34,7 @@ from src.views.view_helpers import (
 )
 from src.controllers.folder_watcher import FolderWatcher
 from src.models.undo_manager import UndoManager, UndoAction
-from src.utils import order_store
+from src.utils import app_settings, order_store
 from src.utils.pdf_utils import (
     PdfWritePermissionError,
     rotate_pages,
@@ -43,6 +44,7 @@ from src.utils.pdf_utils import (
     print_pdfs,
 )
 from src.views.print_dialog import PrintDialog
+from src.views.settings_dialog import SettingsDialog
 from src.utils.constants import (
     PDFCARD_MIME_TYPE,
     FOLDERCARD_MIME_TYPE,
@@ -52,6 +54,7 @@ from src.utils.windows_shell import show_native_file_context_menu
 from src.workers.file_worker import FileOperationWorker
 from src.workers.import_worker import ImportWorker
 from src.views.main_window_fileops import FileOpsMixin
+from src.views.main_window_split import SplitMixin
 from src.views.main_window_import import ImportMixin
 from src.views.main_window_export import ExportMixin
 from src.views.main_window_dragdrop import DragDropMixin
@@ -59,7 +62,7 @@ from src.views.main_window_dragdrop import DragDropMixin
 logger = logging.getLogger(__name__)
 
 
-class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWindow):
+class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWindow):
     """Main application window.
 
     Displays PDF files as cards in a grid layout.
@@ -138,9 +141,12 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
         self._reconcile_poll_timer.start()
 
         # Setup working directory
-        self._work_dir = Path(folder_path) if folder_path else Path.home() / "Documents" / "PDFs"
+        if folder_path:
+            self._work_dir = Path(folder_path)
+            self._work_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._work_dir = app_settings.ensure_library_dir()
         self._is_root_window = folder_path is None
-        self._work_dir.mkdir(parents=True, exist_ok=True)
 
         # Undo manager
         self._undo_manager = UndoManager(max_size=20)
@@ -196,18 +202,17 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
     def open_external_folder(cls, source_dir: str) -> "MainWindow":
         """Open a folder launched from Explorer's「JusticePDFで開く」.
 
-        The folder is copied into the PDFs library (``~/Documents/PDFs``)
-        under a non-colliding name and that copy becomes this window's work
-        dir; the folder's contents are imported into it once the event loop
-        starts.
+        The folder is copied into the PDFs library (configured via the
+        設定ダイアログ; defaults to ``~/Documents/PDFs``) under a non-colliding
+        name and that copy becomes this window's work dir; the folder's
+        contents are imported into it once the event loop starts.
 
         Only this single window opens — the work dir is the copy itself, so
         there is no separate PDFs-library window.  (This differs from importing
         a file, which lands flat in the library window, and from a mixed
         file+folder launch, which still needs the library window as host.)
         """
-        library = Path.home() / "Documents" / "PDFs"
-        library.mkdir(parents=True, exist_ok=True)
+        library = app_settings.ensure_library_dir()
         folder_name = os.path.basename(os.path.abspath(source_dir).rstrip(os.sep)) or "folder"
         dest = Path(str(ensure_unique_path(library, folder_name, pattern="{stem}({i}){ext}")))
         dest.mkdir(parents=True, exist_ok=True)
@@ -299,13 +304,26 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
         self._rename_btn.setMenu(self._rename_menu)
         toolbar.addWidget(self._rename_btn)
 
-        self._merge_btn = QPushButton("結合")
-        self._merge_btn.setToolTip(
+        # 結合（複数→1つ）と分解（1つ→複数）は互いに逆操作なので 1 つのボタンに
+        # 統合し、クリックでドロップダウンメニューを表示する。
+        self._merge_split_btn = QPushButton("結合・分解")
+        self._merge_split_btn.setToolTip("複数ファイルを1つに結合／1つのPDFを複数に分解")
+        self._merge_split_menu = QMenu(self._merge_split_btn)
+        self._merge_split_menu.setToolTipsVisible(True)
+        self._merge_action = self._merge_split_menu.addAction("結合")
+        self._merge_action.setToolTip(
             "選択したファイル・フォルダを1つのPDFに結合\n"
             "（フォルダ構成をしおりの階層として再現します）"
         )
-        self._merge_btn.clicked.connect(self._on_merge_selected)
-        toolbar.addWidget(self._merge_btn)
+        self._merge_action.triggered.connect(self._on_merge_selected)
+        self._split_action = self._merge_split_menu.addAction("分解")
+        self._split_action.setToolTip(
+            "選択したPDFをしおりの最上位階層ごとに複数ファイルへ分解\n"
+            "（しおりが無い場合は1ページずつ分解します）"
+        )
+        self._split_action.triggered.connect(self._on_split_selected)
+        self._merge_split_btn.setMenu(self._merge_split_menu)
+        toolbar.addWidget(self._merge_split_btn)
 
         toolbar.addSeparator()
 
@@ -376,6 +394,14 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
         toolbar.addWidget(self._sort_btn)
         self._sync_sort_menu_state()
 
+        toolbar.addSeparator()
+
+        # 設定（デフォルトで開くフォルダ等）。単独動作でファイル操作に
+        # 影響しないため、選択状態に関わらず常に有効。
+        self._settings_btn = QPushButton("設定")
+        self._settings_btn.clicked.connect(self._on_open_settings)
+        toolbar.addWidget(self._settings_btn)
+
         self._update_button_states()
 
     def _setup_shortcuts(self) -> None:
@@ -415,9 +441,30 @@ class MainWindow(FileOpsMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWin
         self._redo_btn.setEnabled(self._undo_manager.can_redo() and not busy)
         # エクスポート: ファイルまたはフォルダを1つ以上選択しているとき有効
         self._export_btn.setEnabled((n_files >= 1 or n_folders >= 1) and not busy)
-        # 結合: フォルダを1つ以上、またはファイルを2つ以上選択しているとき有効
-        self._merge_btn.setEnabled((n_folders >= 1 or n_files >= 2) and not busy)
+        # 結合: フォルダを1つ以上、またはファイルを2つ以上選択しているとき
+        can_merge = n_folders >= 1 or n_files >= 2
+        # 分解: PDFファイルをちょうど1つだけ選択しているとき
+        can_split = n_files == 1 and n_folders == 0
+        self._merge_action.setVisible(can_merge)
+        self._split_action.setVisible(can_split)
+        self._merge_split_btn.setEnabled((can_merge or can_split) and not busy)
 
+    def _on_open_settings(self) -> None:
+        """「設定」ボタンのハンドラ。デフォルトで開くフォルダを変更する。
+
+        反映は次回起動から（開いているウィンドウの作業フォルダは切り替えない）。
+        """
+        dialog = SettingsDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        folder = dialog.selected_folder()
+        try:
+            Path(folder).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "設定", f"フォルダを作成できません:\n{e}")
+            return
+        app_settings.set_library_dir(folder)
+        QMessageBox.information(self, "設定", "次回起動時から有効になります。")
 
     def _debug_undo_state(self, reason: str) -> None:
         log_undo_state(

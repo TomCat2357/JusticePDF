@@ -1,4 +1,4 @@
-"""TOC(しおり)・メタデータ・ページ操作・PDF結合。"""
+"""TOC(しおり)・メタデータ・ページ操作・PDF結合・分解。"""
 import logging
 import os
 from dataclasses import dataclass
@@ -10,6 +10,7 @@ import fitz
 logger = logging.getLogger(__name__)
 
 from .common import _save_document_in_place
+from src.utils.path_utils import ensure_unique_path, sanitize_filename
 
 
 @dataclass(slots=True)
@@ -295,6 +296,178 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
         return total
     finally:
         output_doc.close()
+
+
+@dataclass(slots=True)
+class SplitPart:
+    """分解後の1ファイル分の範囲。"""
+
+    title: str      # しおりタイトル(ページ分解時は "")
+    start0: int     # 0始まり開始ページ
+    end0: int       # 0始まり終了ページ(含む)
+    filename: str   # 出力ファイル名(サニタイズ済み、".pdf" 付き)
+
+
+def _split_part_filename_from_title(title: str) -> str:
+    """しおりタイトルから分解後ファイル名を組み立てる(結合時の逆変換)。
+
+    結合時の見出しは ``os.path.basename(path)`` = 拡張子つきファイル名なので、
+    タイトルが ``.pdf`` (大文字小文字問わず)で終わる場合はその拡張子部分を
+    取り除いてから ``sanitize_filename()`` に通し、改めて ``.pdf`` を付ける。
+    そうでない場合もサニタイズ後に ``.pdf`` を付ける。これにより
+    ``報告書.pdf`` → ``報告書.pdf``(``報告書.pdf.pdf`` にはならない)。
+    """
+    if title.lower().endswith(".pdf"):
+        base = title[: -len(".pdf")]
+    else:
+        base = title
+    return sanitize_filename(base) + ".pdf"
+
+
+def plan_split(pdf_path: str) -> tuple[list[SplitPart], str]:
+    """分解プランを作る。戻り値は (パーツ一覧, モード)。モードは "toc" か "page"。
+
+    - しおりの最上位階層(level==1)が1件でもあれば、そのページを境界にファイルを
+      分割する(モード "toc")。最初の level==1 エントリが p.1 より後ろにある場合は、
+      p.1 〜 その直前ページまでを「しおり前ページ」として独立した先頭パーツにする。
+    - level==1 のエントリが1件も無ければ、1ページ1ファイルに分割する(モード "page")。
+    - PDFが開けない・0ページの場合は例外を投げず ``([], "page")`` を返す。
+    """
+    try:
+        with fitz.open(pdf_path) as doc:
+            page_count = doc.page_count
+    except Exception:
+        logger.warning("分解プランを作成できません(開けません): %s", pdf_path)
+        return ([], "page")
+
+    if page_count <= 0:
+        logger.warning("分解プランを作成できません(0ページ): %s", pdf_path)
+        return ([], "page")
+
+    stem = os.path.splitext(os.path.basename(pdf_path))[0]
+
+    # level==1 のエントリを page 昇順に安定ソートし、同一pageは最初の1件のみ採用
+    toc = get_pdf_toc(pdf_path)
+    top_level = [e for e in toc if e.level == 1]
+    top_level.sort(key=lambda e: e.page)
+    top: list[TocEntry] = []
+    seen_pages: set[int] = set()
+    for entry in top_level:
+        if entry.page in seen_pages:
+            continue
+        seen_pages.add(entry.page)
+        top.append(entry)
+
+    if not top:
+        # モード "page": 1ページ1ファイル
+        width = max(3, len(str(page_count)))
+        parts = [
+            SplitPart(
+                title="",
+                start0=n - 1,
+                end0=n - 1,
+                filename=f"{stem}_{n:0{width}d}p.pdf",
+            )
+            for n in range(1, page_count + 1)
+        ]
+        return parts, "page"
+
+    # モード "toc"
+    parts: list[SplitPart] = []
+
+    first_page = top[0].page
+    if first_page > 1:
+        start0 = 0
+        end0 = first_page - 2  # 0始まりで p.1 〜 (最初のしおりの直前ページ) まで
+        if start0 <= end0:
+            parts.append(
+                SplitPart(
+                    title="",
+                    start0=start0,
+                    end0=end0,
+                    filename=f"{sanitize_filename(stem)}_しおり前ページ.pdf",
+                )
+            )
+
+    for i, entry in enumerate(top):
+        start0 = entry.page - 1
+        if i + 1 < len(top):
+            end0 = top[i + 1].page - 2
+        else:
+            end0 = page_count - 1
+        if start0 > end0:
+            continue  # 空ページ範囲は生成しない
+        parts.append(
+            SplitPart(
+                title=entry.title,
+                start0=start0,
+                end0=end0,
+                filename=_split_part_filename_from_title(entry.title),
+            )
+        )
+
+    return parts, "toc"
+
+
+def split_pdf_by_toc(pdf_path: str, out_dir: str, parts: list[SplitPart]) -> list[str]:
+    """``parts`` の各範囲を ``out_dir`` へ書き出し、実際に作成したパスのリストを返す。
+
+    子しおり(level >= 2)はページ番号をリベースして各出力ファイルへ引き継ぐ:
+    元TOCのうち page がそのパーツの範囲(``[start0+1, end0+1]``)にあり level >= 2
+    のエントリを取り出し、``level -= (最小level - 1)`` で1始まりに正規化し、
+    ``page -= start0`` でリベースする。子しおりが無ければ ``set_toc`` は呼ばない。
+
+    途中で失敗した場合は、それまでに作成済みのファイル(と失敗したパーツの
+    出力先ファイルがもし存在すれば)を削除してから例外を再送出する。
+    """
+    created: list[str] = []
+    src_doc = fitz.open(pdf_path)
+    try:
+        full_toc = src_doc.get_toc(simple=True)  # [[level, title, page], ...]
+        for part in parts:
+            out_path = ensure_unique_path(out_dir, part.filename, pattern="{stem}({i}){ext}")
+            try:
+                out_doc = fitz.open()
+                try:
+                    out_doc.insert_pdf(src_doc, from_page=part.start0, to_page=part.end0)
+
+                    sub_entries = [
+                        (int(level), str(title), int(page))
+                        for level, title, page in full_toc
+                        if int(level) >= 2 and part.start0 + 1 <= int(page) <= part.end0 + 1
+                    ]
+                    if sub_entries:
+                        min_level = min(level for level, _, _ in sub_entries)
+                        rebased = [
+                            TocEntry(
+                                level=level - (min_level - 1),
+                                title=title,
+                                page=page - part.start0,
+                            )
+                            for level, title, page in sub_entries
+                        ]
+                        normalized = normalize_toc(rebased, page_count=len(out_doc))
+                        out_doc.set_toc([[e.level, e.title, e.page] for e in normalized])
+
+                    out_doc.save(str(out_path))
+                finally:
+                    out_doc.close()
+                created.append(str(out_path))
+            except Exception:
+                if out_path.exists():
+                    try:
+                        out_path.unlink()
+                    except OSError:
+                        pass
+                for created_path in created:
+                    try:
+                        os.unlink(created_path)
+                    except OSError:
+                        pass
+                raise
+    finally:
+        src_doc.close()
+    return created
 
 
 def extract_pages(src_path: str, output_path: str, page_indices: list[int]) -> bool:

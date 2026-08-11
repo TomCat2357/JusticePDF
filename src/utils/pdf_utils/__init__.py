@@ -136,10 +136,12 @@ from .rendering import (
 )
 
 from .pages import (
+    SplitPart,
     TocEntry,
     _file_bookmark_title,
     _file_toc_entries,
     _offset_toc_entries,
+    _split_part_filename_from_title,
     create_empty_pdf,
     extract_pages,
     get_pdf_metadata_title,
@@ -148,9 +150,11 @@ from .pages import (
     merge_paths_to_pdf,
     merge_pdfs_in_place,
     normalize_toc,
+    plan_split,
     remove_pages,
     reorder_pages,
     rotate_pages,
+    split_pdf_by_toc,
     update_pdf_metadata_title,
     update_pdf_toc,
 )
