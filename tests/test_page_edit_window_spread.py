@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 from PyQt6.QtCore import Qt
 
+from src.views.page_edit_window import ZoomPageLayout
 from src.utils.pdf_utils import FreeTextAnnotData, create_freetext_annot
 from tests.helpers import (
     create_page_edit_window,
@@ -20,23 +21,20 @@ def test_spread_toggle_sets_view_only_and_label(qtbot, tmp_path):
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
 
-    assert window._zoom_spread_mode is False
+    assert window._zoom_page_layout is ZoomPageLayout.SINGLE
     assert window._zoom_page_label.text() == "1 / 4"
 
     window._toggle_zoom_spread_view()
 
-    assert window._zoom_spread_mode is True
+    assert window._zoom_page_layout is ZoomPageLayout.HORIZONTAL
     assert window._zoom_label._view_only is True
-    assert window._zoom_spread_btn.isChecked() is True
     # 見開き中はアノテーション(付箋)ドロワーを無効化する。
     assert window._zoom_object_btn.isEnabled() is False
     assert window._zoom_page_label.text() == "1-2 / 4"
 
     window._toggle_zoom_spread_view()
 
-    assert window._zoom_spread_mode is False
     assert window._zoom_label._view_only is False
-    assert window._zoom_spread_btn.isChecked() is False
     assert window._zoom_object_btn.isEnabled() is True
     assert window._zoom_page_label.text() == "1 / 4"
 
@@ -57,6 +55,8 @@ def test_spread_disables_rotate_delete_and_bookmark_edit(qtbot, tmp_path):
     # 見開き中は回転・削除ボタンが無効化される。
     assert window._rotate_btn.isEnabled() is False
     assert window._delete_btn.isEnabled() is False
+    assert window._undo_btn.isEnabled() is False
+    assert window._redo_btn.isEnabled() is False
     # しおりパネルは閲覧専用(作成系も無効)。
     panel = window._bookmarks_panel
     assert panel._read_only is True
@@ -66,7 +66,7 @@ def test_spread_disables_rotate_delete_and_bookmark_edit(qtbot, tmp_path):
     # ショートカット相当のハンドラ直接呼び出しでもページは変化しない(no-op)。
     window._on_rotate()
     window._on_delete()
-    assert window._zoom_spread_mode is True
+    assert window._zoom_page_layout is ZoomPageLayout.HORIZONTAL
     assert window._zoom_page_label.text() == "1-2 / 4"
 
     window._toggle_zoom_spread_view()
@@ -162,16 +162,89 @@ def test_exit_zoom_resets_spread_mode(qtbot, tmp_path):
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
     window._toggle_zoom_spread_view()
-    assert window._zoom_spread_mode is True
+    assert window._zoom_page_layout is ZoomPageLayout.HORIZONTAL
 
     window._exit_zoom_view()
 
-    assert window._zoom_spread_mode is False
+    assert window._zoom_page_layout is ZoomPageLayout.SINGLE
     assert window._zoom_label._view_only is False
-    assert window._zoom_spread_btn.isChecked() is False
     assert window._zoom_object_btn.isEnabled() is True
 
     # 再度開くと単ページで開始する。
     window._open_zoom_view(0)
-    assert window._zoom_spread_mode is False
+    assert window._zoom_page_layout is ZoomPageLayout.SINGLE
     assert window._zoom_page_label.text() == "1 / 4"
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_page_layout_menu_has_four_exclusive_choices(qtbot, tmp_path):
+    pdf_path = tmp_path / "page-layout-menu.pdf"
+    make_pdf(pdf_path, pages=4)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    assert [action.text() for action in window._zoom_layout_menu.actions()] == [
+        "1枚",
+        "横2枚",
+        "縦2枚",
+        "4枚",
+    ]
+    assert window._zoom_spread_btn.isCheckable() is False
+    assert window._zoom_page_layout is ZoomPageLayout.SINGLE
+    assert window._zoom_layout_actions[ZoomPageLayout.SINGLE].isChecked() is True
+
+    window._zoom_layout_actions[ZoomPageLayout.GRID].trigger()
+
+    assert window._zoom_page_layout is ZoomPageLayout.GRID
+    assert window._zoom_layout_actions[ZoomPageLayout.GRID].isChecked() is True
+    assert sum(
+        action.isChecked() for action in window._zoom_layout_actions.values()
+    ) == 1
+
+
+@pytest.mark.usefixtures("qtbot")
+@pytest.mark.parametrize(
+    ("layout", "first_label", "next_label", "next_page"),
+    [
+        (ZoomPageLayout.SINGLE, "1 / 7", "2 / 7", 1),
+        (ZoomPageLayout.HORIZONTAL, "1-2 / 7", "3-4 / 7", 2),
+        (ZoomPageLayout.VERTICAL, "1-2 / 7", "3-4 / 7", 2),
+        (ZoomPageLayout.GRID, "1-4 / 7", "5-7 / 7", 4),
+    ],
+)
+def test_page_layout_controls_render_and_page_by_layout(
+    qtbot, tmp_path, layout, first_label, next_label, next_page
+):
+    pdf_path = tmp_path / f"page-layout-{layout.key}.pdf"
+    make_pdf(pdf_path, pages=7)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    window._set_zoom_page_layout(layout)
+
+    assert window._zoom_page_label.text() == first_label
+    assert window._zoom_page_num == 0
+    assert window._zoom_next_btn.isEnabled() is True
+
+    window._on_zoom_next_page()
+
+    assert window._zoom_page_num == next_page
+    assert window._zoom_page_label.text() == next_label
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_one_page_choice_restores_editable_mode(qtbot, tmp_path):
+    pdf_path = tmp_path / "page-layout-single.pdf"
+    make_pdf(pdf_path, pages=4)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    window._set_zoom_page_layout(ZoomPageLayout.GRID)
+    assert window._zoom_label._view_only is True
+    assert window._rotate_btn.isEnabled() is False
+
+    window._zoom_layout_actions[ZoomPageLayout.SINGLE].trigger()
+
+    assert window._zoom_page_layout is ZoomPageLayout.SINGLE
+    assert window._zoom_label._view_only is False
+    assert window._rotate_btn.isEnabled() is True
