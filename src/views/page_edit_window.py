@@ -166,6 +166,25 @@ from src.views.page_edit_annotations import (
 logger = logging.getLogger(__name__)
 
 
+class ZoomPageLayout(Enum):
+    """レイアウトごとの1画面あたりのページ配置。"""
+
+    SINGLE = ("single", "1枚", 1, 1)
+    HORIZONTAL = ("horizontal", "横2枚", 2, 1)
+    VERTICAL = ("vertical", "縦2枚", 1, 2)
+    GRID = ("grid", "4枚", 2, 2)
+
+    def __init__(self, key: str, label: str, columns: int, rows: int) -> None:
+        self.key = key
+        self.label = label
+        self.columns = columns
+        self.rows = rows
+
+    @property
+    def page_capacity(self) -> int:
+        return self.columns * self.rows
+
+
 # 括弧図形コンボボックスの並び(インデックス⇔値の唯一の対応表)
 
 
@@ -213,8 +232,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._zoom_annotation_drawer = None
         self._zoom_annotation_panel = None
         self._zoom_annotation_open = False
-        # 見開き表示(2ページ並べ・閲覧専用)モードのON/OFF。
-        self._zoom_spread_mode = False
+        # 拡大表示のページレイアウト。SINGLE は編集可能、それ以外は閲覧専用。
+        self._zoom_page_layout = ZoomPageLayout.SINGLE
+        self._zoom_layout_actions: dict[ZoomPageLayout, QAction] = {}
         self._zoom_annotation_form_sync = False
         self._zoom_annotation_text_commit_in_progress = False
         self._zoom_annotation_new_btn = None
@@ -411,11 +431,21 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._zoom_bookmark_btn.clicked.connect(self._toggle_bookmarks_drawer)
         controls_layout.addWidget(self._zoom_bookmark_btn)
 
-        # 見開き表示(2ページを左右に並べて閲覧)。閲覧専用で編集・文字選択は不可。
-        self._zoom_spread_btn = QPushButton("見開き表示")
-        self._zoom_spread_btn.setCheckable(True)
-        self._zoom_spread_btn.setToolTip("見開き表示（閲覧のみ）")
-        self._zoom_spread_btn.clicked.connect(self._toggle_zoom_spread_view)
+        # ページ表示レイアウト。クリックで選択肢を開き、1枚を選ぶと閲覧専用を解除する。
+        self._zoom_spread_btn = QPushButton("ページ表示")
+        self._zoom_spread_btn.setToolTip("ページ表示方法を選択")
+        self._zoom_layout_menu = QMenu(self._zoom_spread_btn)
+        for layout in ZoomPageLayout:
+            action = self._zoom_layout_menu.addAction(layout.label)
+            action.setCheckable(True)
+            action.setToolTip(
+                "通常表示・編集可" if layout is ZoomPageLayout.SINGLE else "閲覧専用"
+            )
+            action.triggered.connect(
+                lambda _checked=False, selected=layout: self._set_zoom_page_layout(selected)
+            )
+            self._zoom_layout_actions[layout] = action
+        self._zoom_spread_btn.setMenu(self._zoom_layout_menu)
         controls_layout.addWidget(self._zoom_spread_btn)
 
         # PDF 内テキスト検索 (Ctrl+F と同じ)
@@ -484,33 +514,66 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         if panel is not None:
             panel.set_open(not panel.is_open)
 
-    def _toggle_zoom_spread_view(self) -> None:
-        """見開き表示(閲覧専用)の ON/OFF を切り替える。"""
-        enable = not self._zoom_spread_mode
+    def _zoom_page_layout_is_multi(self) -> bool:
+        return self._zoom_page_layout is not ZoomPageLayout.SINGLE
+
+    def _zoom_page_capacity(self) -> int:
+        return self._zoom_page_layout.page_capacity
+
+    def _last_zoom_group_start(self, page_count: int) -> int:
+        if page_count <= 0:
+            return 0
+        last_index = page_count - 1
+        capacity = self._zoom_page_capacity()
+        return last_index - (last_index % capacity)
+
+    def _sync_zoom_page_layout_controls(self) -> None:
+        selected = getattr(self, "_zoom_page_layout", ZoomPageLayout.SINGLE)
+        for layout, action in getattr(self, "_zoom_layout_actions", {}).items():
+            action.setChecked(layout is selected)
+
+    def _set_zoom_page_layout(self, layout: ZoomPageLayout) -> None:
+        """拡大表示のページレイアウトを切り替える。"""
+        if not isinstance(layout, ZoomPageLayout):
+            layout = ZoomPageLayout.SINGLE
         self._commit_inline_annotation_editor()
-        if enable:
+        is_multi = layout is not ZoomPageLayout.SINGLE
+        if is_multi:
             # 閲覧専用モードへ入る前に、編集系の状態を全て終了させる。
             self._set_zoom_annotation_create_mode(False)
             self._set_selected_zoom_annotation(None)
             if self._zoom_annotation_open:
                 self._set_zoom_annotation_drawer_open(False)
-            # 左ページを偶数 index に正規化(LTR ペアリング: (0,1),(2,3),...)。
+            # ページ送りの単位に合わせて先頭ページへ正規化する。
             if self._zoom_page_num is not None:
-                self._zoom_page_num -= self._zoom_page_num % 2
-        self._zoom_spread_mode = enable
+                capacity = layout.page_capacity
+                self._zoom_page_num -= self._zoom_page_num % capacity
+
+        self._zoom_page_layout = layout
         if self._zoom_label:
-            self._zoom_label.set_view_only(enable)
-        # 見開き中はアノテーション(付箋)ドロワーを無効化する。
+            self._zoom_label.set_view_only(is_multi)
+        # 複数ページ表示中はアノテーション(付箋)ドロワーを無効化する。
         if getattr(self, "_zoom_object_btn", None) is not None:
-            self._zoom_object_btn.setEnabled(not enable)
-        if getattr(self, "_zoom_spread_btn", None) is not None:
-            self._zoom_spread_btn.setChecked(enable)
-        # 見開き中はしおりを閲覧/ジャンプ専用にし、回転・削除ボタンを無効化する。
+            self._zoom_object_btn.setEnabled(not is_multi)
+        self._sync_zoom_page_layout_controls()
+        # 複数ページ表示中はしおりを閲覧/ジャンプ専用にし、回転・削除ボタンを無効化する。
         panel = getattr(self, "_bookmarks_panel", None)
         if panel is not None:
-            panel.set_read_only(enable)
+            panel.set_read_only(is_multi)
+        # Undo/Redo も閲覧専用中は操作させない。
+        self._undo_btn.setEnabled(not is_multi and self._undo_manager.can_undo())
+        self._redo_btn.setEnabled(not is_multi and self._undo_manager.can_redo())
         self._update_button_states()
         self._render_zoom()
+
+    def _toggle_zoom_spread_view(self) -> None:
+        """旧来の見開き切替呼び出しを横2枚の選択へ互換接続する。"""
+        layout = (
+            ZoomPageLayout.SINGLE
+            if self._zoom_page_layout_is_multi()
+            else ZoomPageLayout.HORIZONTAL
+        )
+        self._set_zoom_page_layout(layout)
 
     def _on_bookmarks_drawer_open_changed(self, is_open: bool) -> None:
         if getattr(self, "_zoom_bookmark_btn", None) is not None:
@@ -771,14 +834,14 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             and self._zoom_view.isVisible()
             and self._zoom_page_num is not None
         )
-        # 見開き表示(閲覧専用)中はページ編集(回転・削除)を不可にする。
-        spread = getattr(self, "_zoom_spread_mode", False)
+        # 複数ページ表示(閲覧専用)中はページ編集(回転・削除)を不可にする。
+        spread = self._zoom_page_layout_is_multi()
         can_edit_pages = (has_selection or zoom_active) and not spread
         self._delete_btn.setEnabled(can_edit_pages)
         self._rename_btn.setEnabled(True)
         self._rotate_btn.setEnabled(can_edit_pages)
-        self._undo_btn.setEnabled(self._undo_manager.can_undo())
-        self._redo_btn.setEnabled(self._undo_manager.can_redo())
+        self._undo_btn.setEnabled(not spread and self._undo_manager.can_undo())
+        self._redo_btn.setEnabled(not spread and self._undo_manager.can_redo())
 
     def _debug_undo_state(self, reason: str) -> None:
         log_undo_state(
@@ -1100,13 +1163,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
 
         self._update_button_states()
 
-    def _reset_zoom_spread_mode(self) -> None:
-        """見開きモードを解除し、通常(単ページ・編集可)の状態へ戻す。再描画はしない。"""
-        self._zoom_spread_mode = False
+    def _reset_zoom_page_layout(self) -> None:
+        """ページレイアウトを通常(単ページ・編集可)へ戻す。再描画はしない。"""
+        self._zoom_page_layout = ZoomPageLayout.SINGLE
         if self._zoom_label:
             self._zoom_label.set_view_only(False)
-        if getattr(self, "_zoom_spread_btn", None) is not None:
-            self._zoom_spread_btn.setChecked(False)
+        self._sync_zoom_page_layout_controls()
         if getattr(self, "_zoom_object_btn", None) is not None:
             self._zoom_object_btn.setEnabled(True)
         panel = getattr(self, "_bookmarks_panel", None)
@@ -1116,7 +1178,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
     def _open_zoom_view(self, page_num: int) -> None:
         self._commit_inline_annotation_editor()
         # 拡大ビューは常に単ページ表示で開始する。
-        self._reset_zoom_spread_mode()
+        self._reset_zoom_page_layout()
         self._zoom_page_num = page_num
         self._selected_zoom_annotation = None
         self._set_zoom_annotation_create_mode(False)
@@ -1132,8 +1194,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
 
     def _exit_zoom_view(self) -> None:
         self._commit_inline_annotation_editor()
-        # 見開きモードはここで解除し、次回の拡大表示は単ページで開始させる。
-        self._reset_zoom_spread_mode()
+        # 複数ページ表示はここで解除し、次回の拡大表示は単ページで開始させる。
+        self._reset_zoom_page_layout()
         last_page = self._zoom_page_num
         self._set_zoom_annotation_create_mode(False)
         self._set_selected_zoom_annotation(None)
@@ -1223,10 +1285,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._commit_inline_annotation_editor()
         self._set_zoom_annotation_create_mode(False)
         self._selected_zoom_annotation = None
-        if self._zoom_spread_mode:
-            # 見開きは2ページ単位で戻り、左ページを偶数 index に保つ。
-            new = self._zoom_page_num - 2
-            new -= new % 2
+        if self._zoom_page_layout_is_multi():
+            # 複数ページ表示はレイアウトの収容枚数単位で戻る。
+            capacity = self._zoom_page_capacity()
+            new = self._zoom_page_num - capacity
+            new -= new % capacity
             self._zoom_page_num = max(0, new)
         else:
             self._zoom_page_num -= 1
@@ -1236,18 +1299,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         if self._zoom_page_num is None:
             return
         page_count = get_page_count(self._pdf_path)
-        if self._zoom_spread_mode:
-            # 見開きは2ページ単位で進む。最後の見開き(left==last_left)で停止。
-            last_left = (page_count - 1) - ((page_count - 1) % 2)
-            if self._zoom_page_num >= last_left:
+        if self._zoom_page_layout_is_multi():
+            # 複数ページ表示は最後のグループ先頭で停止する。
+            last_start = self._last_zoom_group_start(page_count)
+            if self._zoom_page_num >= last_start:
                 self._update_zoom_nav_buttons(page_count)
                 return
             self._commit_inline_annotation_editor()
             self._set_zoom_annotation_create_mode(False)
             self._selected_zoom_annotation = None
-            new = self._zoom_page_num + 2
-            new -= new % 2
-            self._zoom_page_num = min(last_left, new)
+            capacity = self._zoom_page_capacity()
+            new = self._zoom_page_num + capacity
+            new -= new % capacity
+            self._zoom_page_num = min(last_start, new)
             self._render_zoom()
             return
         if self._zoom_page_num >= page_count - 1:
@@ -1277,8 +1341,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         if page_count <= 0:
             return
         last_index = page_count - 1
-        # 見開き時は最後の見開きの左ページ(偶数 index)へ移動する。
-        target = last_index - (last_index % 2) if self._zoom_spread_mode else last_index
+        # 複数ページ表示時は最後のグループ先頭へ移動する。
+        target = (
+            self._last_zoom_group_start(page_count)
+            if self._zoom_page_layout_is_multi()
+            else last_index
+        )
         if self._zoom_page_num == target:
             return
         self._commit_inline_annotation_editor()
@@ -1300,11 +1368,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             self._zoom_prev_btn.setEnabled(False)
             self._zoom_next_btn.setEnabled(False)
             return
-        if self._zoom_spread_mode:
-            # 見開き: 最後の見開き(left==last_left)で「次」を無効化する。
-            last_left = (page_count - 1) - ((page_count - 1) % 2)
+        if self._zoom_page_layout_is_multi():
+            # 複数ページ表示: 最後のグループ先頭で「次」を無効化する。
+            last_start = self._last_zoom_group_start(page_count)
             self._zoom_prev_btn.setEnabled(self._zoom_page_num > 0)
-            self._zoom_next_btn.setEnabled(self._zoom_page_num < last_left)
+            self._zoom_next_btn.setEnabled(self._zoom_page_num < last_start)
             return
         self._zoom_prev_btn.setEnabled(self._zoom_page_num > 0)
         self._zoom_next_btn.setEnabled(self._zoom_page_num < page_count - 1)
@@ -1366,45 +1434,74 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._update_note_list_widget()
 
     def _render_zoom(self) -> None:
-        """現在のモードに応じてズーム表示を更新する(単ページ / 見開き)。"""
-        if self._zoom_spread_mode:
-            self._render_zoom_spread()
+        """現在のレイアウトに応じてズーム表示を更新する。"""
+        if self._zoom_page_layout_is_multi():
+            self._render_zoom_pages()
         else:
             self._render_zoom_page()
 
-    # 見開き表示のページ間ゲター(論理px)。
+    # 複数ページ表示のページ間ゲター(論理px)。
     SPREAD_GUTTER = 12
 
-    def _compose_spread_pixmap(self, left_pix: QPixmap, right_pix: QPixmap | None,
-                               dpr: float) -> QPixmap:
-        """左右ページの pixmap をデバイスピクセルのまま1枚に合成して返す。
+    def _format_zoom_page_label(
+        self, start: int, displayed_count: int, page_count: int
+    ) -> str:
+        first = start + 1
+        if displayed_count <= 1:
+            return f"{first} / {page_count}"
+        return f"{first}-{start + displayed_count} / {page_count}"
 
-        ソース pixmap は DPR=1.0 のまま(=デバイスピクセル等倍)で受け取り、
-        合成後の pixmap にのみ呼び出し側で setDevicePixelRatio(dpr) を適用する。
-        ここで個別に DPR を掛けると drawPixmap が 1/dpr 縮小してボケるため。
-        """
+    def _compose_page_pixmap(
+        self, pixmaps: list[QPixmap], columns: int, dpr: float
+    ) -> QPixmap:
+        """ページ画像を行優先のグリッドに合成して返す。"""
+        if not pixmaps:
+            return QPixmap(1, 1)
+        columns = max(1, columns)
+        rows = (len(pixmaps) + columns - 1) // columns
         gutter_dev = round(self.SPREAD_GUTTER * dpr)
-        lw, lh = left_pix.width(), left_pix.height()
-        has_right = right_pix is not None and not right_pix.isNull()
-        if has_right:
-            rw, rh = right_pix.width(), right_pix.height()
-            total_w = lw + gutter_dev + rw
-            total_h = max(lh, rh)
-        else:
-            # 右ページが無い(最終奇数ページ等)場合は左単独。
-            total_w = lw
-            total_h = lh
+        column_widths = [0] * columns
+        row_heights = [0] * rows
+        for index, pixmap in enumerate(pixmaps):
+            column = index % columns
+            row = index // columns
+            column_widths[column] = max(column_widths[column], pixmap.width())
+            row_heights[row] = max(row_heights[row], pixmap.height())
+        total_w = sum(column_widths) + gutter_dev * (columns - 1)
+        total_h = sum(row_heights) + gutter_dev * (rows - 1)
         canvas = QPixmap(max(1, total_w), max(1, total_h))
         canvas.fill(Qt.GlobalColor.white)
         painter = QPainter(canvas)
-        painter.drawPixmap(0, 0, left_pix)  # 上揃え(top-aligned)
-        if has_right:
-            painter.drawPixmap(lw + gutter_dev, 0, right_pix)
+        y = 0
+        for row in range(rows):
+            x = 0
+            for column in range(columns):
+                index = row * columns + column
+                if index < len(pixmaps):
+                    painter.drawPixmap(x, y, pixmaps[index])
+                x += column_widths[column]
+                if column < columns - 1:
+                    x += gutter_dev
+            y += row_heights[row]
+            if row < rows - 1:
+                y += gutter_dev
         painter.end()
         return canvas
 
+    def _compose_spread_pixmap(self, left_pix: QPixmap, right_pix: QPixmap | None,
+                               dpr: float) -> QPixmap:
+        """既存の横2枚合成APIを互換維持する。"""
+        pixmaps = [left_pix]
+        if right_pix is not None and not right_pix.isNull():
+            pixmaps.append(right_pix)
+        return self._compose_page_pixmap(pixmaps, 2, dpr)
+
     def _render_zoom_spread(self) -> None:
-        """見開き(左→右で2ページ並べ)を合成して表示する。閲覧専用。"""
+        """旧来の見開き描画APIを複数ページ描画へ互換接続する。"""
+        self._render_zoom_pages()
+
+    def _render_zoom_pages(self) -> None:
+        """選択されたレイアウトで複数ページを合成して表示する。閲覧専用。"""
         if not self._zoom_annotation_text_commit_in_progress:
             self._commit_inline_annotation_editor()
         if self._zoom_page_num is None or not self._zoom_label:
@@ -1413,32 +1510,30 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         if page_count <= 0:
             self._exit_zoom_view()
             return
-        # 左ページ index を有効範囲・偶数へ正規化する。
-        left = self._zoom_page_num
-        if left >= page_count:
-            left = (page_count - 1) - ((page_count - 1) % 2)
-        left -= left % 2
-        left = max(0, left)
-        self._zoom_page_num = left
-        right = left + 1
-        has_right = right < page_count
+        layout = self._zoom_page_layout
+        capacity = layout.page_capacity
+        start = self._zoom_page_num
+        if start >= page_count:
+            start = self._last_zoom_group_start(page_count)
+        start -= start % capacity
+        start = max(0, start)
+        self._zoom_page_num = start
+        page_indices = list(range(start, min(start + capacity, page_count)))
 
         self._update_zoom_nav_buttons(page_count)
         if self._zoom_page_label:
-            if has_right:
-                self._zoom_page_label.setText(f"{left + 1}-{right + 1} / {page_count}")
-            else:
-                self._zoom_page_label.setText(f"{left + 1} / {page_count}")
+            self._zoom_page_label.setText(
+                self._format_zoom_page_label(start, len(page_indices), page_count)
+            )
 
         dpr = self._zoom_label.devicePixelRatioF()
         scale = self._zoom_factor * dpr
         # 注釈はページ画像に焼き込んで見えるようにする(annots=True)。
-        left_pix = get_page_pixmap(self._pdf_path, left, scale, annots=True)
-        right_pix = (
-            get_page_pixmap(self._pdf_path, right, scale, annots=True)
-            if has_right else None
-        )
-        combined = self._compose_spread_pixmap(left_pix, right_pix, dpr)
+        pixmaps = [
+            get_page_pixmap(self._pdf_path, page_index, scale, annots=True)
+            for page_index in page_indices
+        ]
+        combined = self._compose_page_pixmap(pixmaps, layout.columns, dpr)
         combined.setDevicePixelRatio(dpr)
         # words/links/annots/chars を空で渡し、選択・編集のヒット対象を無くす。
         self._zoom_label.set_page(
@@ -1446,7 +1541,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         )
         # 合成画像にはページ座標系が無いため検索ハイライトは出さない。
         self._zoom_label.set_search_hit_rects([])
-        # 見開き中は付箋編集UI(B一覧)を対象外にするため注釈状態をクリアする。
+        # 複数ページ表示中は付箋編集UI(B一覧)を対象外にするため注釈状態をクリアする。
         self._zoom_annotations = []
         self._update_note_list_widget()
 
@@ -1465,6 +1560,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             self._render_zoom()
 
     def _on_undo(self) -> None:
+        if self._zoom_page_layout_is_multi():
+            return
         self._commit_inline_annotation_editor()
         try:
             self._undo_manager.undo()
@@ -1475,6 +1572,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._update_button_states()
 
     def _on_redo(self) -> None:
+        if self._zoom_page_layout_is_multi():
+            return
         self._commit_inline_annotation_editor()
         try:
             self._undo_manager.redo()
@@ -1485,8 +1584,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._update_button_states()
 
     def _on_delete(self) -> None:
-        # 見開き表示(閲覧専用)中は削除不可(Delete キーのショートカット対策)。
-        if getattr(self, "_zoom_spread_mode", False):
+        # 複数ページ表示(閲覧専用)中は削除不可(Delete キーのショートカット対策)。
+        if self._zoom_page_layout_is_multi():
             return
         # ズームビュー表示中の場合
         if self._zoom_view and self._zoom_view.isVisible():
@@ -1622,8 +1721,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         print_pdfs([self._pdf_path], self, settings=dialog.get_settings(), printer=dialog.build_printer())
 
     def _on_rotate(self) -> None:
-        # 見開き表示(閲覧専用)中は回転不可(R キーのショートカット対策)。
-        if getattr(self, "_zoom_spread_mode", False):
+        # 複数ページ表示(閲覧専用)中は回転不可(R キーのショートカット対策)。
+        if self._zoom_page_layout_is_multi():
             return
         # ズームビュー表示中の場合
         if self._zoom_view and self._zoom_view.isVisible():
