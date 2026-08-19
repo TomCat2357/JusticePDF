@@ -14,7 +14,7 @@ import pytest
 from PyQt6.QtGui import QPixmap
 
 from src.views import main_window, pdf_card
-from tests.helpers import FakeWatcher
+from tests.helpers import FakeWatcher, make_pdf
 
 
 PDF_BYTES = b"%PDF-1.4\n%%EOF\n"
@@ -80,7 +80,7 @@ def test_leaked_internal_add_recovers_after_ttl(window_factory):
 
     # 先に内部追加を登録（busy 化）してから実ファイルを作る。watchdog 追加イベントは来ない。
     window._register_internal_add([str(doc)])
-    doc.write_bytes(PDF_BYTES)
+    make_pdf(doc)
 
     # まだ新しい間は追加しない（in-flight race 保護を維持）。
     window._reconcile_with_disk()
@@ -92,6 +92,118 @@ def test_leaked_internal_add_recovers_after_ttl(window_factory):
     window._reconcile_with_disk()
     assert window._get_card_by_path(str(doc)) is not None
     assert len(window._cards) == 1
+
+
+def test_reconcile_recovers_zero_page_card_after_copy_completes_without_event(
+    window_factory, monkeypatch,
+):
+    window = window_factory()
+    doc = Path(window._work_dir) / "copying.pdf"
+    doc.write_bytes(b"%PDF-partial")
+    monkeypatch.setattr(
+        pdf_card,
+        "get_pdf_card_info",
+        lambda path, _size: (QPixmap(), main_window.get_page_count(path)),
+    )
+
+    card = window._add_card(str(doc))
+    assert card.page_count == 0
+
+    completed = Path(window._work_dir) / "completed.tmp"
+    make_pdf(completed, pages=2)
+    completed.replace(doc)
+
+    # First pass observes the changed signature; second pass proves stability
+    # and retries the card parse even though no modified event arrived.
+    window._reconcile_with_disk()
+    assert card.page_count == 0
+    window._reconcile_with_disk()
+    assert card.page_count == 2
+
+
+def test_reconcile_refreshes_existing_card_when_signature_changes(
+    window_factory, monkeypatch,
+):
+    window = window_factory()
+    doc = Path(window._work_dir) / "replaced.pdf"
+    make_pdf(doc, pages=1)
+    monkeypatch.setattr(
+        pdf_card,
+        "get_pdf_card_info",
+        lambda path, _size: (QPixmap(), main_window.get_page_count(path)),
+    )
+
+    card = window._add_card(str(doc))
+    assert card.page_count == 1
+
+    replacement = Path(window._work_dir) / "replacement.tmp"
+    make_pdf(replacement, pages=3)
+    replacement.replace(doc)
+
+    window._reconcile_with_disk()
+    assert card.page_count == 1
+    window._reconcile_with_disk()
+    assert card.page_count == 3
+
+
+def test_file_add_waits_until_pdf_is_stable_and_parseable(
+    window_factory, monkeypatch,
+):
+    window = window_factory()
+    doc = Path(window._work_dir) / "external.pdf"
+    doc.write_bytes(b"%PDF-partial")
+    monkeypatch.setattr(
+        pdf_card,
+        "get_pdf_card_info",
+        lambda path, _size: (QPixmap(), main_window.get_page_count(path)),
+    )
+
+    window._on_file_added(str(doc))
+    window._reconcile_with_disk()
+    assert window._get_card_by_path(str(doc)) is None
+
+    completed = Path(window._work_dir) / "external-complete.tmp"
+    make_pdf(completed, pages=1)
+    completed.replace(doc)
+
+    # No follow-up watchdog event: polling alone must eventually add it.
+    window._reconcile_with_disk()
+    assert window._get_card_by_path(str(doc)) is None
+    window._reconcile_with_disk()
+    card = window._get_card_by_path(str(doc))
+    assert card is not None
+    assert card.page_count == 1
+
+
+def test_async_operation_end_schedules_immediate_reconcile(
+    window_factory, monkeypatch,
+):
+    window = window_factory()
+    scheduled: list[bool] = []
+    monkeypatch.setattr(window, "_schedule_reconcile", lambda: scheduled.append(True))
+    window._operation_in_progress = True
+
+    window._end_async_operation()
+
+    assert window._operation_in_progress is False
+    assert scheduled == [True]
+
+
+def test_stabilized_internal_add_preserves_undo_history(
+    window_factory, monkeypatch,
+):
+    window = window_factory()
+    doc = Path(window._work_dir) / "internal.pdf"
+    make_pdf(doc)
+    window._register_internal_add([str(doc)])
+    cleared: list[bool] = []
+    monkeypatch.setattr(window, "_clear_undo_history", lambda: cleared.append(True))
+
+    window._on_file_added(str(doc))
+    window._reconcile_with_disk()
+
+    assert window._get_card_by_path(str(doc)) is not None
+    assert cleared == []
 
 
 def test_late_watchdog_remove_after_expiry_does_not_clear_undo(window_factory, monkeypatch):
