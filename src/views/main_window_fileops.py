@@ -47,6 +47,9 @@ class FileOpsMixin:
         self._active_worker = None
         QApplication.restoreOverrideCursor()
         self._update_button_states()
+        # A watchdog event may have been lost while reconcile was suppressed
+        # by _operation_in_progress.  Do not wait for the next 2-second poll.
+        self._schedule_reconcile()
     def _run_file_operation(
         self,
         do_io: Callable[[], object],

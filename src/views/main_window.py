@@ -97,6 +97,14 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         # 除外対象から外し、ディスク差分での再同期を再開させる（恒久ズレ防止）。
         self._busy_since: dict[str, float] = {}
         self._BUSY_TTL_SEC = 6.0
+        # Last signature that was rendered successfully for each PDF card.
+        # A missing entry (or a 0-page card) is retried by reconcile even when
+        # watchdog's final modified event was lost during an external copy.
+        self._file_signatures: dict[str, tuple[int, int, int, int]] = {}
+        # norm path -> (last observed signature, consecutive observation count)
+        self._file_stability: dict[
+            str, tuple[tuple[int, int, int, int], int]
+        ] = {}
         self._preview_thumb_size = PDFCard.THUMBNAIL_SIZE
         self._preview_card_ratio = PDFCard.CARD_WIDTH / PDFCard.THUMBNAIL_SIZE
         self._preview_card_width = int(round(self._preview_thumb_size * self._preview_card_ratio))
@@ -134,7 +142,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._order_save_timer.timeout.connect(self._flush_order_save)
 
         # Low-frequency backstop poll for missed watchdog events (bulk copies,
-        # cloud-synced folders, AV interference). Runs only while visible.
+        # cloud-synced folders, AV interference). A minimized window is still
+        # polled so missed events are recovered before the user restores it.
         self._reconcile_poll_timer = QTimer(self)
         self._reconcile_poll_timer.setInterval(2000)
         self._reconcile_poll_timer.timeout.connect(self._maybe_poll_reconcile)
@@ -493,6 +502,49 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         """Normalize paths for internal tracking."""
         return os.path.normcase(os.path.abspath(path))
 
+    def _get_file_signature(self, path: str) -> tuple[int, int, int, int] | None:
+        """Return a signature that changes for writes and atomic replacement."""
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+
+    def _record_card_signature(self, card: PDFCard) -> None:
+        """Remember the on-disk version represented by a successfully loaded card."""
+        normalized = self._normalize_path(card.pdf_path)
+        signature = self._get_file_signature(card.pdf_path)
+        if card.page_count > 0 and signature is not None:
+            self._file_signatures[normalized] = signature
+        else:
+            # Keep failed/partial loads retryable even if their stat is stable.
+            self._file_signatures.pop(normalized, None)
+
+    def _observe_file_stability(self, path: str) -> bool:
+        """Return True after two equal signatures and a successful PDF parse.
+
+        Explorer/cloud copies can be readable and non-empty before the PDF
+        trailer has arrived.  Requiring both a stable stat and a successful
+        parse prevents committing that transient state as a permanent 0-page
+        card.  Parse failures remain queued for a later reconcile pass.
+        """
+        normalized = self._normalize_path(path)
+        signature = self._get_file_signature(path)
+        if signature is None or signature[0] <= 0:
+            self._file_stability.pop(normalized, None)
+            return False
+
+        previous = self._file_stability.get(normalized)
+        count = previous[1] + 1 if previous and previous[0] == signature else 1
+        self._file_stability[normalized] = (signature, count)
+        if count < 2:
+            return False
+        if get_page_count(path) <= 0:
+            return False
+
+        self._file_stability.pop(normalized, None)
+        return True
+
     def _register_internal_add(self, paths: list[str]) -> None:
         """Mark paths as internally added to avoid clearing undo history."""
         now = time.monotonic()
@@ -680,6 +732,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             self._cards.append(card)
         else:
             self._cards.insert(max(0, insert_index), card)
+        self._record_card_signature(card)
         return card
 
     def _add_folder_card(self, folder_path: str, insert_index: int | None = None) -> FolderCard:
@@ -754,21 +807,13 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         )
 
     def _maybe_poll_reconcile(self) -> None:
-        """Backstop poll: only scan the directory while the window is visible."""
-        if self.isVisible() and not self.isMinimized():
+        """Backstop poll: scan while the window is alive and visible."""
+        if self.isVisible():
             self._schedule_reconcile()
 
     def _is_file_ready(self, path: str) -> bool:
-        """Best-effort check that a freshly-appeared file is fully written
-        (not still being copied / exclusively locked by another process)."""
-        try:
-            if os.path.getsize(path) <= 0:
-                return False
-            with open(path, "rb"):
-                pass
-            return True
-        except OSError:
-            return False
+        """Check that a freshly-appeared PDF is stable and parseable."""
+        return self._observe_file_stability(path)
 
     def _reconcile_with_disk(self) -> None:
         """Diff the on-disk contents of the work dir against the displayed
@@ -821,9 +866,27 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         changed = False
 
         # --- PDF cards ---
-        card_norm = {self._normalize_path(c.pdf_path) for c in self._cards}
+        card_by_norm = {self._normalize_path(c.pdf_path): c for c in self._cards}
         for norm, real in disk_pdf_norm.items():
-            if norm in card_norm or norm in busy:
+            if norm in busy:
+                # Observe only; never mutate cards while an internal operation
+                # is protected.  If watchdog is lost, this lets the first pass
+                # after TTL expiry complete the two-sample stability check.
+                self._observe_file_stability(real)
+                continue
+            card = card_by_norm.get(norm)
+            signature = self._get_file_signature(real)
+            if card is not None:
+                rendered_signature = self._file_signatures.get(norm)
+                if card.page_count > 0 and signature == rendered_signature:
+                    self._file_stability.pop(norm, None)
+                    continue
+                if not self._is_file_ready(real):
+                    continue
+                clear_pixmap_cache_for_path(real)
+                card.refresh()
+                self._record_card_signature(card)
+                changed = True
                 continue
             if not self._is_file_ready(real):  # still being copied; pick it up next pass
                 continue
@@ -899,6 +962,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                     self._selected_cards.remove(card)
                 self._cards.remove(card)
                 card.deleteLater()
+                normalized = self._normalize_path(card.pdf_path)
+                self._file_signatures.pop(normalized, None)
+                self._file_stability.pop(normalized, None)
                 logger.debug("Card removed successfully")
                 break
         else:
@@ -1389,16 +1455,19 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                 # The path was reused for a different file before the old card was removed.
                 # Refresh in place rather than treating this as a duplicate add.
                 card.refresh()
+                self._record_card_signature(card)
                 self._refresh_page_edit_windows_for_paths([path])
                 self._grid_refresh_timer.start()
+                self._schedule_reconcile()
                 return
         if normalized in self._internal_adds:
             self._internal_adds.discard(normalized)
         else:
             self._clear_undo_history()
-        new_card = self._add_card(path, insert_index=None)
-        self._grid_refresh_timer.start()
-        self._schedule_order_save()
+        # Seed the stability observation and let reconcile add the card only
+        # after the same signature is seen again and the PDF parses cleanly.
+        self._observe_file_stability(path)
+        self._schedule_reconcile()
 
     def _on_file_removed(self, path: str) -> None:
         """Handle file removed from folder."""
@@ -1479,6 +1548,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             if self._normalize_path(card.pdf_path) == normalized:
                 try:
                     card.refresh()
+                    self._record_card_signature(card)
                 except Exception:
                     logger.debug("modified debounce: card.refresh() failed for %s", path, exc_info=True)
                 break
