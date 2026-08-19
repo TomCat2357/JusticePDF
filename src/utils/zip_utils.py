@@ -56,20 +56,101 @@ def is_encrypted_zip(path: str | Path) -> bool:
         return any(info.flag_bits & _ENCRYPTED_FLAG for info in zf.infolist())
 
 
+_SJIS_LEAD_RANGES = ((0x81, 0x9F), (0xE0, 0xFC))
+_SJIS_TRAIL_RANGES = ((0x40, 0x7E), (0x80, 0xFC))
+
+
+def _is_sjis_lead_byte(b: int) -> bool:
+    return any(lo <= b <= hi for lo, hi in _SJIS_LEAD_RANGES)
+
+
+def _is_sjis_trail_byte(b: int) -> bool:
+    return any(lo <= b <= hi for lo, hi in _SJIS_TRAIL_RANGES)
+
+
+def _cp932_lenient_decode(raw: bytes) -> str:
+    """Decode cp932 bytes byte-by-byte, tolerating a known corruption.
+
+    Some tools "sanitize" archive member names by blindly rewriting every
+    backslash byte (0x5C) to a forward slash (0x2F). 0x5C is also the second
+    byte of many common cp932 kanji (e.g. "表" is 0x95 0x5C), so that rewrite
+    turns the trailing byte of those characters into a stray 0x2F.
+
+    A naive whole-string decode failure would otherwise fall back to raw
+    cp437 mojibake, whose stray 0x2F/0x5C bytes look like path separators to
+    :func:`_safe_relpath` and split one file into a bogus subfolder plus an
+    oddly named (often hidden, dot-prefixed) file. Decoding byte-by-byte and
+    always consuming both bytes of an attempted lead/trail pair — recovering
+    the 0x5C corruption when that is the cause, else substituting a single
+    replacement character — guarantees a corrupted trail byte can never leak
+    out as a literal "/" or "\\" and be mistaken for a real separator.
+
+    A lead byte is only treated as starting a pair when the following byte
+    is a plausible trail byte, or is the specific corruption byte 0x2F.
+    Otherwise the lead byte is decoded on its own (with a cp437 fallback,
+    since cp437 is what non-cp932 archives such as Western-filename ones
+    were decoded as before falling into this function). Without that guard,
+    e.g. a cp437 name like "café.pdf" (0x82 = "é" in cp437, but also a valid
+    cp932 lead byte) would have its trailing "." wrongly swallowed as an
+    attempted — and failed — trail byte, corrupting the extension and
+    silently dropping the file from import.
+    """
+    chars: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        b = raw[i]
+        next_byte = raw[i + 1] if i + 1 < n else None
+        if _is_sjis_lead_byte(b) and next_byte is not None and (
+            _is_sjis_trail_byte(next_byte) or next_byte == 0x2F
+        ):
+            pair = raw[i : i + 2]
+            try:
+                chars.append(pair.decode("cp932"))
+            except UnicodeDecodeError:
+                recovered = False
+                if next_byte == 0x2F:
+                    try:
+                        chars.append(bytes((b, 0x5C)).decode("cp932"))
+                        recovered = True
+                    except UnicodeDecodeError:
+                        pass
+                if not recovered:
+                    chars.append("\uFFFD")
+            i += 2
+            continue
+        try:
+            chars.append(bytes((b,)).decode("cp932"))
+        except UnicodeDecodeError:
+            try:
+                chars.append(bytes((b,)).decode("cp437"))
+            except UnicodeDecodeError:
+                chars.append("\uFFFD")
+        i += 1
+    return "".join(chars)
+
+
 def _decode_member_name(info: zipfile.ZipInfo) -> str:
     """Best-effort decode of a member name, recovering Japanese filenames.
 
     When the UTF-8 flag is not set, :mod:`zipfile` decodes the raw bytes as
     cp437.  Archives created on Japanese Windows store names in cp932
     (Shift-JIS), so re-encode/decode to recover the original characters.
+
+    If the whole-string decode fails (e.g. a corrupted trailing byte), fall
+    back to a lenient byte-level decode instead of the raw cp437 mojibake —
+    see :func:`_cp932_lenient_decode` for why that fallback matters.
     """
-    name = info.filename
-    if not (info.flag_bits & _UTF8_NAME_FLAG):
-        try:
-            name = name.encode("cp437").decode("cp932")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            name = info.filename
-    return name
+    if info.flag_bits & _UTF8_NAME_FLAG:
+        return info.filename
+    try:
+        raw = info.filename.encode("cp437")
+    except UnicodeEncodeError:
+        return info.filename
+    try:
+        return raw.decode("cp932")
+    except UnicodeDecodeError:
+        return _cp932_lenient_decode(raw)
 
 
 def _safe_relpath(member_name: str) -> Path | None:
