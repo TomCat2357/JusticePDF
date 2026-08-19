@@ -258,7 +258,10 @@ class PageThumbnail(QFrame):
         self.load_thumbnail()
 
     def set_thumbnail_size(self, size: int) -> None:
-        self._thumb_size = int(size)
+        size = int(size)
+        if size == self._thumb_size:
+            return
+        self._thumb_size = size
         self.setFixedSize(self._thumb_size + self.CARD_PADDING, self._thumb_size + self.CARD_PADDING)
         self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
         self._image_label.setFixedSize(self._thumb_size, self._thumb_size)

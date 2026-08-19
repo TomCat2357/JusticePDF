@@ -185,6 +185,8 @@ class PDFCard(QFrame):
         """Update sizes with fast Qt-side scaling (no fitz re-render)."""
         self._card_width = int(card_width)
         self._thumb_size = int(thumb_size)
+        if self.width() == self._card_width and self._thumbnail_label.width() == self._thumb_size:
+            return
         self.setFixedWidth(self._card_width)
         self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
         self._thumbnail_label.setFixedSize(self._thumb_size, self._thumb_size)

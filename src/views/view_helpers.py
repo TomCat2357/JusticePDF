@@ -79,12 +79,50 @@ def log_undo_state(
 def viewport_width_or_fallback(
     scroll_area: QScrollArea | None,
     fallback_width: int,
+    *,
+    reserve_vertical_scrollbar: bool = False,
 ) -> int:
     """Return viewport width when available, otherwise fallback width."""
     width = int(scroll_area.viewport().width()) if scroll_area else 0
+    if width <= 0:
+        return int(fallback_width)
+    if reserve_vertical_scrollbar and scroll_area is not None:
+        if scroll_area.verticalScrollBarPolicy() != Qt.ScrollBarPolicy.ScrollBarAlwaysOff:
+            # The bar can appear after the layout is calculated. Reserve its
+            # width up front so appearing/disappearing does not oscillate the
+            # number of columns or leave the last item clipped.
+            bar_width = scroll_area.verticalScrollBar().sizeHint().width()
+            reserved_width = (
+                scroll_area.width()
+                - 2 * scroll_area.frameWidth()
+                - int(bar_width)
+            )
+            if reserved_width > 0:
+                width = min(width, reserved_width)
     if width > 0:
         return width
     return int(fallback_width)
+
+
+def responsive_grid_metrics(
+    available_width: int,
+    preferred_item_width: int,
+    spacing: int,
+    horizontal_margins: int = 0,
+) -> tuple[int, int]:
+    """Return ``(columns, item_width)`` for a width-constrained grid.
+
+    ``preferred_item_width`` is the normal preview size.  The grid keeps as
+    many columns as that size allows, then distributes the remaining width
+    across those columns.  If the window is narrower than one preferred item,
+    the item is reduced so the row still fits without horizontal scrolling.
+    """
+    usable_width = max(1, int(available_width) - max(0, int(horizontal_margins)))
+    preferred_width = max(1, int(preferred_item_width))
+    gap = max(0, int(spacing))
+    columns = max(1, (usable_width + gap) // (preferred_width + gap))
+    item_width = max(1, (usable_width - gap * (columns - 1)) // columns)
+    return columns, item_width
 
 
 def clear_selection(items: list[TSelectable]) -> None:

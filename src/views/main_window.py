@@ -30,6 +30,7 @@ from src.views.view_helpers import (
     clear_selection,
     log_undo_state,
     register_shortcuts,
+    responsive_grid_metrics,
     viewport_width_or_fallback,
 )
 from src.controllers.folder_watcher import FolderWatcher
@@ -702,6 +703,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         return viewport_width_or_fallback(
             getattr(self, "_scroll_area", None),
             self.width(),
+            reserve_vertical_scrollbar=True,
         )
 
     def _connect_card_signals(self, card: PDFCard) -> PDFCard:
@@ -986,11 +988,28 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             spacing = self._grid_layout.spacing()
         spacing = int(spacing)
         m = self._grid_layout.contentsMargins()
-        usable = max(1, int(available_width) - int(m.left() + m.right()))
+        cols, card_width = responsive_grid_metrics(
+            available_width,
+            self._preview_card_width,
+            spacing,
+            m.left() + m.right(),
+        )
 
-        # n*W + (n-1)*S <= usable  => cols = floor((usable + S) / (W + S))
-        w = int(self._preview_card_width)
-        cols = max(1, int((usable + spacing) // (w + spacing)))
+        # Keep the grid at least as wide as the viewport.  This prevents the
+        # layout's size hint from making QScrollArea choose a wider content
+        # widget than the current window.
+        self._container.setMinimumWidth(max(1, int(available_width)))
+
+        # The card width and thumbnail size are coupled.  Recalculate both so
+        # cards fit the current viewport while preserving the preview aspect.
+        thumb_size = max(1, int(round(card_width / self._preview_card_ratio)))
+        pdf_thumbnail_size_changed = any(
+            card._thumb_size != thumb_size for card in self._cards
+        )
+        for item in (*self._folder_cards, *self._cards):
+            item.set_preview_size_fast(card_width, thumb_size)
+        if pdf_thumbnail_size_changed:
+            self._zoom_debounce_timer.start()
 
         all_items: list[QWidget] = list(self._folder_cards) + list(self._cards)
         for i, item in enumerate(all_items):
@@ -1058,14 +1077,19 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             return
         self._preview_thumb_size = size
         self._preview_card_width = int(round(self._preview_thumb_size * self._preview_card_ratio))
-        for card in self._cards:
-            card.set_preview_size_fast(self._preview_card_width, self._preview_thumb_size)
         self._refresh_grid()
         self._zoom_debounce_timer.start()
 
     def eventFilter(self, obj, event) -> bool:
         scroll_area = getattr(self, "_scroll_area", None)
-        if scroll_area and obj is scroll_area.viewport() and event.type() == QEvent.Type.Wheel:
+        if scroll_area and obj is scroll_area.viewport():
+            if event.type() == QEvent.Type.Resize:
+                # A vertical scrollbar can appear after the grid is laid out,
+                # reducing the viewport width by its own width.
+                self._grid_refresh_timer.start()
+                return False
+            if event.type() != QEvent.Type.Wheel:
+                return super().eventFilter(obj, event)
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 delta = event.angleDelta().y()
                 if delta != 0:
@@ -1808,6 +1832,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         super().resizeEvent(event)
         # As requested: even tiny resizes can reflow. The key fix is that the logic is identical to initial.
         self._refresh_grid()
+        # The vertical scrollbar may be created by the refresh above. Run one
+        # more pass after Qt has settled the viewport geometry.
+        self._grid_refresh_timer.start()
 
     def closeEvent(self, event) -> None:
         """Handle window close."""
