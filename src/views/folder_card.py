@@ -165,6 +165,8 @@ class FolderCard(QFrame):
         self.updateGeometry()
 
     def set_preview_size_fast(self, card_width: int, thumb_size: int) -> None:
+        if self.width() == int(card_width) and self._icon_label.width() == int(thumb_size):
+            return
         self.set_preview_size(card_width, thumb_size)
 
     def render_high_quality(self) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PyQt6.QtCore import QPoint
+from PyQt6.QtCore import QPoint, QRect, Qt
 from PyQt6.QtGui import QPixmap
 
 from src.views import main_window, pdf_card
@@ -135,3 +135,26 @@ def test_refresh_button_refreshes_cards_and_open_page_windows(window_factory, mo
 
     assert card_refreshes == paths
     assert fake_window.refresh_calls == 1
+
+
+def test_file_grid_reflows_without_horizontal_overflow(window_factory, qtbot):
+    window, _paths = window_factory(count=8)
+
+    for width, height in ((800, 700), (800, 300), (500, 300), (1100, 700)):
+        window.resize(width, height)
+        qtbot.wait(20)
+
+        assert (
+            window._scroll_area.horizontalScrollBarPolicy()
+            == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        assert not window._scroll_area.horizontalScrollBar().isVisible()
+        viewport = window._scroll_area.viewport()
+        viewport_rect = viewport.rect()
+        for card in (*window._folder_cards, *window._cards):
+            item_rect = card.geometry()
+            top_left = window._container.mapTo(viewport, item_rect.topLeft())
+            bottom_right = window._container.mapTo(viewport, item_rect.bottomRight())
+            visible_rect = QRect(top_left, bottom_right).normalized()
+            assert visible_rect.left() >= viewport_rect.left()
+            assert visible_rect.right() <= viewport_rect.right()

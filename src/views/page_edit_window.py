@@ -152,6 +152,7 @@ from src.views.view_helpers import (
     clear_selection,
     log_undo_state,
     register_shortcuts,
+    responsive_grid_metrics,
     viewport_width_or_fallback,
 )
 from send2trash import send2trash
@@ -270,7 +271,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         # 本文編集中の付箋 xref と、確定前の元本文（差分判定用）。
         self._editing_note_xref: int | None = None
         self._editing_note_original = ""
-        self._thumb_size = PageThumbnail.THUMBNAIL_SIZE
+        # Preferred size is controlled by Ctrl+wheel.  _thumb_size is the
+        # effective size after fitting the current window width.
+        self._preferred_thumb_size = PageThumbnail.THUMBNAIL_SIZE
+        self._thumb_size = self._preferred_thumb_size
         self._thumb_render_queue: deque[int] = deque()
         self._thumb_render_queue_set: set[int] = set()
         self._thumb_render_timer = QTimer(self)
@@ -280,6 +284,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._scroll_debounce_timer.setSingleShot(True)
         self._scroll_debounce_timer.setInterval(60)
         self._scroll_debounce_timer.timeout.connect(self._enqueue_visible_thumbnail_renders)
+        self._grid_resize_timer = QTimer(self)
+        self._grid_resize_timer.setSingleShot(True)
+        self._grid_resize_timer.timeout.connect(self._refresh_grid)
 
         # Drop indicator
         self._drop_indicator = None
@@ -320,6 +327,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         """ページサムネイル一覧(グリッド)と選択・ドロップ表示部品を組み立てる。"""
         self._grid_scroll = QScrollArea()
         self._grid_scroll.setWidgetResizable(True)
+        self._grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._grid_scroll.viewport().installEventFilter(self)
         self._grid_scroll.verticalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
         self._grid_scroll.horizontalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
@@ -1021,7 +1029,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
 
     def _grid_available_width(self) -> int:
         """Width source for column calculation (always consistent)."""
-        return viewport_width_or_fallback(self._grid_scroll, self.width())
+        return viewport_width_or_fallback(
+            self._grid_scroll,
+            self.width(),
+            reserve_vertical_scrollbar=True,
+        )
 
     def _refresh_grid(self) -> None:
         while self._grid_layout.count():
@@ -1037,10 +1049,21 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             spacing = self._grid_layout.spacing()
         spacing = int(spacing)
         m = self._grid_layout.contentsMargins()
-        usable = max(1, int(available_width) - int(m.left() + m.right()))
+        preferred_item_width = self._preferred_thumb_size + PageThumbnail.CARD_PADDING
+        cols, item_width = responsive_grid_metrics(
+            available_width,
+            preferred_item_width,
+            spacing,
+            m.left() + m.right(),
+        )
 
-        w = int(self._thumb_size)
-        cols = max(1, int((usable + spacing) // (w + spacing)))
+        self._container.setMinimumWidth(max(1, int(available_width)))
+        thumb_size = max(1, item_width - PageThumbnail.CARD_PADDING)
+        if thumb_size != self._thumb_size:
+            self._reset_thumbnail_render_queue()
+            self._thumb_size = thumb_size
+            for thumb in self._thumbnails:
+                thumb.set_thumbnail_size(self._thumb_size)
 
         visible_thumbs = [t for t in self._thumbnails if not t._explicitly_hidden]
         for i, thumb in enumerate(visible_thumbs):
@@ -1100,25 +1123,29 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
 
     def _set_thumbnail_size(self, size: int) -> None:
         size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
-        if size == self._thumb_size:
+        if size == self._preferred_thumb_size:
             return
-        self._reset_thumbnail_render_queue()
-        self._thumb_size = size
-        for thumb in self._thumbnails:
-            thumb.set_thumbnail_size(self._thumb_size)
+        self._preferred_thumb_size = size
         self._refresh_grid()
         self._enqueue_all_thumbnail_renders()
 
     def eventFilter(self, obj, event) -> bool:
         grid_scroll = getattr(self, "_grid_scroll", None)
-        if grid_scroll and obj is grid_scroll.viewport() and event.type() == QEvent.Type.Wheel:
+        if grid_scroll and obj is grid_scroll.viewport():
+            if event.type() == QEvent.Type.Resize:
+                # A vertical scrollbar can appear after the grid is laid out,
+                # reducing the viewport width by its own width.
+                self._grid_resize_timer.start()
+                return False
+            if event.type() != QEvent.Type.Wheel:
+                return super().eventFilter(obj, event)
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 if self._zoom_view and self._zoom_view.isVisible():
                     return False
                 delta = event.angleDelta().y()
                 if delta != 0:
                     step = self.PREVIEW_THUMB_STEP if delta > 0 else -self.PREVIEW_THUMB_STEP
-                    self._set_thumbnail_size(self._thumb_size + step)
+                    self._set_thumbnail_size(self._preferred_thumb_size + step)
                 event.accept()
                 return True
         return super().eventFilter(obj, event)
@@ -1912,6 +1939,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._refresh_grid()
+        # The vertical scrollbar may be created by the refresh above. Run one
+        # more pass after Qt has settled the viewport geometry.
+        self._grid_resize_timer.start()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
