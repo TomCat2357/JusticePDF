@@ -61,11 +61,64 @@ def test_extract_zip_preserves_structure(tmp_path):
     assert (dest / "sub" / "b.pdf").read_bytes() == _PDF_BYTES
 
 
+def test_extract_zip_keeps_real_separator_before_corrupted_segment(tmp_path):
+    """The lenient cp932 fallback must not eat a genuine directory separator.
+
+    Only the trailing segment's "表" is corrupted (0x95 0x5c -> 0x95 0x2f);
+    the "/" between "資料" and the filename is a real, uncorrupted separator
+    and must still split into two path parts, not get merged into one name.
+    """
+    real_dir = "資料"
+    original_name = "10_災害対策基本法の新旧対照表.pdf"
+    corrupted_member = (
+        real_dir.encode("cp932")
+        + b"/"
+        + original_name.encode("cp932").replace(b"\x95\x5c", b"\x95/")
+    )
+    placeholder = "P" * len(corrupted_member)
+    src = tmp_path / "src.zip"
+    _make_plain_zip(src, {placeholder: _PDF_BYTES})
+    data = src.read_bytes().replace(placeholder.encode("ascii"), corrupted_member)
+    src.write_bytes(data)
+
+    dest = tmp_path / "out"
+    zip_utils.extract_zip(src, dest)
+    assert (dest / real_dir / original_name).read_bytes() == _PDF_BYTES
+    assert list(dest.iterdir()) == [dest / real_dir]
+    assert list((dest / real_dir).iterdir()) == [dest / real_dir / original_name]
+
+
 def test_extract_zip_raises_on_encrypted(tmp_path):
     locked = tmp_path / "locked.zip"
     _make_encrypted_zip(locked)
     with pytest.raises(zip_utils.EncryptedZipError):
         zip_utils.extract_zip(locked, tmp_path / "out")
+
+
+def test_extract_zip_recovers_backslash_sanitized_kanji_filename(tmp_path):
+    """End-to-end regression for the corrupted-trailing-byte bug: extraction
+    must produce one correctly named file, not an empty folder plus a hidden
+    ".pdf" (see test_decode_member_name_recovers_backslash_sanitized_kanji).
+
+    zipfile.writestr() auto-sets the UTF-8 flag for any non-ASCII filename,
+    which would sidestep the cp932 fallback path entirely and defeat the
+    point of this test. So, as with _make_encrypted_zip above, the archive
+    is built with an ASCII placeholder name (keeping the UTF-8 flag off)
+    and the raw member-name bytes are then patched directly to the
+    corrupted cp932 bytes actually seen in the field.
+    """
+    original = "10_災害対策基本法の新旧対照表.pdf"
+    corrupted_cp932 = original.encode("cp932").replace(b"\x95\x5c", b"\x95/")
+    placeholder = "P" * len(corrupted_cp932)
+    src = tmp_path / "src.zip"
+    _make_plain_zip(src, {placeholder: _PDF_BYTES})
+    data = src.read_bytes().replace(placeholder.encode("ascii"), corrupted_cp932)
+    src.write_bytes(data)
+
+    dest = tmp_path / "out"
+    zip_utils.extract_zip(src, dest)
+    assert (dest / original).read_bytes() == _PDF_BYTES
+    assert list(dest.iterdir()) == [dest / original]
 
 
 def test_extract_zip_blocks_path_traversal(tmp_path):
@@ -93,6 +146,66 @@ def test_decode_member_name_keeps_utf8_flagged():
     info.filename = "報告書.pdf"
     info.flag_bits = zip_utils._UTF8_NAME_FLAG
     assert zip_utils._decode_member_name(info) == "報告書.pdf"
+
+
+def test_decode_member_name_keeps_western_cp437_extension():
+    """Regression guard for a bug introduced and caught during review: the
+    byte-level fallback must not treat every cp932 lead byte (0x81-0x9F,
+    0xE0-0xFC) as always starting a 2-byte pair. 0x82 is both a valid cp932
+    lead byte and, in cp437, the accented "é" — a common byte in Western
+    filenames stored without the UTF-8 flag. Naively pairing it with
+    whatever follows (here "." before the extension) swallowed the
+    following byte as a failed trail byte, corrupting the extension and
+    causing the importer's extension check to silently drop the file - the
+    same user-visible symptom this whole fix exists to eliminate, just for
+    a different filename charset.
+    """
+    for raw, expected_name in (
+        (b"caf\x82.pdf", "café.pdf"),
+        (b"expos\x82-final.pdf", "exposé-final.pdf"),
+    ):
+        info = zipfile.ZipInfo()
+        info.filename = raw.decode("cp437")
+        info.flag_bits = 0
+        decoded = zip_utils._decode_member_name(info)
+        assert decoded == expected_name
+        assert Path(decoded).suffix == ".pdf"
+
+
+def test_decode_member_name_recovers_backslash_sanitized_kanji():
+    """Regression: some zip builders rewrite every 0x5C byte to 0x2F, which
+    corrupts the trailing byte of cp932 kanji like "表" (0x95 0x5C -> 0x95 0x2F).
+
+    Before the fix, the whole-string decode failure fell back to raw cp437
+    mojibake whose stray "/" was then mistaken for a path separator by
+    _safe_relpath, splitting a single file into an empty folder plus a
+    hidden ".pdf" file (see actual case: "10_...新旧対照表.pdf").
+    """
+    original = "10_災害対策基本法の新旧対照表.pdf"
+    corrupted_cp932 = original.encode("cp932").replace(b"\x95\x5c", b"\x95/")
+    info = zipfile.ZipInfo()
+    info.filename = corrupted_cp932.decode("cp437")
+    info.flag_bits = 0
+    decoded = zip_utils._decode_member_name(info)
+    assert decoded == original
+    # The core safety property, independent of exact recovery: no stray
+    # separator can leak out of a corrupted multi-byte sequence.
+    assert zip_utils._safe_relpath(decoded) == Path(original)
+
+
+def test_decode_member_name_undecodable_byte_never_leaks_separator():
+    """A corruption pattern we can't recover must still never produce a
+    literal "/" or "\\" that _safe_relpath would mistake for a directory
+    boundary. 0x82 is a valid cp932 lead byte, but (0x82, 0x5c) is not a
+    valid pair, so the 0x5c-recovery attempt itself fails here too -
+    exercising the final placeholder fallback, not just the happy path."""
+    raw = b"10_\x8d\xd0\x8aQ\x91\xce\x82/.pdf"
+    info = zipfile.ZipInfo()
+    info.filename = raw.decode("cp437")
+    info.flag_bits = 0
+    decoded = zip_utils._decode_member_name(info)
+    assert "/" not in decoded and "\\" not in decoded
+    assert len(zip_utils._safe_relpath(decoded).parts) == 1
 
 
 def test_prepare_zip_imports_expands_plain_zip(tmp_path):
