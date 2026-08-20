@@ -266,3 +266,23 @@ def test_merge_paths_nothing_mergeable_returns_zero(tmp_path):
 
     assert total == 0
     assert not out.exists()
+
+
+def test_merge_paths_skips_unresolved_internal_bookmark(tmp_path):
+    # PyMuPDF represents an outline without a resolvable page as page -1.
+    # It must not be offset into a valid page in the merged PDF.
+    source = tmp_path / "source.pdf"
+    make_pdf(
+        source,
+        pages=2,
+        toc=[[1, "valid", 1], [1, "unresolved", -1]],
+    )
+    out = tmp_path / "merged.pdf"
+
+    merge_paths_to_pdf(str(out), [str(source)])
+
+    toc = get_pdf_toc(str(out))
+    assert [(e.level, e.title, e.page) for e in toc] == [
+        (1, "source.pdf", 1),
+        (2, "valid", 1),
+    ]

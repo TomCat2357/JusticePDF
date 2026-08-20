@@ -127,16 +127,32 @@ def _file_toc_entries(title: str, start0: int, sub: list) -> list[TocEntry]:
     return entries
 
 
-def _offset_toc_entries(toc: list, offset: int) -> list[TocEntry]:
+def _offset_toc_entries(
+    toc: list, offset: int, *, page_count: int | None = None
+) -> list[TocEntry]:
     """既存しおりを level は変えずページだけ ``offset`` して TocEntry 化する。
 
     結合先(dest)が既に持つファイル名しおりを再ネストせず、そのままの階層で残す
     ために使う。これにより1ファイルずつ重ねても階層が深くならない(フラットを維持)。
     """
-    return [
-        TocEntry(level=int(level), title=str(title), page=int(page) + offset)
-        for level, title, page in toc
-    ]
+    result: list[TocEntry] = []
+    for level, title, page in toc:
+        page = int(page)
+        if page_count is not None and not 1 <= page <= page_count:
+            # PyMuPDF uses -1 for an outline destination that cannot be
+            # resolved to a page. It must be discarded before applying the
+            # merge offset; otherwise -1 can become a valid merged page.
+            logger.warning(
+                "Skipping out-of-range PDF bookmark %r at page %s (page count: %s)",
+                title,
+                page,
+                page_count,
+            )
+            continue
+        result.append(
+            TocEntry(level=int(level), title=str(title), page=page + offset)
+        )
+    return result
 
 
 
@@ -188,7 +204,9 @@ def merge_pdfs_in_place(
                     sub = src_doc.get_toc(simple=True)
                     dest_doc.insert_pdf(src_doc)
                 if count > 0 and sub:
-                    source_entries.extend(_offset_toc_entries(sub, start))
+                    source_entries.extend(
+                        _offset_toc_entries(sub, start, page_count=count)
+                    )
                 start += count
             dest_start = 0
         else:
@@ -201,7 +219,9 @@ def merge_pdfs_in_place(
                     sub = src_doc.get_toc(simple=True)
                     dest_doc.insert_pdf(src_doc, start_at=idx)
                 if count > 0 and sub:
-                    source_entries.extend(_offset_toc_entries(sub, idx))
+                    source_entries.extend(
+                        _offset_toc_entries(sub, idx, page_count=count)
+                    )
                 idx += count
             total_inserted = idx - insert_at
             # 先頭挿入(insert_at==0)のとき、結合先の元ページは挿入分だけ後ろへずれる
@@ -212,7 +232,11 @@ def merge_pdfs_in_place(
             entries = list(source_entries)
             if dest_orig_count > 0 and dest_orig_toc:
                 # 結合先の既存しおりも level はそのまま、ページだけずらして引き継ぐ
-                entries.extend(_offset_toc_entries(dest_orig_toc, dest_start))
+                entries.extend(
+                    _offset_toc_entries(
+                        dest_orig_toc, dest_start, page_count=dest_orig_count
+                    )
+                )
             if entries:
                 # ページ順に並べ替え(安定ソートなので同ページ内の親→子順は保たれる)
                 entries.sort(key=lambda e: e.page)
@@ -272,12 +296,12 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
             logger.warning("結合をスキップしました(開けません): %s", path)
             return []
         entries = [TocEntry(level=level, title=_file_bookmark_title(path), page=start0 + 1)]
-        for sub_level, sub_title, sub_page in sub:
+        for sub_entry in _offset_toc_entries(sub, start0, page_count=count):
             entries.append(
                 TocEntry(
-                    level=level + int(sub_level),
-                    title=str(sub_title),
-                    page=int(sub_page) + start0,
+                    level=level + sub_entry.level,
+                    title=sub_entry.title,
+                    page=sub_entry.page,
                 )
             )
         return entries
