@@ -271,8 +271,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         # 本文編集中の付箋 xref と、確定前の元本文（差分判定用）。
         self._editing_note_xref: int | None = None
         self._editing_note_original = ""
-        # Preferred size is controlled by Ctrl+wheel.  _thumb_size is the
-        # effective size after fitting the current window width.
+        # Preferred size is controlled by Ctrl+wheel.  _thumb_size stays at
+        # that size while the window is resized; a narrow viewport scrolls
+        # horizontally instead of shrinking the thumbnails.
         self._preferred_thumb_size = PageThumbnail.THUMBNAIL_SIZE
         self._thumb_size = self._preferred_thumb_size
         self._thumb_render_queue: deque[int] = deque()
@@ -327,7 +328,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         """ページサムネイル一覧(グリッド)と選択・ドロップ表示部品を組み立てる。"""
         self._grid_scroll = QScrollArea()
         self._grid_scroll.setWidgetResizable(True)
-        self._grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._grid_scroll.viewport().installEventFilter(self)
         self._grid_scroll.verticalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
         self._grid_scroll.horizontalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
@@ -1057,7 +1058,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             m.left() + m.right(),
         )
 
-        self._container.setMinimumWidth(max(1, int(available_width)))
+        content_width = (
+            m.left()
+            + m.right()
+            + cols * item_width
+            + max(0, cols - 1) * spacing
+        )
+        self._container.setMinimumWidth(max(1, int(available_width), content_width))
         thumb_size = max(1, item_width - PageThumbnail.CARD_PADDING)
         if thumb_size != self._thumb_size:
             self._reset_thumbnail_render_queue()

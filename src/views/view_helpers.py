@@ -113,16 +113,16 @@ def responsive_grid_metrics(
     """Return ``(columns, item_width)`` for a width-constrained grid.
 
     ``preferred_item_width`` is the normal preview size.  The grid keeps as
-    many columns as that size allows, then distributes the remaining width
-    across those columns.  If the window is narrower than one preferred item,
-    the item is reduced so the row still fits without horizontal scrolling.
+    many columns as that size allows and leaves any remaining width unused so
+    resizing the window does not resize the items.  The item remains at its
+    preferred width even when it does not fit; callers can allow horizontal
+    scrolling for that case.
     """
     usable_width = max(1, int(available_width) - max(0, int(horizontal_margins)))
     preferred_width = max(1, int(preferred_item_width))
     gap = max(0, int(spacing))
     columns = max(1, (usable_width + gap) // (preferred_width + gap))
-    item_width = max(1, (usable_width - gap * (columns - 1)) // columns)
-    return columns, item_width
+    return columns, preferred_width
 
 
 def clear_selection(items: list[TSelectable]) -> None:

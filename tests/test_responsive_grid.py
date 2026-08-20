@@ -29,11 +29,11 @@ def test_responsive_grid_metrics_keeps_the_row_inside_the_viewport() -> None:
     )
 
     assert columns == 4
-    assert item_width == 187
+    assert item_width == 150
     assert columns * item_width + (columns - 1) * 10 + 20 <= 800
 
 
-def test_responsive_grid_metrics_shrinks_a_single_item_when_needed() -> None:
+def test_responsive_grid_metrics_keeps_item_width_when_one_item_does_not_fit() -> None:
     columns, item_width = responsive_grid_metrics(
         available_width=120,
         preferred_item_width=150,
@@ -42,7 +42,7 @@ def test_responsive_grid_metrics_shrinks_a_single_item_when_needed() -> None:
     )
 
     assert columns == 1
-    assert item_width == 100
+    assert item_width == 150
 
 
 def test_page_grid_reflows_without_horizontal_overflow(qtbot, tmp_path) -> None:
@@ -60,9 +60,10 @@ def test_page_grid_reflows_without_horizontal_overflow(qtbot, tmp_path) -> None:
 
         assert (
             window._grid_scroll.horizontalScrollBarPolicy()
-            == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            == Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         assert not window._grid_scroll.horizontalScrollBar().isVisible()
+        assert {thumb.width() for thumb in window._thumbnails} == {150}
         _assert_items_fit_horizontally(
             window._grid_scroll,
             window._container,
