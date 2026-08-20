@@ -255,7 +255,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         # Keep as an attribute so we can reliably use viewport width for column calculation.
         self._scroll_area = QScrollArea()
         self._scroll_area.setWidgetResizable(True)
-        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._scroll_area.viewport().installEventFilter(self)
         layout.addWidget(self._scroll_area)
 
@@ -995,13 +995,21 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             m.left() + m.right(),
         )
 
-        # Keep the grid at least as wide as the viewport.  This prevents the
-        # layout's size hint from making QScrollArea choose a wider content
-        # widget than the current window.
-        self._container.setMinimumWidth(max(1, int(available_width)))
+        # Keep the grid at least as wide as the viewport, but allow its fixed
+        # items to make it wider when even one item cannot fit.  In that case
+        # QScrollArea provides horizontal scrolling instead of shrinking it.
+        content_width = (
+            m.left()
+            + m.right()
+            + cols * card_width
+            + max(0, cols - 1) * spacing
+        )
+        self._container.setMinimumWidth(max(1, int(available_width), content_width))
 
-        # The card width and thumbnail size are coupled.  Recalculate both so
-        # cards fit the current viewport while preserving the preview aspect.
+        # The card width and thumbnail size are coupled.  Keep the configured
+        # preview size while the window is resized; only the column count
+        # should change.  If one item cannot fit, the scroll area handles the
+        # overflow instead of shrinking the preview.
         thumb_size = max(1, int(round(card_width / self._preview_card_ratio)))
         pdf_thumbnail_size_changed = any(
             card._thumb_size != thumb_size for card in self._cards

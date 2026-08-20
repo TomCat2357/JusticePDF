@@ -146,9 +146,10 @@ def test_file_grid_reflows_without_horizontal_overflow(window_factory, qtbot):
 
         assert (
             window._scroll_area.horizontalScrollBarPolicy()
-            == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            == Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         assert not window._scroll_area.horizontalScrollBar().isVisible()
+        assert {card.width() for card in (*window._folder_cards, *window._cards)} == {150}
         viewport = window._scroll_area.viewport()
         viewport_rect = viewport.rect()
         for card in (*window._folder_cards, *window._cards):
