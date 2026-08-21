@@ -258,9 +258,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._zoom_annotation_text_color = (0.0, 0.0, 0.0)
         self._zoom_annotation_fill_color: tuple[float, float, float] | None = (1.0, 1.0, 0.6)
         self._zoom_annotation_border_color: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
-        # None の間は種類ごとの既定色（ハイライト=黄、下線/取り消し線=赤）を使う。
-        # 一度でも色を選択すると、その色が以後すべての種類で共有される。
-        self._zoom_markup_color: tuple[float, float, float] | None = None
+        self._zoom_markup_color: tuple[float, float, float] = (0.85, 0.0, 0.0)
         self._zoom_markup_color_btn: QPushButton | None = None
         self._markup_buttons: dict[MarkupType, QToolButton] = {}
         self._zoom_note_color: tuple[float, float, float] = (1.0, 0.92, 0.23)

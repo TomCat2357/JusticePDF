@@ -327,9 +327,7 @@ class ZoomAnnotationMixin:
         self._zoom_markup_color_btn.clicked.connect(self._pick_markup_color)
         markup_row.addWidget(self._zoom_markup_color_btn)
         panel_layout.addLayout(markup_row)
-        self._set_color_button_preview(
-            self._zoom_markup_color_btn, self._current_markup_color(MarkupType.HIGHLIGHT)
-        )
+        self._set_color_button_preview(self._zoom_markup_color_btn, self._zoom_markup_color)
     def _build_note_tools(self, panel_layout: QVBoxLayout) -> None:
         """付箋(コメント)/校正コールアウトのツール列と本文エディタを組み立てる。"""
         note_label = QLabel("付箋（コメント）")
@@ -916,14 +914,6 @@ class ZoomAnnotationMixin:
     def _markup_default_opacity(self, markup_type: MarkupType) -> float:
         # ハイライトは半透明で文字が透ける。下線/取り消し線は不透明。
         return 0.4 if markup_type == MarkupType.HIGHLIGHT else 1.0
-    def _markup_default_color(self, markup_type: MarkupType) -> tuple[float, float, float]:
-        # ハイライトは黄色系、下線・取り消し線は赤（校正の訂正線と同系色）を既定色とする。
-        if markup_type == MarkupType.HIGHLIGHT:
-            return (1.0, 0.92, 0.23)
-        return (0.85, 0.0, 0.0)
-    def _current_markup_color(self, markup_type: MarkupType) -> tuple[float, float, float]:
-        # 色を未選択なら種類ごとの既定色、選択済みならその色を全種類で共有する。
-        return self._zoom_markup_color if self._zoom_markup_color is not None else self._markup_default_color(markup_type)
     def _update_markup_controls(self, selected: object) -> None:
         """マークアップツール行の色見本を選択中の注釈（あれば）に合わせる。"""
         if self._zoom_markup_color_btn is None:
@@ -931,9 +921,7 @@ class ZoomAnnotationMixin:
         if isinstance(selected, TextMarkupAnnotData):
             self._set_color_button_preview(self._zoom_markup_color_btn, selected.color)
         else:
-            self._set_color_button_preview(
-                self._zoom_markup_color_btn, self._current_markup_color(MarkupType.HIGHLIGHT)
-            )
+            self._set_color_button_preview(self._zoom_markup_color_btn, self._zoom_markup_color)
     def _update_note_editor(self, selected: object) -> None:
         """付箋本文エディタの表示・内容・色見本を選択状態に合わせる。"""
         if self._zoom_note_editor is None:
@@ -981,7 +969,7 @@ class ZoomAnnotationMixin:
             xref=0,
             quads=tuple(quads),
             markup_type=markup_type,
-            color=self._current_markup_color(markup_type),
+            color=self._zoom_markup_color,
             opacity=self._markup_default_opacity(markup_type),
         )
         # set_page() が再描画とテキスト選択の解除を行う。
@@ -993,7 +981,7 @@ class ZoomAnnotationMixin:
     def _pick_markup_color(self) -> None:
         selected = self._selected_zoom_annotation
         is_markup = isinstance(selected, TextMarkupAnnotData)
-        current = selected.color if is_markup else self._current_markup_color(MarkupType.HIGHLIGHT)
+        current = selected.color if is_markup else self._zoom_markup_color
         rgb = self._pick_color_via_dialog(current)
         if rgb is None:
             return
