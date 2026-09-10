@@ -80,6 +80,7 @@ from src.utils.pdf_utils import (
     ShapeAnnotData,
     AnyAnnotData,
     list_ink_annot_xrefs,
+    list_ink_annot_xrefs_by_page,
     list_shape_annots,
     create_shape_annot,
     replace_shape_annot,
@@ -241,6 +242,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         # アノテーション/しおりドロワーの切替や複数ページ同時表示への切替では
         # リセットされず、ウィンドウ内でこの状態を保持する(永続化はしない)。
         self._show_ink_annots: bool = True
+        # ページ番号ごとの Ink 注釈 xref のキャッシュ(サムネイル用)。
+        # ページ数が多い文書でサムネイル1枚ごとに fitz.open するのを避けるため、
+        # 初回アクセス時に文書全体を一度だけ開いて集計する。ページ構成が変わる
+        # 操作(読み込み直し・削除等)の際に None へ戻して再集計させる。
+        self._ink_xrefs_by_page_cache: dict[int, list[int]] | None = None
         self._zoom_annotation_form_sync = False
         self._zoom_annotation_text_commit_in_progress = False
         self._zoom_annotation_new_btn = None
@@ -948,6 +954,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._enqueue_thumbnail_render(page_num, priority=True)
         self._schedule_thumbnail_render()
 
+    def _get_ink_xrefs_by_page(self) -> dict[int, list[int]]:
+        """文書全体の Ink 注釈 xref をページ番号ごとに取得する(結果はキャッシュ)。"""
+        if self._ink_xrefs_by_page_cache is None:
+            self._ink_xrefs_by_page_cache = list_ink_annot_xrefs_by_page(self._pdf_path)
+        return self._ink_xrefs_by_page_cache
+
+    def _invalidate_and_requeue_thumbnails(self) -> None:
+        """全サムネイルを未読込状態に戻し、再描画キューへ積み直す。"""
+        self._reset_thumbnail_render_queue()
+        for thumb in self._thumbnails:
+            thumb.invalidate_thumbnail()
+        self._enqueue_all_thumbnail_renders()
+
     def _process_thumbnail_render_queue(self) -> None:
         batch: list[int] = []
         while self._thumb_render_queue and len(batch) < 5:
@@ -960,7 +979,16 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
                 continue
             batch.append(page_num)
         if batch:
-            pixmaps = render_page_thumbnails_batch(self._pdf_path, batch, self._thumb_size)
+            # 手書き(Ink)注釈を非表示にする設定なら、対象ページ分だけ xref を隠す。
+            hide_xrefs_by_page = None
+            if not self._show_ink_annots:
+                ink_xrefs_by_page = self._get_ink_xrefs_by_page()
+                hide_xrefs_by_page = {
+                    pn: ink_xrefs_by_page[pn] for pn in batch if ink_xrefs_by_page.get(pn)
+                }
+            pixmaps = render_page_thumbnails_batch(
+                self._pdf_path, batch, self._thumb_size, hide_xrefs=hide_xrefs_by_page
+            )
             for pn in batch:
                 if pn < len(self._thumbnails):
                     self._thumbnails[pn].set_pixmap_direct(pixmaps.get(pn, QPixmap()))
@@ -971,6 +999,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
 
     def _load_pages(self) -> None:
         self._reset_thumbnail_render_queue()
+        # ページ構成が変わるため、ページ別 Ink xref キャッシュも破棄する。
+        self._ink_xrefs_by_page_cache = None
         # ページ構成が変わったので検索結果は破棄する
         self._invalidate_search_results()
         # 既存のサムネイルをグリッドから先に取り除く
@@ -1021,10 +1051,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
 
         self._zoom_text_cache.clear()
         self._zoom_annotations = []
-        self._reset_thumbnail_render_queue()
-        for thumb in self._thumbnails:
-            thumb.invalidate_thumbnail()
-        self._enqueue_all_thumbnail_renders()
+        # ページ内容(Ink 注釈を含む)が変わった可能性があるためキャッシュを破棄する。
+        self._ink_xrefs_by_page_cache = None
+        self._invalidate_and_requeue_thumbnails()
 
         if self._zoom_view and self._zoom_view.isVisible():
             self._render_zoom()
@@ -1088,6 +1117,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
     def _remove_page_thumbnails(self, page_indices: list[int]) -> None:
         """指定されたページのサムネイルを削除（差分更新）"""
         self._reset_thumbnail_render_queue()
+        # ページ番号がずれるため、ページ別 Ink xref キャッシュも破棄する。
+        self._ink_xrefs_by_page_cache = None
         # グリッドから全サムネイルを一旦取り除く
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
