@@ -109,6 +109,8 @@ from .annotations import (
     get_annot_xref_order,
     list_annot_group,
     list_freetext_annots,
+    list_ink_annot_xrefs,
+    list_ink_annot_xrefs_by_page,
     list_markup_annots,
     list_note_annots,
     list_shape_annots,
