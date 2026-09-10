@@ -1,5 +1,6 @@
 """ページ描画・サムネイル・テキスト抽出/検索。"""
 import logging
+from collections.abc import Collection
 
 import fitz
 from PyQt6.QtGui import QPixmap, QImage
@@ -59,6 +60,7 @@ def _render_page_pixmap(
     size: int | None = None,
     zoom: float | None = None,
     annots: bool = True,
+    hide_xrefs: Collection[int] | None = None,
 ) -> QPixmap:
     """Render a PDF page to a pixmap with either size-based or zoom-based scaling."""
     try:
@@ -69,6 +71,7 @@ def _render_page_pixmap(
             size,
             round(zoom, 4) if zoom is not None else None,
             bool(annots),
+            tuple(sorted(hide_xrefs)) if hide_xrefs else None,
             cache_token,
         )
         cached = _pixmap_cache.get(cache_key)
@@ -78,6 +81,11 @@ def _render_page_pixmap(
             if page_num >= len(doc) or page_num < 0:
                 return QPixmap()
             page = doc[page_num]
+            if hide_xrefs:
+                hide_set = set(hide_xrefs)
+                for annot in page.annots():
+                    if annot.xref in hide_set:
+                        annot.set_flags(annot.flags | fitz.PDF_ANNOT_IS_HIDDEN)
             if size is not None:
                 scale = size / max(page.rect.width, page.rect.height)
             else:
@@ -127,9 +135,16 @@ def get_page_thumbnail(pdf_path: str, page_num: int, size: int = 128) -> QPixmap
     return _render_page_pixmap(pdf_path, page_num, size=size)
 
 
-def get_page_pixmap(pdf_path: str, page_num: int, zoom: float = 1.0, *, annots: bool = True) -> QPixmap:
+def get_page_pixmap(
+    pdf_path: str,
+    page_num: int,
+    zoom: float = 1.0,
+    *,
+    annots: bool = True,
+    hide_xrefs: Collection[int] | None = None,
+) -> QPixmap:
     """Render a page at the given zoom factor."""
-    return _render_page_pixmap(pdf_path, page_num, zoom=zoom, annots=annots)
+    return _render_page_pixmap(pdf_path, page_num, zoom=zoom, annots=annots, hide_xrefs=hide_xrefs)
 
 
 def render_page_thumbnails_batch(pdf_path: str, page_nums: list[int], size: int = 128) -> dict[int, QPixmap]:
