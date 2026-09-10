@@ -79,6 +79,7 @@ from src.utils.pdf_utils import (
     ShapeType,
     ShapeAnnotData,
     AnyAnnotData,
+    list_ink_annot_xrefs,
     list_shape_annots,
     create_shape_annot,
     replace_shape_annot,
@@ -236,6 +237,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         # 拡大表示のページレイアウト。SINGLE は編集可能、それ以外は閲覧専用。
         self._zoom_page_layout = ZoomPageLayout.SINGLE
         self._zoom_layout_actions: dict[ZoomPageLayout, QAction] = {}
+        # Acrobat 等で書かれた手書き(Ink)注釈の表示/非表示。既定は表示。
+        # アノテーション/しおりドロワーの切替や複数ページ同時表示への切替では
+        # リセットされず、ウィンドウ内でこの状態を保持する(永続化はしない)。
+        self._show_ink_annots: bool = True
         self._zoom_annotation_form_sync = False
         self._zoom_annotation_text_commit_in_progress = False
         self._zoom_annotation_new_btn = None
@@ -1432,12 +1437,16 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         # オーバーレイで描く注釈(フリーテキスト・図形・マークアップ・ノート)は
         # 二重描画を避けるためページ画像側では隠す。それ以外(Ink など本アプリが
         # 編集対象としない注釈)はページ画像にそのまま焼き込んで表示する。
+        hide_xrefs = {a.xref for a in merged}
+        if not self._show_ink_annots:
+            # 手書き(Ink)注釈を非表示にする設定の場合、この xref もページ画像側で隠す。
+            hide_xrefs |= set(list_ink_annot_xrefs(self._pdf_path, self._zoom_page_num))
         pixmap = get_page_pixmap(
             self._pdf_path,
             self._zoom_page_num,
             self._zoom_factor * dpr,
             annots=True,
-            hide_xrefs={a.xref for a in merged},
+            hide_xrefs=hide_xrefs,
         )
         pixmap.setDevicePixelRatio(dpr)
         words = []
@@ -1567,8 +1576,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         dpr = self._zoom_label.devicePixelRatioF()
         scale = self._zoom_factor * dpr
         # 注釈はページ画像に焼き込んで見えるようにする(annots=True)。
+        # 手書き(Ink)注釈を非表示にする設定なら、各ページの Ink の xref を隠す。
         pixmaps = [
-            get_page_pixmap(self._pdf_path, page_index, scale, annots=True)
+            get_page_pixmap(
+                self._pdf_path,
+                page_index,
+                scale,
+                annots=True,
+                hide_xrefs=(
+                    None
+                    if self._show_ink_annots
+                    else set(list_ink_annot_xrefs(self._pdf_path, page_index))
+                ),
+            )
             for page_index in page_indices
         ]
         combined = self._compose_page_pixmap(pixmaps, layout.columns, dpr)
