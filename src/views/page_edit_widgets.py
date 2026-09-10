@@ -1127,9 +1127,10 @@ class ZoomPageWidget(QWidget):
     def _paint_markup_annotation(self, painter: QPainter, annot: TextMarkupAnnotData) -> None:
         """Render highlight / underline / strikeout from quads.
 
-        ズームビューのページ画像は注釈なし (annots=False) で描画されるため、
-        マークアップの見た目はここで描く。保存済み PDF を PyMuPDF が
-        描画する際は実際のマークアップ注釈として再現される。
+        ズームビューのページ画像はオーバーレイで管理する注釈(フリーテキスト・
+        図形・マークアップ・ノート)を除いて描画される(それ以外の注釈はページ
+        画像に焼き込まれる)ため、マークアップの見た目はここで描く。保存済み
+        PDF を PyMuPDF が描画する際は実際のマークアップ注釈として再現される。
         """
         base = self._annotation_color(annot.color, opacity=1.0) or QColor(255, 255, 0)
         opacity = max(0.0, min(1.0, float(annot.opacity)))

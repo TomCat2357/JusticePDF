@@ -1424,11 +1424,20 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             self._exit_zoom_view()
             return
         dpr = self._zoom_label.devicePixelRatioF()
+        freetext_annots = list_freetext_annots(self._pdf_path, self._zoom_page_num)
+        shape_annots = list_shape_annots(self._pdf_path, self._zoom_page_num)
+        markup_annots = list_markup_annots(self._pdf_path, self._zoom_page_num)
+        note_annots = list_note_annots(self._pdf_path, self._zoom_page_num)
+        merged = freetext_annots + shape_annots + markup_annots + note_annots
+        # オーバーレイで描く注釈(フリーテキスト・図形・マークアップ・ノート)は
+        # 二重描画を避けるためページ画像側では隠す。それ以外(Ink など本アプリが
+        # 編集対象としない注釈)はページ画像にそのまま焼き込んで表示する。
         pixmap = get_page_pixmap(
             self._pdf_path,
             self._zoom_page_num,
             self._zoom_factor * dpr,
-            annots=False,
+            annots=True,
+            hide_xrefs={a.xref for a in merged},
         )
         pixmap.setDevicePixelRatio(dpr)
         words = []
@@ -1441,11 +1450,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             links = get_page_links(self._pdf_path, self._zoom_page_num)
             chars = get_page_chars(self._pdf_path, self._zoom_page_num)
             self._zoom_text_cache[self._zoom_page_num] = (words, links, chars)
-        freetext_annots = list_freetext_annots(self._pdf_path, self._zoom_page_num)
-        shape_annots = list_shape_annots(self._pdf_path, self._zoom_page_num)
-        markup_annots = list_markup_annots(self._pdf_path, self._zoom_page_num)
-        note_annots = list_note_annots(self._pdf_path, self._zoom_page_num)
-        merged = freetext_annots + shape_annots + markup_annots + note_annots
         xref_order = get_annot_xref_order(self._pdf_path, self._zoom_page_num)
         order_index = {x: i for i, x in enumerate(xref_order)}
         # PDF の /Annots 配列順（描画順）に並べ替え。未登録 xref は末尾に置く。

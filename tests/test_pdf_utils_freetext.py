@@ -33,6 +33,18 @@ def _page_rgb(path, x: int, y: int, *, annots: bool = True) -> tuple[int, int, i
     return tuple(pix.samples[offset:offset + 3])
 
 
+def _count_reddish_pixels(image, rect: tuple[float, float, float, float], zoom: float) -> int:
+    """rect(PDF座標, 左上原点) を zoom 倍したピクセル範囲内で赤っぽい画素数を数える。"""
+    x0, y0, x1, y1 = [int(round(v * zoom)) for v in rect]
+    count = 0
+    for x in range(max(x0, 0), min(x1, image.width())):
+        for y in range(max(y0, 0), min(y1, image.height())):
+            color = image.pixelColor(x, y)
+            if color.red() > 180 and color.green() < 100 and color.blue() < 100:
+                count += 1
+    return count
+
+
 def test_freetext_create_replace_delete_roundtrip(tmp_path):
     pdf_path = tmp_path / "roundtrip.pdf"
     make_pdf(pdf_path)
@@ -419,6 +431,61 @@ def test_get_page_pixmap_can_exclude_annotation_appearance(tmp_path):
     assert without_annots.red() > 240
     assert without_annots.green() > 240
     assert without_annots.blue() > 240
+
+
+def test_get_page_pixmap_hide_xrefs_keeps_unmanaged_annots(tmp_path):
+    """hide_xrefs で指定した注釈だけが隠れ、それ以外(Ink など)は描画され続ける。"""
+    pdf_path = tmp_path / "pixmap-hide-xrefs.pdf"
+    make_pdf(pdf_path)
+
+    ink_rect = (40.0, 40.0, 90.0, 90.0)
+    rect_rect = (150.0, 150.0, 200.0, 200.0)
+
+    with fitz.open(str(pdf_path)) as doc:
+        page = doc[0]
+        ink_annot = page.add_ink_annot([[(40, 40), (90, 90), (40, 90), (90, 40)]])
+        ink_annot.set_colors(stroke=(1.0, 0.0, 0.0))
+        ink_annot.set_border(width=3)
+        ink_annot.update()
+
+        rect_annot = page.add_rect_annot(fitz.Rect(*rect_rect))
+        rect_annot.set_colors(stroke=(1.0, 0.0, 0.0))
+        rect_annot.set_border(width=3)
+        rect_annot.update()
+        rect_xref = rect_annot.xref
+
+        doc.save(str(pdf_path), incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+
+    zoom = 2.0
+    pix = get_page_pixmap(str(pdf_path), 0, zoom, annots=True, hide_xrefs={rect_xref})
+    image = pix.toImage()
+
+    assert _count_reddish_pixels(image, ink_rect, zoom) > 0
+    assert _count_reddish_pixels(image, rect_rect, zoom) == 0
+
+
+def test_get_page_pixmap_hide_xrefs_does_not_collide_with_cache(tmp_path):
+    """hide_xrefs の有無でキャッシュキーが分かれ、別々の描画結果になる。"""
+    pdf_path = tmp_path / "pixmap-hide-xrefs-cache.pdf"
+    make_pdf(pdf_path)
+
+    rect_rect = (150.0, 150.0, 200.0, 200.0)
+    with fitz.open(str(pdf_path)) as doc:
+        page = doc[0]
+        rect_annot = page.add_rect_annot(fitz.Rect(*rect_rect))
+        rect_annot.set_colors(stroke=(1.0, 0.0, 0.0))
+        rect_annot.set_border(width=3)
+        rect_annot.update()
+        rect_xref = rect_annot.xref
+        doc.save(str(pdf_path), incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+
+    zoom = 2.0
+    pix_shown = get_page_pixmap(str(pdf_path), 0, zoom, annots=True)
+    pix_hidden = get_page_pixmap(str(pdf_path), 0, zoom, annots=True, hide_xrefs={rect_xref})
+
+    assert pix_shown.toImage() != pix_hidden.toImage()
+    assert _count_reddish_pixels(pix_shown.toImage(), rect_rect, zoom) > 0
+    assert _count_reddish_pixels(pix_hidden.toImage(), rect_rect, zoom) == 0
 
 
 def test_replace_freetext_annot_raises_permission_error_when_destination_is_locked(tmp_path, monkeypatch):
