@@ -996,6 +996,32 @@ class _AnnotFamily:
     extract_fn: Callable[[fitz.Document, int, fitz.Annot], Any]
 
 
+def list_ink_annot_xrefs(pdf_path: str, page_num: int | None = None) -> list[int]:
+    """Acrobat 等で書かれた手書き(Ink)注釈の xref 一覧を返す。
+
+    本アプリはInk注釈を編集対象にしないため専用のデータモデルは持たないが、
+    表示/非表示切替(``get_page_pixmap`` の ``hide_xrefs``)のために xref だけを
+    列挙する。``page_num`` を省略すると文書全ページ分を返す。
+    """
+    xrefs: list[int] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            page_numbers = _page_numbers_for(doc, page_num)
+            if page_numbers is None:
+                return []
+            for pn in page_numbers:
+                page = doc[pn]
+                annots = page.annots(types=[fitz.PDF_ANNOT_INK])
+                if annots is None:
+                    continue
+                for annot in annots:
+                    xrefs.append(annot.xref)
+    except Exception:
+        logger.debug("list_ink_annot_xrefs failed: %s", pdf_path, exc_info=True)
+        return []
+    return xrefs
+
+
 def _list_annots(family: _AnnotFamily, pdf_path: str, page_num: int | None) -> list:
     results: list = []
     try:
