@@ -213,6 +213,7 @@ class ZoomAnnotationMixin:
         title = QLabel("付箋")
         panel_layout.addWidget(title)
 
+        self._build_ink_visibility_toggle(panel_layout)
         self._build_annotation_actions(panel_layout)
         self._build_shape_tools(panel_layout)
         self._build_markup_tools(panel_layout)
@@ -234,6 +235,28 @@ class ZoomAnnotationMixin:
         panel_layout.addStretch()
         drawer_layout.addWidget(self._zoom_annotation_panel)
         return self._zoom_annotation_drawer
+
+    def _build_ink_visibility_toggle(self, panel_layout: QVBoxLayout) -> None:
+        """Acrobat手書き(Ink)注釈の表示/非表示トグルボタンを組み立てる。
+
+        既定は表示(チェック状態)。この状態はタブ(アノテーション/しおり)切替や
+        複数ページ同時表示への切替でリセットされず、ウィンドウ内で保持される。
+        """
+        self._zoom_ink_visibility_btn = QPushButton("Acrobat手書きを表示")
+        self._zoom_ink_visibility_btn.setCheckable(True)
+        self._zoom_ink_visibility_btn.setChecked(self._show_ink_annots)
+        self._zoom_ink_visibility_btn.setToolTip(
+            "Acrobat などで書かれた手書き(Ink)注釈の表示/非表示を切り替え"
+        )
+        self._zoom_ink_visibility_btn.toggled.connect(self._on_toggle_ink_visibility)
+        panel_layout.addWidget(self._zoom_ink_visibility_btn)
+
+    def _on_toggle_ink_visibility(self, checked: bool) -> None:
+        """Acrobat手書き(Ink)注釈の表示/非表示を切り替え、現在のビューとサムネイル一覧を再描画する。"""
+        self._show_ink_annots = bool(checked)
+        self._render_zoom()
+        self._invalidate_and_requeue_thumbnails()
+
     def _build_annotation_actions(self, panel_layout: QVBoxLayout) -> None:
         """付箋の新規/削除と重なり順操作のボタン列を組み立てる。"""
         action_row = QHBoxLayout()

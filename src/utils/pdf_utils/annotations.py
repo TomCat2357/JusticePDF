@@ -996,6 +996,56 @@ class _AnnotFamily:
     extract_fn: Callable[[fitz.Document, int, fitz.Annot], Any]
 
 
+def list_ink_annot_xrefs(pdf_path: str, page_num: int | None = None) -> list[int]:
+    """Acrobat 等で書かれた手書き(Ink)注釈の xref 一覧を返す。
+
+    本アプリはInk注釈を編集対象にしないため専用のデータモデルは持たないが、
+    表示/非表示切替(``get_page_pixmap`` の ``hide_xrefs``)のために xref だけを
+    列挙する。``page_num`` を省略すると文書全ページ分を返す。
+    """
+    xrefs: list[int] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            page_numbers = _page_numbers_for(doc, page_num)
+            if page_numbers is None:
+                return []
+            for pn in page_numbers:
+                page = doc[pn]
+                annots = page.annots(types=[fitz.PDF_ANNOT_INK])
+                if annots is None:
+                    continue
+                for annot in annots:
+                    xrefs.append(annot.xref)
+    except Exception:
+        logger.debug("list_ink_annot_xrefs failed: %s", pdf_path, exc_info=True)
+        return []
+    return xrefs
+
+
+def list_ink_annot_xrefs_by_page(pdf_path: str) -> dict[int, list[int]]:
+    """文書全体の Ink 注釈 xref を、ページ番号ごとに集計して返す。
+
+    サムネイル一覧のようにページ数が多い文書を扱う場合、ページごとに
+    ``fitz.open`` するのは避けたいため、一度だけ開いて全ページ分をまとめて
+    集計する。Ink 注釈が1件も無いページはキーに含めない。
+    """
+    result: dict[int, list[int]] = {}
+    try:
+        with fitz.open(pdf_path) as doc:
+            for pn in range(len(doc)):
+                page = doc[pn]
+                annots = page.annots(types=[fitz.PDF_ANNOT_INK])
+                if annots is None:
+                    continue
+                xrefs = [annot.xref for annot in annots]
+                if xrefs:
+                    result[pn] = xrefs
+    except Exception:
+        logger.debug("list_ink_annot_xrefs_by_page failed: %s", pdf_path, exc_info=True)
+        return {}
+    return result
+
+
 def _list_annots(family: _AnnotFamily, pdf_path: str, page_num: int | None) -> list:
     results: list = []
     try:
