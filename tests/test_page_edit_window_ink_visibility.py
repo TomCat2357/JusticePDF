@@ -118,6 +118,39 @@ def test_ink_visibility_hidden_in_multi_page_layout(qtbot, tmp_path):
     assert _count_reddish_pixels(image, INK_RECT, window._zoom_factor) > 0
 
 
+def test_ink_visibility_toggle_hides_and_restores_thumbnail(qtbot, tmp_path):
+    """ページサムネイル一覧にもトグルの表示/非表示が反映され、再描画される。"""
+    pdf_path = tmp_path / "ink-thumbnail.pdf"
+    make_pdf(pdf_path)
+    _add_ink_annot(pdf_path, 0)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+
+    # コンストラクタが積む初回の遅延読み込みが完了するまで待つ(それまでは
+    # window._thumbnails が入れ替わる可能性があるため、都度参照し直す)。
+    qtbot.waitUntil(lambda: window._thumbnails and window._thumbnails[0].thumbnail_loaded)
+
+    def thumb_image():
+        thumb = window._thumbnails[0]
+        return thumb._image_label.pixmap().toImage(), thumb._thumb_size / max(320, 420)
+
+    image, thumb_zoom = thumb_image()
+    assert _count_reddish_pixels(image, INK_RECT, thumb_zoom) > 0
+
+    # 非表示に切り替えるとサムネイルも再描画され、Ink が隠れる。
+    window._zoom_ink_visibility_btn.setChecked(False)
+    qtbot.waitUntil(lambda: window._thumbnails[0].thumbnail_loaded)
+    image, thumb_zoom = thumb_image()
+    assert _count_reddish_pixels(image, INK_RECT, thumb_zoom) == 0
+
+    # 表示に戻すとサムネイルにも Ink が戻る。
+    window._zoom_ink_visibility_btn.setChecked(True)
+    qtbot.waitUntil(lambda: window._thumbnails[0].thumbnail_loaded)
+    image, thumb_zoom = thumb_image()
+    assert _count_reddish_pixels(image, INK_RECT, thumb_zoom) > 0
+
+
 def test_ink_visibility_shown_in_multi_page_layout_by_default(qtbot, tmp_path):
     """既定(表示)のまま見開きへ切り替えても Ink は焼き込んで表示される。"""
     pdf_path = tmp_path / "ink-spread-default.pdf"

@@ -1022,6 +1022,30 @@ def list_ink_annot_xrefs(pdf_path: str, page_num: int | None = None) -> list[int
     return xrefs
 
 
+def list_ink_annot_xrefs_by_page(pdf_path: str) -> dict[int, list[int]]:
+    """文書全体の Ink 注釈 xref を、ページ番号ごとに集計して返す。
+
+    サムネイル一覧のようにページ数が多い文書を扱う場合、ページごとに
+    ``fitz.open`` するのは避けたいため、一度だけ開いて全ページ分をまとめて
+    集計する。Ink 注釈が1件も無いページはキーに含めない。
+    """
+    result: dict[int, list[int]] = {}
+    try:
+        with fitz.open(pdf_path) as doc:
+            for pn in range(len(doc)):
+                page = doc[pn]
+                annots = page.annots(types=[fitz.PDF_ANNOT_INK])
+                if annots is None:
+                    continue
+                xrefs = [annot.xref for annot in annots]
+                if xrefs:
+                    result[pn] = xrefs
+    except Exception:
+        logger.debug("list_ink_annot_xrefs_by_page failed: %s", pdf_path, exc_info=True)
+        return {}
+    return result
+
+
 def _list_annots(family: _AnnotFamily, pdf_path: str, page_num: int | None) -> list:
     results: list = []
     try:

@@ -130,9 +130,15 @@ def get_page_size_points(pdf_path: str, page_index: int) -> "tuple[float, float]
 
 
 
-def get_page_thumbnail(pdf_path: str, page_num: int, size: int = 128) -> QPixmap:
+def get_page_thumbnail(
+    pdf_path: str,
+    page_num: int,
+    size: int = 128,
+    *,
+    hide_xrefs: Collection[int] | None = None,
+) -> QPixmap:
     """Generate a thumbnail of a specific page."""
-    return _render_page_pixmap(pdf_path, page_num, size=size)
+    return _render_page_pixmap(pdf_path, page_num, size=size, hide_xrefs=hide_xrefs)
 
 
 def get_page_pixmap(
@@ -147,8 +153,18 @@ def get_page_pixmap(
     return _render_page_pixmap(pdf_path, page_num, zoom=zoom, annots=annots, hide_xrefs=hide_xrefs)
 
 
-def render_page_thumbnails_batch(pdf_path: str, page_nums: list[int], size: int = 128) -> dict[int, QPixmap]:
+def render_page_thumbnails_batch(
+    pdf_path: str,
+    page_nums: list[int],
+    size: int = 128,
+    *,
+    hide_xrefs: "dict[int, Collection[int]] | None" = None,
+) -> dict[int, QPixmap]:
     """Batch-render thumbnails for multiple pages, using cache where possible.
+
+    ``hide_xrefs`` はページ番号ごとに隠す注釈の xref 集合(例: Ink 注釈を
+    非表示にする場合)。ページによって隠す対象が異なるため単一の集合ではなく
+    ページ番号をキーとした辞書で受け取る。
 
     Opens the PDF only once for all cache-missed pages.
     """
@@ -156,8 +172,12 @@ def render_page_thumbnails_batch(pdf_path: str, page_nums: list[int], size: int 
     result: dict[int, QPixmap] = {}
     miss_pages: list[int] = []
 
+    def _hide_key(pn: int) -> tuple[int, ...] | None:
+        xrefs = hide_xrefs.get(pn) if hide_xrefs else None
+        return tuple(sorted(xrefs)) if xrefs else None
+
     for pn in page_nums:
-        cache_key = (pdf_path, pn, size, None, True, cache_token)
+        cache_key = (pdf_path, pn, size, None, True, _hide_key(pn), cache_token)
         cached = _pixmap_cache.get(cache_key)
         if cached is not None:
             result[pn] = cached
@@ -172,11 +192,16 @@ def render_page_thumbnails_batch(pdf_path: str, page_nums: list[int], size: int 
                         result[pn] = QPixmap()
                         continue
                     page = doc[pn]
+                    hide_set = hide_xrefs.get(pn) if hide_xrefs else None
+                    if hide_set:
+                        for annot in page.annots():
+                            if annot.xref in hide_set:
+                                annot.set_flags(annot.flags | fitz.PDF_ANNOT_IS_HIDDEN)
                     scale = size / max(page.rect.width, page.rect.height)
                     mat = fitz.Matrix(scale, scale)
                     pix = page.get_pixmap(matrix=mat)
                     qpix = _pixmap_to_qpixmap(pix)
-                    cache_key = (pdf_path, pn, size, None, True, cache_token)
+                    cache_key = (pdf_path, pn, size, None, True, _hide_key(pn), cache_token)
                     _pixmap_cache.put(cache_key, qpix)
                     result[pn] = qpix
         except Exception:
