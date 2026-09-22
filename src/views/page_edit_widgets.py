@@ -63,6 +63,60 @@ from src.views.view_helpers import apply_drag_pixmap
 
 logger = logging.getLogger(__name__)
 
+# PyMuPDF's word extraction splits only on whitespace, so an unbroken CJK
+# sentence (no spaces between characters) comes back as a single "word"
+# spanning the whole line. `_char_script_class` groups characters by script
+# instead, so click-to-select-word narrows down to a same-script run
+# (kanji / hiragana / katakana / fullwidth-alnum) rather than the entire line;
+# whitespace-delimited Latin words are unaffected (they stay one run, as
+# before).
+_CJK_KANJI_RANGES = (
+    (0x3005, 0x3007),  # 々 〆 〇 (iteration mark / kanji-like, not punctuation)
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xF900, 0xFAFF),
+)
+_CJK_HIRAGANA_RANGE = (0x3040, 0x309F)
+_CJK_KATAKANA_RANGES = (
+    (0x30A0, 0x30FA),
+    (0x30FC, 0x30FF),  # excludes 0x30FB (・), which is punctuation below
+    (0x31F0, 0x31FF),
+)
+# Deliberately overlaps parts of _CJK_PUNCT_RANGES (e.g. 0xFF1A-0xFF20); the
+# punct check runs first in _char_script_class, so punctuation wins there.
+_FULLWIDTH_ALNUM_RANGE = (0xFF10, 0xFF5A)
+_CJK_PUNCT_RANGES = (
+    (0x3000, 0x3004),
+    (0x3008, 0x303F),
+    (0x30FB, 0x30FB),  # ・ katakana middle dot: keep names/compounds separated
+    (0xFF01, 0xFF0F),
+    (0xFF1A, 0xFF20),
+    (0xFF3B, 0xFF40),
+    (0xFF5B, 0xFF65),
+)
+
+
+def _in_ranges(codepoint: int, ranges: tuple[tuple[int, int], ...]) -> bool:
+    return any(lo <= codepoint <= hi for lo, hi in ranges)
+
+
+def _char_script_class(ch: str, index: int) -> str | tuple[str, int]:
+    """Classify a char for click-select grouping; punctuation stands alone."""
+    if not ch:
+        return "other"
+    cp = ord(ch[0])
+    if _in_ranges(cp, _CJK_PUNCT_RANGES):
+        return ("punct", index)
+    if _in_ranges(cp, _CJK_KANJI_RANGES):
+        return "kanji"
+    if _CJK_HIRAGANA_RANGE[0] <= cp <= _CJK_HIRAGANA_RANGE[1]:
+        return "hiragana"
+    if _in_ranges(cp, _CJK_KATAKANA_RANGES):
+        return "katakana"
+    if _FULLWIDTH_ALNUM_RANGE[0] <= cp <= _FULLWIDTH_ALNUM_RANGE[1]:
+        return "fullwidth"
+    return "other"
+
 
 def _apply_block_line_height(document: "QTextDocument") -> None:
     """文書の全ブロックに共有の行間係数(FREETEXT_LINE_HEIGHT)を適用する。
@@ -410,6 +464,10 @@ class ZoomPageWidget(QWidget):
     HANDLE_SIZE = 10
     # 付箋アイコンの画面上の固定サイズ（px）。ズームに依らず一定。
     NOTE_ICON_PX = 22
+    # Click-vs-drag jitter floor for text selection release handling: a
+    # release within this many px of the press always word-selects, even if
+    # the pointer's nearest char flipped across a char-center midpoint.
+    CLICK_JITTER_PX = 3
     # 矢印キーによる注釈移動量（PDF ポイント）。細かい / 通常 / 粗い移動。
     # 押下回数によらず一定ステップ（加速なし）。
     # Alt/Shift=細かく、無修飾=通常、Ctrl=粗く。
@@ -1639,7 +1697,12 @@ class ZoomPageWidget(QWidget):
         self._selected_char_indices = list(range(lo, hi + 1))
 
     def _select_word_at_char(self, char_idx: int) -> None:
-        """Promote a single char to its enclosing word's char run (click-select)."""
+        """Promote a single char to its enclosing word's char run (click-select).
+
+        The PyMuPDF word box can span an entire line for CJK text (no spaces
+        to split on), so narrow it down to the contiguous same-script run
+        that contains ``char_idx`` (see ``_char_script_class``).
+        """
         if char_idx is None or char_idx >= len(self._char_rects):
             self._selected_char_indices = [char_idx] if char_idx is not None else []
             return
@@ -1653,7 +1716,22 @@ class ZoomPageWidget(QWidget):
             self._selected_char_indices = [char_idx]
             return
         run = [i for i, cr in enumerate(self._char_rects) if word_rect.contains(cr.center())]
-        self._selected_char_indices = run or [char_idx]
+        if not run:
+            self._selected_char_indices = [char_idx]
+            return
+        try:
+            pos = run.index(char_idx)
+        except ValueError:
+            self._selected_char_indices = run
+            return
+        classes = [_char_script_class(self._chars[i].get("c", ""), i) for i in run]
+        lo = pos
+        while lo > 0 and classes[lo - 1] == classes[pos]:
+            lo -= 1
+        hi = pos
+        while hi < len(run) - 1 and classes[hi + 1] == classes[pos]:
+            hi += 1
+        self._selected_char_indices = run[lo : hi + 1]
 
     def _selected_line_runs(self) -> list[list[int]]:
         """Group selected char indices into per-line runs, preserving order."""
@@ -2019,13 +2097,19 @@ class ZoomPageWidget(QWidget):
                 self._selection_rect = None
                 self._pressed_link = self._link_at(event.pos())
                 self._selection_active = self._pressed_link is None
+                # Always clear any anchor/head from a prior selection, even
+                # when this press lands on a link (selection stays inactive).
+                # Otherwise a later drag off that link would resume from a
+                # stale anchor instead of re-anchoring in mouseMoveEvent.
+                self._sel_anchor_char = None
+                self._sel_head_char = None
+                self._selected_char_indices = []
                 if self._selection_active:
                     # Anchor the caret now; the visible run is built once the
                     # drag starts (or promoted to a word on a no-drag release).
                     anchor = self._char_index_at(event.pos(), nearest=True)
                     self._sel_anchor_char = anchor
                     self._sel_head_char = anchor
-                    self._selected_char_indices = []
                 self.update()
         except Exception:
             logger.exception("Error in ZoomPageWidget.mousePressEvent")
@@ -2326,10 +2410,24 @@ class ZoomPageWidget(QWidget):
                     event.accept()
                     return
                 if self._selection_active:
-                    no_drag = (
-                        self._selection_origin is not None
-                        and (event.pos() - self._selection_origin).manhattanLength()
-                        < QApplication.startDragDistance()
+                    press_to_release = (
+                        (event.pos() - self._selection_origin).manhattanLength()
+                        if self._selection_origin is not None
+                        else None
+                    )
+                    no_drag = press_to_release is not None and (
+                        press_to_release <= self.CLICK_JITTER_PX
+                        or (
+                            press_to_release < QApplication.startDragDistance()
+                            # _char_index_at(nearest=True) flips to the next
+                            # char at the midpoint between char centers, so a
+                            # deliberate short drag (e.g. 2-3 CJK chars) can
+                            # already have moved the head off the anchor char
+                            # well under Qt's drag-start threshold. Once that
+                            # happens, keep the char range instead of
+                            # discarding it into a word-select.
+                            and self._sel_head_char == self._sel_anchor_char
+                        )
                     )
                     if no_drag:
                         # Pure click: select the whole word at this point.

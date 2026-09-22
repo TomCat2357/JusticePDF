@@ -786,6 +786,118 @@ def test_zoom_single_click_selects_word(qtbot, tmp_path):
 
 
 @pytest.mark.usefixtures("qtbot")
+def test_zoom_single_click_on_cjk_text_selects_script_run_not_whole_line(qtbot, tmp_path):
+    pdf_path = tmp_path / "click-cjk.pdf"
+    make_pdf(pdf_path)
+
+    doc = fitz.open(str(pdf_path))
+    page = doc[0]
+    # PyMuPDF's word boxes are whitespace-delimited, so this whole sentence
+    # (no spaces) is reported as a single "word" spanning the full line.
+    page.insert_text((40, 80), "これは日本語のテスト文章です", fontsize=14, fontname="japan")
+    doc.saveIncr()
+    doc.close()
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+
+    assert len(label._chars) > 5  # sanity: CJK glyphs were actually extracted
+
+    pos = _char_widget_pos(window, _char_index_of(window, "本"))
+    qtbot.mousePress(label, Qt.MouseButton.LeftButton, pos=pos)
+    qtbot.mouseRelease(label, Qt.MouseButton.LeftButton, pos=pos)
+
+    # Click should stop at the kanji run ("日本語"), not jump to the whole
+    # line the way a plain whitespace-delimited word box would.
+    assert label._selected_text() == "日本語"
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_single_click_on_kanji_iteration_mark_keeps_word_together(qtbot, tmp_path):
+    pdf_path = tmp_path / "click-iteration-mark.pdf"
+    make_pdf(pdf_path)
+
+    doc = fitz.open(str(pdf_path))
+    page = doc[0]
+    # 々 (U+3005) is an iteration mark used inside ordinary kanji compounds
+    # (様々, 時々); it must not be classified as punctuation and split them.
+    page.insert_text((40, 80), "様々な事情", fontsize=14, fontname="japan")
+    doc.saveIncr()
+    doc.close()
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+
+    pos = _char_widget_pos(window, _char_index_of(window, "様"))
+    qtbot.mousePress(label, Qt.MouseButton.LeftButton, pos=pos)
+    qtbot.mouseRelease(label, Qt.MouseButton.LeftButton, pos=pos)
+
+    assert label._selected_text() == "様々"
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_single_click_on_katakana_middle_dot_does_not_merge_names(qtbot, tmp_path):
+    pdf_path = tmp_path / "click-katakana-dot.pdf"
+    make_pdf(pdf_path)
+
+    doc = fitz.open(str(pdf_path))
+    page = doc[0]
+    # ・ (U+30FB) separates compound katakana names/terms; it must not be
+    # grouped with katakana or it re-creates the whole-line selection bug
+    # for any sentence containing it.
+    page.insert_text((40, 80), "アメリカ・カナダ", fontsize=14, fontname="japan")
+    doc.saveIncr()
+    doc.close()
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+
+    pos = _char_widget_pos(window, _char_index_of(window, "メ"))
+    qtbot.mousePress(label, Qt.MouseButton.LeftButton, pos=pos)
+    qtbot.mouseRelease(label, Qt.MouseButton.LeftButton, pos=pos)
+
+    assert label._selected_text() == "アメリカ"
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_zoom_short_drag_keeps_char_range_over_word_promotion(qtbot, tmp_path):
+    pdf_path = tmp_path / "short-drag.pdf"
+    make_pdf(pdf_path)
+
+    doc = fitz.open(str(pdf_path))
+    page = doc[0]
+    page.insert_text((40, 80), "hello world")
+    doc.saveIncr()
+    doc.close()
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+
+    start_idx = _char_index_of(window, "w")  # start of "world"
+    end_idx = _char_index_of(window, "o", occurrence=1)  # next char: "wo"
+    start_pos = _char_widget_pos(window, start_idx)
+    end_pos = _char_widget_pos(window, end_idx)
+
+    # This drag must land strictly between the click-jitter floor and Qt's
+    # drag-start threshold to exercise the head != anchor path in
+    # mouseReleaseEvent (ZoomPageWidget.CLICK_JITTER_PX / startDragDistance).
+    distance = (end_pos - start_pos).manhattanLength()
+    assert label.CLICK_JITTER_PX < distance < QApplication.startDragDistance()
+
+    qtbot.mousePress(label, Qt.MouseButton.LeftButton, pos=start_pos)
+    qtbot.mouseMove(label, end_pos)
+    qtbot.mouseRelease(label, Qt.MouseButton.LeftButton, pos=end_pos)
+
+    # A real short drag ("wo") must survive, not get discarded in favor of
+    # promoting the whole enclosing word on release.
+    assert label._selected_text() == "wo"
+
+
+@pytest.mark.usefixtures("qtbot")
 def test_fontsize_spin_defaults_to_14(qtbot, tmp_path):
     # 未保存の QSettings(conftest で分離済み)では既定 14pt(吹き出しと共通)で始まる。
     pdf_path = tmp_path / "fontsize-default.pdf"
