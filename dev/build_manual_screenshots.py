@@ -31,6 +31,7 @@ from src.views import page_edit_window as page_edit_window_module
 from src.views.export_dialog import ExportOptionsDialog
 from src.views.print_dialog import PrintDialog
 from src.views.search_dialog import SearchDialog
+from src.views.settings_dialog import SettingsDialog
 from src.models.undo_manager import UndoManager
 from src.utils.pdf_utils import (
     get_page_words,
@@ -312,6 +313,17 @@ def scene_search_dialog() -> None:
     dlg.set_status(2, 5)
     QApplication.processEvents()
     _save(dlg, "09_search_dialog.png")
+    dlg.close()
+
+
+def scene_settings_dialog() -> None:
+    print("[scene] 08_settings_dialog")
+    dlg = SettingsDialog()
+    dlg._folder_edit.setText(r"C:\Users\ユーザー名\Documents\PDFs")
+    dlg.resize(420, 100)
+    dlg.show()
+    QApplication.processEvents()
+    _save(dlg, "08_settings_dialog.png")
     dlg.close()
 
 
@@ -632,6 +644,7 @@ def main() -> None:
         scene_zoom_annotation_panel(proposal_pdf)
 
         scene_search_dialog()
+        scene_settings_dialog()
         scene_export_dialog()
         scene_print_dialog(proposal_pdf)
 
