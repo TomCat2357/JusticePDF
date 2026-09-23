@@ -263,9 +263,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._zoom_annotation_border_width_spin = None
         self._zoom_annotation_text_color_btn = None
         self._zoom_annotation_fill_color_btn = None
-        self._zoom_annotation_fill_color_clear_btn = None
         self._zoom_annotation_border_color_btn = None
-        self._zoom_annotation_border_color_clear_btn = None
         self._zoom_annotation_text_color = (0.0, 0.0, 0.0)
         self._zoom_annotation_fill_color: tuple[float, float, float] | None = (1.0, 1.0, 0.6)
         self._zoom_annotation_border_color: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
@@ -275,6 +273,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         # マーカー/下線/取り消し線の連続モード中に選択中の種類（未使用時は None）。
         self._markup_sticky_type: MarkupType | None = None
         self._eraser_btn: QToolButton | None = None
+        # 「連続」トグル(既定OFF)。ONの間だけマーカー/U/S/消しゴムのクリックが
+        # sticky ツール切り替えとして扱われる。OFF中は各ボタンは常に単発動作。
+        self._markup_continuous_mode: bool = False
+        self._markup_continuous_btn: QToolButton | None = None
         self._zoom_note_color: tuple[float, float, float] = (1.0, 0.92, 0.23)
         self._zoom_note_color_btn: QPushButton | None = None
         self._zoom_note_btn: QToolButton | None = None
