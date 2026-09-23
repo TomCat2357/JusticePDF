@@ -456,6 +456,11 @@ class ZoomPageWidget(QWidget):
     annotation_paste_placement_requested = pyqtSignal(object)
     # Ctrl+ドラッグで複製: (annotation, new_rect_tuple, new_vertices_or_None)
     annotation_duplicate_requested = pyqtSignal(object, object, object)
+    # テキスト選択（ドラッグ確定 or クリックの単語選択）がリリースで確定した通知。
+    # マークアップ/消しゴムの連続モードが、この通知を受けて選択範囲に処理を適用する。
+    text_selection_released = pyqtSignal()
+    # 連続モード（テキスト選択専用モード）中の Esc 押下通知。
+    text_select_only_escape_requested = pyqtSignal()
     # ビューのスクロール要求 (dx, dy: ピクセル)。中ボタンドラッグ / Ctrl+矢印で発火。
     scroll_requested = pyqtSignal(int, int)
     # 右ドラッグで指定した範囲（ページ座標 QRectF）への拡大要求。
@@ -557,6 +562,11 @@ class ZoomPageWidget(QWidget):
         self._note_popup: QFrame | None = None
         # 校正コールアウト配置モード（クリックで挿入位置を指定）。
         self._callout_create_mode = False
+        # マークアップ/消しゴムの連続モード。有効時は注釈のヒットテスト・リンク操作を
+        # 抑止し、常にテキスト選択のみを行う（ドラッグ/クリックで確定するたび
+        # text_selection_released を発火する）。
+        self._text_select_only_mode = False
+        self._text_select_only_cursor: Qt.CursorShape | None = None
         # 閲覧専用モード（見開き表示）。文字選択・注釈編集・リンク操作を抑止する。
         self._view_only = False
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -611,6 +621,24 @@ class ZoomPageWidget(QWidget):
     def set_callout_create_mode(self, enabled: bool) -> None:
         self._callout_create_mode = bool(enabled)
         self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def set_text_select_only_mode(self, enabled: bool, cursor: Qt.CursorShape | None = None) -> None:
+        """マークアップ/消しゴムの連続モードを切り替える。
+
+        有効時は注釈のヒットテストとリンク操作を止め、常にテキスト選択のみを
+        行うようにする（mousePressEvent/mouseDoubleClickEvent 側で参照）。
+        """
+        self._text_select_only_mode = bool(enabled)
+        self._text_select_only_cursor = cursor
+        self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def clear_text_selection(self) -> None:
+        """現在の文字選択（範囲・アンカー）を解除する。"""
+        self._selected_char_indices = []
+        self._sel_anchor_char = None
+        self._sel_head_char = None
         self.update()
 
     def _note_widget_rect(self, note: NoteAnnotData) -> QRectF:
@@ -1240,23 +1268,69 @@ class ZoomPageWidget(QWidget):
         One quad per line-run: consecutive selected chars on the same line are
         merged into a single horizontal (or vertical) bar.
         """
+        return self._quads_for_char_indices(self._selected_char_indices)
+
+    def _quad_for_run(self, run: list[int]) -> tuple[float, float, float, float]:
+        """Merge a contiguous same-line run of char indices into one bbox quad."""
+        x0 = y0 = x1 = y1 = None
+        for idx in run:
+            bx0, by0, bx1, by1 = self._chars[idx]["bbox"]
+            if x0 is None:
+                x0, y0, x1, y1 = bx0, by0, bx1, by1
+            else:
+                x0 = min(x0, bx0)
+                y0 = min(y0, by0)
+                x1 = max(x1, bx1)
+                y1 = max(y1, by1)
+        return (float(x0), float(y0), float(x1), float(y1))
+
+    def _quads_for_char_indices(
+        self, indices: "Iterable[int]"
+    ) -> list[tuple[float, float, float, float]]:
+        """Group arbitrary char indices into per-line-run quads.
+
+        Unlike a plain "same line_id" grouping, a run is also split whenever
+        the char index is not contiguous with the previous one (e.g. after
+        subtracting erased chars from the middle of a line-run, the left and
+        right remainders must become two separate quads instead of one that
+        spans the erased gap).
+        """
+        ordered = sorted(i for i in indices if 0 <= i < len(self._chars))
         quads: list[tuple[float, float, float, float]] = []
-        for run in self._selected_line_runs():
-            x0 = y0 = x1 = y1 = None
-            for idx in run:
-                if idx >= len(self._chars):
-                    continue
-                bx0, by0, bx1, by1 = self._chars[idx]["bbox"]
-                if x0 is None:
-                    x0, y0, x1, y1 = bx0, by0, bx1, by1
-                else:
-                    x0 = min(x0, bx0)
-                    y0 = min(y0, by0)
-                    x1 = max(x1, bx1)
-                    y1 = max(y1, by1)
-            if x0 is not None:
-                quads.append((float(x0), float(y0), float(x1), float(y1)))
+        run: list[int] = []
+        prev_idx: int | None = None
+        prev_line = None
+        for idx in ordered:
+            line_id = self._char_line_ids[idx] if idx < len(self._char_line_ids) else None
+            if run and (line_id != prev_line or idx != prev_idx + 1):
+                quads.append(self._quad_for_run(run))
+                run = []
+            run.append(idx)
+            prev_idx = idx
+            prev_line = line_id
+        if run:
+            quads.append(self._quad_for_run(run))
         return quads
+
+    def _char_indices_in_quads(
+        self, quads: "Iterable[tuple[float, float, float, float]]"
+    ) -> set[int]:
+        """Return the indices of chars whose bbox center lies inside any quad."""
+        quads = list(quads)
+        if not quads:
+            return set()
+        result: set[int] = set()
+        for i, ch in enumerate(self._chars):
+            bbox = ch.get("bbox")
+            if not bbox:
+                continue
+            cx = (bbox[0] + bbox[2]) / 2.0
+            cy = (bbox[1] + bbox[3]) / 2.0
+            for qx0, qy0, qx1, qy1 in quads:
+                if qx0 <= cx <= qx1 and qy0 <= cy <= qy1:
+                    result.add(i)
+                    break
+        return result
 
     def _paint_note_annotation(self, painter: QPainter, annot: NoteAnnotData) -> None:
         """Draw a fixed-size sticky-note icon at the note's anchor point."""
@@ -1789,6 +1863,12 @@ class ZoomPageWidget(QWidget):
         if self._view_only:
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
+        if self._text_select_only_mode:
+            if self._point_in_pixmap(pos) is not None:
+                self.setCursor(self._text_select_only_cursor or Qt.CursorShape.IBeamCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
         if self.has_annotation_paste_mode() or self._note_create_mode or self._callout_create_mode:
             if self._point_in_pixmap(pos) is not None:
                 self.setCursor(Qt.CursorShape.CrossCursor)
@@ -2061,7 +2141,12 @@ class ZoomPageWidget(QWidget):
                     event.accept()
                     return
 
-                annot, handle = self._annotation_hit_test(event.pos())
+                # マークアップ/消しゴムの連続モード中は、既存注釈のヒットテストと
+                # リンク操作を止めて常にテキスト選択のみを行う。
+                if self._text_select_only_mode:
+                    annot, handle = None, None
+                else:
+                    annot, handle = self._annotation_hit_test(event.pos())
                 if annot is not None and handle == "select":
                     # マークアップ: 選択のみ。ドラッグによる移動・リサイズはしない。
                     self._selected_annotation_xref = annot.xref
@@ -2111,7 +2196,7 @@ class ZoomPageWidget(QWidget):
 
                 self._selection_origin = event.pos()
                 self._selection_rect = None
-                self._pressed_link = self._link_at(event.pos())
+                self._pressed_link = None if self._text_select_only_mode else self._link_at(event.pos())
                 self._selection_active = self._pressed_link is None
                 # Always clear any anchor/head from a prior selection, even
                 # when this press lands on a link (selection stays inactive).
@@ -2136,7 +2221,7 @@ class ZoomPageWidget(QWidget):
             super().mouseDoubleClickEvent(event)
             return
         try:
-            if event.button() == Qt.MouseButton.LeftButton:
+            if event.button() == Qt.MouseButton.LeftButton and not self._text_select_only_mode:
                 annot, handle = self._annotation_hit_test(event.pos())
                 if annot is not None and handle == "move" and not isinstance(annot, ShapeAnnotData):
                     self.annotation_edit_requested.emit(annot)
@@ -2425,6 +2510,7 @@ class ZoomPageWidget(QWidget):
                     self.update()
                     event.accept()
                     return
+                was_selecting = self._selection_active
                 if self._selection_active:
                     press_to_release = (
                         (event.pos() - self._selection_origin).manhattanLength()
@@ -2462,6 +2548,9 @@ class ZoomPageWidget(QWidget):
                 self._selection_origin = None
                 self._pressed_link = None
                 self.update()
+                if was_selecting:
+                    # マークアップ/消しゴムの連続モードが、確定した選択へ処理を適用する。
+                    self.text_selection_released.emit()
         except Exception:
             logger.exception("Error in ZoomPageWidget.mouseReleaseEvent")
         event.accept()
@@ -2480,6 +2569,10 @@ class ZoomPageWidget(QWidget):
                 event.accept()
                 return
             super().keyPressEvent(event)
+            return
+        if event.key() == Qt.Key.Key_Escape and self._text_select_only_mode:
+            self.text_select_only_escape_requested.emit()
+            event.accept()
             return
         if event.key() == Qt.Key.Key_Escape and self.has_annotation_paste_mode():
             self.cancel_annotation_paste_mode()
