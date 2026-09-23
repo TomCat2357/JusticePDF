@@ -520,6 +520,9 @@ class ZoomPageWidget(QWidget):
         self._selection_rect: QRect | None = None
         self._selection_active = False
         self._pressed_link: dict | None = None
+        # press 時にヒットしたマークアップ注釈の候補(ドラッグなしクリックの
+        # ときだけ mouseReleaseEvent でこの注釈を選択する)。
+        self._pending_markup_click_candidate: "TextMarkupAnnotData | None" = None
         self._annotations: list[FreeTextAnnotData] = []
         self._annotation_rects: list[QRectF] = []
         self._selected_annotation_xref: int | None = None
@@ -1633,9 +1636,13 @@ class ZoomPageWidget(QWidget):
                 if self._line_hit_test(annot, pos):
                     return annot, "move"
             elif isinstance(annot, TextMarkupAnnotData):
-                # マークアップは選択のみ（移動・リサイズ不可）。
-                if self._annotation_widget_rect(annot).contains(QPointF(pos)):
-                    return annot, "select"
+                # マークアップは選択のみ（移動・リサイズ不可）。矩形全体ではなく
+                # quad(行単位の帯)ごとに判定し、マークアップの隙間では
+                # 下のテキストのドラッグ選択を邪魔しないようにする。
+                for quad in annot.quads:
+                    quad_rect = self._page_rect_to_widget_rect(self._rect_tuple_to_qrectf(quad))
+                    if quad_rect.contains(QPointF(pos)):
+                        return annot, "select"
             elif isinstance(annot, NoteAnnotData):
                 # 付箋は固定サイズアイコンのヒット領域で選択のみ。
                 if self._note_widget_rect(annot).contains(QPointF(pos)):
@@ -2147,8 +2154,15 @@ class ZoomPageWidget(QWidget):
                     annot, handle = None, None
                 else:
                     annot, handle = self._annotation_hit_test(event.pos())
+                self._pending_markup_click_candidate = None
+                if annot is not None and handle == "select" and isinstance(annot, TextMarkupAnnotData):
+                    # マークアップ: press 時点では捕捉しない。ドラッグ確定なら
+                    # 下のテキストを選択できるようにし、ドラッグなしクリックの
+                    # 場合だけ mouseReleaseEvent 側でこの候補を選択する。
+                    self._pending_markup_click_candidate = annot
+                    annot, handle = None, None
                 if annot is not None and handle == "select":
-                    # マークアップ: 選択のみ。ドラッグによる移動・リサイズはしない。
+                    # 付箋(コメント)アイコン等: 選択のみ。ドラッグによる移動・リサイズはしない。
                     self._selected_annotation_xref = annot.xref
                     self.annotation_selected.emit(annot)
                     self._selection_origin = None
@@ -2532,19 +2546,30 @@ class ZoomPageWidget(QWidget):
                         )
                     )
                     if no_drag:
-                        # Pure click: select the whole word at this point.
-                        idx = self._char_index_at(event.pos())
-                        if idx is None:
-                            idx = self._sel_anchor_char
-                        if idx is not None:
-                            self._select_word_at_char(idx)
-                        else:
+                        candidate = self._pending_markup_click_candidate
+                        if candidate is not None:
+                            # ドラッグなしクリック: press 時点で quad にヒットして
+                            # いたマークアップ注釈自体を選択する(単語選択はしない)。
+                            self._selected_annotation_xref = candidate.xref
+                            self.annotation_selected.emit(candidate)
                             self._selected_char_indices = []
+                            self._sel_anchor_char = None
+                            self._sel_head_char = None
+                        else:
+                            # Pure click: select the whole word at this point.
+                            idx = self._char_index_at(event.pos())
+                            if idx is None:
+                                idx = self._sel_anchor_char
+                            if idx is not None:
+                                self._select_word_at_char(idx)
+                            else:
+                                self._selected_char_indices = []
                     self._selection_rect = None
                     self._selection_active = False
                 else:
                     if self._pressed_link is not None:
                         self.link_clicked.emit(self._pressed_link)
+                self._pending_markup_click_candidate = None
                 self._selection_origin = None
                 self._pressed_link = None
                 self.update()

@@ -12,7 +12,7 @@ from src.utils.pdf_utils import (
     ShapeType,
     list_shape_annots,
 )
-from src.views import page_edit_window as page_edit_window_module
+from src.views import page_edit_annotations as page_edit_annotations_module
 from tests.helpers import create_page_edit_window, make_pdf, open_zoom, page_click_pos
 
 
@@ -68,11 +68,13 @@ def test_pick_line_color_in_create_mode_applies_to_new_line(qtbot, monkeypatch, 
 
     _enter_shape_mode(qtbot, window, ShapeType.LINE)
 
-    # 色選択ダイアログを赤で確定したことにする
+    # 色選択ダイアログを赤で確定したことにする(線色ボタンは「透明」も選べる
+    # ダイアログ経路になったため、QColorDialog.getColor ではなく共通ヘルパー
+    # _pick_color を monkeypatch する)。
     monkeypatch.setattr(
-        page_edit_window_module.QColorDialog,
-        "getColor",
-        staticmethod(lambda *a, **k: QColor(255, 0, 0)),
+        page_edit_annotations_module,
+        "_pick_color",
+        lambda *a, **k: (True, QColor(255, 0, 0)),
     )
     qtbot.mouseClick(window._zoom_annotation_border_color_btn, Qt.MouseButton.LeftButton)
     assert window._zoom_annotation_border_color == pytest.approx((1.0, 0.0, 0.0), abs=0.01)
@@ -102,9 +104,9 @@ def test_rectangle_create_mode_uses_default_border_and_fill(qtbot, monkeypatch, 
 
     colors = iter([QColor(0, 0, 255), QColor(0, 255, 0)])
     monkeypatch.setattr(
-        page_edit_window_module.QColorDialog,
-        "getColor",
-        staticmethod(lambda *a, **k: next(colors)),
+        page_edit_annotations_module,
+        "_pick_color",
+        lambda *a, **k: (True, next(colors)),
     )
     # 線色=青、背景色=緑
     qtbot.mouseClick(window._zoom_annotation_border_color_btn, Qt.MouseButton.LeftButton)

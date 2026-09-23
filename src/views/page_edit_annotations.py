@@ -35,6 +35,10 @@ from PyQt6.QtWidgets import (
     QMenu,
     QListWidget,
     QListWidgetItem,
+    QSizePolicy,
+    QDialog,
+    QDialogButtonBox,
+    QStyleFactory,
 )
 from PyQt6.QtCore import (
     Qt,
@@ -150,6 +154,129 @@ def _line_endpoints_from_shape(
     )
 
 
+_SWATCH_CHECKER_SIZE = 6
+_SWATCH_CHECKER_LIGHT = QColor(235, 235, 235)
+_SWATCH_CHECKER_DARK = QColor(202, 202, 202)
+
+
+def _contrasting_text_qcolor(color: QColor) -> QColor:
+    """背景色の輝度から、視認しやすい文字色(黒系/白系)を選ぶ。"""
+    luminance = (0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()) / 255.0
+    return QColor(20, 20, 20) if luminance > 0.55 else QColor(245, 245, 245)
+
+
+class _ColorSwatchButton(QPushButton):
+    """色そのものを背景いっぱいに描き、文字でその「意味」を示す横長ボタン。
+
+    アプリ全体のスタイルシート(QSS)に左右されず常に正しい色/透明チェッカー柄を
+    表示できるよう、背景・枠線・文字を paintEvent で自前描画する。
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._swatch_color: QColor | None = QColor(255, 255, 255)
+        self.setMinimumHeight(24)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # ネイティブスタイル(ベベル/背景)の描画を完全に避け、常に自前の
+        # paintEvent の結果だけが見えるようにする。
+        self.setFlat(True)
+        self.setAutoFillBackground(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        # Windows ネイティブスタイルでは、同じ幅で並ぶこのバー同士で別ボタンの
+        # 見た目(市松模様など)が誤って出る現象が確認された(Fusion では再現せず、
+        # 原因は未特定)。paintEvent を自前実装しているのでネイティブ装飾は不要。
+        # このウィジェットだけ Fusion スタイルへ切り替えて回避する。
+        fusion_style = QStyleFactory.create("Fusion")
+        if fusion_style is not None:
+            fusion_style.setParent(self)
+            self.setStyle(fusion_style)
+
+    def set_swatch_color(self, color: QColor | None) -> None:
+        """None は「透明」を表す。"""
+        self._swatch_color = color
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        painter = QPainter(self)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        if not self.isEnabled():
+            painter.setOpacity(0.45)
+        if self._swatch_color is None:
+            self._paint_checkerboard(painter, rect)
+            painter.setPen(QColor(200, 40, 40))
+            painter.drawLine(rect.topLeft(), rect.bottomRight())
+            text_color = QColor(20, 20, 20)
+        else:
+            painter.fillRect(rect, self._swatch_color)
+            text_color = _contrasting_text_qcolor(self._swatch_color)
+        painter.setPen(QColor(136, 136, 136))
+        painter.drawRect(rect)
+        painter.setPen(text_color)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
+        painter.end()
+
+    def _paint_checkerboard(self, painter: QPainter, rect: QRect) -> None:
+        size = _SWATCH_CHECKER_SIZE
+        painter.fillRect(rect, _SWATCH_CHECKER_LIGHT)
+        row = 0
+        y = rect.top()
+        while y < rect.bottom():
+            col = row
+            x = rect.left()
+            while x < rect.right():
+                if col % 2 == 0:
+                    painter.fillRect(x, y, size, size, _SWATCH_CHECKER_DARK)
+                x += size
+                col += 1
+            y += size
+            row += 1
+
+
+def _pick_color(
+    parent: QWidget | None,
+    initial: QColor,
+    title: str,
+    *,
+    allow_none: bool = False,
+) -> tuple[bool, QColor | None]:
+    """色選択ダイアログ(常に非ネイティブ)を表示する。
+
+    戻り値は (accepted, color)。キャンセル時は (False, None)。
+    allow_none=True の場合はダイアログのボタン列に「透明」ボタンを追加し、
+    押すと (True, None) を返す(= 色を透明にする、という決定)。
+    モジュールレベル関数として呼び出し側から毎回名前解決させることで、
+    テストから monkeypatch できるようにしている(他の create_fn/delete_fn と同じ方針)。
+    """
+    options = QColorDialog.ColorDialogOption.DontUseNativeDialog
+    if not allow_none:
+        color = QColorDialog.getColor(initial, parent, title, options)
+        if not color.isValid():
+            return False, None
+        return True, color
+
+    dialog = QColorDialog(initial, parent)
+    dialog.setWindowTitle(title)
+    dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+    chose_none = {"value": False}
+    button_box = dialog.findChild(QDialogButtonBox)
+    if button_box is not None:
+        none_btn = button_box.addButton("透明", QDialogButtonBox.ButtonRole.ActionRole)
+
+        def _pick_none() -> None:
+            chose_none["value"] = True
+            dialog.accept()
+
+        none_btn.clicked.connect(_pick_none)
+    if not dialog.exec():
+        return False, None
+    if chose_none["value"]:
+        return True, None
+    color = dialog.selectedColor()
+    if not color.isValid():
+        return False, None
+    return True, color
+
+
 from src.models.undo_manager import UndoManager, UndoAction
 from src.views.bookmarks_panel import BookmarksPanel
 from src.views.view_helpers import (
@@ -200,7 +327,12 @@ class ZoomAnnotationMixin:
     """PageEditWindow に混ぜ込む付箋(アノテーション)編集機能。"""
 
     def _build_annotation_drawer(self) -> QFrame:
-        """付箋編集ドロワー(作成ツール群+プロパティフォーム)を組み立てる。"""
+        """付箋編集ドロワー(作成ツール群+プロパティフォーム)を組み立てる。
+
+        構成は上から「Acrobat手書き表示トグル」「■追加（新規作成ツール群）」
+        「■選択中の注釈（削除・重なり順・プロパティ）」「■このページの付箋（一覧）」
+        の3セクション。
+        """
         self._zoom_annotation_drawer = QFrame()
         self._zoom_annotation_drawer.setObjectName("annotationDrawer")
         self._zoom_annotation_drawer.setFrameShape(QFrame.Shape.StyledPanel)
@@ -212,22 +344,24 @@ class ZoomAnnotationMixin:
         panel_layout = QVBoxLayout(self._zoom_annotation_panel)
         panel_layout.setContentsMargins(10, 10, 10, 10)
 
-        title = QLabel("付箋")
-        panel_layout.addWidget(title)
-
         self._build_ink_visibility_toggle(panel_layout)
+
+        panel_layout.addWidget(self._build_section_header("追加"))
+        self._build_addition_grid(panel_layout)
+
+        panel_layout.addWidget(self._build_section_header("選択中の注釈"))
         self._build_annotation_actions(panel_layout)
-        self._build_shape_tools(panel_layout)
-        self._build_markup_tools(panel_layout)
-        self._build_note_tools(panel_layout)
         self._build_annotation_form(panel_layout)
         self._build_shape_option_rows(panel_layout)
+        self._build_annotation_colors(panel_layout)
+        panel_layout.addWidget(self._zoom_note_editor)
 
         # FreeText-only widgets container references for visibility toggling
         self._zoom_freetext_only_widgets: list[QWidget] = []
 
         # 現在ページの付箋一覧（B）。クリックで該当付箋を選択。
         self._zoom_note_list_label = QLabel("このページの付箋")
+        self._style_section_header(self._zoom_note_list_label)
         panel_layout.addWidget(self._zoom_note_list_label)
         self._zoom_note_list = QListWidget()
         self._zoom_note_list.setMaximumHeight(140)
@@ -237,6 +371,54 @@ class ZoomAnnotationMixin:
         panel_layout.addStretch()
         drawer_layout.addWidget(self._zoom_annotation_panel)
         return self._zoom_annotation_drawer
+
+    def _style_section_header(self, label: QLabel) -> None:
+        """ドロワー内のセクション見出し(太字+上部に区切り線)の見た目を適用する。"""
+        label.setStyleSheet(
+            "font-weight: bold; margin-top: 8px; padding-top: 6px;"
+            " border-top: 1px solid palette(mid);"
+        )
+
+    def _build_section_header(self, text: str) -> QLabel:
+        """ドロワー内のセクション見出しラベルを作る。"""
+        label = QLabel(text)
+        self._style_section_header(label)
+        return label
+
+    def _build_sub_label(self, text: str) -> QLabel:
+        """セクション内の各ツール行の小見出し(見出しより弱調)を作る。"""
+        label = QLabel(text)
+        label.setStyleSheet("color: palette(dark);")
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        return label
+
+    def _build_addition_grid(self, panel_layout: QVBoxLayout) -> None:
+        """「追加」セクションの新規作成ツール(テキスト/付箋/図形/文字装飾)を、
+
+        左に小見出し・右にツール群を並べたグリッドとして組み立てる。
+        """
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+
+        row = 0
+        grid.addWidget(self._build_sub_label("テキスト"), row, 0)
+        self._build_freetext_tool_row(grid, row)
+        row += 1
+
+        grid.addWidget(self._build_sub_label("付箋"), row, 0)
+        self._build_note_tools(grid, row)
+        row += 1
+
+        grid.addWidget(self._build_sub_label("図形"), row, 0)
+        self._build_shape_tools(grid, row)
+        row += 1
+
+        grid.addWidget(self._build_sub_label("文字装飾"), row, 0)
+        self._build_markup_tools(grid, row)
+
+        panel_layout.addLayout(grid)
 
     def _build_ink_visibility_toggle(self, panel_layout: QVBoxLayout) -> None:
         """Acrobat手書き(Ink)注釈の表示/非表示トグルボタンを組み立てる。
@@ -259,18 +441,27 @@ class ZoomAnnotationMixin:
         self._render_zoom()
         self._invalidate_and_requeue_thumbnails()
 
-    def _build_annotation_actions(self, panel_layout: QVBoxLayout) -> None:
-        """付箋の新規/削除と重なり順操作のボタン列を組み立てる。"""
-        action_row = QHBoxLayout()
-        self._zoom_annotation_new_btn = QPushButton("新規")
+    def _build_freetext_tool_row(self, grid: QGridLayout, row: int) -> None:
+        """「追加」セクションの「テキスト」行(テキストボックス作成ボタン)を組み立てる。"""
+        self._zoom_annotation_new_btn = QPushButton("テキストボックス")
         self._zoom_annotation_new_btn.setCheckable(True)
+        self._zoom_annotation_new_btn.setToolTip("テキストボックスを追加（ドラッグで配置）")
         self._zoom_annotation_new_btn.clicked.connect(self._on_zoom_annotation_new_clicked)
-        action_row.addWidget(self._zoom_annotation_new_btn)
+        grid.addWidget(self._zoom_annotation_new_btn, row, 1)
 
+    def _build_annotation_actions(self, panel_layout: QVBoxLayout) -> None:
+        """選択中の付箋の削除と重なり順操作のボタン列を組み立てる。
+
+        「削除」+ 重なり順4ボタンの計5個をドロワーの通常幅(320px)で1行に
+        並べると省略表示になるため、「削除」を単独行(右寄せ)にし、
+        重なり順4ボタンをその下の行にまとめる。
+        """
+        delete_row = QHBoxLayout()
+        delete_row.addStretch()
         self._zoom_annotation_delete_btn = QPushButton("削除")
         self._zoom_annotation_delete_btn.clicked.connect(self._delete_selected_zoom_annotation)
-        action_row.addWidget(self._zoom_annotation_delete_btn)
-        panel_layout.addLayout(action_row)
+        delete_row.addWidget(self._zoom_annotation_delete_btn)
+        panel_layout.addLayout(delete_row)
 
         order_row = QHBoxLayout()
         self._zoom_annotation_order_back_btn = QPushButton("最背面")
@@ -305,11 +496,10 @@ class ZoomAnnotationMixin:
         )
         order_row.addWidget(self._zoom_annotation_order_front_btn)
         panel_layout.addLayout(order_row)
-    def _build_shape_tools(self, panel_layout: QVBoxLayout) -> None:
-        """図形作成ボタン列を組み立てる。"""
-        shape_label = QLabel("図形")
-        panel_layout.addWidget(shape_label)
+    def _build_shape_tools(self, grid: QGridLayout, row: int) -> None:
+        """「追加」セクションの「図形」行(図形作成ボタン列)を組み立てる。"""
         shape_row = QHBoxLayout()
+        shape_row.setSpacing(4)
         self._shape_buttons: dict[ShapeType, QToolButton] = {}
         shape_defs = [
             ("―", ShapeType.LINE, "線"),
@@ -323,82 +513,105 @@ class ZoomAnnotationMixin:
             btn.setText(text)
             btn.setToolTip(tooltip)
             btn.setCheckable(True)
-            btn.setMinimumWidth(40)
+            btn.setMinimumWidth(36)
             btn.clicked.connect(lambda checked, st=shape_type: self._on_shape_btn_clicked(st, checked))
             shape_row.addWidget(btn)
             self._shape_buttons[shape_type] = btn
-        panel_layout.addLayout(shape_row)
-    def _build_markup_tools(self, panel_layout: QVBoxLayout) -> None:
-        """文字装飾(ハイライト/下線/取り消し線)・消しゴムのボタン列を組み立てる。"""
-        markup_label = QLabel("文字装飾")
-        panel_layout.addWidget(markup_label)
-        markup_row = QHBoxLayout()
+        grid.addLayout(shape_row, row, 1)
+    def _build_markup_tools(self, grid: QGridLayout, row: int) -> None:
+        """「追加」セクションの「文字装飾」行(ハイライト/下線/取り消し線・消しゴム)を組み立てる。
+
+        ドロワーの通常幅(320px)では横1列に全ボタンを並べると文字が省略記号
+        ("...")で切れてしまうため、3列×2行のグリッドに組んでボタンごとに
+        十分な幅を確保する(各列は均等に伸縮する)。
+        """
+        markup_grid = QGridLayout()
+        markup_grid.setHorizontalSpacing(4)
+        markup_grid.setVerticalSpacing(4)
         self._markup_buttons: dict[MarkupType, QToolButton] = {}
         markup_defs = [
-            ("ﾏｰｶｰ", MarkupType.HIGHLIGHT, "ハイライト（テキスト選択後にクリック / 未選択でクリックすると連続モード）"),
-            ("U", MarkupType.UNDERLINE, "下線（テキスト選択後にクリック / 未選択でクリックすると連続モード）"),
-            ("S", MarkupType.STRIKEOUT, "取り消し線（テキスト選択後にクリック / 未選択でクリックすると連続モード）"),
+            ("マーカー", MarkupType.HIGHLIGHT, "選択したテキストにマーカー"),
+            ("U", MarkupType.UNDERLINE, "選択したテキストに下線"),
+            ("S", MarkupType.STRIKEOUT, "選択したテキストに取り消し線"),
         ]
-        for text, markup_type, tooltip in markup_defs:
+        for col, (text, markup_type, tooltip) in enumerate(markup_defs):
             btn = QToolButton()
             btn.setText(text)
             btn.setToolTip(tooltip)
             btn.setCheckable(True)
-            btn.setMinimumWidth(48)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(
-                lambda checked=False, mt=markup_type: self._on_markup_btn_clicked(mt, checked)
+                lambda _checked=False, mt=markup_type: self._on_markup_btn_clicked(mt)
             )
-            markup_row.addWidget(btn)
+            markup_grid.addWidget(btn, 0, col)
             self._markup_buttons[markup_type] = btn
         self._eraser_btn = QToolButton()
         self._eraser_btn.setText("消しゴム")
         self._eraser_btn.setToolTip(
-            "消しゴム（連続モード。ドラッグ/クリックで選択した範囲の文字装飾だけを部分的に消去）"
+            "選択したテキストの文字装飾を消去（未選択で注釈選択中はその注釈を削除）"
         )
         self._eraser_btn.setCheckable(True)
-        self._eraser_btn.setMinimumWidth(56)
+        self._eraser_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._eraser_btn.clicked.connect(self._on_eraser_btn_clicked)
-        markup_row.addWidget(self._eraser_btn)
-        self._zoom_markup_color_btn = QPushButton()
-        self._zoom_markup_color_btn.setToolTip("マークアップの色")
+        markup_grid.addWidget(self._eraser_btn, 1, 0)
+        self._markup_continuous_btn = QToolButton()
+        self._markup_continuous_btn.setText("連続")
+        self._markup_continuous_btn.setToolTip(
+            "ONにするとツールボタンを押した状態のまま、ドラッグするたびに適用"
+        )
+        self._markup_continuous_btn.setCheckable(True)
+        self._markup_continuous_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._markup_continuous_btn.toggled.connect(self._on_markup_continuous_toggled)
+        markup_grid.addWidget(self._markup_continuous_btn, 1, 1)
+        self._zoom_markup_color_btn = _ColorSwatchButton()
+        self._init_color_button(
+            self._zoom_markup_color_btn,
+            "装飾色",
+            tooltip_label="マーカー・下線・取り消し線の色",
+        )
         self._zoom_markup_color_btn.clicked.connect(self._pick_markup_color)
-        markup_row.addWidget(self._zoom_markup_color_btn)
-        panel_layout.addLayout(markup_row)
+        markup_grid.addWidget(self._zoom_markup_color_btn, 1, 2)
+        for col in range(3):
+            markup_grid.setColumnStretch(col, 1)
+        grid.addLayout(markup_grid, row, 1)
         self._set_color_button_preview(self._zoom_markup_color_btn, self._zoom_markup_color)
-    def _build_note_tools(self, panel_layout: QVBoxLayout) -> None:
-        """付箋(コメント)/校正コールアウトのツール列と本文エディタを組み立てる。"""
-        note_label = QLabel("付箋（コメント）")
-        panel_layout.addWidget(note_label)
+    def _build_note_tools(self, grid: QGridLayout, row: int) -> None:
+        """「追加」セクションの「付箋」行(付箋(コメント)/校正コールアウト作成ボタン列)を組み立てる。
+
+        付箋本文エディタ自体は「選択中の注釈」セクション側で表示する(付箋選択時のみ表示)。
+        """
         note_row = QHBoxLayout()
+        note_row.setSpacing(4)
         self._zoom_note_btn = QToolButton()
         self._zoom_note_btn.setText("ノート")
         self._zoom_note_btn.setCheckable(True)
         self._zoom_note_btn.setToolTip("付箋を追加（クリックで配置）")
         self._zoom_note_btn.clicked.connect(self._on_note_btn_clicked)
         note_row.addWidget(self._zoom_note_btn)
-        self._zoom_note_color_btn = QPushButton()
-        self._zoom_note_color_btn.setToolTip("付箋の色")
-        self._zoom_note_color_btn.clicked.connect(self._pick_note_color)
-        note_row.addWidget(self._zoom_note_color_btn)
         self._zoom_callout_btn = QToolButton()
         self._zoom_callout_btn.setText("校正")
         self._zoom_callout_btn.setCheckable(True)
         self._zoom_callout_btn.setToolTip("校正コールアウトを追加（挿入位置をクリック）")
         self._zoom_callout_btn.clicked.connect(self._on_callout_btn_clicked)
         note_row.addWidget(self._zoom_callout_btn)
-        note_row.addStretch(1)
-        panel_layout.addLayout(note_row)
+        self._zoom_note_color_btn = _ColorSwatchButton()
+        self._init_color_button(self._zoom_note_color_btn, "付箋色")
+        self._zoom_note_color_btn.clicked.connect(self._pick_note_color)
+        note_row.addWidget(self._zoom_note_color_btn, 1)
+        grid.addLayout(note_row, row, 1)
         self._set_color_button_preview(self._zoom_note_color_btn, self._zoom_note_color)
 
-        # 付箋本文エディタ（付箋選択時のみ表示）
+        # 付箋本文エディタ（付箋選択時のみ表示。配置は「選択中の注釈」セクション側）
         self._zoom_note_editor = NoteContentEdit()
         self._zoom_note_editor.setPlaceholderText("コメントを入力")
         self._zoom_note_editor.setFixedHeight(80)
         self._zoom_note_editor.commit_requested.connect(self._commit_note_editor_if_dirty)
-        panel_layout.addWidget(self._zoom_note_editor)
         self._zoom_note_editor.hide()
     def _build_annotation_form(self, panel_layout: QVBoxLayout) -> None:
-        """サイズ/文字サイズ/線幅/透明度/色のプロパティフォームを組み立てる。"""
+        """サイズ/文字サイズ/線幅/透明度のプロパティフォームを組み立てる。
+
+        文字色/背景色/線色は _build_annotation_colors 側で組み立てる。
+        """
         form = QFormLayout()
         self._zoom_annotation_width_spin = QSpinBox()
         self._zoom_annotation_width_spin.setRange(1, 5000)
@@ -441,39 +654,32 @@ class ZoomAnnotationMixin:
         self._zoom_annotation_opacity_label = QLabel("100%")
         opacity_layout.addWidget(self._zoom_annotation_opacity_label)
         panel_layout.addWidget(opacity_row)
-
-        self._zoom_annotation_text_color_btn = QPushButton()
+    def _build_annotation_colors(self, panel_layout: QVBoxLayout) -> None:
+        """選択中の注釈(または作成中のデフォルト)の文字色/背景色/線色ボタンを1行にまとめる。"""
+        self._zoom_annotation_text_color_btn = _ColorSwatchButton()
+        self._init_color_button(self._zoom_annotation_text_color_btn, "文字色")
         self._zoom_annotation_text_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("text"))
-        self._zoom_annotation_text_color_row = self._build_labeled_color_row("文字色", self._zoom_annotation_text_color_btn)
-        panel_layout.addWidget(self._zoom_annotation_text_color_row)
+        self._zoom_annotation_text_color_row = self._build_labeled_color_row(self._zoom_annotation_text_color_btn)
 
-        self._zoom_annotation_fill_color_btn = QPushButton()
+        self._zoom_annotation_fill_color_btn = _ColorSwatchButton()
+        self._init_color_button(self._zoom_annotation_fill_color_btn, "背景色")
         self._zoom_annotation_fill_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("fill"))
-        self._zoom_annotation_fill_color_clear_btn = QPushButton("透明")
-        self._zoom_annotation_fill_color_clear_btn.clicked.connect(
-            lambda: self._clear_zoom_annotation_color("fill")
-        )
-        panel_layout.addWidget(
-            self._build_labeled_color_row(
-                "背景色",
-                self._zoom_annotation_fill_color_btn,
-                clear_button=self._zoom_annotation_fill_color_clear_btn,
-            )
-        )
+        fill_color_row = self._build_labeled_color_row(self._zoom_annotation_fill_color_btn)
 
-        self._zoom_annotation_border_color_btn = QPushButton()
+        self._zoom_annotation_border_color_btn = _ColorSwatchButton()
+        self._init_color_button(self._zoom_annotation_border_color_btn, "線色")
         self._zoom_annotation_border_color_btn.clicked.connect(lambda: self._pick_zoom_annotation_color("border"))
-        self._zoom_annotation_border_color_clear_btn = QPushButton("透明")
-        self._zoom_annotation_border_color_clear_btn.clicked.connect(
-            lambda: self._clear_zoom_annotation_color("border")
-        )
-        panel_layout.addWidget(
-            self._build_labeled_color_row(
-                "線色",
-                self._zoom_annotation_border_color_btn,
-                clear_button=self._zoom_annotation_border_color_clear_btn,
-            )
-        )
+        border_color_row = self._build_labeled_color_row(self._zoom_annotation_border_color_btn)
+
+        colors_row = QHBoxLayout()
+        colors_row.setSpacing(4)
+        # _zoom_annotation_text_color_row は付箋/マークアップ選択時に単体で非表示にされる
+        # (setVisible)。QHBoxLayout はウィジェットの非表示を反映して残り2つを詰めるため、
+        # そのままこの行に加えるだけでよい。
+        colors_row.addWidget(self._zoom_annotation_text_color_row, 1)
+        colors_row.addWidget(fill_color_row, 1)
+        colors_row.addWidget(border_color_row, 1)
+        panel_layout.addLayout(colors_row)
     def _build_shape_option_rows(self, panel_layout: QVBoxLayout) -> None:
         """図形種別ごとの追加オプション行(回転/線/括弧/三角形)を組み立てる。"""
         # Rotation
@@ -591,21 +797,33 @@ class ZoomAnnotationMixin:
         self._zoom_shape_triangle_options.hide()
     def _build_labeled_color_row(
         self,
-        label_text: str,
         button: QPushButton,
-        *,
-        clear_button: QPushButton | None = None,
     ) -> QWidget:
+        """色ボタンを1つだけ載せた行を作る。
+
+        ボタン自体のバー上に「意味」テキストが表示される(_init_color_button /
+        _set_color_button_preview 参照)ため、以前ここにあった左側ラベルは
+        冗長として廃止し、ボタンが行幅いっぱいに広がるようにする。
+        """
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel(label_text))
-        button.setMinimumWidth(120)
-        layout.addWidget(button, 1)
-        if clear_button is not None:
-            clear_button.setFixedWidth(56)
-            layout.addWidget(clear_button)
+        layout.addWidget(button)
         return row
+    def _init_color_button(
+        self,
+        button: QPushButton,
+        label: str,
+        *,
+        tooltip_label: str | None = None,
+    ) -> None:
+        """色ボタン生成時に、バー上のテキスト/ツールチップに使う「意味」を設定する。
+
+        以後 _set_color_button_preview が呼ばれるたびに、ここで設定した文言を
+        使ってバーの表示を更新する(呼び出し側で毎回 label を渡す必要をなくす)。
+        """
+        button.setProperty("swatch_label", label)
+        button.setProperty("swatch_tooltip_label", tooltip_label or label)
     def _set_color_button_preview(
         self,
         button: QPushButton | None,
@@ -613,16 +831,29 @@ class ZoomAnnotationMixin:
         *,
         allow_none: bool = False,
     ) -> None:
+        """色ボタンの見た目を、色の「意味」を表示する色見本バーとして更新する。
+
+        バーいっぱいを色で塗り、_init_color_button で設定した文言(「文字色」等)を
+        中央に表示する(16進テキストはツールチップにのみ表示)。文字色は背景の
+        輝度から自動的に黒系/白系を選び、視認性を確保する。透明時はチェッカー柄+
+        斜線で「透明」であることが一目で分かるようにする。
+        """
         if button is None:
             return
-        if color is None and allow_none:
-            button.setText("透明")
-            button.setStyleSheet("background-color: transparent; color: #000000;")
+        label = button.property("swatch_label") or ""
+        tooltip_label = button.property("swatch_tooltip_label") or label
+        button.setText(label)
+        is_transparent = color is None and allow_none
+        button.setProperty("transparent", is_transparent)
+        if isinstance(button, _ColorSwatchButton):
+            button.set_swatch_color(
+                None if is_transparent else self._rgb_tuple_to_qcolor(color or (0.0, 0.0, 0.0))
+            )
+        if is_transparent:
+            button.setToolTip(f"{tooltip_label}: 透明" if tooltip_label else "透明")
             return
         qcolor = self._rgb_tuple_to_qcolor(color or (0.0, 0.0, 0.0))
-        button.setText(qcolor.name())
-        text_color = "#ffffff" if qcolor.lightnessF() < 0.5 else "#000000"
-        button.setStyleSheet(f"background-color: {qcolor.name()}; color: {text_color};")
+        button.setToolTip(f"{tooltip_label}: {qcolor.name()}" if tooltip_label else qcolor.name())
     def _rgb_tuple_to_qcolor(self, color: tuple[float, float, float]) -> QColor:
         return QColor(
             max(0, min(255, round(color[0] * 255))),
@@ -708,7 +939,7 @@ class ZoomAnnotationMixin:
         if self._zoom_annotation_new_btn:
             with QSignalBlocker(self._zoom_annotation_new_btn):
                 self._zoom_annotation_new_btn.setChecked(enabled)
-            self._zoom_annotation_new_btn.setText("配置待ち" if enabled else "新規")
+            self._zoom_annotation_new_btn.setText("配置待ち" if enabled else "テキストボックス")
         self._set_zoom_create_mode("freetext" if enabled else None)
     def _set_zoom_create_mode(self, mode: ShapeType | str | None) -> None:
         """作成モードを更新し、変化した場合のみ右パネルへ反映する。
@@ -793,9 +1024,7 @@ class ZoomAnnotationMixin:
                 self._zoom_annotation_opacity_slider,
                 self._zoom_annotation_border_width_spin,
                 self._zoom_annotation_fill_color_btn,
-                self._zoom_annotation_fill_color_clear_btn,
                 self._zoom_annotation_border_color_btn,
-                self._zoom_annotation_border_color_clear_btn,
             ]
             if not panel_is_shape:
                 widgets.extend([
@@ -921,25 +1150,43 @@ class ZoomAnnotationMixin:
         finally:
             self._zoom_annotation_form_sync = False
     def _pick_color_via_dialog(
-        self, current: tuple[float, float, float]
-    ) -> tuple[float, float, float] | None:
-        """共通のカラー選択ダイアログ。キャンセル時は None を返す。"""
-        color = QColorDialog.getColor(self._rgb_tuple_to_qcolor(current), self, "色を選択")
-        if not color.isValid():
-            return None
-        return self._qcolor_to_rgb_tuple(color)
+        self,
+        current: tuple[float, float, float] | None,
+        *,
+        title: str = "色を選択",
+        allow_none: bool = False,
+    ) -> tuple[bool, tuple[float, float, float] | None]:
+        """共通のカラー選択ダイアログ。
+
+        戻り値は (accepted, rgb)。キャンセル時は (False, None)。
+        allow_none=True でダイアログの「透明」ボタンが押されたときは
+        (True, None) を返す(= 透明にする、という決定)。
+        """
+        initial = self._rgb_tuple_to_qcolor(current) if current is not None else QColor(255, 255, 255)
+        accepted, qcolor = _pick_color(self, initial, title, allow_none=allow_none)
+        if not accepted:
+            return False, None
+        if qcolor is None:
+            return True, None
+        return True, self._qcolor_to_rgb_tuple(qcolor)
     def _pick_zoom_annotation_color(self, kind: str) -> None:
         # 注釈選択中はその注釈へ適用、作成モード中は新規作成のデフォルト色を更新する
         if self._selected_zoom_annotation is None and self._zoom_create_mode is None:
             return
         if kind == "text":
             current = self._zoom_annotation_text_color
+            title = "文字色を選択"
+            allow_none = False
         elif kind == "fill":
             current = self._zoom_annotation_fill_color or (1.0, 1.0, 0.6)
+            title = "背景色を選択"
+            allow_none = True
         else:
             current = self._zoom_annotation_border_color or (0.0, 0.0, 0.0)
-        rgb = self._pick_color_via_dialog(current)
-        if rgb is None:
+            title = "線色を選択"
+            allow_none = True
+        accepted, rgb = self._pick_color_via_dialog(current, title=title, allow_none=allow_none)
+        if not accepted:
             return
         if kind == "text":
             self._zoom_annotation_text_color = rgb
@@ -950,18 +1197,6 @@ class ZoomAnnotationMixin:
         else:
             self._zoom_annotation_border_color = rgb
             self._set_color_button_preview(self._zoom_annotation_border_color_btn, rgb, allow_none=True)
-        self._apply_zoom_annotation_form()
-    def _clear_zoom_annotation_color(self, kind: str) -> None:
-        if self._selected_zoom_annotation is None and self._zoom_create_mode is None:
-            return
-        if kind == "fill":
-            self._zoom_annotation_fill_color = None
-            self._set_color_button_preview(self._zoom_annotation_fill_color_btn, None, allow_none=True)
-        elif kind == "border":
-            self._zoom_annotation_border_color = None
-            self._set_color_button_preview(self._zoom_annotation_border_color_btn, None, allow_none=True)
-        else:
-            return
         self._apply_zoom_annotation_form()
     def _markup_default_opacity(self, markup_type: MarkupType) -> float:
         # ハイライトは半透明で文字が透ける。下線/取り消し線は不透明。
@@ -993,21 +1228,35 @@ class ZoomAnnotationMixin:
             self._zoom_note_editor.hide()
             if self._zoom_note_color_btn is not None:
                 self._set_color_button_preview(self._zoom_note_color_btn, self._zoom_note_color)
-    def _on_markup_btn_clicked(self, markup_type: MarkupType, checked: bool) -> None:
-        # 連続モード中: 同じボタン→解除、別ボタン(または消しゴムから)→切替。
-        # Qt がチェック状態を自動反転させるので、いずれの分岐でも
-        # _set_markup_sticky_mode/_set_eraser_sticky_mode が最終状態を上書きする。
-        if self._create_mode in (CreateMode.MARKUP, CreateMode.ERASER):
+    def _on_markup_continuous_toggled(self, checked: bool) -> None:
+        """「連続」トグルの ON/OFF を切り替える。OFF にすると sticky ツールも解除する。
+
+        ON にした瞬間、既存のテキスト選択が残っていても後続のツール選択で
+        誤って即適用されないよう、ここで選択を解除しておく。
+        """
+        self._markup_continuous_mode = bool(checked)
+        if self._markup_continuous_mode:
+            if self._zoom_label is not None:
+                self._zoom_label.clear_text_selection()
+        elif self._create_mode in (CreateMode.MARKUP, CreateMode.ERASER):
+            self._activate_create_mode(CreateMode.NONE)
+    def _on_markup_btn_clicked(self, markup_type: MarkupType) -> None:
+        if self._markup_continuous_mode:
+            # 連続モード ON: ボタンは sticky ツールの切り替えとして働くだけで、
+            # 既存のテキスト選択には適用しない(直感に反するため)。
+            # 適用はツール装着後の新しいドラッグ確定時のみ行う。
+            # 同じボタン→解除、別ボタン(または消しゴムから)→切替。
             if self._create_mode is CreateMode.MARKUP and self._markup_sticky_type == markup_type:
                 self._activate_create_mode(CreateMode.NONE)
-            else:
-                self._activate_create_mode(CreateMode.MARKUP, markup_type=markup_type)
+                return
+            self._activate_create_mode(CreateMode.MARKUP, markup_type=markup_type)
             return
+        # 連続モード OFF: e4c00ce 時点の単発動作(ボタンは常に押しっぱなしにしない)。
+        with QSignalBlocker(self._markup_buttons[markup_type]):
+            self._markup_buttons[markup_type].setChecked(False)
         selected = self._selected_zoom_annotation
         if isinstance(selected, TextMarkupAnnotData):
-            # 選択中のマークアップの種類を変更する（連続モードには入らない）。
-            with QSignalBlocker(self._markup_buttons[markup_type]):
-                self._markup_buttons[markup_type].setChecked(False)
+            # 選択中のマークアップの種類を変更する。
             if selected.markup_type == markup_type:
                 return
             new_annotation = dataclass_replace(
@@ -1019,15 +1268,7 @@ class ZoomAnnotationMixin:
             )
             self._run_zoom_markup_replace(selected, new_annotation, f"Change to {markup_type.value}")
             return
-        has_selection = bool(self._zoom_label._selected_char_indices) if self._zoom_label else False
-        if has_selection:
-            # テキスト選択がある: 一度だけ適用し、連続モードには入らない。
-            with QSignalBlocker(self._markup_buttons[markup_type]):
-                self._markup_buttons[markup_type].setChecked(False)
-            self._create_markup_from_selection(markup_type)
-            return
-        # 何も選択していない: 連続モード（sticky mode）へ入る。
-        self._activate_create_mode(CreateMode.MARKUP, markup_type=markup_type)
+        self._create_markup_from_selection(markup_type)
     def _set_markup_sticky_mode(self, markup_type: "MarkupType | None") -> None:
         """マークアップ連続モードの有効/無効を切り替える。"""
         if markup_type is not None:
@@ -1041,11 +1282,35 @@ class ZoomAnnotationMixin:
         if self._zoom_label is not None:
             if markup_type is not None:
                 self._zoom_label.cancel_annotation_paste_mode()
+                # ツール装着時点の既存選択には適用しない(装着後の新しい
+                # ドラッグ確定でのみ適用するため、ここで選択を解除する)。
+                self._zoom_label.clear_text_selection()
             self._zoom_label.set_text_select_only_mode(
                 markup_type is not None, cursor=Qt.CursorShape.IBeamCursor
             )
     def _on_eraser_btn_clicked(self, checked: bool) -> None:
+        if not self._markup_continuous_mode:
+            # 連続モード OFF: 単発動作。ボタンは押しっぱなしにしない。
+            with QSignalBlocker(self._eraser_btn):
+                self._eraser_btn.setChecked(False)
+            self._apply_one_shot_eraser()
+            return
+        # 連続モード ON: 装着するだけで、既存のテキスト選択には適用しない。
         self._activate_create_mode(CreateMode.ERASER if checked else CreateMode.NONE)
+    def _apply_one_shot_eraser(self) -> None:
+        """連続モード OFF での消しゴムの単発動作。
+
+        テキスト選択があればその範囲の文字装飾を部分消去し、テキスト選択が無く
+        マークアップ注釈が選択中ならその注釈を削除する（削除ボタンと同じ経路）。
+        どちらも無ければヒントを表示する。
+        """
+        if self._zoom_label is not None and self._zoom_label._selected_char_indices:
+            self._apply_eraser_to_selection()
+            return
+        if isinstance(self._selected_zoom_annotation, TextMarkupAnnotData):
+            self._delete_selected_zoom_annotation()
+            return
+        self._flash_zoom_hint("消す範囲のテキストを選択してください")
     def _set_eraser_sticky_mode(self, enabled: bool) -> None:
         """消しゴム連続モードの有効/無効を切り替える。"""
         enabled = bool(enabled)
@@ -1059,7 +1324,9 @@ class ZoomAnnotationMixin:
         if self._zoom_label is not None:
             if enabled:
                 self._zoom_label.cancel_annotation_paste_mode()
-            self._zoom_label.set_text_select_only_mode(enabled, cursor=Qt.CursorShape.CrossCursor)
+                # ツール装着時点の既存選択には適用しない。
+                self._zoom_label.clear_text_selection()
+            self._zoom_label.set_text_select_only_mode(enabled, cursor=Qt.CursorShape.IBeamCursor)
     def _on_zoom_text_selection_released(self) -> None:
         """テキスト選択の確定（ドラッグ確定/クリックの単語選択）を、連続モードに応じて処理する。"""
         if self._zoom_label is None or not self._zoom_label._selected_char_indices:
@@ -1070,7 +1337,7 @@ class ZoomAnnotationMixin:
                 after_create=lambda _created: self._set_selected_zoom_annotation(None),
             )
         elif self._create_mode is CreateMode.ERASER:
-            self._apply_sticky_eraser()
+            self._apply_eraser_to_selection()
     def _find_matching_markup(
         self, markup_type: MarkupType, char_indices: set[int]
     ) -> TextMarkupAnnotData | None:
@@ -1120,11 +1387,12 @@ class ZoomAnnotationMixin:
             lambda *a: delete_markup_annot(*a),
             after_create=after_create,
         )
-    def _apply_sticky_eraser(self) -> None:
-        """消しゴム連続モード: 選択中の文字が重なる文字装飾を部分的に(または完全に)消去する。
+    def _apply_eraser_to_selection(self) -> None:
+        """消しゴム: 選択中の文字が重なる文字装飾を部分的に(または完全に)消去する。
 
-        1回のドラッグ/クリックで影響を受けるすべての注釈の変更を、単一のUndoステップに
-        まとめる(Ctrl+Zで一括復元できるようにする)。
+        単発動作・連続モードのどちらからも呼ばれる共通ロジック。1回のドラッグ/クリックで
+        影響を受けるすべての注釈の変更を、単一のUndoステップにまとめる
+        (Ctrl+Zで一括復元できるようにする)。
         """
         if self._zoom_label is None or self._zoom_page_num is None:
             return
@@ -1192,8 +1460,8 @@ class ZoomAnnotationMixin:
         selected = self._selected_zoom_annotation
         is_markup = isinstance(selected, TextMarkupAnnotData)
         current = selected.color if is_markup else self._zoom_markup_color
-        rgb = self._pick_color_via_dialog(current)
-        if rgb is None:
+        accepted, rgb = self._pick_color_via_dialog(current, title="装飾色を選択")
+        if not accepted:
             return
         self._zoom_markup_color = rgb
         if self._zoom_markup_color_btn is not None:
@@ -1341,8 +1609,8 @@ class ZoomAnnotationMixin:
         selected = self._selected_zoom_annotation
         is_note = isinstance(selected, NoteAnnotData)
         current = selected.color if is_note else self._zoom_note_color
-        rgb = self._pick_color_via_dialog(current)
-        if rgb is None:
+        accepted, rgb = self._pick_color_via_dialog(current, title="付箋色を選択")
+        if not accepted:
             return
         self._zoom_note_color = rgb
         if self._zoom_note_color_btn is not None:

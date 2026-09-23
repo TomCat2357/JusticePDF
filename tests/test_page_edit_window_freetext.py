@@ -323,7 +323,7 @@ def test_zoom_delete_key_in_editor_deletes_char_not_annotation(qtbot, tmp_path):
 
 
 @pytest.mark.usefixtures("qtbot")
-def test_zoom_can_clear_fill_and_border_colors(qtbot, tmp_path):
+def test_zoom_can_clear_fill_and_border_colors(qtbot, monkeypatch, tmp_path):
     pdf_path = tmp_path / "clear-transparent-colors.pdf"
     make_pdf(pdf_path)
 
@@ -354,10 +354,17 @@ def test_zoom_can_clear_fill_and_border_colors(qtbot, tmp_path):
         and window._selected_zoom_annotation.xref == created.xref
     )
 
-    qtbot.mouseClick(window._zoom_annotation_fill_color_clear_btn, Qt.MouseButton.LeftButton)
+    # 「透明」選択はカラーダイアログ内のボタンへ移動したため、ダイアログを
+    # 開くヘルパー自体を monkeypatch して (accepted=True, color=None) を返させる。
+    monkeypatch.setattr(
+        page_edit_annotations_module,
+        "_pick_color",
+        lambda *a, **k: (True, None),
+    )
+    qtbot.mouseClick(window._zoom_annotation_fill_color_btn, Qt.MouseButton.LeftButton)
     qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].fill_color is None)
 
-    qtbot.mouseClick(window._zoom_annotation_border_color_clear_btn, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window._zoom_annotation_border_color_btn, Qt.MouseButton.LeftButton)
     qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].border_color is None)
 
     changed = list_freetext_annots(str(pdf_path), 0)[0]
@@ -365,8 +372,18 @@ def test_zoom_can_clear_fill_and_border_colors(qtbot, tmp_path):
     assert changed.border_color is None
     assert changed.border_width == 3.0
     assert abs(changed.opacity - 0.6) < 0.02
-    assert window._zoom_annotation_fill_color_btn.text() == "透明"
-    assert window._zoom_annotation_border_color_btn.text() == "透明"
+    assert window._zoom_annotation_fill_color_btn.text() == "背景色"
+    assert window._zoom_annotation_border_color_btn.text() == "線色"
+    assert window._zoom_annotation_fill_color_btn.property("transparent") is True
+    assert window._zoom_annotation_border_color_btn.property("transparent") is True
+    assert "透明" in window._zoom_annotation_fill_color_btn.toolTip()
+    assert "透明" in window._zoom_annotation_border_color_btn.toolTip()
+
+    # 元へ戻せることを確認(Undoの対象になっている)
+    window._on_undo()
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].border_color is not None)
+    window._on_undo()
+    qtbot.waitUntil(lambda: list_freetext_annots(str(pdf_path), 0)[0].fill_color is not None)
 
 
 @pytest.mark.usefixtures("qtbot")
