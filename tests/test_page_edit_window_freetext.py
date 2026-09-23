@@ -863,6 +863,48 @@ def test_zoom_single_click_on_katakana_middle_dot_does_not_merge_names(qtbot, tm
 
 
 @pytest.mark.usefixtures("qtbot")
+def test_zoom_drag_in_second_column_selects_that_columns_text(qtbot, tmp_path):
+    pdf_path = tmp_path / "two-columns.pdf"
+    make_pdf(pdf_path)
+
+    doc = fitz.open(str(pdf_path))
+    page = doc[0]
+    # A spreadsheet-style export (e.g. Google Sheets -> PDF) writes each
+    # table cell as its own text-show operation. PyMuPDF's rawdict then
+    # reports same-row cells as separate "lines" sharing one block *and*
+    # the same y-bbox, ordered by document/insertion order rather than by
+    # x position. Selecting inside a later column used to resolve to the
+    # earlier column's line because the nearest-line search only compared
+    # y-distance (see _char_index_at).
+    page.insert_text((40, 80), "left col", fontsize=12)
+    page.insert_text((300, 80), "right col", fontsize=12)
+    doc.saveIncr()
+    doc.close()
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+
+    # Locate the second column's chars by line_id rather than by letter:
+    # "left col" and "right col" share letters, so searching by character
+    # could accidentally land back in the first column.
+    right_col_line_id = label._chars[-1]["line_id"]
+    right_col_indices = [
+        i for i, ch in enumerate(label._chars) if ch["line_id"] == right_col_line_id
+    ]
+    start_idx = right_col_indices[0]  # "r" of "right col"
+    end_idx = right_col_indices[3]  # "h" of "right col"
+    start_pos = _char_widget_pos(window, start_idx)
+    end_pos = _char_widget_pos(window, end_idx)
+
+    qtbot.mousePress(label, Qt.MouseButton.LeftButton, pos=start_pos)
+    qtbot.mouseMove(label, end_pos)
+    qtbot.mouseRelease(label, Qt.MouseButton.LeftButton, pos=end_pos)
+
+    assert label._selected_text() == "righ"
+
+
+@pytest.mark.usefixtures("qtbot")
 def test_zoom_short_drag_keeps_char_range_over_word_promotion(qtbot, tmp_path):
     pdf_path = tmp_path / "short-drag.pdf"
     make_pdf(pdf_path)
