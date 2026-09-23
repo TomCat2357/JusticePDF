@@ -172,6 +172,8 @@ class CreateMode(Enum):
     SHAPE = auto()  # 図形の配置待ち(種別は _zoom_create_mode が保持)
     NOTE = auto()  # コメント付箋の配置待ち
     CALLOUT = auto()  # 校正コールアウトの配置待ち
+    MARKUP = auto()  # 文字装飾(ハイライト/下線/取り消し線)の連続モード(種類は _markup_sticky_type が保持)
+    ERASER = auto()  # 文字装飾の消しゴム連続モード
 _BRACKET_STYLES = ("square", "round", "curly")
 _BRACKET_SIZES = ("small", "medium", "large")
 class _AnnotRef:
@@ -327,24 +329,36 @@ class ZoomAnnotationMixin:
             self._shape_buttons[shape_type] = btn
         panel_layout.addLayout(shape_row)
     def _build_markup_tools(self, panel_layout: QVBoxLayout) -> None:
-        """文字装飾(ハイライト/下線/取り消し線)ボタン列を組み立てる。"""
+        """文字装飾(ハイライト/下線/取り消し線)・消しゴムのボタン列を組み立てる。"""
         markup_label = QLabel("文字装飾")
         panel_layout.addWidget(markup_label)
         markup_row = QHBoxLayout()
         self._markup_buttons: dict[MarkupType, QToolButton] = {}
         markup_defs = [
-            ("ﾏｰｶｰ", MarkupType.HIGHLIGHT, "ハイライト（テキスト選択後にクリック）"),
-            ("U", MarkupType.UNDERLINE, "下線（テキスト選択後にクリック）"),
-            ("S", MarkupType.STRIKEOUT, "取り消し線（テキスト選択後にクリック）"),
+            ("ﾏｰｶｰ", MarkupType.HIGHLIGHT, "ハイライト（テキスト選択後にクリック / 未選択でクリックすると連続モード）"),
+            ("U", MarkupType.UNDERLINE, "下線（テキスト選択後にクリック / 未選択でクリックすると連続モード）"),
+            ("S", MarkupType.STRIKEOUT, "取り消し線（テキスト選択後にクリック / 未選択でクリックすると連続モード）"),
         ]
         for text, markup_type, tooltip in markup_defs:
             btn = QToolButton()
             btn.setText(text)
             btn.setToolTip(tooltip)
+            btn.setCheckable(True)
             btn.setMinimumWidth(48)
-            btn.clicked.connect(lambda _checked=False, mt=markup_type: self._on_markup_btn_clicked(mt))
+            btn.clicked.connect(
+                lambda checked=False, mt=markup_type: self._on_markup_btn_clicked(mt, checked)
+            )
             markup_row.addWidget(btn)
             self._markup_buttons[markup_type] = btn
+        self._eraser_btn = QToolButton()
+        self._eraser_btn.setText("消しゴム")
+        self._eraser_btn.setToolTip(
+            "消しゴム（連続モード。ドラッグ/クリックで選択した範囲の文字装飾だけを部分的に消去）"
+        )
+        self._eraser_btn.setCheckable(True)
+        self._eraser_btn.setMinimumWidth(56)
+        self._eraser_btn.clicked.connect(self._on_eraser_btn_clicked)
+        markup_row.addWidget(self._eraser_btn)
         self._zoom_markup_color_btn = QPushButton()
         self._zoom_markup_color_btn.setToolTip("マークアップの色")
         self._zoom_markup_color_btn.clicked.connect(self._pick_markup_color)
@@ -640,7 +654,10 @@ class ZoomAnnotationMixin:
         """テスト互換用の読み取り専用ミラー(状態は _create_mode が唯一の情報源)。"""
         return self._create_mode is CreateMode.CALLOUT
     def _activate_create_mode(
-        self, mode: CreateMode, shape_type: ShapeType | None = None
+        self,
+        mode: CreateMode,
+        shape_type: ShapeType | None = None,
+        markup_type: "MarkupType | None" = None,
     ) -> None:
         """新規作成モードを切り替える単一の状態機械。
 
@@ -655,6 +672,10 @@ class ZoomAnnotationMixin:
             self._set_note_create_mode(False)
         if mode is not CreateMode.CALLOUT:
             self._set_callout_create_mode(False)
+        if mode is not CreateMode.MARKUP:
+            self._set_markup_sticky_mode(None)
+        if mode is not CreateMode.ERASER:
+            self._set_eraser_sticky_mode(False)
         if mode is CreateMode.FREETEXT:
             self._set_zoom_annotation_create_mode(True)
         elif mode is CreateMode.SHAPE:
@@ -666,6 +687,14 @@ class ZoomAnnotationMixin:
                 self._set_note_create_mode(True)
             else:
                 self._set_callout_create_mode(True)
+        elif mode is CreateMode.MARKUP:
+            if self._selected_zoom_annotation is not None:
+                self._set_selected_zoom_annotation(None)
+            self._set_markup_sticky_mode(markup_type)
+        elif mode is CreateMode.ERASER:
+            if self._selected_zoom_annotation is not None:
+                self._set_selected_zoom_annotation(None)
+            self._set_eraser_sticky_mode(True)
     def _set_zoom_annotation_create_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
         if enabled:
@@ -964,10 +993,21 @@ class ZoomAnnotationMixin:
             self._zoom_note_editor.hide()
             if self._zoom_note_color_btn is not None:
                 self._set_color_button_preview(self._zoom_note_color_btn, self._zoom_note_color)
-    def _on_markup_btn_clicked(self, markup_type: MarkupType) -> None:
+    def _on_markup_btn_clicked(self, markup_type: MarkupType, checked: bool) -> None:
+        # 連続モード中: 同じボタン→解除、別ボタン(または消しゴムから)→切替。
+        # Qt がチェック状態を自動反転させるので、いずれの分岐でも
+        # _set_markup_sticky_mode/_set_eraser_sticky_mode が最終状態を上書きする。
+        if self._create_mode in (CreateMode.MARKUP, CreateMode.ERASER):
+            if self._create_mode is CreateMode.MARKUP and self._markup_sticky_type == markup_type:
+                self._activate_create_mode(CreateMode.NONE)
+            else:
+                self._activate_create_mode(CreateMode.MARKUP, markup_type=markup_type)
+            return
         selected = self._selected_zoom_annotation
         if isinstance(selected, TextMarkupAnnotData):
-            # 選択中のマークアップの種類を変更する。
+            # 選択中のマークアップの種類を変更する（連続モードには入らない）。
+            with QSignalBlocker(self._markup_buttons[markup_type]):
+                self._markup_buttons[markup_type].setChecked(False)
             if selected.markup_type == markup_type:
                 return
             new_annotation = dataclass_replace(
@@ -979,13 +1019,91 @@ class ZoomAnnotationMixin:
             )
             self._run_zoom_markup_replace(selected, new_annotation, f"Change to {markup_type.value}")
             return
-        self._create_markup_from_selection(markup_type)
-    def _create_markup_from_selection(self, markup_type: MarkupType) -> None:
+        has_selection = bool(self._zoom_label._selected_char_indices) if self._zoom_label else False
+        if has_selection:
+            # テキスト選択がある: 一度だけ適用し、連続モードには入らない。
+            with QSignalBlocker(self._markup_buttons[markup_type]):
+                self._markup_buttons[markup_type].setChecked(False)
+            self._create_markup_from_selection(markup_type)
+            return
+        # 何も選択していない: 連続モード（sticky mode）へ入る。
+        self._activate_create_mode(CreateMode.MARKUP, markup_type=markup_type)
+    def _set_markup_sticky_mode(self, markup_type: "MarkupType | None") -> None:
+        """マークアップ連続モードの有効/無効を切り替える。"""
+        if markup_type is not None:
+            self._create_mode = CreateMode.MARKUP
+        elif self._create_mode is CreateMode.MARKUP:
+            self._create_mode = CreateMode.NONE
+        self._markup_sticky_type = markup_type
+        for mt, btn in self._markup_buttons.items():
+            with QSignalBlocker(btn):
+                btn.setChecked(mt == markup_type)
+        if self._zoom_label is not None:
+            if markup_type is not None:
+                self._zoom_label.cancel_annotation_paste_mode()
+            self._zoom_label.set_text_select_only_mode(
+                markup_type is not None, cursor=Qt.CursorShape.IBeamCursor
+            )
+    def _on_eraser_btn_clicked(self, checked: bool) -> None:
+        self._activate_create_mode(CreateMode.ERASER if checked else CreateMode.NONE)
+    def _set_eraser_sticky_mode(self, enabled: bool) -> None:
+        """消しゴム連続モードの有効/無効を切り替える。"""
+        enabled = bool(enabled)
+        if enabled:
+            self._create_mode = CreateMode.ERASER
+        elif self._create_mode is CreateMode.ERASER:
+            self._create_mode = CreateMode.NONE
+        if self._eraser_btn is not None:
+            with QSignalBlocker(self._eraser_btn):
+                self._eraser_btn.setChecked(enabled)
+        if self._zoom_label is not None:
+            if enabled:
+                self._zoom_label.cancel_annotation_paste_mode()
+            self._zoom_label.set_text_select_only_mode(enabled, cursor=Qt.CursorShape.CrossCursor)
+    def _on_zoom_text_selection_released(self) -> None:
+        """テキスト選択の確定（ドラッグ確定/クリックの単語選択）を、連続モードに応じて処理する。"""
+        if self._zoom_label is None or not self._zoom_label._selected_char_indices:
+            return
+        if self._create_mode is CreateMode.MARKUP and self._markup_sticky_type is not None:
+            self._create_markup_from_selection(
+                self._markup_sticky_type,
+                after_create=lambda _created: self._set_selected_zoom_annotation(None),
+            )
+        elif self._create_mode is CreateMode.ERASER:
+            self._apply_sticky_eraser()
+    def _find_matching_markup(
+        self, markup_type: MarkupType, char_indices: set[int]
+    ) -> TextMarkupAnnotData | None:
+        """同じ種類・同じ文字範囲を完全カバーする既存マークアップがあれば返す(重複防止用)。"""
+        if self._zoom_label is None or self._zoom_page_num is None or not char_indices:
+            return None
+        for annot in self._zoom_annotations:
+            if (
+                isinstance(annot, TextMarkupAnnotData)
+                and annot.page_num == self._zoom_page_num
+                and annot.markup_type == markup_type
+            ):
+                covered = self._zoom_label._char_indices_in_quads(annot.quads)
+                if covered and covered == char_indices:
+                    return annot
+        return None
+    def _create_markup_from_selection(
+        self,
+        markup_type: MarkupType,
+        *,
+        after_create: Callable[[TextMarkupAnnotData], None] | None = None,
+    ) -> None:
         if self._zoom_page_num is None or self._zoom_label is None:
             return
         quads = self._zoom_label.selected_markup_quads()
         if not quads:
             self._flash_zoom_hint("マークアップするテキストを選択してください")
+            return
+        sel_indices = set(self._zoom_label._selected_char_indices)
+        if self._find_matching_markup(markup_type, sel_indices) is not None:
+            # 同じ範囲・同じ種類のマークアップが既にあるため何もしない。
+            self._flash_zoom_hint("同じ範囲に既にマークアップがあります")
+            self._zoom_label.clear_text_selection()
             return
         template = TextMarkupAnnotData(
             page_num=self._zoom_page_num,
@@ -1000,7 +1118,76 @@ class ZoomAnnotationMixin:
             f"Create {markup_type.value}",
             lambda: create_markup_annot(self._pdf_path, template),
             lambda *a: delete_markup_annot(*a),
+            after_create=after_create,
         )
+    def _apply_sticky_eraser(self) -> None:
+        """消しゴム連続モード: 選択中の文字が重なる文字装飾を部分的に(または完全に)消去する。
+
+        1回のドラッグ/クリックで影響を受けるすべての注釈の変更を、単一のUndoステップに
+        まとめる(Ctrl+Zで一括復元できるようにする)。
+        """
+        if self._zoom_label is None or self._zoom_page_num is None:
+            return
+        label = self._zoom_label
+        sel_indices = set(label._selected_char_indices)
+        if not sel_indices:
+            return
+        entries: list[dict] = []
+        for annot in list(self._zoom_annotations):
+            if not isinstance(annot, TextMarkupAnnotData) or annot.page_num != self._zoom_page_num:
+                continue
+            covered = label._char_indices_in_quads(annot.quads)
+            if not covered or not (covered & sel_indices):
+                continue
+            remaining = covered - sel_indices
+            remaining_quads = label._quads_for_char_indices(remaining)
+            new_annotation = (
+                dataclass_replace(
+                    annot,
+                    quads=tuple(remaining_quads),
+                    xref=0,
+                    annotation_id="",
+                    subject="",
+                )
+                if remaining_quads
+                else None
+            )
+            entries.append({"old": annot, "new": new_annotation, "ref": None})
+        if not entries:
+            label.clear_text_selection()
+            return
+
+        def do_erase() -> None:
+            for entry in entries:
+                old = entry["old"]
+                ref = entry["ref"] or self._annot_ref_for(old.page_num, old.xref)
+                entry["ref"] = ref
+                if entry["new"] is not None:
+                    saved = replace_markup_annot(self._pdf_path, ref.page_num, ref.xref, entry["new"])
+                    self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+                else:
+                    delete_markup_annot(self._pdf_path, ref.page_num, ref.xref)
+                    self._release_annot_ref(ref)
+            self._selected_zoom_annotation = None
+            label.clear_text_selection()
+            self._refresh_current_zoom_page()
+
+        def undo_erase() -> None:
+            for entry in reversed(entries):
+                old = entry["old"]
+                ref = entry["ref"]
+                if entry["new"] is not None:
+                    saved = replace_markup_annot(self._pdf_path, ref.page_num, ref.xref, old)
+                    self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+                else:
+                    recreated = create_markup_annot(
+                        self._pdf_path, dataclass_replace(old, xref=0)
+                    )
+                    self._rebind_annot_ref(ref, recreated.page_num, recreated.xref)
+            self._selected_zoom_annotation = None
+            self._refresh_current_zoom_page()
+
+        self._push_undoable("Erase markup", do_erase, undo_erase)
     def _pick_markup_color(self) -> None:
         selected = self._selected_zoom_annotation
         is_markup = isinstance(selected, TextMarkupAnnotData)

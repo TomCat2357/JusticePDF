@@ -272,6 +272,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._zoom_markup_color: tuple[float, float, float] = (0.85, 0.0, 0.0)
         self._zoom_markup_color_btn: QPushButton | None = None
         self._markup_buttons: dict[MarkupType, QToolButton] = {}
+        # マーカー/下線/取り消し線の連続モード中に選択中の種類（未使用時は None）。
+        self._markup_sticky_type: MarkupType | None = None
+        self._eraser_btn: QToolButton | None = None
         self._zoom_note_color: tuple[float, float, float] = (1.0, 0.92, 0.23)
         self._zoom_note_color_btn: QPushButton | None = None
         self._zoom_note_btn: QToolButton | None = None
@@ -508,6 +511,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._zoom_label.annotation_paste_requested.connect(self._on_zoom_annotation_paste_requested)
         self._zoom_label.annotation_paste_placement_requested.connect(self._on_zoom_annotation_paste_placement_requested)
         self._zoom_label.annotation_duplicate_requested.connect(self._on_zoom_annotation_duplicate_requested)
+        self._zoom_label.text_selection_released.connect(self._on_zoom_text_selection_released)
+        self._zoom_label.text_select_only_escape_requested.connect(
+            lambda: self._activate_create_mode(CreateMode.NONE)
+        )
         self._zoom_label.scroll_requested.connect(self._on_zoom_scroll_requested)
         self._zoom_label.zoom_region_requested.connect(self._on_zoom_region_requested)
         self._zoom_scroll.setWidget(self._zoom_label)
