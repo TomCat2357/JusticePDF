@@ -1007,20 +1007,36 @@ class ZoomPageWidget(QWidget):
         # char to decide which axis runs along the line.
         first_idx = self._line_bounds[0][0]
         wmode = self._chars[first_idx].get("wmode", 0) if first_idx < len(self._chars) else 0
+        # Distance is a (primary, secondary) tuple: primary is the distance
+        # along the axis lines stack on (0.0 when the point's band contains
+        # the line), secondary is the distance along the other axis, used to
+        # break ties. Without the secondary term, a table row exported as
+        # several same-height "lines" (one per column, e.g. spreadsheet-style
+        # PDFs) would always resolve to whichever column happens to be first
+        # in document order, even when the point is over a different column.
         best_line = None
         best_dist = None
         for lb in self._line_bounds:
             _f, _l, lx0, ly0, lx1, ly1 = lb
             if wmode == 1:  # vertical: lines stack left/right, pick by x band
                 if lx0 <= px <= lx1:
-                    dist = 0.0
+                    primary = 0.0
                 else:
-                    dist = lx0 - px if px < lx0 else px - lx1
+                    primary = lx0 - px if px < lx0 else px - lx1
+                if ly0 <= py <= ly1:
+                    secondary = 0.0
+                else:
+                    secondary = ly0 - py if py < ly0 else py - ly1
             else:  # horizontal: lines stack top/bottom, pick by y band
                 if ly0 <= py <= ly1:
-                    dist = 0.0
+                    primary = 0.0
                 else:
-                    dist = ly0 - py if py < ly0 else py - ly1
+                    primary = ly0 - py if py < ly0 else py - ly1
+                if lx0 <= px <= lx1:
+                    secondary = 0.0
+                else:
+                    secondary = lx0 - px if px < lx0 else px - lx1
+            dist = (primary, secondary)
             if best_dist is None or dist < best_dist:
                 best_dist = dist
                 best_line = lb
