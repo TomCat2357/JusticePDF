@@ -1,9 +1,10 @@
 """Page edit window for editing PDF pages."""
+import itertools
 import os
 import shutil
 import logging
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import replace as dataclass_replace
 from enum import Enum, auto
 from PyQt6.QtWidgets import (
@@ -107,7 +108,9 @@ from src.utils.pdf_utils import (
     TocEntry,
     get_pdf_toc,
     update_pdf_toc,
+    is_heavy_pdf,
 )
+from src.utils import app_settings
 from src.utils.constants import (
     PAGETHUMBNAIL_MIME_TYPE,
     PDFCARD_MIME_TYPE,
@@ -294,6 +297,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._thumb_size = self._preferred_thumb_size
         self._thumb_render_queue: deque[int] = deque()
         self._thumb_render_queue_set: set[int] = set()
+        # ページ数/ファイルサイズが閾値を超える「重量文書」かどうか
+        # (_load_pages() で判定して更新)。真の間は、サムネイルウィジェット
+        # 生成をチャンク分割し、描画も表示範囲のみを逐次処理する。
+        self._is_heavy_document: bool = False
+        # 重量文書でのウィジェット生成をチャンクへ分割するための残りページ
+        # イテレータ(通常文書では None のまま)。
+        self._pending_widget_pages: "Iterator[int] | None" = None
+        # 進捗表示用(_pending_widget_pages が None でない間だけ意味を持つ)。
+        self._pending_widget_total: int = 0
+        # _load_pages() 呼び出しごとに増える世代番号。チャンク処理中に再度
+        # _load_pages() が呼ばれた場合、古い世代のタイマーコールバックが
+        # クリア済みの self._thumbnails へ追記してしまうのを防ぐ。
+        self._widget_build_generation: int = 0
         self._thumb_render_timer = QTimer(self)
         self._thumb_render_timer.setSingleShot(True)
         self._thumb_render_timer.timeout.connect(self._process_thumbnail_render_queue)
@@ -948,6 +964,14 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._schedule_thumbnail_render()
 
     def _enqueue_all_thumbnail_renders(self) -> None:
+        if self._is_heavy_document:
+            # 重量文書は全ページを一括でキューへ積まない。表示範囲のページだけ
+            # 描画し、残りはスクロールに応じて逐次描画する(オンデマンド方式)。
+            # そうしないと数千ページ分の描画ジョブが一度に走り、CPU を長時間
+            # 占有した上、256 件しかない固定サイズキャッシュを次々追い出して
+            # 表示中のサムネイルまで再描画させてしまう。
+            self._enqueue_visible_thumbnail_renders()
+            return
         for page_num, thumb in enumerate(self._thumbnails):
             if thumb._explicitly_hidden:
                 continue
@@ -978,7 +1002,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
 
     def _process_thumbnail_render_queue(self) -> None:
         batch: list[int] = []
-        while self._thumb_render_queue and len(batch) < 5:
+        batch_limit = (
+            max(1, app_settings.heavy_pdf_render_batch_size()) if self._is_heavy_document else 5
+        )
+        while self._thumb_render_queue and len(batch) < batch_limit:
             page_num = self._thumb_render_queue.popleft()
             self._thumb_render_queue_set.discard(page_num)
             if page_num < 0 or page_num >= len(self._thumbnails):
@@ -1036,15 +1063,82 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         if self._zoom_page_num is not None and self._zoom_page_num >= page_count:
             self._zoom_page_num = max(0, page_count - 1)
 
-        for i in range(page_count):
+        self._widget_build_generation += 1
+        self._is_heavy_document = is_heavy_pdf(self._pdf_path, page_count)
+
+        if self._is_heavy_document:
+            # 重量文書: サムネイルウィジェットを一度に生成すると数千個の QWidget
+            # 生成が UI スレッドを長時間ブロックしフリーズしたように見えるため、
+            # チャンクに分けてイベントループへ制御を返しながら生成する。
+            # グリッドへの反映(_refresh_grid())は全ウィジェット生成後に1回だけ
+            # 行う。チャンクごとに呼ぶと、その時点までの全ウィジェットを毎回
+            # 並べ直すことになり O(ページ数^2) になってしまい、後半のチャンクほど
+            # 処理が重くなって結局フリーズしたように見えてしまうため。
+            self._pending_widget_pages = iter(range(page_count))
+            self._pending_widget_total = page_count
+            self._build_thumbnail_widgets_chunk(self._widget_build_generation)
+        else:
+            for i in range(page_count):
+                thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
+                thumb.clicked.connect(self._on_thumbnail_clicked)
+                self._thumbnails.append(thumb)
+
+            self._refresh_grid()
+            self._enqueue_all_thumbnail_renders()
+            if self._zoom_view and self._zoom_view.isVisible():
+                self._render_zoom()
+
+    def _page_edit_window_title(self) -> str:
+        return f"JusticePDF - 編集:{os.path.basename(self._pdf_path)}"
+
+    def _build_thumbnail_widgets_chunk(self, generation: int) -> None:
+        """重量文書向け: サムネイルウィジェットを少しずつ生成し、都度グリッドへ足す。
+
+        1 チャンク生成するたびに次のイベントループへ ``QTimer.singleShot(0, ...)``
+        で処理を譲り、UI スレッドを長く占有しないようにする。新規ウィジェットは
+        その場でグリッドへ ``addWidget()`` する(位置は現在の列数から算出)。
+        ``_refresh_grid()`` のように「一旦全部外してから全件を並べ直す」方式だと
+        件数が増えるほど1回あたりのコストが線形に伸び、チャンクを重ねると
+        全体では件数の2乗のコストになってしまうため、ここでは増分追加のみ行う
+        (列数が変わるリサイズ等は次に呼ばれる ``_refresh_grid()`` で解消される)。
+        表示範囲のサムネイル描画予約(``_enqueue_visible_thumbnail_renders()``)は
+        最初と最後のチャンクでのみ行う(これも全件走査のため、毎チャンク呼ぶと
+        同様に重くなる)。読み込み中はタイトルバーに進捗を表示し、フリーズと
+        誤認されないようにする。
+        """
+        if generation != self._widget_build_generation or self._pending_widget_pages is None:
+            return  # 途中で _load_pages() がやり直された(古い世代は破棄)
+
+        cols = max(1, self._apply_grid_metrics())
+        chunk_size = max(1, app_settings.heavy_pdf_widget_chunk_size())
+        is_first_chunk = not self._thumbnails
+        chunk = list(itertools.islice(self._pending_widget_pages, chunk_size))
+        for i in chunk:
             thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
             thumb.clicked.connect(self._on_thumbnail_clicked)
             self._thumbnails.append(thumb)
+            row, col = divmod(len(self._thumbnails) - 1, cols)
+            self._grid_layout.addWidget(thumb, row, col)
+            thumb.setVisible(True)
 
-        self._refresh_grid()
-        self._enqueue_all_thumbnail_renders()
-        if self._zoom_view and self._zoom_view.isVisible():
-            self._render_zoom()
+        if len(chunk) == chunk_size:
+            if is_first_chunk:
+                # 最初の可視範囲だけは早く描画し、起動直後にフリーズと誤認
+                # されないようにする。
+                self._enqueue_visible_thumbnail_renders()
+            # まだ続きがある: 進捗をタイトルに表示しつつ次のイベントループへ
+            self.setWindowTitle(
+                f"{self._page_edit_window_title()} - 読み込み中 "
+                f"({len(self._thumbnails)}/{self._pending_widget_total})"
+            )
+            QTimer.singleShot(0, lambda: self._build_thumbnail_widgets_chunk(generation))
+        else:
+            # 全ページ分のウィジェット生成が完了。
+            self._pending_widget_pages = None
+            self.setWindowTitle(self._page_edit_window_title())
+            self._enqueue_visible_thumbnail_renders()
+            if self._zoom_view and self._zoom_view.isVisible():
+                self._render_zoom()
 
     def refresh_from_disk(self) -> None:
         """Reload the current PDF from disk without closing the edit window."""
@@ -1079,14 +1173,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             reserve_vertical_scrollbar=True,
         )
 
-    def _refresh_grid(self) -> None:
-        while self._grid_layout.count():
-            item = self._grid_layout.takeAt(0)
-            # 削除予定のウィジェットには触らない
-            widget = item.widget()
-            if widget and widget in self._thumbnails:
-                widget.setParent(None)
+    def _apply_grid_metrics(self) -> int:
+        """列数を計算し、コンテナ幅・サムネイルサイズへ反映して列数を返す。
 
+        ウィジェットを実際にグリッドへ追加(addWidget)するのは呼び出し側の
+        責務(``_refresh_grid()`` は全件を一括で、重量文書の読み込み中は
+        ``_build_thumbnail_widgets_chunk()`` がチャンクごとに増分で行う)。
+        """
         available_width = self._grid_available_width()
         spacing = self._grid_layout.horizontalSpacing()
         if spacing < 0:
@@ -1114,6 +1207,17 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             self._thumb_size = thumb_size
             for thumb in self._thumbnails:
                 thumb.set_thumbnail_size(self._thumb_size)
+        return cols
+
+    def _refresh_grid(self) -> None:
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            # 削除予定のウィジェットには触らない
+            widget = item.widget()
+            if widget and widget in self._thumbnails:
+                widget.setParent(None)
+
+        cols = self._apply_grid_metrics()
 
         visible_thumbs = [t for t in self._thumbnails if not t._explicitly_hidden]
         for i, thumb in enumerate(visible_thumbs):

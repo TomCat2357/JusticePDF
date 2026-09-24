@@ -5,7 +5,8 @@ import logging
 from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QApplication
-from src.utils import order_store
+from src.utils import app_settings, order_store
+from src.utils.pdf_utils import set_pixmap_cache_max_entries
 from src.views.main_window import MainWindow
 
 
@@ -38,6 +39,10 @@ def main():
     app.setOrganizationName("JusticePDF")
     app.setApplicationName("JusticePDF")
     app.setApplicationDisplayName("JusticePDF")
+
+    # 設定で保存されたサムネイル/ページ画像キャッシュの上限件数を反映する
+    # (QSettings は上の組織名/アプリ名設定に依存するため、ここで初めて呼べる)。
+    set_pixmap_cache_max_entries(app_settings.pixmap_cache_max_entries())
 
     qss_path = Path(__file__).parent / "views" / "style.qss"
     if qss_path.exists():

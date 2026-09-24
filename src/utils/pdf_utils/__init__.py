@@ -16,7 +16,9 @@ from .common import (
     _save_document_in_place,
     clear_pixmap_cache,
     clear_pixmap_cache_for_path,
+    is_heavy_pdf,
     logger,
+    set_pixmap_cache_max_entries,
 )
 
 from .annotations import (
