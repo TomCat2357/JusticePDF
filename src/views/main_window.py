@@ -460,9 +460,13 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._merge_split_btn.setEnabled((can_merge or can_split) and not busy)
 
     def _on_open_settings(self) -> None:
-        """「設定」ボタンのハンドラ。デフォルトで開くフォルダを変更する。
+        """「設定」ボタンのハンドラ。デフォルトで開くフォルダ・大容量PDFの
+        逐次処理設定を変更する。
 
-        反映は次回起動から（開いているウィンドウの作業フォルダは切り替えない）。
+        デフォルトで開くフォルダの反映は次回起動から（開いているウィンドウの
+        作業フォルダは切り替えない）。大容量PDF関連の設定は、キャッシュ上限
+        件数は即座に、ページ数/ファイルサイズのしきい値などは次に開く文書
+        から有効になる。
         """
         dialog = SettingsDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -474,7 +478,14 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             QMessageBox.warning(self, "設定", f"フォルダを作成できません:\n{e}")
             return
         app_settings.set_library_dir(folder)
-        QMessageBox.information(self, "設定", "次回起動時から有効になります。")
+        dialog.save_heavy_pdf_settings()
+        QMessageBox.information(
+            self,
+            "設定",
+            "デフォルトで開くフォルダは次回起動時から有効になります。\n"
+            "大容量PDFの設定は次に開く文書から有効になります"
+            "（キャッシュ上限件数は即座に反映されます）。",
+        )
 
     def _debug_undo_state(self, reason: str) -> None:
         log_undo_state(
