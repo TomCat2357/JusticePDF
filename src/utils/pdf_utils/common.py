@@ -8,9 +8,30 @@ from collections import OrderedDict
 import fitz
 from PyQt6.QtGui import QPixmap
 
+from src.utils import app_settings
+from src.utils.constants import PIXMAP_CACHE_MAX_ENTRIES
+
 
 
 logger = logging.getLogger(__name__)
+
+
+def is_heavy_pdf(pdf_path: str, page_count: int | None = None) -> bool:
+    """ページ数またはファイルサイズが閾値を超える「重量文書」かどうか判定する。
+
+    しきい値は設定ダイアログでユーザーが変更でき(``app_settings``)、
+    未設定なら ``src.utils.constants`` の既定値にフォールバックする。
+    ``page_count`` が既に分かっていれば再取得せずに使う(呼び出し側で
+    ``get_page_count`` 済みのことが多いため、二重に PDF を開かない)。
+    """
+    if page_count is not None and page_count > app_settings.heavy_pdf_page_count_threshold():
+        return True
+    try:
+        if os.path.getsize(pdf_path) > app_settings.heavy_pdf_file_size_bytes():
+            return True
+    except OSError:
+        pass
+    return False
 
 
 class PdfWritePermissionError(PermissionError):
@@ -25,7 +46,7 @@ class PdfWritePermissionError(PermissionError):
 
 class _PixmapCache:
     def __init__(self, maxsize: int = 256):
-        self._maxsize = maxsize
+        self._maxsize = max(1, int(maxsize))
         self._cache: OrderedDict[tuple, QPixmap] = OrderedDict()
 
     def get(self, key: tuple) -> QPixmap | None:
@@ -51,12 +72,31 @@ class _PixmapCache:
         for k in keys_to_remove:
             del self._cache[k]
 
+    def set_maxsize(self, maxsize: int) -> None:
+        """上限件数を変更する(設定ダイアログからの即時反映用)。
 
-_pixmap_cache = _PixmapCache(maxsize=256)
+        縮小した場合は古いエントリから追い出して、すぐに新しい上限へ従う。
+        """
+        self._maxsize = max(1, int(maxsize))
+        while len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+
+
+# 起動時の実際の上限値は、QApplication 生成後に main.py が
+# set_pixmap_cache_max_entries(app_settings.pixmap_cache_max_entries()) を
+# 呼んで反映する(QSettings は QApplication の組織名/アプリ名設定に依存する
+# ため、モジュール読み込み時点ではまだ呼び出せない)。ここでは素の既定値で
+# 初期化しておく。
+_pixmap_cache = _PixmapCache(maxsize=PIXMAP_CACHE_MAX_ENTRIES)
 
 
 def clear_pixmap_cache_for_path(pdf_path: str) -> None:
     _pixmap_cache.clear_for_path(pdf_path)
+
+
+def set_pixmap_cache_max_entries(maxsize: int) -> None:
+    """設定で変更されたキャッシュ上限件数を、実行中のキャッシュへ即時反映する。"""
+    _pixmap_cache.set_maxsize(maxsize)
 
 
 def clear_pixmap_cache() -> None:

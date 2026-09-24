@@ -1,5 +1,41 @@
 """インポート/変換対象の拡張子定義(単一情報源)。"""
 
+# ---------------------------------------------------------------------------
+# 「重量文書」判定の閾値(単一情報源)
+# ---------------------------------------------------------------------------
+# ページ編集画面は通常、キャッシュ主体で全ページのサムネイルウィジェットを
+# 先読みする(応答性・体験を優先)。しかしページ数が極端に多い、または
+# ファイルサイズが極端に大きい PDF ではこの先読みが UI スレッドを長時間
+# 占有し、フリーズしたように見える／メモリを圧迫する原因になる。
+# ここで定めた閾値のいずれかを超えた PDF は「重量文書」とみなし、
+# ウィジェット生成をチャンク分割し、サムネイル描画も表示範囲のみを
+# 逐次処理する方式へ自動的に切り替える(src/views/page_edit_window.py 参照)。
+#
+# 以下は「設定で未指定のときに使う既定値」であり、実際の判定・利用は
+# ユーザーが設定ダイアログで上書きできる src/utils/app_settings.py の
+# 各 getter (heavy_pdf_*) 経由で行う。GUI を持たないコード(pdf_utils 等)
+# から使う場合もこの既定値を経由すること。
+HEAVY_PDF_PAGE_COUNT_THRESHOLD = 300
+HEAVY_PDF_FILE_SIZE_MB = 150
+HEAVY_PDF_FILE_SIZE_BYTES = HEAVY_PDF_FILE_SIZE_MB * 1024 * 1024
+# 重量文書でサムネイルウィジェットを生成する際、1回のイベントループ処理で
+# 生成するページ数。大きいほど初期表示は速いがUIブロック時間が伸びる。
+HEAVY_PDF_WIDGET_CHUNK_SIZE = 120
+# 重量文書でサムネイルを描画する際、1回のタイマー発火で処理するページ数
+# (通常文書は 5 ページ/回)。1ページずつに絞ることで、埋め込み画像が
+# 大きく描画が重いページがあっても他の操作を挟める。
+HEAVY_PDF_RENDER_BATCH_SIZE = 1
+# サムネイル/ページ画像キャッシュ(_PixmapCache)の既定の最大保持件数。
+PIXMAP_CACHE_MAX_ENTRIES = 256
+
+# 設定ダイアログでの入力値をクランプする許容範囲(単一情報源)。
+# (下限, 上限) のタプル。
+HEAVY_PDF_PAGE_COUNT_THRESHOLD_RANGE = (10, 100_000)
+HEAVY_PDF_FILE_SIZE_MB_RANGE = (1, 10_000)
+HEAVY_PDF_WIDGET_CHUNK_SIZE_RANGE = (10, 2_000)
+HEAVY_PDF_RENDER_BATCH_SIZE_RANGE = (1, 50)
+PIXMAP_CACHE_MAX_ENTRIES_RANGE = (32, 4_096)
+
 WORD_EXTS = {".doc", ".docx", ".docm"}
 EXCEL_EXTS = {".xls", ".xlsx", ".xlsm"}
 PPT_EXTS = {".ppt", ".pptx"}
