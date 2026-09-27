@@ -213,6 +213,64 @@ def test_redact_ellipse_blanks_image_pixels_with_no_text_under_it(tmp_path):
         assert pixmap.pixel(outside_x, outside_y)[:3] == (255, 255, 255)
 
 
+def test_redact_rotated_rect_removes_only_text_inside_rotation_and_draws_it(tmp_path):
+    """回転した矩形は、回転前の外接矩形ではなく実際に回転した四角形の内側
+    にある文字だけを削除し、黒塗りもその回転した輪郭で描かれること
+    (回転を無視して外接矩形の位置に黒塗りされてしまう不具合の回帰テスト)。
+    """
+    src = tmp_path / "src.pdf"
+    out = tmp_path / "out.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=300)
+    page.draw_rect(fitz.Rect(0, 0, 300, 300), color=(1, 1, 1), fill=(1, 1, 1))
+    # INSIDE: 回転した図形の中心付近(回転しても内側)。
+    page.insert_text((140, 152), "INSIDE", fontsize=10)
+    # XX: 回転前の外接矩形の角付近(回転後の菱形の外側)。文字ごとに中心点で
+    # 判定するため、単語全体が確実に菱形の外側に収まる短い文字列にする。
+    page.insert_text((100, 107), "XX", fontsize=8)
+    doc.save(str(src))
+    doc.close()
+
+    # 100x100の正方形(中心150,150)を45度回転させた菱形。
+    region = (100.0, 100.0, 200.0, 200.0, 45.0)
+    redact_pdf_remove_text(str(src), str(out), redact_rects={0: [region]})
+
+    with fitz.open(str(out)) as out_doc:
+        remaining = out_doc[0].get_text()
+        assert "INSIDE" not in remaining
+        assert "XX" in remaining
+
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(300, 300)[:3] == (0, 0, 0)  # 中心 → 黒
+        # 回転前の矩形の角(外接矩形の内側・菱形の外側)は塗られていないこと
+        assert pix.pixel(int(102 * 2), int(102 * 2))[:3] != (0, 0, 0)
+
+
+def test_redact_rotated_ellipse_follows_rotation(tmp_path):
+    """回転した楕円も、回転後の向きで文字判定・黒塗りが行われること。"""
+    src = tmp_path / "src.pdf"
+    out = tmp_path / "out.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=300)
+    page.draw_rect(fitz.Rect(0, 0, 400, 300), color=(1, 1, 1), fill=(1, 1, 1))
+    page.insert_text((150, 152), "INSIDE", fontsize=10)
+    page.insert_text((195, 152), "FAROUT", fontsize=10)
+    doc.save(str(src))
+    doc.close()
+
+    region = (100.0, 130.0, 220.0, 170.0, 90.0)  # 横長(120x40)→90度回転で縦長
+    redact_pdf_remove_text(str(src), str(out), redact_ellipses={0: [region]})
+
+    with fitz.open(str(out)) as out_doc:
+        remaining = out_doc[0].get_text()
+        assert "INSIDE" not in remaining
+        assert "FAROUT" in remaining
+
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(int(160 * 2), int(150 * 2))[:3] == (0, 0, 0)
+        assert pix.pixel(int(210 * 2), int(150 * 2))[:3] != (0, 0, 0)
+
+
 def test_redact_removes_only_target_annot_keeps_normal_ones(tmp_path):
     """候補マーカー/塗りつぶし図形のxrefだけを消し、通常の注釈は残ること。"""
     src = tmp_path / "src.pdf"

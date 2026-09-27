@@ -166,6 +166,55 @@ def test_rasterize_black_fill_ellipse_paints_oval_not_corners(tmp_path):
         assert pix.pixel(45, 45)[:3] != (0, 0, 0)
 
 
+def test_rasterize_black_fill_rotated_rect_follows_rotation(tmp_path):
+    """図形を回転させた状態でエクスポートすると、黒塗りは回転前の外接矩形
+    ではなく実際に回転した四角形の位置に描かれること(回転を無視して
+    回転前の位置が塗られてしまう不具合の回帰テスト)。
+    """
+    src = tmp_path / "src.pdf"
+    out = tmp_path / "out.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=300)
+    page.draw_rect(fitz.Rect(0, 0, 300, 300), color=(1, 1, 1), fill=(1, 1, 1))
+    doc.save(str(src))
+    doc.close()
+
+    # 100x100の正方形(中心150,150)を45度回転させた菱形。
+    region = (100.0, 100.0, 200.0, 200.0, 45.0)
+    rasterize_pdf(str(src), str(out), dpi=150, black_fill_regions={0: [region]})
+
+    with fitz.open(str(out)) as out_doc:
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        # 中心は回転後も図形の内側 → 黒
+        assert pix.pixel(300, 300)[:3] == (0, 0, 0)
+        # 回転前の矩形の角(外接矩形の内側)は、回転後の菱形の外側 → 白のまま
+        assert pix.pixel(int(102 * 2), int(102 * 2))[:3] != (0, 0, 0)
+
+
+def test_rasterize_black_fill_rotated_ellipse_follows_rotation(tmp_path):
+    """楕円も回転させた向きで塗りつぶされること(横長の楕円を90度回転させる
+    と縦長になり、回転前の横長の範囲は黒塗りされないことを確認する)。
+    """
+    src = tmp_path / "src.pdf"
+    out = tmp_path / "out.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=300)
+    page.draw_rect(fitz.Rect(0, 0, 400, 300), color=(1, 1, 1), fill=(1, 1, 1))
+    doc.save(str(src))
+    doc.close()
+
+    region = (100.0, 130.0, 220.0, 170.0, 90.0)  # 横長(120x40)→90度回転で縦長
+    rasterize_pdf(str(src), str(out), dpi=150, black_fill_ellipses={0: [region]})
+
+    with fitz.open(str(out)) as out_doc:
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(int(160 * 2), int(150 * 2))[:3] == (0, 0, 0)  # 中心
+        # 回転前の横長の右端付近は、回転後(縦長)の外側 → 白のまま
+        assert pix.pixel(int(210 * 2), int(150 * 2))[:3] != (0, 0, 0)
+        # 回転後の縦長の上端付近は内側 → 黒
+        assert pix.pixel(int(160 * 2), int(100 * 2))[:3] == (0, 0, 0)
+
+
 def test_rasterize_hide_xrefs_hides_annotation_before_render(tmp_path):
     """hide_xrefs で指定した注釈が、ラスタライズ結果に写り込まないこと。"""
     src = tmp_path / "src.pdf"

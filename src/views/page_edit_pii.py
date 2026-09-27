@@ -363,9 +363,9 @@ class PiiDrawerMixin:
             # (キャッシュを信用しない)。マーカー(検出結果)側は逆に検出時の
             # テキストの方が正確なため pii_text をそのまま使う。
             if shape.shape_type == ShapeType.ELLIPSE:
-                text = text_under_ellipse(chars_for(shape.page_num), shape.rect)
+                text = text_under_ellipse(chars_for(shape.page_num), shape.rect, shape.rotation)
             elif shape.shape_type == ShapeType.RECTANGLE:
-                text = text_under_rect(chars_for(shape.page_num), shape.rect)
+                text = text_under_rect(chars_for(shape.page_num), shape.rect, shape.rotation)
             else:
                 text = shape.pii_text
             rows.append(
@@ -540,10 +540,14 @@ class PiiDrawerMixin:
                 )
         for shape in shape_targets:
             hide_xrefs.setdefault(shape.page_num, []).append(shape.xref)
+            # rotation を末尾に付けて渡す(回転していない図形は0.0で従来通り)。
+            # 図形が回転していても外接矩形ではなく実際の輪郭が黒塗りされるよう
+            # rasterize_pdf 側で解釈される(shape.rect は回転前の矩形のため)。
+            region = (*shape.rect, shape.rotation)
             if shape.shape_type == ShapeType.ELLIPSE:
-                black_fill_ellipses.setdefault(shape.page_num, []).append(shape.rect)
+                black_fill_ellipses.setdefault(shape.page_num, []).append(region)
             else:
-                black_fill_regions.setdefault(shape.page_num, []).append(shape.rect)
+                black_fill_regions.setdefault(shape.page_num, []).append(region)
 
         try:
             rasterize_pdf(
@@ -601,10 +605,14 @@ class PiiDrawerMixin:
                 )
         for shape in shape_targets:
             remove_xrefs.setdefault(shape.page_num, []).append(shape.xref)
+            # rotation を末尾に付けて渡す(回転していない図形は0.0で従来通り)。
+            # 図形が回転していても外接矩形ではなく実際の輪郭がredact/黒塗り
+            # されるよう redact_pdf_remove_text 側で解釈される。
+            region = (*shape.rect, shape.rotation)
             if shape.shape_type == ShapeType.ELLIPSE:
-                redact_ellipses.setdefault(shape.page_num, []).append(shape.rect)
+                redact_ellipses.setdefault(shape.page_num, []).append(region)
             else:
-                redact_rects.setdefault(shape.page_num, []).append(shape.rect)
+                redact_rects.setdefault(shape.page_num, []).append(region)
 
         try:
             redact_pdf_remove_text(
