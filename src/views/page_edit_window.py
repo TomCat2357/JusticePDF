@@ -164,6 +164,7 @@ from src.views.page_edit_annotations import (
     ZoomAnnotationMixin,
     _AnnotRef,
 )
+from src.views.page_edit_pii import PiiDrawerMixin
 
 
 logger = logging.getLogger(__name__)
@@ -191,7 +192,7 @@ class ZoomPageLayout(Enum):
 # 括弧図形コンボボックスの並び(インデックス⇔値の唯一の対応表)
 
 
-class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
+class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin):
     """Window for editing pages within a PDF."""
 
     ZOOM_MIN = 25
@@ -284,6 +285,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._zoom_note_list: QListWidget | None = None
         self._zoom_callout_btn: QToolButton | None = None
         self._create_mode = CreateMode.NONE
+        # 個人情報検出ドロワー: 「塗りつぶし用の四角/楕円」配置待ち中の図形種別。
+        self._mask_shape_pending_type = None
         # 本文編集中の付箋 xref と、確定前の元本文（差分判定用）。
         self._editing_note_xref: int | None = None
         self._editing_note_original = ""
@@ -384,6 +387,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         zoom_content_layout.addWidget(self._build_zoom_canvas(), 1)
         zoom_content_layout.addWidget(self._build_annotation_drawer())
         zoom_content_layout.addWidget(self._build_bookmarks_panel())
+        zoom_content_layout.addWidget(self._build_pii_drawer())
 
         zoom_layout.addWidget(zoom_content, 1)
         self._set_zoom_annotation_drawer_open(False)
@@ -455,6 +459,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._zoom_bookmark_btn.setToolTip("しおり編集")
         self._zoom_bookmark_btn.clicked.connect(self._toggle_bookmarks_drawer)
         controls_layout.addWidget(self._zoom_bookmark_btn)
+
+        self._zoom_pii_btn = QPushButton("個人情報検出")
+        self._zoom_pii_btn.setCheckable(True)
+        self._zoom_pii_btn.setToolTip("個人情報(PII)の検出・ハイライト・黒塗りエクスポート")
+        self._zoom_pii_btn.clicked.connect(self._toggle_pii_drawer)
+        controls_layout.addWidget(self._zoom_pii_btn)
 
         # ページ表示レイアウト。クリックで選択肢を開き、1枚を選ぶと閲覧専用を解除する。
         self._zoom_spread_btn = QPushButton("ページ表示")
@@ -573,6 +583,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
             self._set_selected_zoom_annotation(None)
             if self._zoom_annotation_open:
                 self._set_zoom_annotation_drawer_open(False)
+            pii_panel = getattr(self, "_pii_panel", None)
+            if pii_panel is not None and pii_panel.is_open:
+                pii_panel.set_open(False)
             # ページ送りの単位に合わせて先頭ページへ正規化する。
             if self._zoom_page_num is not None:
                 capacity = layout.page_capacity
@@ -581,9 +594,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         self._zoom_page_layout = layout
         if self._zoom_label:
             self._zoom_label.set_view_only(is_multi)
-        # 複数ページ表示中はアノテーション(付箋)ドロワーを無効化する。
+        # 複数ページ表示中はアノテーション(付箋)/個人情報検出ドロワーを無効化する。
         if getattr(self, "_zoom_object_btn", None) is not None:
             self._zoom_object_btn.setEnabled(not is_multi)
+        if getattr(self, "_zoom_pii_btn", None) is not None:
+            self._zoom_pii_btn.setEnabled(not is_multi)
         self._sync_zoom_page_layout_controls()
         # 複数ページ表示中はしおりを閲覧/ジャンプ専用にし、回転・削除ボタンを無効化する。
         panel = getattr(self, "_bookmarks_panel", None)
@@ -608,9 +623,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin):
         if getattr(self, "_zoom_bookmark_btn", None) is not None:
             self._zoom_bookmark_btn.setChecked(is_open)
         if is_open:
-            # 付箋ドロワーと排他にする
+            # 付箋/個人情報検出ドロワーと排他にする
             if self._zoom_annotation_open:
                 self._set_zoom_annotation_drawer_open(False)
+            pii_panel = getattr(self, "_pii_panel", None)
+            if pii_panel is not None and pii_panel.is_open:
+                pii_panel.set_open(False)
             self._reload_bookmarks_tree()
 
     def _reload_bookmarks_tree(self) -> None:

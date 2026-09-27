@@ -11,6 +11,20 @@ dependencies = [
     "pytest==9.0.2",
     "pytest-qt==4.5.0",
     "pywin32==312; platform_system == 'Windows'",
+    # 個人情報(PII)検出エンジン(src/pii、PresidioPDFから移植)が使用する依存。
+    # 形態素解析ベースのPII検出(sudachipy)と日本の電話番号妥当性検証(phonenumbers)。
+    "sudachipy>=0.6.11",
+    "sudachidict-core>=20240409",
+    "phonenumbers>=8.13.0",
+]
+
+[project.optional-dependencies]
+# OCR(RapidOCR v3)。テキストレイヤの無いページ(スキャン画像等)を対象に、
+# 個人情報検出用のテキスト・座標を補完する任意機能。未導入でもアプリは
+# 通常起動し、PII検出ドロワーのOCRオプションが無効表示になるだけ。
+ocr = [
+    "rapidocr>=3.8.1",
+    "onnxruntime>=1.22.0",
 ]
 
 [build-system]
