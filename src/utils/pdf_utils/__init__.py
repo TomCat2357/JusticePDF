@@ -101,11 +101,13 @@ from .annotations import (
     create_callout,
     create_freetext_annot,
     create_markup_annot,
+    create_markup_annots,
     create_note_annot,
     create_shape_annot,
     delete_annot_group,
     delete_freetext_annot,
     delete_markup_annot,
+    delete_markup_annots,
     delete_note_annot,
     delete_shape_annot,
     get_annot_xref_order,
@@ -114,6 +116,8 @@ from .annotations import (
     list_ink_annot_xrefs,
     list_ink_annot_xrefs_by_page,
     list_markup_annots,
+    list_pii_markup_annots,
+    list_pii_mask_shapes,
     list_note_annots,
     list_shape_annots,
     reorder_annot_on_page,
@@ -171,6 +175,7 @@ from .export import (
     export_pdf_compressed,
     images_to_pdf,
     rasterize_pdf,
+    redact_pdf_remove_text,
 )
 
 from .printing import (
