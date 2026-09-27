@@ -57,6 +57,7 @@ from src.utils.constants import (
     PAGETHUMBNAIL_MIME_TYPE,
     freetext_canvas_font_families,
 )
+from src.pii.entity_types import get_entity_type_name_ja, get_highlight_color
 
 
 from src.views.view_helpers import apply_drag_pixmap
@@ -1241,7 +1242,13 @@ class ZoomPageWidget(QWidget):
         opacity = max(0.0, min(1.0, float(annot.opacity)))
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        if annot.markup_type == MarkupType.HIGHLIGHT:
+        if annot.pii_entity and annot.markup_type == MarkupType.HIGHLIGHT:
+            # 塗りつぶし候補: 通常のマーカーと混同しないよう、暗い半透明塗り+
+            # エンティティ色の破線枠+小さな種別ラベルで描く(下の文字はまだ読める)。
+            self._paint_mask_candidate_rects(
+                painter, [self._rect_tuple_to_qrectf(q) for q in annot.quads], base, annot.pii_entity
+            )
+        elif annot.markup_type == MarkupType.HIGHLIGHT:
             fill = QColor(base)
             fill.setAlphaF(opacity)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -1265,6 +1272,50 @@ class ZoomPageWidget(QWidget):
                 painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
         painter.restore()
 
+    def _paint_mask_candidate_rects(
+        self,
+        painter: QPainter,
+        page_rects: list[QRectF],
+        accent: QColor,
+        entity: str,
+    ) -> None:
+        """塗りつぶし候補(マーカー)・塗りつぶし用図形に共通の「見た目」を描く。
+
+        通常のマーカー/図形と混同されないよう、暗い半透明の塗り+エンティティ色の
+        破線枠+小さな種別ラベルにする(下の文字はまだ読める程度の不透明度)。
+        ``page_rects`` はPDF座標系(display座標系)の矩形群。
+        """
+        if not page_rects:
+            return
+        fill = QColor(10, 10, 10)
+        fill.setAlphaF(0.42)
+        border = QColor(accent)
+        border.setAlphaF(0.95)
+        pen = QPen(border)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setWidthF(max(1.2, 1.2 * self._zoom_factor))
+        painter.setPen(pen)
+        painter.setBrush(fill)
+        widget_rects: list[QRectF] = []
+        for page_rect in page_rects:
+            rect = self._page_rect_to_widget_rect(page_rect)
+            painter.drawRect(rect)
+            widget_rects.append(rect)
+        label = get_entity_type_name_ja(entity or "OTHER")
+        if widget_rects and label:
+            first = min(widget_rects, key=lambda r: (r.top(), r.left()))
+            if first.width() >= 18 and first.height() >= 10:
+                painter.setPen(QColor(245, 245, 245))
+                font = painter.font()
+                font.setPointSizeF(max(6.0, min(10.0, first.height() * 0.55)))
+                painter.setFont(font)
+                label_rect = QRectF(first.left() + 2, first.top(), first.width() - 4, first.height())
+                painter.drawText(
+                    label_rect,
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    label,
+                )
+
     def selected_markup_quads(self) -> list[tuple[float, float, float, float]]:
         """Return PDF-space quads (x0, y0, x1, y1) for the current text selection.
 
@@ -1272,6 +1323,17 @@ class ZoomPageWidget(QWidget):
         merged into a single horizontal (or vertical) bar.
         """
         return self._quads_for_char_indices(self._selected_char_indices)
+
+    def selected_text(self) -> str:
+        """Return the plain text (reading order) of the current char selection.
+
+        Used by the 個人情報検出ドロワー's manual 塗りつぶし候補 tool to cache
+        the matched text for the results list (``TextMarkupAnnotData.pii_text``).
+        """
+        from src.pii.pdf_text_map import join_chars_reading_order
+
+        indices = sorted(i for i in self._selected_char_indices if 0 <= i < len(self._chars))
+        return join_chars_reading_order([self._chars[i] for i in indices])
 
     def _quad_for_run(self, run: list[int]) -> tuple[float, float, float, float]:
         """Merge a contiguous same-line run of char indices into one bbox quad."""
@@ -1399,6 +1461,43 @@ class ZoomPageWidget(QWidget):
             paint_rect = QRectF(-rect.width() / 2, -rect.height() / 2, rect.width(), rect.height())
         else:
             paint_rect = rect
+
+        if shape.pii_entity and shape.shape_type in (ShapeType.RECTANGLE, ShapeType.ELLIPSE):
+            # 塗りつぶし用図形: ユーザーが設定した色は無視し、塗りつぶし候補の
+            # マーカーと同じ「見た目の言語」(暗い半透明塗り+エンティティ色の
+            # 破線枠+種別ラベル)に統一する(通常図形と混同させないため)。
+            accent = self._annotation_color(
+                get_highlight_color(shape.pii_entity), opacity=1.0
+            ) or QColor(200, 200, 200)
+            fill = QColor(10, 10, 10)
+            fill.setAlphaF(0.42)
+            border = QColor(accent)
+            border.setAlphaF(0.95)
+            pen = QPen(border)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            pen.setWidthF(max(1.2, 1.2 * self._zoom_factor))
+            painter.setPen(pen)
+            painter.setBrush(QBrush(fill))
+            if shape.shape_type == ShapeType.ELLIPSE:
+                painter.drawEllipse(paint_rect)
+            else:
+                painter.drawRect(paint_rect)
+            label = get_entity_type_name_ja(shape.pii_entity or "OTHER")
+            if label and paint_rect.width() >= 18 and paint_rect.height() >= 10:
+                painter.setPen(QColor(245, 245, 245))
+                font = painter.font()
+                font.setPointSizeF(max(6.0, min(10.0, paint_rect.height() * 0.2)))
+                painter.setFont(font)
+                label_rect = QRectF(
+                    paint_rect.left() + 2, paint_rect.top(), paint_rect.width() - 4, paint_rect.height()
+                )
+                painter.drawText(
+                    label_rect,
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop),
+                    label,
+                )
+            painter.restore()
+            return
 
         if shape.shape_type == ShapeType.LINE:
             verts = vertices_override if vertices_override is not None else shape.vertices

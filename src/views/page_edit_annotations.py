@@ -301,6 +301,8 @@ class CreateMode(Enum):
     CALLOUT = auto()  # 校正コールアウトの配置待ち
     MARKUP = auto()  # 文字装飾(ハイライト/下線/取り消し線)の連続モード(種類は _markup_sticky_type が保持)
     ERASER = auto()  # 文字装飾の消しゴム連続モード
+    MASK_MARKUP = auto()  # 個人情報検出ドロワー: テキスト選択→塗りつぶし候補への追加モード
+    MASK_SHAPE = auto()  # 個人情報検出ドロワー: 塗りつぶし用図形(四角/楕円)の配置待ち
 _BRACKET_STYLES = ("square", "round", "curly")
 _BRACKET_SIZES = ("small", "medium", "large")
 class _AnnotRef:
@@ -870,10 +872,13 @@ class ZoomAnnotationMixin:
             self._zoom_annotation_drawer.setFixedWidth(320 if self._zoom_annotation_open else 0)
         if getattr(self, "_zoom_object_btn", None) is not None:
             self._zoom_object_btn.setChecked(self._zoom_annotation_open)
-        # 横幅を確保するため、付箋ドロワーを開いたらしおりドロワーを閉じる
+        # 横幅を確保するため、付箋ドロワーを開いたら他のドロワーを閉じる
         if self._zoom_annotation_open and getattr(self, "_bookmarks_panel", None):
             if self._bookmarks_panel.is_open:
                 self._bookmarks_panel.set_open(False)
+        if self._zoom_annotation_open and getattr(self, "_pii_panel", None):
+            if self._pii_panel.is_open:
+                self._pii_panel.set_open(False)
     def _toggle_zoom_annotation_drawer(self) -> None:
         self._set_zoom_annotation_drawer_open(not self._zoom_annotation_open)
     @property
@@ -907,6 +912,10 @@ class ZoomAnnotationMixin:
             self._set_markup_sticky_mode(None)
         if mode is not CreateMode.ERASER:
             self._set_eraser_sticky_mode(False)
+        if mode is not CreateMode.MASK_MARKUP:
+            self._set_mask_markup_sticky_mode(False)
+        if mode is not CreateMode.MASK_SHAPE:
+            self._set_mask_shape_create_mode(None)
         if mode is CreateMode.FREETEXT:
             self._set_zoom_annotation_create_mode(True)
         elif mode is CreateMode.SHAPE:
@@ -926,6 +935,57 @@ class ZoomAnnotationMixin:
             if self._selected_zoom_annotation is not None:
                 self._set_selected_zoom_annotation(None)
             self._set_eraser_sticky_mode(True)
+        elif mode is CreateMode.MASK_MARKUP:
+            if self._selected_zoom_annotation is not None:
+                self._set_selected_zoom_annotation(None)
+            self._set_mask_markup_sticky_mode(True)
+        elif mode is CreateMode.MASK_SHAPE:
+            if self._selected_zoom_annotation is not None:
+                self._set_selected_zoom_annotation(None)
+            self._set_mask_shape_create_mode(shape_type)
+    def _set_mask_markup_sticky_mode(self, enabled: bool) -> None:
+        """個人情報検出ドロワー「テキスト候補」ツールの連続モードを切り替える。
+
+        文字装飾の連続モード(``_set_markup_sticky_mode``)と同じ考え方で、
+        テキスト選択だけを受け付けるモードへ切り替え、選択確定時
+        (``_on_zoom_text_selection_released``)に塗りつぶし候補を作る。
+        """
+        enabled = bool(enabled)
+        if enabled:
+            self._create_mode = CreateMode.MASK_MARKUP
+        elif self._create_mode is CreateMode.MASK_MARKUP:
+            self._create_mode = CreateMode.NONE
+        panel = getattr(self, "_pii_panel", None)
+        if panel is not None:
+            panel.set_mask_markup_tool_active(enabled)
+        if self._zoom_label is not None:
+            if enabled:
+                self._zoom_label.cancel_annotation_paste_mode()
+                self._zoom_label.clear_text_selection()
+            self._zoom_label.set_text_select_only_mode(enabled, cursor=Qt.CursorShape.IBeamCursor)
+    def _set_mask_shape_create_mode(self, shape_type: "ShapeType | None") -> None:
+        """個人情報検出ドロワー「塗りつぶし用の四角/楕円」ツールの配置待ちを切り替える。
+
+        図形作成そのもの(ドラッグでの矩形/楕円確定)は通常の図形ツールと同じ
+        ``_zoom_label`` の作成モードを再利用する。作成後に通常図形と区別する
+        ため、確定時のハンドラ(``_on_zoom_shape_create_requested``)側で
+        ``self._create_mode is CreateMode.MASK_SHAPE`` を見て塗りつぶし用の
+        メタデータ(pii_entity等)を付けて保存する。
+        """
+        if shape_type is not None:
+            self._create_mode = CreateMode.MASK_SHAPE
+        elif self._create_mode is CreateMode.MASK_SHAPE:
+            self._create_mode = CreateMode.NONE
+        self._mask_shape_pending_type = shape_type
+        panel = getattr(self, "_pii_panel", None)
+        if panel is not None:
+            panel.set_mask_shape_tool_active(shape_type)
+        if self._zoom_label:
+            if shape_type is not None:
+                self._zoom_label.cancel_annotation_paste_mode()
+                self._zoom_label.set_annotation_create_mode(True, shape_type=shape_type)
+            elif self._zoom_label._annotation_create_shape_type is not None:
+                self._zoom_label.set_annotation_create_mode(False)
     def _set_zoom_annotation_create_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
         if enabled:
@@ -1307,7 +1367,12 @@ class ZoomAnnotationMixin:
         if self._zoom_label is not None and self._zoom_label._selected_char_indices:
             self._apply_eraser_to_selection()
             return
-        if isinstance(self._selected_zoom_annotation, TextMarkupAnnotData):
+        selected = self._selected_zoom_annotation
+        if isinstance(selected, TextMarkupAnnotData):
+            if selected.pii_entity:
+                # 塗りつぶし候補(個人情報検出結果)は消しゴムでは削除できない。
+                self._flash_zoom_hint("塗りつぶし候補は消しゴムで削除できません")
+                return
             self._delete_selected_zoom_annotation()
             return
         self._flash_zoom_hint("消す範囲のテキストを選択してください")
@@ -1338,6 +1403,10 @@ class ZoomAnnotationMixin:
             )
         elif self._create_mode is CreateMode.ERASER:
             self._apply_eraser_to_selection()
+        elif self._create_mode is CreateMode.MASK_MARKUP:
+            create_mask_candidate = getattr(self, "_create_mask_candidate_from_selection", None)
+            if create_mask_candidate is not None:
+                create_mask_candidate()
     def _find_matching_markup(
         self, markup_type: MarkupType, char_indices: set[int]
     ) -> TextMarkupAnnotData | None:
@@ -1393,6 +1462,9 @@ class ZoomAnnotationMixin:
         単発動作・連続モードのどちらからも呼ばれる共通ロジック。1回のドラッグ/クリックで
         影響を受けるすべての注釈の変更を、単一のUndoステップにまとめる
         (Ctrl+Zで一括復元できるようにする)。
+
+        塗りつぶし候補(``pii_entity`` が設定された ``TextMarkupAnnotData``)は
+        対象外とし、縮小・分割・削除のいずれも行わない。
         """
         if self._zoom_label is None or self._zoom_page_num is None:
             return
@@ -1403,6 +1475,10 @@ class ZoomAnnotationMixin:
         entries: list[dict] = []
         for annot in list(self._zoom_annotations):
             if not isinstance(annot, TextMarkupAnnotData) or annot.page_num != self._zoom_page_num:
+                continue
+            if annot.pii_entity:
+                # 塗りつぶし候補(個人情報検出結果)は消しゴムの対象外:
+                # 縮小・分割・削除のいずれも行わない。
                 continue
             covered = label._char_indices_in_quads(annot.quads)
             if not covered or not (covered & sel_indices):
@@ -1467,14 +1543,8 @@ class ZoomAnnotationMixin:
         if self._zoom_markup_color_btn is not None:
             self._set_color_button_preview(self._zoom_markup_color_btn, rgb)
         if is_markup:
-            new_annotation = TextMarkupAnnotData(
-                page_num=selected.page_num,
-                xref=selected.xref,
-                quads=selected.quads,
-                markup_type=selected.markup_type,
-                color=rgb,
-                opacity=selected.opacity,
-            )
+            # dataclass_replace で他フィールド(pii_entity 等)を保ったまま色だけ更新する。
+            new_annotation = dataclass_replace(selected, color=rgb)
             self._run_zoom_markup_replace(selected, new_annotation, "Update markup color")
     def _run_zoom_create(
         self,
@@ -1483,6 +1553,7 @@ class ZoomAnnotationMixin:
         delete_fn: Callable[[str, int, int], bool],
         *,
         after_create: Callable[["AnyAnnotData"], None] | None = None,
+        select_created: bool = True,
     ) -> None:
         """注釈の新規作成をundo可能な操作として実行する(全注釈種共通の骨格)。
 
@@ -1490,6 +1561,10 @@ class ZoomAnnotationMixin:
         後続のundo操作が常に生きているxrefを参照できるようにする。
         create_fn/delete_fn はモジュールグローバルを遅延参照する lambda を渡すこと
         (テストの monkeypatch を効かせるため)。
+
+        ``select_created=False`` にすると、作成した注釈を選択状態にせず付箋
+        ドロワーも開かない(個人情報検出ドロワーの「テキスト候補」/「塗り四角」/
+        「塗り丸」ツールのような、ドロワー排他制御と競合する連続作成モード用)。
         """
         ref: _AnnotRef | None = None
 
@@ -1500,8 +1575,11 @@ class ZoomAnnotationMixin:
                 ref = self._register_annot_ref(created.page_num, created.xref)
             else:
                 self._rebind_annot_ref(ref, created.page_num, created.xref)
-            self._selected_zoom_annotation = created
-            self._refresh_current_zoom_page(open_drawer=True)
+            if select_created:
+                self._selected_zoom_annotation = created
+                self._refresh_current_zoom_page(open_drawer=True)
+            else:
+                self._refresh_current_zoom_page()
             if after_create is not None:
                 after_create(created)
 
@@ -1814,6 +1892,10 @@ class ZoomAnnotationMixin:
                 self._set_zoom_annotation_drawer_open(True)
         # しおりドロワーが開いていれば付箋一覧も更新する。
         self._reload_bookmark_notes()
+        # 個人情報検出ドロワーが開いていれば結果一覧も更新する。
+        reload_pii = getattr(self, "_reload_pii_results", None)
+        if reload_pii is not None:
+            reload_pii()
     def _on_zoom_annotation_selected(self, annotation: object) -> None:
         self._set_zoom_annotation_create_mode(False)
         self._set_shape_create_mode(None)
@@ -2075,6 +2157,15 @@ class ZoomAnnotationMixin:
                 return
             rect_tuple = (x0, y0, x1, y1)
 
+        if self._create_mode is CreateMode.MASK_SHAPE:
+            # 「テキスト候補」ツールと同じ連続モード: 1個描いても解除せず、
+            # 続けて次の図形をドラッグできるようにする(widgetの作成モードは
+            # set_annotation_create_mode(True, ...) のままなので何もしなくて良い)。
+            create_mask_shape = getattr(self, "_create_mask_shape", None)
+            if create_mask_shape is not None:
+                create_mask_shape(shape_type, rect_tuple)
+            return
+
         self._set_shape_create_mode(None)
 
         # For bracket with "both sides" checked, create a pair
@@ -2241,6 +2332,10 @@ class ZoomAnnotationMixin:
             triangle_apex=triangle_apex,
             annotation_id=base.annotation_id,
             subject="",
+            # 塗りつぶし用図形かどうかのフラグ・キャッシュ済み文字列は、フォーム編集
+            # (幅/高さ/色/回転等)で消えると通常図形に化けてしまうため必ず引き継ぐ。
+            pii_entity=base.pii_entity,
+            pii_text=base.pii_text,
         )
     def _on_zoom_shape_rotation_changed(self, value: int) -> None:
         with QSignalBlocker(self._zoom_shape_rotation_slider):
