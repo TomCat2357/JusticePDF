@@ -252,6 +252,9 @@ def rasterize_pdf(
     *,
     image_format: str = "png",
     jpeg_quality: int = 75,
+    hide_xrefs: "dict[int, list[int]] | None" = None,
+    black_fill_regions: "dict[int, list[tuple[float, float, float, float]]] | None" = None,
+    black_fill_ellipses: "dict[int, list[tuple[float, float, float, float]]] | None" = None,
 ) -> None:
     """Create a rasterized (image-only) copy of a PDF.
 
@@ -266,12 +269,47 @@ def rasterize_pdf(
         image_format: "png" (lossless, sharp text) or "jpeg" (lossy,
             much smaller for photo/scan-heavy pages).
         jpeg_quality: JPEG quality (1-100); ignored for PNG.
+        hide_xrefs: Optional ``{page_num: [xref, ...]}`` of annotations to hide
+            before rendering (same convention as
+            ``rendering.render_page_thumbnails_batch``). Used by the "個人情報
+            検出" drawer's blackout export to omit the PII highlight
+            annotations themselves so only the solid black fill remains.
+        black_fill_regions: Optional ``{page_num: [(x0, y0, x1, y1), ...]}``
+            of rectangles in the *display* coordinate system (the same one
+            used throughout ``pdf_utils`` for quads, e.g.
+            ``TextMarkupAnnotData.quads`` / ``get_page_words`` / ``page.rect``)
+            to paint solid black (drawn directly into the page content, not
+            as an annotation) before rasterizing, so the underlying text is
+            genuinely gone from the exported image. Used for "黒塗りして
+            画像のみエクスポート". Unlike annotation quads (which PyMuPDF
+            stores in the page's unrotated internal space and therefore need
+            ``derotation_matrix``, see ``annotations._add_markup_annot_to_page``),
+            ``Page.draw_rect`` already operates in the same rotated/display
+            space as ``page.rect`` -- verified empirically with
+            ``page.set_rotation(90)`` -- so no extra transform is applied here.
+        black_fill_ellipses: Same convention as ``black_fill_regions`` but each
+            rectangle is filled as an ellipse inscribed in it (``Page.draw_oval``),
+            for "塗りつぶし用の丸" mask shapes so the rasterized result keeps the
+            shape's actual outline instead of a bounding-box rectangle.
     """
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
     try:
         for page_num in range(len(src_doc)):
             page = src_doc[page_num]
+            hide_set = set((hide_xrefs or {}).get(page_num, ()))
+            if hide_set:
+                for annot in page.annots() or []:
+                    if annot.xref in hide_set:
+                        annot.set_flags(annot.flags | fitz.PDF_ANNOT_IS_HIDDEN)
+            for rect in (black_fill_regions or {}).get(page_num, ()):
+                page.draw_rect(
+                    fitz.Rect(*rect), color=(0, 0, 0), fill=(0, 0, 0), width=0
+                )
+            for rect in (black_fill_ellipses or {}).get(page_num, ()):
+                page.draw_oval(
+                    fitz.Rect(*rect), color=(0, 0, 0), fill=(0, 0, 0), width=0
+                )
             img_data, _ = _render_page_to_image_bytes(
                 page, dpi, image_format=image_format, jpeg_quality=jpeg_quality
             )
@@ -289,5 +327,138 @@ def rasterize_pdf(
     finally:
         src_doc.close()
         out_doc.close()
+
+
+def redact_pdf_remove_text(
+    src_path: str,
+    output_path: str,
+    *,
+    remove_xrefs: "dict[int, list[int]] | None" = None,
+    redact_rects: "dict[int, list[tuple[float, float, float, float]]] | None" = None,
+    redact_ellipses: "dict[int, list[tuple[float, float, float, float]]] | None" = None,
+) -> None:
+    """PresidioPDF ``run_mask`` 相当の「文字を本当に削除」するエクスポート。
+
+    ``rasterize_pdf`` (画像のみエクスポート)とは異なり、出力は通常のテキスト
+    PDFのまま保たれる。塗りつぶし対象の下にある文字そのものを
+    ``page.add_redact_annot`` + ``page.apply_redactions`` で削除し、
+    (画像がある場合は既定でその領域のピクセルも黒塗りする)、その位置に
+    実際に見える黒塗りを残す。
+
+    Args:
+        src_path: 元のPDF(このパスは変更しない。常に別ファイルへ保存する)。
+        output_path: 保存先PDFパス。
+        remove_xrefs: ``{page_num: [xref, ...]}``。塗りつぶし候補のマーカー
+            注釈・塗りつぶし用図形注釈そのもの(候補/図形の見た目)を出力から
+            取り除くための xref 一覧。通常の注釈は含めないこと。
+        redact_rects: ``{page_num: [(x0, y0, x1, y1), ...]}`` (表示座標系)。
+            塗りつぶし候補の各quad、および「塗りつぶし用の四角」の矩形。
+            ``add_redact_annot(rect, fill=(0, 0, 0))`` で文字を削除しつつ、
+            そのまま矩形の黒塗りが残る。
+        redact_ellipses: ``{page_num: [(x0, y0, x1, y1), ...]}`` (表示座標系、
+            楕円の外接矩形)。「塗りつぶし用の丸」用。楕円に内接する文字だけを
+            (``src.pii.pdf_text_map.chars_under_ellipse`` で判定し)個別に
+            redactした上で、見た目を丸に揃えるため楕円を上から黒く描画する。
+    """
+    from src.pii.pdf_text_map import chars_under_ellipse
+    from src.utils.pdf_utils.rendering import get_page_chars
+
+    doc = fitz.open(src_path)
+    try:
+        page_indices = sorted(
+            set((remove_xrefs or {}).keys())
+            | set((redact_rects or {}).keys())
+            | set((redact_ellipses or {}).keys())
+        )
+        for page_num in page_indices:
+            if page_num < 0 or page_num >= len(doc):
+                continue
+            page = doc[page_num]
+
+            for xref in (remove_xrefs or {}).get(page_num, ()):
+                annot = page.load_annot(xref)
+                if annot is not None:
+                    page.delete_annot(annot)
+
+            rects = list((redact_rects or {}).get(page_num, ()))
+            ellipse_rects = list((redact_ellipses or {}).get(page_num, ()))
+
+            def _to_internal(rect: tuple[float, float, float, float]) -> fitz.Rect:
+                # add_redact_annot は他の注釈(add_highlight_annot等)と同じく
+                # ページの未回転の内部座標系を扱うため derotation_matrix が必要
+                # (draw_rect/draw_oval とは逆の規則。annotations._add_markup_annot_to_page
+                # 参照。回転ページでの黒塗りテスト test_redact_removes_text_on_rotated_page
+                # で実測して確認済み)。
+                r = fitz.Rect(*rect)
+                if page.rotation != 0:
+                    r = r * page.derotation_matrix
+                return r
+
+            had_redaction = False
+            for rect in rects:
+                r = _to_internal(rect)
+                if r.is_empty or r.is_infinite:
+                    continue
+                page.add_redact_annot(r, fill=(0, 0, 0))
+                had_redaction = True
+
+            ellipse_char_count = 0
+            if ellipse_rects:
+                chars = get_page_chars(src_path, page_num)
+                for rect in ellipse_rects:
+                    for ch in chars_under_ellipse(chars, rect):
+                        bbox = ch.get("bbox")
+                        if not bbox:
+                            continue
+                        r = _to_internal(bbox)
+                        if r.is_empty or r.is_infinite:
+                            continue
+                        page.add_redact_annot(r, fill=(0, 0, 0))
+                        had_redaction = True
+                        ellipse_char_count += 1
+
+            if had_redaction:
+                try:
+                    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+                except TypeError:
+                    # 古い PyMuPDF は images 引数を持たない。
+                    page.apply_redactions()
+
+            # 楕円: 文字が無い部分(写真・印影等の画像)は上のループでは文字が
+            # 検出されずredactされないため、外接矩形全体に対して「画像ピクセルは
+            # 黒塗り・文字は削除しない(text=PDF_REDACT_TEXT_NONE)」を追加で
+            # 適用する。楕円の外だが外接矩形の内側にある文字を誤って消さない
+            # ための text=NONE で、古い PyMuPDF がこの引数を持たない場合は
+            # 安全側に倒してこの追加パスをスキップする(文字削除は保証済み、
+            # 画像の黒塗りが外接矩形いっぱいにならないだけ)。
+            if ellipse_rects and hasattr(fitz, "PDF_REDACT_TEXT_NONE"):
+                try:
+                    for rect in ellipse_rects:
+                        r = _to_internal(rect)
+                        if r.is_empty or r.is_infinite:
+                            continue
+                        # fill無し・cross_out無し: 見た目には何も残さず、画像ピクセルの
+                        # 黒塗りだけを起こす(見た目の丸は後段でdraw_ovalが描く)。
+                        page.add_redact_annot(r, cross_out=False)
+                    page.apply_redactions(
+                        images=fitz.PDF_REDACT_IMAGE_PIXELS,
+                        text=fitz.PDF_REDACT_TEXT_NONE,
+                    )
+                except TypeError:
+                    pass
+
+            # 楕円は外接矩形ではなく丸として見えるよう、redaction後に描き直す。
+            for rect in ellipse_rects:
+                r = _to_internal(rect)
+                if r.is_empty or r.is_infinite:
+                    continue
+                shape = page.new_shape()
+                shape.draw_oval(r)
+                shape.finish(color=(0, 0, 0), fill=(0, 0, 0), width=0)
+                shape.commit()
+
+        doc.save(output_path, garbage=4, deflate=True, clean=True)
+    finally:
+        doc.close()
 
 

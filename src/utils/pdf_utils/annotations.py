@@ -87,6 +87,12 @@ class ShapeAnnotData:
     triangle_apex: tuple[float, float] = (0.5, 0.0)
     annotation_id: str = ""
     subject: str = ""
+    # 個人情報(PII)検出ドロワーが作成した「塗りつぶし用図形(RECTANGLE/ELLIPSE)」
+    # のエンティティ種別("PERSON"等、手動作成は"OTHER")。空文字は通常の図形
+    # (塗りつぶし対象ではない)を意味する。TextMarkupAnnotData.pii_entity と同じ役割。
+    pii_entity: str = ""
+    # 塗りつぶし用図形の下にある文字列(結果一覧表示用にキャッシュする)。
+    pii_text: str = ""
 
 
 class MarkupType(str, Enum):
@@ -111,6 +117,14 @@ class TextMarkupAnnotData:
     opacity: float = 1.0
     annotation_id: str = ""
     subject: str = ""
+    # 個人情報(PII)検出ドロワーが作成したハイライトのエンティティ種別
+    # ("PERSON"等)。空文字は手動で作成した通常のマークアップを意味する。
+    # 空でない = 「塗りつぶし候補」(mask candidate)であり、通常のマーカーとは
+    # 別扱い(黒塗り/テキスト削除エクスポートの対象)になる。
+    pii_entity: str = ""
+    # 検出時(または手動選択時)にマッチした実際の文字列。結果一覧に表示するため
+    # 保存する。旧バージョンが作成したハイライト(このフィールドが無い)は空文字。
+    pii_text: str = ""
 
     @property
     def rect(self) -> tuple[float, float, float, float]:
@@ -773,6 +787,10 @@ def _encode_shape_metadata(data: ShapeAnnotData, *, page_rotation: int = 0) -> s
     }
     if data.group_id:
         payload["group_id"] = data.group_id
+    if data.pii_entity:
+        payload["pii_entity"] = data.pii_entity
+    if data.pii_text:
+        payload["pii_text"] = data.pii_text
     if data.shape_type == ShapeType.LINE:
         payload["arrow_start"] = data.arrow_start
         payload["arrow_end"] = data.arrow_end
@@ -868,7 +886,12 @@ def _add_shape_annot_to_page(page: fitz.Page, data: ShapeAnnotData) -> fitz.Anno
         annot = page.add_polygon_annot(points)
 
     annot.set_colors(stroke=stroke, fill=fill)
-    annot.set_border(width=stroke_width)
+    if data.pii_entity:
+        # 塗りつぶし用図形は外部ビューアでも通常図形と混同されないよう、
+        # 破線枠にする(JusticePDF自前描画はさらに暗い半透明塗りで強調する)。
+        annot.set_border(width=stroke_width, dashes=(3,))
+    else:
+        annot.set_border(width=stroke_width)
     annot.set_opacity(opacity)
     annot.update()
     annot.set_info(subject=_encode_shape_metadata(data, page_rotation=creation_page_rotation))
@@ -967,6 +990,8 @@ def _extract_shape_data(
         triangle_apex=triangle_apex,
         annotation_id=annotation_id,
         subject=subject,
+        pii_entity=str(metadata.get("pii_entity", "") or ""),
+        pii_text=str(metadata.get("pii_text", "") or ""),
     )
 
 
@@ -1149,6 +1174,16 @@ def replace_shape_annot(
     return _replace_annot(_SHAPE_FAMILY, pdf_path, page_num, xref, data)
 
 
+def list_pii_mask_shapes(pdf_path: str, page_num: int | None = None) -> list[ShapeAnnotData]:
+    """個人情報検出ドロワーが作成した「塗りつぶし用図形」(``pii_entity`` 設定済み)
+    のみを返す(通常の図形は対象外)。``list_pii_markup_annots`` のシェイプ版。"""
+    return [
+        shape
+        for shape in list_shape_annots(pdf_path, page_num)
+        if shape.pii_entity
+    ]
+
+
 def create_bracket_pair(
     pdf_path: str,
     rect: tuple[float, float, float, float],
@@ -1316,6 +1351,10 @@ def _encode_markup_metadata(data: TextMarkupAnnotData, *, page_rotation: int = 0
         "quads": [[float(c) for c in quad] for quad in data.quads],
         "page_rotation": int(page_rotation),
     }
+    if data.pii_entity:
+        payload["pii_entity"] = data.pii_entity
+    if data.pii_text:
+        payload["pii_text"] = data.pii_text
     return _encode_prefixed_json(JUSTICEPDF_MARKUP_SUBJECT_PREFIX, payload)
 
 
@@ -1347,7 +1386,13 @@ def _add_markup_annot_to_page(page: fitz.Page, data: TextMarkupAnnotData) -> fit
     else:
         annot = page.add_strikeout_annot(quads=quads)
 
-    annot.set_colors(stroke=list(data.color))
+    if data.pii_entity:
+        # 塗りつぶし候補は通常のマーカーと混同されないよう、実PDF上の色も暗く
+        # 落として見た目を変える(JusticePDF自前描画はさらにダッシュ枠等で強調する)。
+        # メタデータの data.color 自体はエンティティ色のまま保持し往復させる。
+        annot.set_colors(stroke=[c * 0.35 for c in data.color])
+    else:
+        annot.set_colors(stroke=list(data.color))
     annot.set_opacity(max(0.0, min(1.0, float(data.opacity))))
     annot.update()
     annot.set_info(subject=_encode_markup_metadata(data, page_rotation=creation_page_rotation))
@@ -1403,6 +1448,8 @@ def _extract_markup_data(
         opacity=max(0.0, min(1.0, float(opacity))),
         annotation_id=annotation_id,
         subject=subject,
+        pii_entity=str(metadata.get("pii_entity", "") or ""),
+        pii_text=str(metadata.get("pii_text", "") or ""),
     )
 
 
@@ -1417,6 +1464,16 @@ _MARKUP_FAMILY = _AnnotFamily(
 def list_markup_annots(pdf_path: str, page_num: int | None = None) -> list[TextMarkupAnnotData]:
     """Return JusticePDF text-markup annotations for one page or the whole document."""
     return _list_annots(_MARKUP_FAMILY, pdf_path, page_num)
+
+
+def list_pii_markup_annots(pdf_path: str, page_num: int | None = None) -> list[TextMarkupAnnotData]:
+    """Return only the markup annotations created by the PII detection drawer
+    (``pii_entity`` set), for one page or the whole document."""
+    return [
+        annot
+        for annot in list_markup_annots(pdf_path, page_num)
+        if annot.pii_entity
+    ]
 
 
 def create_markup_annot(pdf_path: str, data: TextMarkupAnnotData) -> TextMarkupAnnotData:
@@ -1435,6 +1492,60 @@ def replace_markup_annot(
 ) -> TextMarkupAnnotData:
     """Replace a markup annotation (used for color / opacity changes)."""
     return _replace_annot(_MARKUP_FAMILY, pdf_path, page_num, xref, data)
+
+
+def create_markup_annots(
+    pdf_path: str, items: list[TextMarkupAnnotData]
+) -> list[TextMarkupAnnotData]:
+    """Create many markup annotations in a single document open/save.
+
+    Used by the PII detection drawer, which can create dozens of highlights
+    from one detection run; opening/saving the PDF once per item would be
+    far slower and would repeatedly invalidate the page pixmap cache.
+    """
+    if not items:
+        return []
+    doc = fitz.open(pdf_path)
+    try:
+        saved: list[TextMarkupAnnotData] = []
+        for data in items:
+            if data.page_num < 0 or data.page_num >= len(doc):
+                continue
+            page = doc[data.page_num]
+            annot = _add_markup_annot_to_page(page, data)
+            extracted = _extract_markup_data(doc, data.page_num, annot)
+            if extracted is not None:
+                saved.append(extracted)
+        _save_document_in_place(doc, pdf_path)
+        return saved
+    finally:
+        doc.close()
+
+
+def delete_markup_annots(pdf_path: str, refs: list[tuple[int, int]]) -> int:
+    """Delete many markup annotations (by (page_num, xref)) in one open/save.
+
+    Returns the number of annotations actually deleted.
+    """
+    if not refs:
+        return 0
+    doc = fitz.open(pdf_path)
+    try:
+        deleted = 0
+        for page_num, xref in refs:
+            if page_num < 0 or page_num >= len(doc):
+                continue
+            page = doc[page_num]
+            annot = page.load_annot(xref)
+            if annot is None or annot.type[0] not in _MARKUP_ANNOT_TYPES:
+                continue
+            page.delete_annot(annot)
+            deleted += 1
+        if deleted:
+            _save_document_in_place(doc, pdf_path)
+        return deleted
+    finally:
+        doc.close()
 
 
 # --- Sticky note (comment) annotations -----------------------------------
