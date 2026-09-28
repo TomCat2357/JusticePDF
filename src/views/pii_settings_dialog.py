@@ -32,7 +32,8 @@ from PyQt6.QtWidgets import (
 )
 
 from src.pii import ocr_support
-from src.pii.entity_types import ENTITY_TYPES, get_entity_type_name_ja
+from src.pii.engines import ENGINES, is_engine_available
+from src.pii.entity_types import ENTITY_TYPES, MANUAL_ENTITY_TYPE, get_entity_type_name_ja
 from src.pii.settings import PiiSettings
 from src.views.view_helpers import build_accept_cancel_box
 
@@ -65,6 +66,7 @@ class PiiSettingsDialog(QDialog):
         layout.addWidget(tabs, 1)
 
         tabs.addTab(self._build_entities_tab(), "検出対象・色")
+        tabs.addTab(self._build_engines_tab(), "検出エンジン")
         tabs.addTab(self._build_exclusions_tab(), "除外・追加パターン")
         tabs.addTab(self._build_dedupe_tab(), "重複除去")
         tabs.addTab(self._build_ocr_tab(), "OCR")
@@ -79,6 +81,16 @@ class PiiSettingsDialog(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.addWidget(QLabel("チェックした種別のみ検出します。色はマーカーの色になります。"))
+
+        select_row = QHBoxLayout()
+        select_all_btn = QPushButton("すべて選択")
+        select_all_btn.clicked.connect(lambda: self._set_all_entity_checks(True))
+        select_row.addWidget(select_all_btn)
+        deselect_all_btn = QPushButton("すべて解除")
+        deselect_all_btn.clicked.connect(lambda: self._set_all_entity_checks(False))
+        select_row.addWidget(deselect_all_btn)
+        select_row.addStretch()
+        layout.addLayout(select_row)
 
         self._entity_checks: dict[str, QCheckBox] = {}
         self._entity_color_btns: dict[str, QPushButton] = {}
@@ -99,8 +111,25 @@ class PiiSettingsDialog(QDialog):
             self._entity_checks[entity_type] = checkbox
             self._entity_color_btns[entity_type] = color_btn
 
+        # 「手動」は自動検出の対象ではない(チェックボックスは出さない)ため、
+        # 色だけを設定できるようにする(手動追加ツールの既定種別・見た目に使う)。
+        manual_row = QHBoxLayout()
+        manual_row.addWidget(QLabel(f"{get_entity_type_name_ja(MANUAL_ENTITY_TYPE)}(手動追加分の色)"), 1)
+        manual_color_btn = QPushButton("色...")
+        manual_color_btn.clicked.connect(
+            lambda _checked=False: self._on_pick_color(MANUAL_ENTITY_TYPE)
+        )
+        self._apply_color_preview(manual_color_btn, self._settings.color_for(MANUAL_ENTITY_TYPE))
+        manual_row.addWidget(manual_color_btn)
+        layout.addLayout(manual_row)
+        self._entity_color_btns[MANUAL_ENTITY_TYPE] = manual_color_btn
+
         layout.addStretch()
         return widget
+
+    def _set_all_entity_checks(self, checked: bool) -> None:
+        for checkbox in self._entity_checks.values():
+            checkbox.setChecked(checked)
 
     def _apply_color_preview(self, button: QPushButton, rgb: tuple[float, float, float]) -> None:
         qcolor = _color_to_qcolor(rgb)
@@ -116,6 +145,55 @@ class PiiSettingsDialog(QDialog):
             return
         self._settings.colors[entity_type] = _qcolor_to_color(color)
         self._apply_color_preview(self._entity_color_btns[entity_type], self._settings.colors[entity_type])
+
+    # ------------------------------------------------------------------
+    # タブ: 検出エンジン
+    # ------------------------------------------------------------------
+    def _build_engines_tab(self) -> QWidget:
+        """検出エンジン(認識器)ごとのON/OFF。
+
+        以前のPresidioPDFでは複数のエンジン/認識器を選択できたが、JusticePDFへの
+        移植時に単一パイプラインへ統合され選べなくなっていたため、ここで
+        ``src.pii.engines.ENGINES`` を選択式に戻す。GiNZA/Janome等の未導入の
+        エンジンはチェックボックスをグレーアウトし、選んでもエラーにならない
+        ことを明示する。
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.addWidget(
+            QLabel("チェックしたエンジンだけを検出に使用します。未導入のエンジンは選択できません。")
+        )
+
+        select_row = QHBoxLayout()
+        select_all_btn = QPushButton("すべて選択")
+        select_all_btn.clicked.connect(lambda: self._set_all_engine_checks(True))
+        select_row.addWidget(select_all_btn)
+        deselect_all_btn = QPushButton("すべて解除")
+        deselect_all_btn.clicked.connect(lambda: self._set_all_engine_checks(False))
+        select_row.addWidget(deselect_all_btn)
+        select_row.addStretch()
+        layout.addLayout(select_row)
+
+        self._engine_checks: dict[str, QCheckBox] = {}
+        for engine in ENGINES:
+            available = is_engine_available(engine.key)
+            label = engine.name_ja if available else f"{engine.name_ja}(未インストール)"
+            checkbox = QCheckBox(label)
+            checkbox.setToolTip(engine.description_ja)
+            checkbox.setEnabled(available)
+            checkbox.setChecked(
+                available and self._settings.enabled_engines.get(engine.key, engine.default_enabled)
+            )
+            layout.addWidget(checkbox)
+            self._engine_checks[engine.key] = checkbox
+
+        layout.addStretch()
+        return widget
+
+    def _set_all_engine_checks(self, checked: bool) -> None:
+        for checkbox in self._engine_checks.values():
+            if checkbox.isEnabled():
+                checkbox.setChecked(checked)
 
     # ------------------------------------------------------------------
     # タブ: 除外・追加パターン
@@ -316,6 +394,11 @@ class PiiSettingsDialog(QDialog):
         """ダイアログで編集した内容を反映した ``PiiSettings`` を返す。"""
         for entity_type, checkbox in self._entity_checks.items():
             self._settings.enabled_entities[entity_type] = checkbox.isChecked()
+        for engine_key, checkbox in self._engine_checks.items():
+            # 未導入(disabled)のチェックボックスは常に未チェックなので、そのまま
+            # 保存してもis_engine_enabled()側の既定値解決には影響しない
+            # (導入され次第、チェックすれば有効になる)。
+            self._settings.enabled_engines[engine_key] = checkbox.isChecked()
         self._settings.dedupe_enabled = self._dedupe_enabled_check.isChecked()
         self._settings.dedupe_overlap = self._dedupe_overlap_combo.currentData()
         self._settings.dedupe_keep = self._dedupe_keep_combo.currentData()

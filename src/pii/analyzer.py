@@ -36,10 +36,17 @@ class Analyzer:
         self.config_manager = config_manager
         self._chunk_delimiter = config_manager.get_chunk_delimiter()
         self._chunk_max_chars = config_manager.get_chunk_max_chars()
-        self._tokenizer = SudachiTokenizer(
-            dict_type=config_manager.get_sudachi_dict_type(),
-            split_mode=config_manager.get_sudachi_split_mode(),
-        )
+        # SudachiPyの辞書読み込みは重いため、"sudachi"エンジンが実際に使われる
+        # ときまで遅延生成する(他のエンジンだけを使う設定では読み込まない)。
+        self._tokenizer: SudachiTokenizer | None = None
+
+    def _get_tokenizer(self) -> SudachiTokenizer:
+        if self._tokenizer is None:
+            self._tokenizer = SudachiTokenizer(
+                dict_type=self.config_manager.get_sudachi_dict_type(),
+                split_mode=self.config_manager.get_sudachi_split_mode(),
+            )
+        return self._tokenizer
 
     def analyze_text(self, text: str, entities: List[str] = None) -> List[Dict]:
         """テキストの個人情報を解析（大容量ファイル対応）"""
@@ -100,11 +107,26 @@ class Analyzer:
             occupied.append((s, e))
             add_selected.append({k: v for k, v in cand.items() if not k.startswith("_")})
 
-        # 2) モデル検出（正規表現認識器 + 形態素 NE + 日時）。返却は素の dict。
+        # 2) モデル検出（正規表現認識器 + 形態素 NE + 日時 + 任意エンジン）。
+        # どのエンジンを実行するかは設定(src.pii.settings.PiiSettings.enabled_engines)
+        # に従う。GiNZA/Janomeは未導入でも例外を出さず0件を返すだけなので、
+        # 有効化されていても未導入なら実質何もしない。
         analyzer_results: List[Dict] = []
-        analyzer_results += detect_regex_entities(text, entities)
-        analyzer_results += detect_pos_entities(self._tokenizer, text, entities)
-        analyzer_results += detect_datetime(text, entities)
+        cm = self.config_manager
+        if cm.is_engine_enabled("regex"):
+            analyzer_results += detect_regex_entities(text, entities)
+        if cm.is_engine_enabled("sudachi"):
+            analyzer_results += detect_pos_entities(self._get_tokenizer(), text, entities)
+        if cm.is_engine_enabled("datetime"):
+            analyzer_results += detect_datetime(text, entities)
+        if cm.is_engine_enabled("ginza"):
+            from src.pii.ginza_recognizer import detect_ginza_entities
+
+            analyzer_results += detect_ginza_entities(text, entities)
+        if cm.is_engine_enabled("janome"):
+            from src.pii.janome_recognizer import detect_janome_entities
+
+            analyzer_results += detect_janome_entities(text, entities)
 
         # 3) モデル結果に除外適用＆追加と重複するものを抑制
         def overlaps_any(span):
