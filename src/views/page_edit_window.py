@@ -1085,7 +1085,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin):
                     pixmap = pixmaps.get(pn, QPixmap())
                     if pn in pii_targets_by_page:
                         page_size, targets = pii_targets_by_page[pn]
-                        pixmap = paint_pii_mask_overlay(pixmap, targets, page_size)
+                        pixmap = paint_pii_mask_overlay(
+                            pixmap, targets, page_size, self._zoom_label.pii_display_mode()
+                        )
                     self._thumbnails[pn].set_pixmap_direct(pixmap)
         self._schedule_thumbnail_render()
 
