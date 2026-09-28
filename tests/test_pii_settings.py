@@ -25,7 +25,6 @@ def test_settings_round_trip_with_customizations():
     settings = PiiSettings()
     settings.enabled_entities["PERSON"] = False
     settings.colors["PERSON"] = (1.0, 0.0, 0.0)
-    settings.text_exclusions = ["除外語A"]
     settings.text_exclusions_regex = [r"\d{3}-\d{4}"]
     settings.entity_exclusions = {"LOCATION": ["東京都"]}
     settings.additional_patterns = [("OTHER", r"社員番号[0-9]{4}")]
@@ -35,7 +34,7 @@ def test_settings_round_trip_with_customizations():
     settings.dedupe_keep = "first"
     settings.ocr_enabled = True
     settings.ocr_dpi = 400
-    settings.enabled_engines["ginza"] = True
+    settings.enabled_engines["datetime"] = False
     settings.enabled_engines["sudachi"] = False
     settings.keep_existing_on_detect = True
     settings.save()
@@ -43,7 +42,6 @@ def test_settings_round_trip_with_customizations():
     loaded = PiiSettings.load()
     assert loaded.enabled_entities["PERSON"] is False
     assert loaded.colors["PERSON"] == pytest.approx((1.0, 0.0, 0.0))
-    assert loaded.text_exclusions == ["除外語A"]
     assert loaded.text_exclusions_regex == [r"\d{3}-\d{4}"]
     assert loaded.entity_exclusions == {"LOCATION": ["東京都"]}
     assert loaded.additional_patterns == [("OTHER", r"社員番号[0-9]{4}")]
@@ -53,7 +51,7 @@ def test_settings_round_trip_with_customizations():
     assert loaded.dedupe_keep == "first"
     assert loaded.ocr_enabled is True
     assert loaded.ocr_dpi == 400
-    assert loaded.enabled_engines["ginza"] is True
+    assert loaded.enabled_engines["datetime"] is False
     assert loaded.enabled_engines["sudachi"] is False
     assert loaded.keep_existing_on_detect is True
 
@@ -82,15 +80,15 @@ def test_to_config_overrides_groups_additional_patterns_by_entity():
 def test_copy_deep_copies_enabled_engines():
     settings = PiiSettings()
     copy = settings.copy()
-    copy.enabled_engines["ginza"] = True
-    assert settings.enabled_engines["ginza"] is False
+    copy.enabled_engines["regex"] = False
+    assert settings.enabled_engines["regex"] is True
 
 
 def test_to_config_overrides_includes_engines():
     settings = PiiSettings()
-    settings.enabled_engines["janome"] = True
+    settings.enabled_engines["sudachi"] = False
     overrides = settings.to_config_overrides()
-    assert overrides["engines"]["janome"] is True
+    assert overrides["engines"]["sudachi"] is False
     assert overrides["engines"]["regex"] is True
 
 
@@ -100,3 +98,26 @@ def test_load_uses_isolated_qsettings_between_tests():
     settings.enabled_entities["PERSON"] = False
     settings.save()
     assert QSettings().value("pii/dedupe_enabled") is not None
+
+
+def test_legacy_text_exclusions_migrate_to_escaped_regex():
+    """旧「除外ワード」は記号をエスケープして除外パターンへ移行される。"""
+    s = QSettings()
+    PiiSettings(text_exclusions_regex=["既存"]).save(s)
+    s.setValue("pii/text_exclusions", '["(株)A.B", "既存"]')
+
+    loaded = PiiSettings.load(s)
+    assert loaded.text_exclusions_regex == ["既存", r"\(株\)A\.B"]
+
+    # 保存し直すと旧キーは消え、削除した除外パターンが再移行で復活しない。
+    loaded.text_exclusions_regex = []
+    loaded.save(s)
+    assert PiiSettings.load(s).text_exclusions_regex == []
+
+
+def test_removed_engine_keys_are_ignored_on_load():
+    s = QSettings()
+    s.setValue("pii/enabled_engines", '{"regex": true, "ginza": true, "janome": true}')
+    loaded = PiiSettings.load(s)
+    assert "ginza" not in loaded.enabled_engines
+    assert "janome" not in loaded.enabled_engines
