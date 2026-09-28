@@ -65,7 +65,13 @@ def _plain_edges(items: List[Dict[str, Any]], overlap: str):
             if overlap == "contain":
                 dup = (si <= sj and ej <= ei) or (sj <= si and ei <= ej)
             else:  # overlap
-                dup = (si <= ej) and (sj <= ei)
+                # 区間は半開区間 [start, end) なので、境界が接するだけ
+                # (例: 一方の end が他方の start と一致)は「重ならない」。
+                # ここを <= のままにすると、テキスト抽出時に区切り文字が
+                # 挟まらない隣接セル同士(表の列など)が誤って重複扱いされ、
+                # 後続の重複除去でどちらか一方が消えてしまう
+                # (例: 「公務員」の直後に区切り無しで日付が続く場合)。
+                dup = (si < ej) and (sj < ei)
             if dup:
                 edges.append((i, j))
     return n, edges

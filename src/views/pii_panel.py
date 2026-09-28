@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from PyQt6.QtCore import Qt, QSignalBlocker, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -28,7 +29,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.pii.entity_types import ENTITY_TYPES, get_entity_type_name_ja
+from src.pii.entity_types import (
+    ENTITY_TYPES,
+    ENTITY_TYPES_WITH_MANUAL,
+    MANUAL_ENTITY_TYPE,
+    get_entity_type_name_ja,
+)
 from src.utils.pdf_utils import ShapeAnnotData, ShapeType, TextMarkupAnnotData
 
 logger = logging.getLogger(__name__)
@@ -78,6 +84,8 @@ class PiiPanel(QFrame):
         結果一覧の右クリックメニュー「同じ語句をすべて削除」。
     add_exclusion_requested(str, str)
         結果一覧の右クリックメニュー「除外語句に登録」。(entity_type, text) を伴う。
+    add_pattern_requested(str, str)
+        結果一覧の右クリックメニュー「追加パターンに登録」。(entity_type, text) を伴う。
     settings_requested()
         「設定...」ボタン押下時。
     export_rasterize_requested()
@@ -87,13 +95,12 @@ class PiiPanel(QFrame):
     result_activated(object)
         結果一覧の項目がクリックされたとき、対応する注釈データを伴って発火
         (``TextMarkupAnnotData`` または ``ShapeAnnotData``)。
-    filter_changed()
-        エンティティ種別フィルタのチェック状態が変わったとき発火。
     """
 
     open_changed = pyqtSignal(bool)
     detect_current_page_requested = pyqtSignal()
     detect_all_pages_requested = pyqtSignal()
+    keep_existing_toggled = pyqtSignal(bool)
     mask_markup_tool_toggled = pyqtSignal(bool)
     mask_rect_tool_toggled = pyqtSignal(bool)
     mask_ellipse_tool_toggled = pyqtSignal(bool)
@@ -101,11 +108,11 @@ class PiiPanel(QFrame):
     remove_all_requested = pyqtSignal()
     delete_same_text_requested = pyqtSignal(str)
     add_exclusion_requested = pyqtSignal(str, str)
+    add_pattern_requested = pyqtSignal(str, str)
     settings_requested = pyqtSignal()
     export_rasterize_requested = pyqtSignal()
     export_redact_requested = pyqtSignal()
     result_activated = pyqtSignal(object)
-    filter_changed = pyqtSignal()
 
     DRAWER_WIDTH = 340
 
@@ -145,6 +152,16 @@ class PiiPanel(QFrame):
         detect_row.addWidget(self._detect_all_btn)
         panel_layout.addLayout(detect_row)
 
+        self._keep_existing_check = QCheckBox("既存の結果を残して追加検出")
+        self._keep_existing_check.setToolTip(
+            "オンにすると、検出済みの塗りつぶし候補・手動追加分は消さずに、"
+            "新しく見つかったものだけを追加します"
+            "(同じページ・同じ位置・同じ語句のものは重複して追加しません)。\n"
+            "オフの場合は従来通り、検出し直したページの結果を置き換えます。"
+        )
+        self._keep_existing_check.toggled.connect(self.keep_existing_toggled.emit)
+        panel_layout.addWidget(self._keep_existing_check)
+
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
         panel_layout.addWidget(self._progress_bar)
@@ -154,7 +171,23 @@ class PiiPanel(QFrame):
 
         # --- 手動で塗りつぶし候補を追加 ---
         manual_group = QGroupBox("手動で塗りつぶし候補を追加")
-        manual_layout = QHBoxLayout(manual_group)
+        manual_layout = QVBoxLayout(manual_group)
+        entity_row = QHBoxLayout()
+        entity_row.addWidget(QLabel("種別:"))
+        self._manual_entity_combo = QComboBox()
+        for entity_type in ENTITY_TYPES_WITH_MANUAL:
+            self._manual_entity_combo.addItem(get_entity_type_name_ja(entity_type), entity_type)
+        # 既定は「手動」(自動検出のどの種別にも属さないことを明示する)。
+        default_idx = self._manual_entity_combo.findData(MANUAL_ENTITY_TYPE)
+        if default_idx >= 0:
+            self._manual_entity_combo.setCurrentIndex(default_idx)
+        self._manual_entity_combo.setToolTip(
+            "「テキスト候補」「塗り四角」「塗り丸」で追加する候補の種別(色)を選びます。"
+        )
+        entity_row.addWidget(self._manual_entity_combo, 1)
+        manual_layout.addLayout(entity_row)
+
+        tools_row = QHBoxLayout()
         self._mask_markup_btn = QToolButton()
         self._mask_markup_btn.setText("テキスト候補")
         self._mask_markup_btn.setToolTip(
@@ -162,7 +195,7 @@ class PiiPanel(QFrame):
         )
         self._mask_markup_btn.setCheckable(True)
         self._mask_markup_btn.toggled.connect(self.mask_markup_tool_toggled.emit)
-        manual_layout.addWidget(self._mask_markup_btn)
+        tools_row.addWidget(self._mask_markup_btn)
         self._mask_rect_btn = QToolButton()
         self._mask_rect_btn.setText("塗り四角")
         self._mask_rect_btn.setToolTip(
@@ -170,7 +203,7 @@ class PiiPanel(QFrame):
         )
         self._mask_rect_btn.setCheckable(True)
         self._mask_rect_btn.toggled.connect(self.mask_rect_tool_toggled.emit)
-        manual_layout.addWidget(self._mask_rect_btn)
+        tools_row.addWidget(self._mask_rect_btn)
         self._mask_ellipse_btn = QToolButton()
         self._mask_ellipse_btn.setText("塗り丸")
         self._mask_ellipse_btn.setToolTip(
@@ -178,23 +211,30 @@ class PiiPanel(QFrame):
         )
         self._mask_ellipse_btn.setCheckable(True)
         self._mask_ellipse_btn.toggled.connect(self.mask_ellipse_tool_toggled.emit)
-        manual_layout.addWidget(self._mask_ellipse_btn)
+        tools_row.addWidget(self._mask_ellipse_btn)
+        manual_layout.addLayout(tools_row)
         panel_layout.addWidget(manual_group)
-
-        # --- エンティティ種別フィルタ ---
-        filter_group = QGroupBox("表示するエンティティ種別")
-        filter_layout = QVBoxLayout(filter_group)
-        self._filter_checks: dict[str, QCheckBox] = {}
-        for entity_type in ENTITY_TYPES:
-            checkbox = QCheckBox(get_entity_type_name_ja(entity_type))
-            checkbox.setChecked(True)
-            checkbox.toggled.connect(self._on_filter_toggled)
-            filter_layout.addWidget(checkbox)
-            self._filter_checks[entity_type] = checkbox
-        panel_layout.addWidget(filter_group)
 
         # --- 結果一覧 ---
         panel_layout.addWidget(QLabel("検出結果・塗りつぶし対象"))
+        sort_row = QHBoxLayout()
+        sort_row.addWidget(QLabel("並び替え:"))
+        self._sort_field = "page"
+        self._sort_ascending = True
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItem("ページ順", "page")
+        self._sort_combo.addItem("語句順", "text")
+        self._sort_combo.addItem("種別順", "entity")
+        self._sort_combo.currentIndexChanged.connect(self._on_sort_field_changed)
+        sort_row.addWidget(self._sort_combo, 1)
+        self._sort_order_btn = QToolButton()
+        self._sort_order_btn.setCheckable(True)
+        self._sort_order_btn.setText("昇順 ▲")
+        self._sort_order_btn.setToolTip("並び順(昇順/降順)を切り替えます。")
+        self._sort_order_btn.toggled.connect(self._on_sort_order_toggled)
+        sort_row.addWidget(self._sort_order_btn)
+        panel_layout.addLayout(sort_row)
+
         self._result_tree = QTreeWidget()
         self._result_tree.setColumnCount(3)
         self._result_tree.setHeaderLabels(["語句", "種別", "ページ"])
@@ -204,6 +244,10 @@ class PiiPanel(QFrame):
         self._result_tree.itemClicked.connect(self._on_result_item_clicked)
         self._result_tree.itemSelectionChanged.connect(self._update_button_states)
         self._result_tree.customContextMenuRequested.connect(self._on_result_context_menu)
+        # 列ヘッダクリックでも並び替えできるようにする(明示的なコンボ/ボタンと併用)。
+        header = self._result_tree.header()
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._on_result_header_clicked)
         panel_layout.addWidget(self._result_tree, 1)
 
         # --- 操作ボタン ---
@@ -280,9 +324,18 @@ class PiiPanel(QFrame):
             self._progress_bar.setValue(done)
         self._status_label.setText(f"検出中... ({done}/{total})")
 
-    def enabled_entity_filter(self) -> set[str]:
-        """フィルタで表示対象になっているエンティティ種別の集合を返す。"""
-        return {et for et, box in self._filter_checks.items() if box.isChecked()}
+    def keep_existing_checked(self) -> bool:
+        """「既存の結果を残して追加検出」チェックボックスの状態を返す。"""
+        return self._keep_existing_check.isChecked()
+
+    def set_keep_existing_checked(self, checked: bool) -> None:
+        with self._signal_blockers(self._keep_existing_check):
+            self._keep_existing_check.setChecked(bool(checked))
+
+    def selected_manual_entity(self) -> str:
+        """手動追加ツール(テキスト候補/塗り四角/塗り丸)用に選択中のエンティティ種別。"""
+        data = self._manual_entity_combo.currentData()
+        return str(data) if data else MANUAL_ENTITY_TYPE
 
     def set_mask_markup_tool_active(self, enabled: bool) -> None:
         """呼び出し側(mixin)の実際の作成モードにボタンのチェック状態を同期する。"""
@@ -295,7 +348,7 @@ class PiiPanel(QFrame):
             self._mask_ellipse_btn.setChecked(shape_type == ShapeType.ELLIPSE)
 
     def set_results(self, rows: list[PiiResultRow]) -> None:
-        """検出結果・塗りつぶし用図形の一覧を表示中のフィルタに従って再描画する。"""
+        """検出結果・塗りつぶし用図形の一覧を、現在の並び順設定で再描画する。"""
         self._rows = list(rows)
         self._rebuild_result_tree()
         self._update_button_states()
@@ -310,16 +363,42 @@ class PiiPanel(QFrame):
     def _signal_blockers(self, *widgets):
         return _MultiSignalBlocker(widgets)
 
-    def _on_filter_toggled(self, _checked: bool) -> None:
+    def _on_sort_field_changed(self, _index: int) -> None:
+        data = self._sort_combo.currentData()
+        self._sort_field = str(data) if data else "page"
         self._rebuild_result_tree()
-        self.filter_changed.emit()
+
+    def _on_sort_order_toggled(self, checked: bool) -> None:
+        self._sort_order_btn.setText("降順 ▼" if checked else "昇順 ▲")
+        self._sort_ascending = not checked
+        self._rebuild_result_tree()
+
+    def _on_result_header_clicked(self, column: int) -> None:
+        """列ヘッダクリックでもコンボ/昇降順ボタンと同じ並び替えを行えるようにする。
+
+        同じ列を続けてクリックしたときは昇順/降順を反転し、別の列をクリック
+        したときはその列の並び替えキーへ切り替える(方向は維持)。
+        """
+        field = {0: "text", 1: "entity", 2: "page"}.get(column, "page")
+        if field == self._sort_field:
+            self._sort_order_btn.setChecked(not self._sort_order_btn.isChecked())
+            return
+        idx = self._sort_combo.findData(field)
+        if idx >= 0:
+            self._sort_combo.setCurrentIndex(idx)  # _on_sort_field_changed 経由で再描画される
+
+    def _sort_key(self, row: "PiiResultRow"):
+        entity_ja = get_entity_type_name_ja(row.entity or "OTHER")
+        if self._sort_field == "text":
+            return (row.display_text, row.page_num, entity_ja)
+        if self._sort_field == "entity":
+            return (entity_ja, row.page_num, row.display_text)
+        return (row.page_num, row.display_text, entity_ja)  # "page"(既定)
 
     def _rebuild_result_tree(self) -> None:
         self._result_tree.clear()
-        visible_entities = self.enabled_entity_filter()
-        for row in self._rows:
-            if row.entity and row.entity not in visible_entities:
-                continue
+        rows = sorted(self._rows, key=self._sort_key, reverse=not self._sort_ascending)
+        for row in rows:
             entity_ja = get_entity_type_name_ja(row.entity or "OTHER")
             item = QTreeWidgetItem([row.display_text, entity_ja, f"p.{row.page_num + 1}"])
             item.setData(0, _ANNOT_ROLE, row)
@@ -344,11 +423,17 @@ class PiiPanel(QFrame):
         delete_same_action.setEnabled(bool(row.text))
         exclude_action = menu.addAction("除外語句に登録")
         exclude_action.setEnabled(bool(row.text and row.entity))
+        # 追加パターンは自動検出の種別(ENTITY_TYPES)向けの機能のため、
+        # 手動追加分(種別="MANUAL")には出さない。
+        add_pattern_action = menu.addAction("追加パターンに登録")
+        add_pattern_action.setEnabled(bool(row.text and row.entity in ENTITY_TYPES))
         chosen = menu.exec(self._result_tree.viewport().mapToGlobal(pos))
         if chosen is delete_same_action:
             self.delete_same_text_requested.emit(row.text)
         elif chosen is exclude_action:
             self.add_exclusion_requested.emit(row.entity, row.text)
+        elif chosen is add_pattern_action:
+            self.add_pattern_requested.emit(row.entity, row.text)
 
     def _update_button_states(self) -> None:
         has_results = self._result_tree.topLevelItemCount() > 0

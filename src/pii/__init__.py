@@ -14,17 +14,23 @@ PresidioPDF の GUI 非依存な検出エンジンを JusticePDF に統合する
 from src.pii.entity_types import (
     ENTITY_TYPES,
     ENTITY_TYPE_NAMES_JA,
+    MANUAL_ENTITY_TYPE,
     get_entity_type_name_ja,
     get_highlight_color,
 )
+from src.pii.engines import ENGINES, ENGINE_KEYS, is_engine_available
 from src.pii.settings import PiiSettings
 from src.pii.detection_service import PiiDetection, run_detection
 
 __all__ = [
     "ENTITY_TYPES",
     "ENTITY_TYPE_NAMES_JA",
+    "MANUAL_ENTITY_TYPE",
     "get_entity_type_name_ja",
     "get_highlight_color",
+    "ENGINES",
+    "ENGINE_KEYS",
+    "is_engine_available",
     "PiiSettings",
     "PiiDetection",
     "run_detection",

@@ -17,6 +17,8 @@ def test_settings_default_round_trip():
     assert loaded.dedupe_overlap == settings.dedupe_overlap
     assert loaded.dedupe_keep == settings.dedupe_keep
     assert loaded.sudachi_dict_type == settings.sudachi_dict_type
+    assert loaded.enabled_engines == settings.enabled_engines
+    assert loaded.keep_existing_on_detect == settings.keep_existing_on_detect
 
 
 def test_settings_round_trip_with_customizations():
@@ -33,6 +35,9 @@ def test_settings_round_trip_with_customizations():
     settings.dedupe_keep = "first"
     settings.ocr_enabled = True
     settings.ocr_dpi = 400
+    settings.enabled_engines["ginza"] = True
+    settings.enabled_engines["sudachi"] = False
+    settings.keep_existing_on_detect = True
     settings.save()
 
     loaded = PiiSettings.load()
@@ -48,6 +53,9 @@ def test_settings_round_trip_with_customizations():
     assert loaded.dedupe_keep == "first"
     assert loaded.ocr_enabled is True
     assert loaded.ocr_dpi == 400
+    assert loaded.enabled_engines["ginza"] is True
+    assert loaded.enabled_engines["sudachi"] is False
+    assert loaded.keep_existing_on_detect is True
 
 
 def test_color_for_falls_back_to_default_when_unset():
@@ -69,6 +77,21 @@ def test_to_config_overrides_groups_additional_patterns_by_entity():
     assert entity_types == {"OTHER", "PERSON"}
     other_entry = next(v for v in recognizers.values() if v["entity_type"] == "OTHER")
     assert [p["regex"] for p in other_entry["patterns"]] == [r"AAA\d+", r"BBB\d+"]
+
+
+def test_copy_deep_copies_enabled_engines():
+    settings = PiiSettings()
+    copy = settings.copy()
+    copy.enabled_engines["ginza"] = True
+    assert settings.enabled_engines["ginza"] is False
+
+
+def test_to_config_overrides_includes_engines():
+    settings = PiiSettings()
+    settings.enabled_engines["janome"] = True
+    overrides = settings.to_config_overrides()
+    assert overrides["engines"]["janome"] is True
+    assert overrides["engines"]["regex"] is True
 
 
 def test_load_uses_isolated_qsettings_between_tests():
