@@ -14,7 +14,7 @@ JusticePDF の既存プリミティブに合わせて新規に書いた薄いア
 """
 from __future__ import annotations
 
-from src.utils.pdf_utils import get_page_chars
+from src.utils.pdf_utils import _rotate_point, get_page_chars
 
 
 def get_page_text_and_chars(pdf_path: str, page_num: int) -> tuple[str, list[dict]]:
@@ -72,13 +72,23 @@ def offset_span_to_quads(
 # 使えるため、検出結果として quad/オフセットではなく「図形の矩形と重なる
 # 文字」を直接見つける必要がある。判定はいずれも文字bboxの中心点を使う
 # (半分だけ図形に掛かる文字を含めるかどうかの一貫した基準として)。
+#
+# ``rotation``(``ShapeAnnotData.rotation`` と同じ、度・時計回り)を渡すと、
+# 図形が回転していても正しく判定できる。``rect`` は常に回転前の(未回転の)
+# 矩形/外接矩形を表すので、文字bboxの中心点の方を図形の中心を軸に
+# ``-rotation`` だけ逆回転させて図形のローカル座標系に引き戻してから、
+# 同じ判定式(軸並行の矩形/楕円)を使う。
 
 
 def chars_under_rect(
-    chars: list[dict], rect: tuple[float, float, float, float]
+    chars: list[dict],
+    rect: tuple[float, float, float, float],
+    rotation: float = 0.0,
 ) -> list[dict]:
     """bboxの中心が矩形 ``rect`` の内側にある文字を、元の順序を保って返す。"""
     x0, y0, x1, y1 = rect
+    cx0 = (x0 + x1) / 2.0
+    cy0 = (y0 + y1) / 2.0
     result: list[dict] = []
     for ch in chars:
         bbox = ch.get("bbox")
@@ -86,13 +96,17 @@ def chars_under_rect(
             continue
         cx = (bbox[0] + bbox[2]) / 2.0
         cy = (bbox[1] + bbox[3]) / 2.0
+        if rotation:
+            cx, cy = _rotate_point(cx, cy, cx0, cy0, -rotation)
         if x0 <= cx <= x1 and y0 <= cy <= y1:
             result.append(ch)
     return result
 
 
 def chars_under_ellipse(
-    chars: list[dict], rect: tuple[float, float, float, float]
+    chars: list[dict],
+    rect: tuple[float, float, float, float],
+    rotation: float = 0.0,
 ) -> list[dict]:
     """bboxの中心が、``rect`` に内接する楕円の内側にある文字を返す。"""
     x0, y0, x1, y1 = rect
@@ -109,6 +123,8 @@ def chars_under_ellipse(
             continue
         cx = (bbox[0] + bbox[2]) / 2.0
         cy = (bbox[1] + bbox[3]) / 2.0
+        if rotation:
+            cx, cy = _rotate_point(cx, cy, cx0, cy0, -rotation)
         if ((cx - cx0) / rx) ** 2 + ((cy - cy0) / ry) ** 2 <= 1.0:
             result.append(ch)
     return result
@@ -127,14 +143,22 @@ def join_chars_reading_order(chars: list[dict]) -> str:
     return "".join(parts)
 
 
-def text_under_rect(chars: list[dict], rect: tuple[float, float, float, float]) -> str:
+def text_under_rect(
+    chars: list[dict],
+    rect: tuple[float, float, float, float],
+    rotation: float = 0.0,
+) -> str:
     """矩形の下にある文字列を読み順で連結して返す(無ければ空文字)。"""
-    return join_chars_reading_order(chars_under_rect(chars, rect))
+    return join_chars_reading_order(chars_under_rect(chars, rect, rotation))
 
 
-def text_under_ellipse(chars: list[dict], rect: tuple[float, float, float, float]) -> str:
+def text_under_ellipse(
+    chars: list[dict],
+    rect: tuple[float, float, float, float],
+    rotation: float = 0.0,
+) -> str:
     """楕円(rectに内接)の下にある文字列を読み順で連結して返す(無ければ空文字)。"""
-    return join_chars_reading_order(chars_under_ellipse(chars, rect))
+    return join_chars_reading_order(chars_under_ellipse(chars, rect, rotation))
 
 
 def extract_text_under_shape(pdf_path: str, page_num: int, shape) -> str:
@@ -151,5 +175,5 @@ def extract_text_under_shape(pdf_path: str, page_num: int, shape) -> str:
     if not chars:
         return ""
     if shape.shape_type == ShapeType.ELLIPSE:
-        return text_under_ellipse(chars, shape.rect)
-    return text_under_rect(chars, shape.rect)
+        return text_under_ellipse(chars, shape.rect, shape.rotation)
+    return text_under_rect(chars, shape.rect, shape.rotation)

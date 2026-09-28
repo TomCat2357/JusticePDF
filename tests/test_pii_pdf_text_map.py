@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace as dataclass_replace
+
 import fitz
 import pytest
 
@@ -166,6 +168,64 @@ def test_extract_text_under_shape_non_rect_ellipse_returns_empty(tmp_path):
         opacity=1.0,
     )
     assert extract_text_under_shape(str(pdf_path), 0, shape) == ""
+
+
+def test_chars_under_rect_rotation_follows_rotated_footprint():
+    """rotation を渡すと、回転前の矩形ではなく回転後の向きで判定されること。"""
+    chars = [
+        _char("A", (95.0, 95.0, 105.0, 105.0)),  # 中心(100,100) → 図形の中心
+        _char("B", (0.0, 95.0, 10.0, 105.0)),  # 中心(5,100) → 回転前は内側、
+        # 回転後(45度)は菱形の外側になる想定。
+    ]
+    rect = (50.0, 50.0, 150.0, 150.0)  # 中心(100,100)の正方形
+    # 回転無し: どちらも内側(Bは矩形の内側)。
+    assert [c["c"] for c in chars_under_rect(chars, rect)] == ["A"]
+    # 45度回転させると B は菱形の外側になり選ばれない。
+    selected = chars_under_rect(chars, rect, rotation=45.0)
+    assert [c["c"] for c in selected] == ["A"]
+
+
+def test_chars_under_ellipse_rotation_follows_rotated_footprint():
+    """横長の楕円を90度回転させると縦長になり、判定もそれに従うこと。"""
+    ellipse_rect = (50.0, 80.0, 150.0, 120.0)  # 横長(100x40)、中心(100,100)
+    chars = [
+        _char("V", (95.0, 55.0, 105.0, 65.0)),  # 中心(100,60) → 縦方向に離れた点
+        _char("H", (135.0, 95.0, 145.0, 105.0)),  # 中心(140,100) → 横方向に離れた点
+    ]
+    # 回転無し(横長のまま): 横方向の点は内側、縦方向の点は外側。
+    assert [c["c"] for c in chars_under_ellipse(chars, ellipse_rect)] == ["H"]
+    # 90度回転(縦長になる): 縦方向の点が内側、横方向の点が外側に入れ替わる。
+    selected = chars_under_ellipse(chars, ellipse_rect, rotation=90.0)
+    assert [c["c"] for c in selected] == ["V"]
+
+
+def test_extract_text_under_shape_rotated_rectangle(tmp_path):
+    """回転した矩形図形は、回転後の向きで文字を抽出すること。"""
+    pdf_path = tmp_path / "shape_text_rot.pdf"
+    _make_text_pdf(pdf_path, "SECRETWORD")
+    _, chars = get_page_text_and_chars(str(pdf_path), 0)
+    x0 = min(ch["bbox"][0] for ch in chars) - 1
+    y0 = min(ch["bbox"][1] for ch in chars) - 1
+    x1 = max(ch["bbox"][2] for ch in chars) + 1
+    y1 = max(ch["bbox"][3] for ch in chars) + 1
+
+    # rotation=0 なら文字が抽出できる矩形をそのまま回転無しで確認(前提確認)。
+    shape = ShapeAnnotData(
+        page_num=0,
+        xref=0,
+        rect=(x0, y0, x1, y1),
+        shape_type=ShapeType.RECTANGLE,
+        stroke_color=(0.0, 0.0, 0.0),
+        fill_color=None,
+        stroke_width=1.0,
+        opacity=1.0,
+        rotation=0.0,
+    )
+    assert extract_text_under_shape(str(pdf_path), 0, shape) == "SECRETWORD"
+
+    # 360度回転は見た目上は無回転と同じ位置に戻るはず。
+    rotated = dataclass_replace(shape, rotation=360.0)
+    assert extract_text_under_shape(str(pdf_path), 0, rotated) == "SECRETWORD"
 
 
 def test_extract_text_under_shape_rectangle_no_text_area(tmp_path):
