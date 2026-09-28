@@ -50,6 +50,39 @@ def test_detects_location():
     assert location_hits, results
 
 
+def test_disabling_sudachi_engine_stops_pos_based_detection():
+    """要望3: 検出エンジンを個別にON/OFFできること(形態素解析エンジンの無効化)。"""
+    settings = PiiSettings()
+    settings.enabled_engines["sudachi"] = False
+    results = _analyze("東京都で開催されました。", settings)
+    assert results == []
+
+
+def test_disabling_regex_engine_stops_regex_based_detection():
+    settings = PiiSettings()
+    settings.enabled_engines["regex"] = False
+    results = _analyze("電話番号は090-1234-5678です。", settings)
+    phone_hits = [r for r in results if r["entity_type"] == "PHONE_NUMBER"]
+    assert phone_hits == []
+
+
+def test_disabling_datetime_engine_stops_datetime_detection():
+    settings = PiiSettings()
+    settings.enabled_engines["datetime"] = False
+    results = _analyze("令和6年4月1日に会議を行いました。", settings)
+    assert "DATE_TIME" not in {r["entity_type"] for r in results}
+
+
+def test_additional_pattern_still_applies_even_with_all_engines_disabled():
+    """追加パターンは「エンジン」の枠外で常に適用される(部分再検出機能の前提)。"""
+    settings = PiiSettings()
+    for key in settings.enabled_engines:
+        settings.enabled_engines[key] = False
+    settings.additional_patterns = [("OTHER", r"社員番号[0-9]{4}")]
+    results = _analyze("社員番号1234を確認してください。", settings)
+    assert [r["text"] for r in results] == ["社員番号1234"]
+
+
 def test_entity_filter_excludes_disabled_types():
     settings = PiiSettings()
     settings.enabled_entities["PERSON"] = False
@@ -75,3 +108,20 @@ def test_additional_pattern_detects_custom_entity():
     other_hits = [r for r in results if r["entity_type"] == "OTHER"]
     assert other_hits
     assert other_hits[0]["text"] == "社員番号1234"
+
+
+def test_additional_pattern_detected_even_when_immediately_adjacent_to_date():
+    """回帰テスト: 追加パターンの直後に区切り文字無しで日付が続いても検出されること。
+
+    表組みのPDFでは列同士がテキスト抽出時に区切り文字無しで連結されることが
+    あり(例:「公務員」の直後に区切り無しで「昭和52年11月23日」が続く)、
+    以前は重複除去(src.pii.dedupe)の境界判定の不具合により、隣接するだけで
+    重ならない検出同士が誤って「重複」扱いされ、短い方(追加パターンの検出)が
+    消えてしまっていた。
+    """
+    settings = PiiSettings()
+    settings.additional_patterns = [("PERSON", "公務員")]
+    results = _analyze("丸尾幸男公務員昭和52年11月23日", settings)
+    entity_types_by_text = {r["text"]: r["entity_type"] for r in results}
+    assert entity_types_by_text.get("公務員") == "PERSON"
+    assert "DATE_TIME" in {r["entity_type"] for r in results}

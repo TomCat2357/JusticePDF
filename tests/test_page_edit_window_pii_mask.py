@@ -74,7 +74,7 @@ def test_mask_markup_tool_creates_candidate_from_selection_and_undo(qtbot, tmp_p
 
     candidates = list_pii_markup_annots(str(pdf_path), 0)
     assert len(candidates) == 1
-    assert candidates[0].pii_entity == "OTHER"
+    assert candidates[0].pii_entity == "MANUAL"
     assert candidates[0].pii_text == "SECRET"
     # 通常のマーカーとしても一覧に出る(list_markup_annotsのスーパーセット)。
     assert len(list_markup_annots(str(pdf_path), 0)) == 1
@@ -155,7 +155,7 @@ def test_mask_rect_tool_creates_shape_and_undo(qtbot, tmp_path):
     shapes = list_pii_mask_shapes(str(pdf_path), 0)
     assert len(shapes) == 1
     assert shapes[0].shape_type == ShapeType.RECTANGLE
-    assert shapes[0].pii_entity == "OTHER"
+    assert shapes[0].pii_entity == "MANUAL"
     # 矩形の下にある文字("SECRET")が抽出されてキャッシュされていること。
     assert "SECRET" in shapes[0].pii_text
     # 通常の図形一覧のスーパーセットとしても見える。
@@ -205,7 +205,7 @@ def test_mask_ellipse_tool_creates_shape(qtbot, tmp_path):
     shapes = list_pii_mask_shapes(str(pdf_path), 0)
     assert len(shapes) == 1
     assert shapes[0].shape_type == ShapeType.ELLIPSE
-    assert shapes[0].pii_entity == "OTHER"
+    assert shapes[0].pii_entity == "MANUAL"
 
 
 @pytest.mark.usefixtures("qtbot")
@@ -259,7 +259,7 @@ def test_mask_shape_tool_does_not_create_normal_shape(qtbot, tmp_path):
 
     all_shapes = list_shape_annots(str(pdf_path), 0)
     assert len(all_shapes) == 1
-    assert all_shapes[0].pii_entity == "OTHER"
+    assert all_shapes[0].pii_entity == "MANUAL"
 
 
 # ---------------------------------------------------------------------------
