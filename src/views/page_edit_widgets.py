@@ -568,6 +568,9 @@ class ZoomPageWidget(QWidget):
         # 個人情報検出の塗りつぶし候補ホバー状態(種別ラベルはボックス内に描かず、
         # ホバー時のツールチップでのみ表示する)。
         self._hover_pii_key: tuple | None = None
+        # 塗りつぶし候補の表示モード("mark": 種別色の薄い塗り+枠 / "black": 黒塗り /
+        # "hidden": 描かない)。表示上の切り替えのみでPDFには影響しない。
+        self._pii_display_mode = "mark"
         # 校正コールアウト配置モード（クリックで挿入位置を指定）。
         self._callout_create_mode = False
         # マークアップ/消しゴムの連続モード。有効時は注釈のヒットテスト・リンク操作を
@@ -1250,6 +1253,7 @@ class ZoomPageWidget(QWidget):
         if annot.pii_entity and annot.markup_type == MarkupType.HIGHLIGHT:
             # 塗りつぶし候補: 通常のマーカーと混同しないよう、種別色の薄い塗り+
             # 濃い枠線で描く(種別ラベルの文字は描かず、下の文字を隠さない)。
+            # 表示モードが「黒塗り」なら黒で塗りつぶし、「非表示」なら描かない。
             self._paint_mask_candidate_rects(
                 painter, [self._rect_tuple_to_qrectf(q) for q in annot.quads], base
             )
@@ -1308,7 +1312,13 @@ class ZoomPageWidget(QWidget):
         (本文を隠してしまうため。種別はホバー時のツールチップで確認できる)。
         ``page_rects`` はPDF座標系(display座標系)の矩形群。
         """
-        if not page_rects:
+        if not page_rects or self._pii_display_mode == "hidden":
+            return
+        if self._pii_display_mode == "black":
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0))
+            for page_rect in page_rects:
+                painter.drawRect(self._page_rect_to_widget_rect(page_rect))
             return
         fill, border = self._mask_candidate_colors(accent)
         pen = QPen(border)
@@ -1472,12 +1482,20 @@ class ZoomPageWidget(QWidget):
             # 以前は種別の既定色テーブルを直接参照しており、設定でのカスタム色が
             # 反映されない不具合があった)を使う。種別ラベルの文字は描かない
             # (下の文字を隠してしまうため。ホバー時のツールチップで確認できる)。
-            accent = self._annotation_color(shape.stroke_color, opacity=1.0) or QColor(200, 200, 200)
-            fill, border = self._mask_candidate_colors(accent)
-            pen = QPen(border)
-            pen.setWidthF(max(1.4, 1.4 * self._zoom_factor))
-            painter.setPen(pen)
-            painter.setBrush(QBrush(fill))
+            # 表示モードが「黒塗り」なら黒で塗りつぶし、「非表示」なら描かない。
+            if self._pii_display_mode == "hidden":
+                painter.restore()
+                return
+            if self._pii_display_mode == "black":
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor(0, 0, 0)))
+            else:
+                accent = self._annotation_color(shape.stroke_color, opacity=1.0) or QColor(200, 200, 200)
+                fill, border = self._mask_candidate_colors(accent)
+                pen = QPen(border)
+                pen.setWidthF(max(1.4, 1.4 * self._zoom_factor))
+                painter.setPen(pen)
+                painter.setBrush(QBrush(fill))
             if shape.shape_type == ShapeType.ELLIPSE:
                 painter.drawEllipse(paint_rect)
             else:
@@ -1717,6 +1735,9 @@ class ZoomPageWidget(QWidget):
                     if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
                         return selected, handle
         for annot in reversed(self._annotations):
+            if self._pii_hidden(annot):
+                # 非表示の塗りつぶし候補はクリックを奪わず、下のテキスト選択を妨げない。
+                continue
             if isinstance(annot, ShapeAnnotData) and annot.shape_type == ShapeType.LINE:
                 if self._line_hit_test(annot, pos):
                     return annot, "move"
@@ -2437,6 +2458,24 @@ class ZoomPageWidget(QWidget):
             logger.exception("Error in ZoomPageWidget.mouseMoveEvent")
         event.accept()
 
+    def pii_display_mode(self) -> str:
+        return self._pii_display_mode
+
+    def set_pii_display_mode(self, mode: str) -> None:
+        """塗りつぶし候補の表示モードを切り替える("mark" | "black" | "hidden")。"""
+        mode = mode if mode in ("mark", "black", "hidden") else "mark"
+        if mode == self._pii_display_mode:
+            return
+        self._pii_display_mode = mode
+        if self._hover_pii_key is not None:
+            self._hover_pii_key = None
+            QToolTip.hideText()
+        self.update()
+
+    def _pii_hidden(self, annot) -> bool:
+        """非表示モードで、描画・ヒットテストの対象外にする塗りつぶし候補か。"""
+        return self._pii_display_mode == "hidden" and bool(getattr(annot, "pii_entity", ""))
+
     def _pii_target_at(self, pos: QPoint) -> "TextMarkupAnnotData | ShapeAnnotData | None":
         """塗りつぶし候補(マーカー)・塗りつぶし用図形のうち、指定位置にあるものを返す。
 
@@ -2444,6 +2483,8 @@ class ZoomPageWidget(QWidget):
         ツールチップ表示に使うヒットテスト(``_annotation_hit_test`` の
         マーカー/矩形判定を、pii_entity付きのものだけに絞った簡易版)。
         """
+        if self._pii_display_mode == "hidden":
+            return None
         for annot in reversed(self._annotations):
             if not getattr(annot, "pii_entity", ""):
                 continue
