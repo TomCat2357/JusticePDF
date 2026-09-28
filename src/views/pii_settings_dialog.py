@@ -154,9 +154,8 @@ class PiiSettingsDialog(QDialog):
 
         以前のPresidioPDFでは複数のエンジン/認識器を選択できたが、JusticePDFへの
         移植時に単一パイプラインへ統合され選べなくなっていたため、ここで
-        ``src.pii.engines.ENGINES`` を選択式に戻す。GiNZA/Janome等の未導入の
-        エンジンはチェックボックスをグレーアウトし、選んでもエラーにならない
-        ことを明示する。
+        ``src.pii.engines.ENGINES`` を選択式に戻す。未導入のエンジン(SudachiPy
+        が入っていない環境など)はチェックボックスをグレーアウトする。
         """
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -202,17 +201,9 @@ class PiiSettingsDialog(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        layout.addWidget(QLabel("除外ワード(部分一致で検出結果から除外)"))
-        self._exclusion_list = QListWidget()
-        self._exclusion_list.addItems(self._settings.text_exclusions)
-        layout.addWidget(self._exclusion_list)
-        layout.addLayout(
-            self._build_add_remove_row(
-                self._exclusion_list, self._settings.text_exclusions, "除外ワードを入力"
-            )
+        layout.addWidget(
+            QLabel("除外パターン(正規表現・部分一致で検出結果から除外。記号は \\ でエスケープ)")
         )
-
-        layout.addWidget(QLabel("除外パターン(正規表現)"))
         self._exclusion_regex_list = QListWidget()
         self._exclusion_regex_list.addItems(self._settings.text_exclusions_regex)
         layout.addWidget(self._exclusion_regex_list)

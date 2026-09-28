@@ -82,6 +82,10 @@ from src.utils.pdf_utils import (
     AnyAnnotData,
     list_ink_annot_xrefs,
     list_ink_annot_xrefs_by_page,
+    list_pii_markup_annots,
+    list_pii_mask_shapes,
+    get_page_size_points,
+    _get_file_cache_token,
     list_shape_annots,
     create_shape_annot,
     replace_shape_annot,
@@ -122,6 +126,7 @@ from src.views.page_edit_widgets import (
     NoteContentEdit,
     PageThumbnail,
     ZoomPageWidget,
+    paint_pii_mask_overlay,
     _apply_block_line_height,
     _build_freetext_document,
     _freetext_pixel_size,
@@ -251,6 +256,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin):
         # 初回アクセス時に文書全体を一度だけ開いて集計する。ページ構成が変わる
         # 操作(読み込み直し・削除等)の際に None へ戻して再集計させる。
         self._ink_xrefs_by_page_cache: dict[int, list[int]] | None = None
+        # ページ一覧サムネイルに重ねる塗りつぶし対象(個人情報検出)のページ別
+        # 集計。塗りつぶし対象の追加/削除はファイル保存を伴うので、ファイルの
+        # キャッシュトークン(mtime/size)が変われば自動的に再集計する。
+        self._pii_targets_by_page_cache: (
+            "tuple[tuple[int, int, int], dict[int, tuple[tuple[float, float], list]]] | None"
+        ) = None
         self._zoom_annotation_form_sync = False
         self._zoom_annotation_text_commit_in_progress = False
         self._zoom_annotation_new_btn = None
@@ -1011,6 +1022,25 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin):
             self._ink_xrefs_by_page_cache = list_ink_annot_xrefs_by_page(self._pdf_path)
         return self._ink_xrefs_by_page_cache
 
+    def _get_pii_targets_by_page(self) -> "dict[int, tuple[tuple[float, float], list]]":
+        """ページ番号 -> (表示座標系のページサイズ, 塗りつぶし対象の一覧)。"""
+        token = _get_file_cache_token(self._pdf_path)
+        cached = self._pii_targets_by_page_cache
+        if cached is not None and cached[0] == token:
+            return cached[1]
+        grouped: dict[int, list] = {}
+        for target in [
+            *list_pii_markup_annots(self._pdf_path),
+            *list_pii_mask_shapes(self._pdf_path),
+        ]:
+            grouped.setdefault(target.page_num, []).append(target)
+        by_page = {
+            pn: (get_page_size_points(self._pdf_path, pn), targets)
+            for pn, targets in grouped.items()
+        }
+        self._pii_targets_by_page_cache = (token, by_page)
+        return by_page
+
     def _invalidate_and_requeue_thumbnails(self) -> None:
         """全サムネイルを未読込状態に戻し、再描画キューへ積み直す。"""
         self._reset_thumbnail_render_queue()
@@ -1034,18 +1064,31 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin):
             batch.append(page_num)
         if batch:
             # 手書き(Ink)注釈を非表示にする設定なら、対象ページ分だけ xref を隠す。
-            hide_xrefs_by_page = None
-            if not self._show_ink_annots:
-                ink_xrefs_by_page = self._get_ink_xrefs_by_page()
-                hide_xrefs_by_page = {
-                    pn: ink_xrefs_by_page[pn] for pn in batch if ink_xrefs_by_page.get(pn)
-                }
+            # 塗りつぶし対象(個人情報検出)も実PDF注釈の暗く薄い見た目では縮小時に
+            # 判別できないため、ページ画像からは隠して後から見やすく重ね描きする。
+            pii_targets_by_page = self._get_pii_targets_by_page()
+            hide_xrefs_by_page: dict[int, set[int]] = {}
+            ink_xrefs_by_page = None if self._show_ink_annots else self._get_ink_xrefs_by_page()
+            for pn in batch:
+                xrefs: set[int] = set()
+                if ink_xrefs_by_page:
+                    xrefs.update(ink_xrefs_by_page.get(pn, ()))
+                if pn in pii_targets_by_page:
+                    xrefs.update(t.xref for t in pii_targets_by_page[pn][1])
+                if xrefs:
+                    hide_xrefs_by_page[pn] = xrefs
             pixmaps = render_page_thumbnails_batch(
-                self._pdf_path, batch, self._thumb_size, hide_xrefs=hide_xrefs_by_page
+                self._pdf_path, batch, self._thumb_size, hide_xrefs=hide_xrefs_by_page or None
             )
             for pn in batch:
                 if pn < len(self._thumbnails):
-                    self._thumbnails[pn].set_pixmap_direct(pixmaps.get(pn, QPixmap()))
+                    pixmap = pixmaps.get(pn, QPixmap())
+                    if pn in pii_targets_by_page:
+                        page_size, targets = pii_targets_by_page[pn]
+                        pixmap = paint_pii_mask_overlay(
+                            pixmap, targets, page_size, self._zoom_label.pii_display_mode()
+                        )
+                    self._thumbnails[pn].set_pixmap_direct(pixmap)
         self._schedule_thumbnail_render()
 
     def _on_grid_viewport_changed(self, _value: int) -> None:
