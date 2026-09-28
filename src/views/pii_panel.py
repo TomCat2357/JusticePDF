@@ -81,9 +81,9 @@ class PiiPanel(QFrame):
     open_changed(bool)
         ドロワーの開閉が切り替わったとき発火。
     detect_current_page_requested()
-        「現在のページを検出」ボタン押下時。
+        「このページだけ検出」ボタン押下時。
     detect_all_pages_requested()
-        「すべてのページを検出」ボタン押下時。
+        「全ページを検出」ボタン押下時。
     mask_markup_tool_toggled(bool)
         「テキスト候補」ツール(手動でテキストを選択→塗りつぶし候補化)のON/OFF。
     mask_rect_tool_toggled(bool)
@@ -161,13 +161,18 @@ class PiiPanel(QFrame):
         panel_layout.addWidget(QLabel("個人情報検出"))
 
         # --- 検出実行 ---
+        # 検出範囲は左から「全ページ」→「このページだけ」の順に並べる。追加検出
+        # パターン登録後の3択ダイアログ(全ページ/このページだけ/登録のみ)と
+        # 表記を揃え、範囲の選び方を一貫させる。
         detect_row = QHBoxLayout()
-        self._detect_current_btn = QPushButton("現在のページを検出")
-        self._detect_current_btn.clicked.connect(self.detect_current_page_requested.emit)
-        detect_row.addWidget(self._detect_current_btn)
-        self._detect_all_btn = QPushButton("すべてのページを検出")
+        self._detect_all_btn = QPushButton("全ページを検出")
+        self._detect_all_btn.setToolTip("すべてのページを個人情報検出します。")
         self._detect_all_btn.clicked.connect(self.detect_all_pages_requested.emit)
         detect_row.addWidget(self._detect_all_btn)
+        self._detect_current_btn = QPushButton("このページだけ検出")
+        self._detect_current_btn.setToolTip("表示中のページだけを個人情報検出します。")
+        self._detect_current_btn.clicked.connect(self.detect_current_page_requested.emit)
+        detect_row.addWidget(self._detect_current_btn)
         panel_layout.addLayout(detect_row)
 
         self._keep_existing_check = QCheckBox("既存の結果を残して追加検出")
@@ -234,7 +239,17 @@ class PiiPanel(QFrame):
         panel_layout.addWidget(manual_group)
 
         # --- 結果一覧 ---
-        panel_layout.addWidget(QLabel("検出結果・塗りつぶし対象"))
+        # 元の「検出結果・塗りつぶし対象」は何を指しているか分かりにくいとの
+        # 要望を受け、一覧の実際の役割(自動検出+手動追加分をまとめた、
+        # 「エクスポート時に塗りつぶされる対象そのもの」の一覧であり、
+        # チェックボックスでの取捨選択は無い)が伝わる表記に変更した。
+        result_label = QLabel("塗りつぶし対象一覧")
+        result_label.setToolTip(
+            "自動検出された箇所と手動で追加した候補/図形の一覧です。\n"
+            "ここに表示されている項目はすべて塗りつぶし(黒塗り/文字削除)の対象になります。\n"
+            "不要な項目は選択して「選択を削除」で一覧から外してください。"
+        )
+        panel_layout.addWidget(result_label)
         display_row = QHBoxLayout()
         display_row.addWidget(QLabel("表示:"))
         self._display_mode_combo = QComboBox()
