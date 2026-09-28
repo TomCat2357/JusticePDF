@@ -353,15 +353,18 @@ class PiiSettingsDialog(QDialog):
         layout = QVBoxLayout(widget)
 
         available = ocr_support.is_ocr_available()
-        group = QGroupBox("OCR (RapidOCR) - 任意機能")
+        group = QGroupBox("OCR (RapidOCR)")
         group_layout = QVBoxLayout(group)
         if available:
             status = QLabel("RapidOCR が利用可能です。")
         else:
+            # RapidOCR/onnxruntimeは必須依存(pyproject.tomlのdependencies)だが、
+            # 実行環境によっては導入に失敗している場合もあるため、その保険として
+            # 導入手順を案内する(`uv sync` で通常は自動的に入る)。
             status = QLabel(
-                "RapidOCR が導入されていません。テキストレイヤの無いページ"
-                "(スキャン画像等)でOCRを使うには、"
-                "`uv sync --extra ocr` を実行してください。"
+                "RapidOCR が利用できません。テキストレイヤの無いページ"
+                "(スキャン画像等)でOCRを使うには、`uv sync` を実行して"
+                "依存関係を入れ直してください。"
             )
             status.setWordWrap(True)
         group_layout.addWidget(status)

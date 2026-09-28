@@ -34,15 +34,35 @@ def _sudachi_available() -> bool:
 
 
 def _ginza_available() -> bool:
-    # GiNZA本体はspaCyのモデルパッケージ(ja_ginza / ja_ginza_electra)として
-    # 配布されるため、spaCyとモデルの両方が入っているかで判定する。
-    return _module_available("spacy") and (
-        _module_available("ja_ginza") or _module_available("ja_ginza_electra")
-    )
+    """spaCy/GiNZAが実際に読み込めるかどうかを判定する。
+
+    パッケージが `pip`/`uv` で導入されていても、実行系のPythonバージョンと
+    依存(pydantic等)の組み合わせによっては import 自体が例外を送出することが
+    ある(実例: Python 3.14 と pydantic 2.x の組み合わせで、pydanticが内部で
+    使う ``typing._eval_type`` の引数がPython 3.14で非互換になり、spaCyの
+    import 中に ``TypeError`` が発生する。2026-09時点でPyPIに公開されている
+    最新版・ベータ版のpydanticでも未修正)。``find_spec`` によるモジュール
+    存在チェックだけでは「入っているのに動かない」状態を「利用可能」と誤判定
+    してしまうため、``src.pii.ginza_recognizer.is_ready()`` で実際に読み込みを
+    試みた結果を使う(初回のみコストがかかるが、結果はプロセス内でキャッシュ
+    されるため以降は一瞬で返る)。
+    """
+    try:
+        from src.pii.ginza_recognizer import is_ready
+
+        return is_ready()
+    except Exception:
+        return False
 
 
 def _janome_available() -> bool:
-    return _module_available("janome")
+    """Janomeが実際に読み込めるかどうかを判定する(理由は_ginza_availableと同様)。"""
+    try:
+        from src.pii.janome_recognizer import is_ready
+
+        return is_ready()
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True, slots=True)

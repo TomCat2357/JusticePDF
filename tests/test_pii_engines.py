@@ -1,10 +1,15 @@
 """src.pii.engines / ginza_recognizer / janome_recognizer のテスト。
 
-GiNZA・Janomeはこのプロジェクトの必須依存ではないため、未導入環境でも
-エラーにならず「検出0件」を返すことを確認する(導入されていれば、その分は
-別途手動確認が必要)。
+GiNZA・Janomeは(要望によりpyproject.tomlでは必須依存だが)実行環境によっては
+実際には読み込めないことがあるため、未導入/読み込み失敗時でもエラーになら
+ず「検出0件」を返すことを確認する。さらに、実際に読み込める環境では
+架空のダミーデータで検出・ラベル対応の妥当性も確認する
+(``src.pii.engines.is_engine_available`` で導入済みかどうかを判定してから
+skipif する。CI/開発環境の状況に応じてどちらの経路もテストされる)。
 """
 from __future__ import annotations
+
+import pytest
 
 from src.pii import engines
 from src.pii.ginza_recognizer import detect_ginza_entities
@@ -38,3 +43,32 @@ def test_ginza_recognizer_never_raises_when_unavailable():
 def test_janome_recognizer_never_raises_when_unavailable():
     result = detect_janome_entities("山田太郎さんに連絡してください。", ["PERSON"])
     assert isinstance(result, list)
+
+
+@pytest.mark.skipif(
+    not engines.is_engine_available("janome"), reason="janome が実際には読み込めない環境"
+)
+def test_janome_recognizer_detects_person_and_location_with_correct_offsets():
+    """導入済み環境限定: Janomeのラベル対応(人名→PERSON/地域→LOCATION)の妥当性確認。"""
+    text = "山田太郎さんは東京都に住んでいます。"
+    results = detect_janome_entities(text, ["PERSON", "LOCATION", "PROPER_NOUN"])
+    by_text = {r["text"]: r for r in results}
+    assert "PERSON" in {r["entity_type"] for r in results}
+    assert "LOCATION" in {r["entity_type"] for r in results}
+    # オフセットが実際の出現位置と一致すること(Janomeは自前でオフセットを
+    # 提供しないため、src.pii.janome_recognizer が text.find で復元している)。
+    for r in results:
+        assert text[r["start"] : r["end"]] == r["text"]
+
+
+@pytest.mark.skipif(
+    not engines.is_engine_available("ginza"), reason="spaCy/GiNZAが実際には読み込めない環境"
+)
+def test_ginza_recognizer_detects_person_with_correct_offsets():
+    """導入済み環境限定: GiNZAのラベル対応(PERSON等)の妥当性確認。"""
+    text = "山田太郎さんは東京都に住んでいます。"
+    results = detect_ginza_entities(text, ["PERSON", "LOCATION"])
+    assert results, "GiNZAが利用可能なのに検出結果が0件だった"
+    for r in results:
+        assert text[r["start"] : r["end"]] == r["text"]
+        assert r["entity_type"] in {"PERSON", "LOCATION"}

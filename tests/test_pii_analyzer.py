@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from src.pii.analyzer import Analyzer
 from src.pii.config_manager import ConfigManager
 from src.pii.settings import PiiSettings
@@ -71,6 +73,32 @@ def test_disabling_datetime_engine_stops_datetime_detection():
     settings.enabled_engines["datetime"] = False
     results = _analyze("令和6年4月1日に会議を行いました。", settings)
     assert "DATE_TIME" not in {r["entity_type"] for r in results}
+
+
+def test_janome_engine_detects_person_when_enabled():
+    """導入済み環境限定: 「janome」エンジン単体でPERSONが検出できること。"""
+    from src.pii import engines as pii_engines
+
+    if not pii_engines.is_engine_available("janome"):
+        pytest.skip("janome が実際には読み込めない環境")
+    settings = PiiSettings()
+    for key in settings.enabled_engines:
+        settings.enabled_engines[key] = key == "janome"
+    results = _analyze("山田太郎さんは東京都に住んでいます。", settings)
+    assert "PERSON" in {r["entity_type"] for r in results}
+
+
+def test_ginza_engine_detects_person_when_enabled():
+    """導入済み環境限定: 「ginza」エンジン単体でPERSONが検出できること。"""
+    from src.pii import engines as pii_engines
+
+    if not pii_engines.is_engine_available("ginza"):
+        pytest.skip("spaCy/GiNZAが実際には読み込めない環境")
+    settings = PiiSettings()
+    for key in settings.enabled_engines:
+        settings.enabled_engines[key] = key == "ginza"
+    results = _analyze("山田太郎さんは東京都に住んでいます。", settings)
+    assert "PERSON" in {r["entity_type"] for r in results}
 
 
 def test_additional_pattern_still_applies_even_with_all_engines_disabled():

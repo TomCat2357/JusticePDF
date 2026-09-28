@@ -13,16 +13,37 @@ dependencies = [
     "pywin32==312; platform_system == 'Windows'",
     # 個人情報(PII)検出エンジン(src/pii、PresidioPDFから移植)が使用する依存。
     # 形態素解析ベースのPII検出(sudachipy)と日本の電話番号妥当性検証(phonenumbers)。
-    "sudachipy>=0.6.11",
+    # sudachipy は 0.7.0 系だと下のGiNZA(ja-ginza/ginza)が要求する上限
+    # (`sudachipy<0.7.0`)と衝突するため、両者が同時に満たせる0.6.x系に留める
+    # (`uv lock` でも実際に0.6.11へ解決される。0.6.11はJusticePDF独自の検出
+    # コード(src/pii/sudachi_tokenizer.py)でも動作確認済み)。
+    "sudachipy>=0.6.11,<0.7.0",
     "sudachidict-core>=20240409",
     "phonenumbers>=8.13.0",
-]
-
-[project.optional-dependencies]
-# OCR(RapidOCR v3)。テキストレイヤの無いページ(スキャン画像等)を対象に、
-# 個人情報検出用のテキスト・座標を補完する任意機能。未導入でもアプリは
-# 通常起動し、PII検出ドロワーのOCRオプションが無効表示になるだけ。
-ocr = [
+    # GiNZA/spaCyによる補助統計的固有表現認識(人名・地名)。PresidioPDFは
+    # Python 3.14移行(2026-06)の際にspaCy/GiNZAを撤去してSudachiPyへ一本化した
+    # (当時 spaCy 系が3.14のcp314 wheelを欠いていたため)。2026-09時点では
+    # spacy 3.8系・ginza/ja-ginza共にcp314向けの実wheelがPyPIに存在し「pip/uvで
+    # インストール」自体は成功するため、JusticePDFでは検出精度向上のため必須
+    # 依存として採用する。ただしCPython 3.14では、pydantic(2.13.5時点、
+    # 2.14.0b2でも未修正)がspaCyの起動時に内部で呼ぶ`typing._eval_type`の
+    # 引数(`prefer_fwd_module`)がPython 3.14で非互換になっており、
+    # `import spacy`自体が失敗することを実機確認済み(2026-09時点の既知の
+    # 上流未修正バグ)。壊れていても`src.pii.engines`/`src.pii.ginza_recognizer`
+    # が例外を捕捉して「未導入」と同様にグレーアウト・0件検出にフォールバック
+    # するためアプリ自体はクラッシュしないが、実質的にこのエンジンが機能する
+    # のは将来pydantic側が修正された後になる可能性がある。
+    # ja-ginza が `spacy<4.0.0,>=3.4.4` / `sudachipy<0.7.0,>=0.6.2` を要求するため、
+    # 上のsudachipy制約・下のspacy制約はこれに合わせている。
+    "ginza>=5.2.0,<5.3.0",
+    "ja-ginza>=5.2.0,<5.3.0",
+    "spacy>=3.4.4,<4.0.0",
+    # Janome形態素解析(純Python)によるSudachiPyの代替/補完的な固有名詞検出。
+    # ネイティブ拡張を持たないため追加のwheel互換性リスクが無い。
+    "janome>=0.5.0",
+    # OCR(RapidOCR v3)。テキストレイヤの無いページ(スキャン画像等)を対象に、
+    # 個人情報検出用のテキスト・座標を補完する。個人情報の見落としを防ぐため、
+    # (PresidioPDFでは任意extraだが)JusticePDFでは必須依存として同梱する。
     "rapidocr>=3.8.1",
     "onnxruntime>=1.22.0",
 ]

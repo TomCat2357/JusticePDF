@@ -293,6 +293,11 @@ function Install-ProjectDeps([string]$VenvPython)
     $oldTmp = [Environment]::GetEnvironmentVariable("TMP", "Process")
     $oldTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
 
+    # pyproject.toml の [project] dependencies には、個人情報検出エンジンが
+    # 使う GiNZA/spaCy/Janome/RapidOCR も含まれる(すべて必須依存)。以前は
+    # OCR(rapidocr/onnxruntime)だけ任意extra(`pip install -e .[ocr]`)扱いで、
+    # このスクリプトがそれを指定していなかったため導入されない不具合が
+    # あったが、必須依存化した現在は `pip install -e .` だけで全て入る。
     Write-Info "Installing project (editable) and deps from pyproject.toml..."
     Write-Info ("Temporary pip dir: " + $pipTempDir)
     try
@@ -322,6 +327,42 @@ function Install-ProjectDeps([string]$VenvPython)
     Write-Ok "Dependencies installed."
 }
 
+function Test-OptionalPiiEngines([string]$VenvPython)
+{
+    # GiNZA(spaCy)・Janome・RapidOCRは個人情報検出の必須依存としてインストール
+    # されるが、実際に import できるかは実行環境(Pythonのパッチバージョン、
+    # 各ライブラリの相互バージョン等)に左右される。アプリ本体は
+    # src/pii/engines.py の可用性チェックにより、importに失敗するエンジンを
+    # 自動的に「未導入」としてグレーアウトし、そのエンジンの検出結果を
+    # 0件として扱うだけでクラッシュしない設計になっているが、ここで
+    # インストール直後に軽く動作確認しておくことで、ユーザーがアプリ内で
+    # 突然「検出されない」と気付くより先に、インストール時点で警告できる。
+    # (実例: Python 3.14 + pydantic の組み合わせでspaCyのimportが失敗する
+    # 既知の非互換が2026-09時点で残っている。この場合GiNZAエンジンは
+    # 検出設定ダイアログでグレーアウトされ、他のエンジン(正規表現/
+    # SudachiPy/日時パターン/Janome)には影響しない)
+    Write-Section "Verify optional PII detection engines"
+
+    $checks = @(
+        @{ Name = "GiNZA (spaCy)"; Code = "import spacy; spacy.load('ja_ginza')" },
+        @{ Name = "Janome";        Code = "from janome.tokenizer import Tokenizer; Tokenizer()" },
+        @{ Name = "RapidOCR";      Code = "import rapidocr" }
+    )
+
+    foreach ($check in $checks)
+    {
+        & $VenvPython -c $check.Code 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0)
+        {
+            Write-Ok ($check.Name + " OK")
+        } else
+        {
+            $msg = $check.Name + " の読み込みに失敗しました。このエンジンは無効として扱われますが、アプリの起動自体は可能です。詳細はアプリ内の「個人情報検出の設定」>「検出エンジン」タブで確認してください。"
+            Write-Warn $msg
+        }
+    }
+}
+
 # =========================
 # Main
 # =========================
@@ -338,6 +379,7 @@ try
 
     $venvPython = Ensure-Venv ".venv"
     Install-ProjectDeps $venvPython
+    Test-OptionalPiiEngines $venvPython
 
     Write-Section "Create Shortcuts"
     $pythonwPath = Join-Path $script:ScriptDir ".venv\Scripts\pythonw.exe"
