@@ -44,7 +44,6 @@ class ConfigManager:
                 "use_with_auto_detection": True,
             },
             "exclusions": {
-                "text_exclusions": [],
                 "text_exclusions_regex": [],
                 "entity_exclusions": {},
             },
@@ -166,9 +165,6 @@ class ConfigManager:
 
     # --- 除外 -------------------------------------------------------------
 
-    def get_text_exclusions(self) -> List[str]:
-        return self._safe_get_config("exclusions.text_exclusions", [])
-
     def get_text_exclusions_regex(self) -> List[str]:
         return self._safe_get_config("exclusions.text_exclusions_regex", [])
 
@@ -183,15 +179,10 @@ class ConfigManager:
     def is_entity_excluded(self, entity_type: str, text: str) -> bool:
         """指定されたテキストが除外対象かどうかを判定する。
 
-        - text_exclusions: 部分一致
-        - text_exclusions_regex: 正規表現
+        - text_exclusions_regex: 正規表現(``re.search`` なので部分一致)
         - entity_exclusions: エンティティ別の完全一致
         """
         text = text.strip()
-
-        for exclusion in self.get_text_exclusions():
-            if exclusion and exclusion in text:
-                return True
 
         for pattern in self.get_text_exclusions_regex():
             if not pattern:
@@ -227,7 +218,7 @@ class ConfigManager:
         """指定した検出エンジンが有効かどうかを返す。
 
         明示設定が無ければ ``src.pii.engines.default_enabled_engines()`` の
-        既定値を使う(GiNZA/Janome等の任意エンジンは既定でOFF)。
+        既定値を使う。
         """
         engines = self._safe_get_config("engines", {})
         if isinstance(engines, dict) and key in engines:
