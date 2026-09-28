@@ -103,10 +103,11 @@ def run_detection(
     progress_callback: "Callable[[int, int], None] | None" = None,
 ) -> list[PiiDetection]:
     """指定ページ群の個人情報を検出する(バックグラウンドスレッドから呼ぶ想定)。"""
-    # SudachiPy辞書(特に"full": 必須依存にしていない。pyproject.toml参照)が
-    # 未導入の場合、ページごとの検出ループ内で毎回失敗してログを埋め尽くし、
-    # かつ結果が黙って0件になるだけでは原因が分かりにくい。事前にチェックして
-    # ここで例外を送出することで、ワーカーの error シグナル経由でダイアログに
+    # SudachiPy辞書(core/full/smallいずれも必須依存だが、"full"は環境によって
+    # ダウンロードに失敗し導入できないことがある。pyproject.toml参照)が未導入の
+    # 場合、ページごとの検出ループ内で毎回失敗してログを埋め尽くし、かつ結果が
+    # 黙って0件になるだけでは原因が分かりにくい。事前にチェックしてここで
+    # 例外を送出することで、ワーカーの error シグナル経由でダイアログに
     # 分かりやすいメッセージを表示できるようにする。
     if settings.is_engine_enabled("sudachi") and not sudachi_dict_available(
         settings.sudachi_dict_type
@@ -115,7 +116,7 @@ def run_detection(
             f"Sudachi辞書「{settings.sudachi_dict_type}」が導入されていないため、"
             "形態素解析(SudachiPy)エンジンを使用できません。"
             "設定で辞書を変更するか、パッケージを追加導入してください"
-            f"(`uv add sudachidict-{settings.sudachi_dict_type}`)。"
+            f"(`pip install sudachidict-{settings.sudachi_dict_type}`)。"
         )
     results: list[PiiDetection] = []
     total = len(page_indices)

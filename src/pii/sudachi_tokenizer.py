@@ -20,11 +20,14 @@ SUDACHI_SPLIT_MODES: Tuple[str, ...] = ("A", "B", "C")
 def sudachi_dict_available(dict_type: str) -> bool:
     """指定辞書種別のパッケージ(``sudachidict_<type>``)が導入済みかを返す。
 
-    ``core``/``small`` は必須依存だが、``full`` は辞書データが数百MBあり、
-    かつPyPIにwheel配布が無く sdist のビルド時に外部URLへ直接アクセスする
-    特殊なパッケージのため、必須依存にはしていない
-    (詳細は ``pyproject.toml`` のコメント参照)。未導入でも選択自体はでき、
-    実際の検出時に分かりやすいエラーで案内する。
+    ``core``/``full``/``small`` はいずれも必須依存(``pyproject.toml``)だが、
+    ``full`` はPyPIにwheel配布が無く sdist のビルド時に外部URL
+    (辞書データ配布用のCDN)へ直接アクセスする特殊なパッケージのため、
+    ネットワーク環境によっては ``pip install``/``uv sync`` 自体が失敗し、
+    導入できないことがある(詳細は ``pyproject.toml`` のコメント参照)。
+    そうした壊れた/一部だけ導入された環境でもアプリがクラッシュしないよう、
+    未導入でも辞書の選択自体はでき、実際の検出時に分かりやすいエラーで
+    案内するようにしている(保険的な扱い)。
     """
     module_name = f"sudachidict_{str(dict_type or '').strip().lower()}"
     try:
@@ -60,7 +63,14 @@ class SudachiTokenizer:
             raise ModuleNotFoundError(
                 f"Sudachi辞書「{dict_name}」が導入されていません"
                 f"(sudachidict_{dict_name} が見つかりません)。"
-                f"`uv add sudachidict-{dict_name}` 等で追加導入してください。"
+                f"`pip install sudachidict-{dict_name}`"
+                f"(uv環境では `uv add sudachidict-{dict_name}`)で追加導入してください。"
+                + (
+                    " full辞書はネットワーク環境によってはダウンロードに"
+                    "失敗することがあります(pyproject.tomlのコメント参照)。"
+                    if dict_name == "full"
+                    else ""
+                )
             )
         # sudachipy 0.6.x の新 API は `dict=`、旧 API は `dict_type=`。両対応。
         try:

@@ -294,11 +294,16 @@ function Install-ProjectDeps([string]$VenvPython)
     $oldTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
 
     # pyproject.toml の [project] dependencies には、個人情報検出エンジンが
-    # 使う RapidOCR/onnxruntime、Sudachi辞書(core/small)も含まれる
+    # 使う RapidOCR/onnxruntime、Sudachi辞書(core/full/small)も含まれる
     # (すべて必須依存)。以前はOCR(rapidocr/onnxruntime)だけ任意extra
     # (`pip install -e .[ocr]`)扱いで、このスクリプトがそれを指定していな
     # かったため導入されない不具合があったが、必須依存化した現在は
     # `pip install -e .` だけで全て入る。
+    # 注意: sudachidict-full はPyPIにwheelを持たずsdist配布のみで、
+    # そのsetup.pyが辞書データ(数百MB)を独自CDN
+    # (https://d2ej7fkh96fzlu.cloudfront.net/...)から直接ダウンロードする。
+    # このURLに到達できない環境(社内プロキシのホスト許可制等)では
+    # `pip install -e .` 自体が失敗するため、失敗時のメッセージでその旨を案内する。
     Write-Info "Installing project (editable) and deps from pyproject.toml..."
     Write-Info ("Temporary pip dir: " + $pipTempDir)
     try
@@ -307,7 +312,15 @@ function Install-ProjectDeps([string]$VenvPython)
         Set-EnvVar "TEMP" $pipTempDir
 
         & $VenvPython -m pip install -e . | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw "Failed to install project dependencies." }
+        if ($LASTEXITCODE -ne 0)
+        {
+            throw ("Failed to install project dependencies. " +
+                "If the error mentions downloading a Sudachi dictionary " +
+                "(sudachidict-full, from d2ej7fkh96fzlu.cloudfront.net), " +
+                "this is a network/proxy issue: that host must be reachable " +
+                "(allowed through any corporate proxy/firewall) during install, " +
+                "separately from pypi.org/files.pythonhosted.org.")
+        }
     } finally
     {
         if ($null -eq $oldTmp)
@@ -330,7 +343,7 @@ function Install-ProjectDeps([string]$VenvPython)
 
 function Test-OptionalPiiEngines([string]$VenvPython)
 {
-    # SudachiPy(辞書core/small)・RapidOCRは個人情報検出の必須依存として
+    # SudachiPy(辞書core/full/small)・RapidOCRは個人情報検出の必須依存として
     # インストールされるが、実際に import できるかは実行環境に左右される。
     # アプリ本体は各種の可用性チェックにより、importに失敗しても「未導入」
     # 扱いにしてクラッシュしない設計になっているが、ここでインストール直後に
@@ -342,6 +355,7 @@ function Test-OptionalPiiEngines([string]$VenvPython)
 
     $checks = @(
         @{ Name = "SudachiPy(core辞書)"; Code = "from sudachipy import Dictionary; Dictionary(dict='core').create()" },
+        @{ Name = "SudachiPy(full辞書)"; Code = "from sudachipy import Dictionary; Dictionary(dict='full').create()" },
         @{ Name = "SudachiPy(small辞書)"; Code = "from sudachipy import Dictionary; Dictionary(dict='small').create()" },
         @{ Name = "RapidOCR";             Code = "import rapidocr" }
     )

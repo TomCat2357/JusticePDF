@@ -23,14 +23,20 @@ dependencies = [
     "sudachipy>=0.6.11",
     # Sudachi辞書は core(既定)に加え、設定ダイアログの「Sudachi 辞書 / 分割
     # モード」(PresidioPDFの同名設定を移植)で full/small も選べるようにする。
-    # sudachidict-full は本体がPyPIにwheelを持たず、sdistのsetup.pyが
-    # 独自URLから辞書データ(数百MB)を直接ダウンロードするビルド時挙動になって
-    # おり(`pip install sudachidict-full`を実機で試すと、そのURLがネットワーク
-    # 制限環境では到達不能で失敗することを確認した)、通常のPyPIミラー経由の
-    # インストールでは完結しないため、必須依存には含めない
-    # (設定では選択可能にするが、未導入なら検出時にエラーメッセージで案内する)。
-    # sudachidict-small は通常のwheel配布(約40MB)のため必須依存にできる。
+    # sudachidict-full はPyPIにwheelを持たずsdist配布のみで、その
+    # setup.py はモジュール直下(setuptools.setup()呼び出しより前)で
+    # 辞書データ(数百MB)を独自URL(https://d2ej7fkh96fzlu.cloudfront.net/...)
+    # から直接ダウンロードするコードを実行する。setup.pyはモジュールとして
+    # execされるため、ビルド(bdist_wheel)だけでなくメタデータ取得
+    # (egg_info/prepare_metadata_for_build_wheel)の際にも同じ処理が走り、
+    # メタデータ取得だけならダウンロードを避けられる、ということはない。
+    # そのURLがネットワーク制限環境(社内プロキシのホスト許可制等)では
+    # 到達不能で失敗しうるため、`pip install`/`uv sync`でのインストールが
+    # そのようなネットワーク環境では失敗する可能性が残る
+    # (未導入時は検出開始時に分かりやすいエラーで案内する処理を保険として
+    # 残してある。src/pii/sudachi_tokenizer.py参照)。
     "sudachidict-core>=20240409",
+    "sudachidict-full>=20240409",
     "sudachidict-small>=20240409",
     "phonenumbers>=8.13.0",
     # OCR(RapidOCR v3)。テキストレイヤの無いページ(スキャン画像等)を対象に、

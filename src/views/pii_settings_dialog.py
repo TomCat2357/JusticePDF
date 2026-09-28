@@ -210,8 +210,10 @@ class PiiSettingsDialog(QDialog):
             self._sudachi_dict_combo.addItem(label, dict_type)
         self._set_combo_value(self._sudachi_dict_combo, self._settings.sudachi_dict_type)
         self._sudachi_dict_combo.setToolTip(
-            "core(既定・約70MB)/small(軽量・約40MB)は同梱済みですぐ使えます。"
-            "full(数百MB)は別途 `uv add sudachidict-full` 等での導入が必要です。"
+            "core(既定・約70MB)/full(固有名詞被覆が広い・数百MB)/"
+            "small(軽量・約40MB)いずれも同梱済みです。"
+            "(未インストール)と表示される場合は、パッケージの追加導入が必要です"
+            "(`pip install sudachidict-<種別>` 等)。"
         )
         sudachi_layout.addWidget(self._sudachi_dict_combo)
         sudachi_layout.addSpacing(12)

@@ -34,6 +34,28 @@ def test_unknown_dict_type_is_not_available():
     assert sudachi_dict_available("no-such-dict") is False
 
 
+def test_full_dict_availability_check_never_raises():
+    """full辞書は必須依存(pyproject.toml)だが、sdist配布のみでビルド時に外部
+    URLから辞書データをダウンロードする特殊なパッケージのため、ネットワーク
+    環境によっては導入に失敗しうる。可用性チェック自体は例外を出さず
+    bool値を返すことだけを確認する(この作業環境ではネットワーク制限により
+    未導入であることが多い)。
+    """
+    assert isinstance(sudachi_dict_available("full"), bool)
+
+
+@pytest.mark.skipif(
+    not sudachi_dict_available("full"),
+    reason="sudachidict-full が実際には導入されていない環境",
+)
+def test_full_dict_tokenizes_when_available():
+    """導入済み環境限定: full辞書でも実際にトークナイズできること。"""
+    text = "国立国会図書館デジタルコレクションを利用した。"
+    full = SudachiTokenizer(dict_type="full", split_mode="C")
+    surfaces_full = [tok.surface for tok in full.tokenize(text)]
+    assert "図書館" in surfaces_full
+
+
 def test_split_mode_changes_tokenization_result():
     """要望: 分割モードの切替えで実際に分割結果が変わること。"""
     text = "国立国会図書館に行った。"
