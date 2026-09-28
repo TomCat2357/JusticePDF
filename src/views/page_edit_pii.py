@@ -636,11 +636,14 @@ class PiiDrawerMixin:
         box.setWindowTitle("個人情報検出")
         box.setText(
             f"「{text}」を追加検出パターン({get_entity_type_name_ja(entity)})に"
-            "登録しました。\nこのパターンで追加検出しますか?"
+            "登録しました。\nこのパターンでどの範囲を追加検出しますか?"
         )
-        all_btn = box.addButton("全ページで追加検出", QMessageBox.ButtonRole.AcceptRole)
-        page_btn = box.addButton("このページだけ追加検出", QMessageBox.ButtonRole.AcceptRole)
-        none_btn = box.addButton("追加検出しない(登録のみ)", QMessageBox.ButtonRole.RejectRole)
+        # ボタン文言は右上の検出範囲ボタン("全ページ"/"このページだけ")と揃え、
+        # 短くすることで(旧文言は長く、環境によってはボタン内で文字が
+        # 見切れていた)必ず全文が表示されるようにする。
+        all_btn = box.addButton("全ページ", QMessageBox.ButtonRole.AcceptRole)
+        page_btn = box.addButton("このページだけ", QMessageBox.ButtonRole.AcceptRole)
+        none_btn = box.addButton("登録のみ", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(all_btn)
         box.exec()
         clicked = box.clickedButton()

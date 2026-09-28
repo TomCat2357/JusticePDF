@@ -256,7 +256,7 @@ def test_add_pattern_requested_registers_pattern_without_detecting(qtbot, monkey
     window._toggle_pii_drawer()
 
     monkeypatch.setattr(
-        page_edit_pii_module, "QMessageBox", _make_choice_message_box("追加検出しない(登録のみ)")
+        page_edit_pii_module, "QMessageBox", _make_choice_message_box("登録のみ")
     )
 
     window._on_pii_add_pattern_requested("PERSON", "公務員")
@@ -274,7 +274,7 @@ def test_add_pattern_requested_does_not_register_duplicate_pattern(qtbot, monkey
     window._toggle_pii_drawer()
 
     monkeypatch.setattr(
-        page_edit_pii_module, "QMessageBox", _make_choice_message_box("追加検出しない(登録のみ)")
+        page_edit_pii_module, "QMessageBox", _make_choice_message_box("登録のみ")
     )
     window._on_pii_add_pattern_requested("PERSON", "公務員")
     window._on_pii_add_pattern_requested("PERSON", "公務員")
@@ -292,7 +292,7 @@ def test_add_pattern_and_detect_current_page_adds_new_markup(qtbot, monkeypatch,
     window._toggle_pii_drawer()
 
     monkeypatch.setattr(
-        page_edit_pii_module, "QMessageBox", _make_choice_message_box("このページだけ追加検出")
+        page_edit_pii_module, "QMessageBox", _make_choice_message_box("このページだけ")
     )
 
     window._on_pii_add_pattern_requested("PERSON", "公務員")
@@ -314,13 +314,86 @@ def test_add_pattern_and_detect_all_pages(qtbot, monkeypatch, tmp_path):
     window._toggle_pii_drawer()
 
     monkeypatch.setattr(
-        page_edit_pii_module, "QMessageBox", _make_choice_message_box("全ページで追加検出")
+        page_edit_pii_module, "QMessageBox", _make_choice_message_box("全ページ")
     )
 
     window._on_pii_add_pattern_requested("PERSON", "公務員")
 
     annots = list_pii_markup_annots(str(pdf_path))
     assert any(a.pii_text == "公務員" and a.pii_entity == "PERSON" for a in annots)
+
+
+def test_add_pattern_detection_only_adds_new_items_keeps_existing_untouched(
+    qtbot, monkeypatch, tmp_path
+):
+    """追加パターン登録後の部分再検出は追加分だけで、既存の結果・手動選択は
+
+    消したり作り直したりしない(xrefも維持される)こと。
+    """
+    from src.utils.pdf_utils import (
+        MarkupType,
+        ShapeAnnotData,
+        ShapeType,
+        TextMarkupAnnotData,
+        create_markup_annot,
+        create_shape_annot,
+        list_pii_mask_shapes,
+    )
+
+    pdf_path = tmp_path / "pii-pattern-keeps-existing.pdf"
+    _make_job_title_pdf(pdf_path)
+    window = _create_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+
+    # 既存の自動検出結果を模した塗りつぶし候補。
+    existing_markup = create_markup_annot(
+        str(pdf_path),
+        TextMarkupAnnotData(
+            page_num=0,
+            xref=0,
+            quads=((40.0, 88.0, 88.0, 102.0),),
+            markup_type=MarkupType.HIGHLIGHT,
+            color=(1.0, 0.0, 0.0),
+            opacity=0.35,
+            pii_entity="PERSON",
+            pii_text="丸尾幸男",
+        ),
+    )
+    # ユーザーが手動で「テキスト候補」ツールにより塗りつぶし対象にした図形。
+    existing_shape = create_shape_annot(
+        str(pdf_path),
+        ShapeAnnotData(
+            page_num=0,
+            xref=0,
+            rect=(200.0, 10.0, 240.0, 40.0),
+            shape_type=ShapeType.RECTANGLE,
+            stroke_color=(0.0, 0.0, 0.0),
+            fill_color=(0.0, 0.0, 0.0),
+            stroke_width=1.2,
+            opacity=0.35,
+            pii_entity="MANUAL",
+            pii_text="",
+        ),
+    )
+
+    monkeypatch.setattr(
+        page_edit_pii_module, "QMessageBox", _make_choice_message_box("全ページ")
+    )
+    window._on_pii_add_pattern_requested("PERSON", "公務員")
+
+    markups = list_pii_markup_annots(str(pdf_path))
+    shapes = list_pii_mask_shapes(str(pdf_path))
+
+    # 既存の塗りつぶし候補・図形はxrefも含めてそのまま(削除→再作成されていない)。
+    assert any(
+        a.xref == existing_markup.xref and a.pii_text == "丸尾幸男" for a in markups
+    )
+    assert any(s.xref == existing_shape.xref for s in shapes)
+    # 新しいパターンでの検出分だけが追加されている。
+    assert any(a.pii_text == "公務員" and a.pii_entity == "PERSON" for a in markups)
+    assert len(markups) == 2
+    assert len(shapes) == 1
 
 
 # ---------------------------------------------------------------------------
