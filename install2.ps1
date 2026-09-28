@@ -294,10 +294,11 @@ function Install-ProjectDeps([string]$VenvPython)
     $oldTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
 
     # pyproject.toml の [project] dependencies には、個人情報検出エンジンが
-    # 使う GiNZA/spaCy/Janome/RapidOCR も含まれる(すべて必須依存)。以前は
-    # OCR(rapidocr/onnxruntime)だけ任意extra(`pip install -e .[ocr]`)扱いで、
-    # このスクリプトがそれを指定していなかったため導入されない不具合が
-    # あったが、必須依存化した現在は `pip install -e .` だけで全て入る。
+    # 使う RapidOCR/onnxruntime、Sudachi辞書(core/small)も含まれる
+    # (すべて必須依存)。以前はOCR(rapidocr/onnxruntime)だけ任意extra
+    # (`pip install -e .[ocr]`)扱いで、このスクリプトがそれを指定していな
+    # かったため導入されない不具合があったが、必須依存化した現在は
+    # `pip install -e .` だけで全て入る。
     Write-Info "Installing project (editable) and deps from pyproject.toml..."
     Write-Info ("Temporary pip dir: " + $pipTempDir)
     try
@@ -329,24 +330,20 @@ function Install-ProjectDeps([string]$VenvPython)
 
 function Test-OptionalPiiEngines([string]$VenvPython)
 {
-    # GiNZA(spaCy)・Janome・RapidOCRは個人情報検出の必須依存としてインストール
-    # されるが、実際に import できるかは実行環境(Pythonのパッチバージョン、
-    # 各ライブラリの相互バージョン等)に左右される。アプリ本体は
-    # src/pii/engines.py の可用性チェックにより、importに失敗するエンジンを
-    # 自動的に「未導入」としてグレーアウトし、そのエンジンの検出結果を
-    # 0件として扱うだけでクラッシュしない設計になっているが、ここで
-    # インストール直後に軽く動作確認しておくことで、ユーザーがアプリ内で
-    # 突然「検出されない」と気付くより先に、インストール時点で警告できる。
-    # (実例: Python 3.14 + pydantic の組み合わせでspaCyのimportが失敗する
-    # 既知の非互換が2026-09時点で残っている。この場合GiNZAエンジンは
-    # 検出設定ダイアログでグレーアウトされ、他のエンジン(正規表現/
-    # SudachiPy/日時パターン/Janome)には影響しない)
+    # SudachiPy(辞書core/small)・RapidOCRは個人情報検出の必須依存として
+    # インストールされるが、実際に import できるかは実行環境に左右される。
+    # アプリ本体は各種の可用性チェックにより、importに失敗しても「未導入」
+    # 扱いにしてクラッシュしない設計になっているが、ここでインストール直後に
+    # 軽く動作確認しておくことで、ユーザーがアプリ内で突然「検出されない」と
+    # 気付くより先に、インストール時点で警告できる。
+    # (以前はGiNZA(spaCy)・Janomeもここで確認していたが、両エンジンは撤去した
+    # ―― 理由は src/pii/engines.py のモジュールdocstring参照)。
     Write-Section "Verify optional PII detection engines"
 
     $checks = @(
-        @{ Name = "GiNZA (spaCy)"; Code = "import spacy; spacy.load('ja_ginza')" },
-        @{ Name = "Janome";        Code = "from janome.tokenizer import Tokenizer; Tokenizer()" },
-        @{ Name = "RapidOCR";      Code = "import rapidocr" }
+        @{ Name = "SudachiPy(core辞書)"; Code = "from sudachipy import Dictionary; Dictionary(dict='core').create()" },
+        @{ Name = "SudachiPy(small辞書)"; Code = "from sudachipy import Dictionary; Dictionary(dict='small').create()" },
+        @{ Name = "RapidOCR";             Code = "import rapidocr" }
     )
 
     foreach ($check in $checks)
@@ -357,7 +354,7 @@ function Test-OptionalPiiEngines([string]$VenvPython)
             Write-Ok ($check.Name + " OK")
         } else
         {
-            $msg = $check.Name + " の読み込みに失敗しました。このエンジンは無効として扱われますが、アプリの起動自体は可能です。詳細はアプリ内の「個人情報検出の設定」>「検出エンジン」タブで確認してください。"
+            $msg = $check.Name + " の読み込みに失敗しました。詳細はアプリ内の「個人情報検出の設定」で確認してください。"
             Write-Warn $msg
         }
     }

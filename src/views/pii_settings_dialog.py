@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -25,6 +26,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QPushButton,
+    QRadioButton,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -35,6 +37,11 @@ from src.pii import ocr_support
 from src.pii.engines import ENGINES, is_engine_available
 from src.pii.entity_types import ENTITY_TYPES, MANUAL_ENTITY_TYPE, get_entity_type_name_ja
 from src.pii.settings import PiiSettings
+from src.pii.sudachi_tokenizer import (
+    SUDACHI_DICT_TYPES,
+    SUDACHI_SPLIT_MODES,
+    sudachi_dict_available,
+)
 from src.views.view_helpers import build_accept_cancel_box
 
 
@@ -150,13 +157,16 @@ class PiiSettingsDialog(QDialog):
     # タブ: 検出エンジン
     # ------------------------------------------------------------------
     def _build_engines_tab(self) -> QWidget:
-        """検出エンジン(認識器)ごとのON/OFF。
+        """検出エンジン(認識器)ごとのON/OFFと、それに付随する詳細設定。
 
         以前のPresidioPDFでは複数のエンジン/認識器を選択できたが、JusticePDFへの
         移植時に単一パイプラインへ統合され選べなくなっていたため、ここで
-        ``src.pii.engines.ENGINES`` を選択式に戻す。GiNZA/Janome等の未導入の
-        エンジンはチェックボックスをグレーアウトし、選んでもエラーにならない
-        ことを明示する。
+        ``src.pii.engines.ENGINES`` を選択式に戻す(現在は正規表現/
+        形態素解析〔SudachiPy〕/日時パターンの3種類。GiNZA/Janomeは撤去済み
+        ―― 理由は ``src.pii.engines`` のモジュールdocstring参照)。
+        「形態素解析(SudachiPy)」エンジンの辞書/分割モード、および検出器
+        共通のテキスト前処理設定(PresidioPDFの同名設定を移植)もこのタブに
+        まとめる。
         """
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -186,6 +196,58 @@ class PiiSettingsDialog(QDialog):
             )
             layout.addWidget(checkbox)
             self._engine_checks[engine.key] = checkbox
+
+        # Sudachi 辞書 / 分割モード(PresidioPDFの設定ダイアログの同名グループを移植)。
+        # 「形態素解析(SudachiPy)」エンジンの挙動を細かく調整する設定なので、
+        # このタブにまとめて置く。
+        sudachi_group = QGroupBox("Sudachi 辞書 / 分割モード")
+        sudachi_layout = QHBoxLayout(sudachi_group)
+        sudachi_layout.addWidget(QLabel("辞書:"))
+        self._sudachi_dict_combo = QComboBox()
+        for dict_type in SUDACHI_DICT_TYPES:
+            dict_available = sudachi_dict_available(dict_type)
+            label = dict_type if dict_available else f"{dict_type}(未インストール)"
+            self._sudachi_dict_combo.addItem(label, dict_type)
+        self._set_combo_value(self._sudachi_dict_combo, self._settings.sudachi_dict_type)
+        self._sudachi_dict_combo.setToolTip(
+            "core(既定・約70MB)/small(軽量・約40MB)は同梱済みですぐ使えます。"
+            "full(数百MB)は別途 `uv add sudachidict-full` 等での導入が必要です。"
+        )
+        sudachi_layout.addWidget(self._sudachi_dict_combo)
+        sudachi_layout.addSpacing(12)
+        sudachi_layout.addWidget(QLabel("分割モード:"))
+        self._sudachi_split_combo = QComboBox()
+        for split_mode in SUDACHI_SPLIT_MODES:
+            self._sudachi_split_combo.addItem(split_mode, split_mode)
+        self._set_combo_value(self._sudachi_split_combo, self._settings.sudachi_split_mode)
+        self._sudachi_split_combo.setToolTip(
+            "A(短単位)/B(中単位)/C(長単位・固有名詞検出に推奨、既定)"
+        )
+        sudachi_layout.addWidget(self._sudachi_split_combo)
+        sudachi_layout.addStretch()
+        layout.addWidget(sudachi_group)
+
+        # テキスト前処理設定(PresidioPDFの同名グループを移植)。
+        preprocess_group = QGroupBox("テキスト前処理設定")
+        preprocess_layout = QVBoxLayout(preprocess_group)
+        self._ignore_newlines_check = QCheckBox("改行無視(OFF時はブロック境界に改行を挿入)")
+        self._ignore_newlines_check.setToolTip(
+            "OFFにすると、表の別セル等、区切り文字の無いブロック境界に改行(\\n)"
+            "を1文字挿入してから検出します。区切りの無い隣接セル同士の文字列が"
+            "誤って連結されて検出される(例:職業名の直後に日付が続く)のを"
+            "防げますが、改行を挟んだ語句は検出できなくなります。"
+        )
+        self._ignore_newlines_check.setChecked(self._settings.ignore_newlines)
+        preprocess_layout.addWidget(self._ignore_newlines_check)
+        self._ignore_whitespace_check = QCheckBox("空白無視(空白文字を除去)")
+        self._ignore_whitespace_check.setToolTip(
+            "ONにすると、検出対象のテキストから空白文字(半角/全角スペース等)を"
+            "除去してから検出します。セル内の字間調整で挿入された空白によって"
+            "追加検出パターン等の正規表現が一致しなくなる場合に有効です。"
+        )
+        self._ignore_whitespace_check.setChecked(self._settings.ignore_whitespace)
+        preprocess_layout.addWidget(self._ignore_whitespace_check)
+        layout.addWidget(preprocess_group)
 
         layout.addStretch()
         return widget
@@ -313,6 +375,23 @@ class PiiSettingsDialog(QDialog):
         self._dedupe_enabled_check.setChecked(self._settings.dedupe_enabled)
         layout.addWidget(self._dedupe_enabled_check)
 
+        # 対象重複判定(PresidioPDFの設定ダイアログの同名グループを移植)。
+        layout.addWidget(QLabel("対象重複判定:"))
+        entity_overlap_row = QHBoxLayout()
+        self._entity_overlap_any_radio = QRadioButton("異なる対象でも同一扱い")
+        self._entity_overlap_same_radio = QRadioButton("同じ対象のみ")
+        self._entity_overlap_group = QButtonGroup(self)
+        self._entity_overlap_group.addButton(self._entity_overlap_any_radio)
+        self._entity_overlap_group.addButton(self._entity_overlap_same_radio)
+        if self._settings.entity_overlap_mode == "same":
+            self._entity_overlap_same_radio.setChecked(True)
+        else:
+            self._entity_overlap_any_radio.setChecked(True)
+        entity_overlap_row.addWidget(self._entity_overlap_any_radio)
+        entity_overlap_row.addWidget(self._entity_overlap_same_radio)
+        entity_overlap_row.addStretch()
+        layout.addLayout(entity_overlap_row)
+
         form = QFormLayout()
         self._dedupe_overlap_combo = QComboBox()
         self._dedupe_overlap_combo.addItem("一部でも重なる", "overlap")
@@ -376,6 +455,21 @@ class PiiSettingsDialog(QDialog):
             self._ocr_enabled_check.setToolTip("RapidOCRが導入されていないため使用できません。")
         group_layout.addWidget(self._ocr_enabled_check)
 
+        tier_row = QHBoxLayout()
+        tier_row.addWidget(QLabel("モデル:"))
+        self._ocr_tier_combo = QComboBox()
+        self._ocr_tier_combo.addItem("軽量 (mobile)", "light")
+        self._ocr_tier_combo.addItem("高精度 (server)", "heavy")
+        self._set_combo_value(self._ocr_tier_combo, self._settings.ocr_tier)
+        self._ocr_tier_combo.setEnabled(available)
+        self._ocr_tier_combo.setToolTip(
+            "軽量(mobile)は高速・小モデル。高精度(server)は大きいモデルで"
+            "認識精度を上げますが、処理が重くなります。"
+        )
+        tier_row.addWidget(self._ocr_tier_combo)
+        tier_row.addStretch()
+        group_layout.addLayout(tier_row)
+
         dpi_row = QHBoxLayout()
         dpi_row.addWidget(QLabel("OCR解像度(DPI):"))
         self._ocr_dpi_spin = QSpinBox()
@@ -405,6 +499,14 @@ class PiiSettingsDialog(QDialog):
         self._settings.dedupe_enabled = self._dedupe_enabled_check.isChecked()
         self._settings.dedupe_overlap = self._dedupe_overlap_combo.currentData()
         self._settings.dedupe_keep = self._dedupe_keep_combo.currentData()
+        self._settings.entity_overlap_mode = (
+            "same" if self._entity_overlap_same_radio.isChecked() else "any"
+        )
+        self._settings.sudachi_dict_type = self._sudachi_dict_combo.currentData()
+        self._settings.sudachi_split_mode = self._sudachi_split_combo.currentData()
+        self._settings.ignore_newlines = self._ignore_newlines_check.isChecked()
+        self._settings.ignore_whitespace = self._ignore_whitespace_check.isChecked()
         self._settings.ocr_enabled = self._ocr_enabled_check.isChecked()
         self._settings.ocr_dpi = self._ocr_dpi_spin.value()
+        self._settings.ocr_tier = self._ocr_tier_combo.currentData()
         return self._settings

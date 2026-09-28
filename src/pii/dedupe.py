@@ -44,7 +44,33 @@ def _interval_len(d: Dict[str, Any]) -> int:
     return max(0, int(d.get("end", 0)) - int(d.get("start", 0)))
 
 
-def _plain_edges(items: List[Dict[str, Any]], overlap: str):
+def _entity_key(d: Dict[str, Any]) -> str:
+    return str(d.get("entity", "")).strip().upper()
+
+
+def _should_compare_entities(
+    left: Dict[str, Any], right: Dict[str, Any], entity_overlap_mode: str
+) -> bool:
+    """"same"(対象重複判定=同じ対象のみ)モード時の比較可否を判定する。
+
+    Ported from PresidioPDF ``src/cli/duplicate_main.py::_should_compare_entities``
+    （無改修のロジック）。"any"(既定)なら常に比較する(従来動作)。"same"なら
+    同じエンティティ種別同士だけを比較するが、PROPER_NOUN(汎用の固有名詞候補)
+    は他の種別とも比較候補に含める(最終的に包含関係がある場合のみ重複として
+    採用する、``_plain_edges``/``_structured_edges`` 側の追加判定と対になる)。
+    """
+    if entity_overlap_mode != "same":
+        return True
+    left_entity = _entity_key(left)
+    right_entity = _entity_key(right)
+    if left_entity == right_entity:
+        return True
+    return "PROPER_NOUN" in {left_entity, right_entity}
+
+
+def _plain_edges(
+    items: List[Dict[str, Any]], overlap: str, entity_overlap_mode: str = "any"
+):
     n = len(items)
     edges: List[Tuple[int, int]] = []
     if overlap == "exact":
@@ -56,11 +82,14 @@ def _plain_edges(items: List[Dict[str, Any]], overlap: str):
             if len(idxs) > 1:
                 base = idxs[0]
                 for j in idxs[1:]:
-                    edges.append((base, j))
+                    if _should_compare_entities(items[base], items[j], entity_overlap_mode):
+                        edges.append((base, j))
         return n, edges
     for i in range(n):
         si, ei = int(items[i].get("start", -1)), int(items[i].get("end", -1))
         for j in range(i + 1, n):
+            if not _should_compare_entities(items[i], items[j], entity_overlap_mode):
+                continue
             sj, ej = int(items[j].get("start", -1)), int(items[j].get("end", -1))
             if overlap == "contain":
                 dup = (si <= sj and ej <= ei) or (sj <= si and ei <= ej)
@@ -72,6 +101,11 @@ def _plain_edges(items: List[Dict[str, Any]], overlap: str):
                 # 後続の重複除去でどちらか一方が消えてしまう
                 # (例: 「公務員」の直後に区切り無しで日付が続く場合)。
                 dup = (si < ej) and (sj < ei)
+            if dup and entity_overlap_mode == "same" and _entity_key(items[i]) != _entity_key(items[j]):
+                # "same"モードで種別が異なる場合(PROPER_NOUN絡み)は、
+                # 単なる重なりではなく包含関係がある場合のみ重複扱いにする
+                # (PresidioPDFの`_dedupe_detections_spec_format`に合わせる)。
+                dup = (si <= sj and ej <= ei) or (sj <= si and ei <= ej)
             if dup:
                 edges.append((i, j))
     return n, edges
@@ -103,7 +137,9 @@ def _norm_quads(quads: List[List[float]]):
     return tuple(sorted(rounded))
 
 
-def _structured_edges(items: List[Dict[str, Any]], overlap: str):
+def _structured_edges(
+    items: List[Dict[str, Any]], overlap: str, entity_overlap_mode: str = "any"
+):
     n = len(items)
     edges: List[Tuple[int, int]] = []
     by_page: Dict[int, List[int]] = {}
@@ -119,7 +155,8 @@ def _structured_edges(items: List[Dict[str, Any]], overlap: str):
                 if len(group) > 1:
                     base = group[0]
                     for j in group[1:]:
-                        edges.append((base, j))
+                        if _should_compare_entities(items[base], items[j], entity_overlap_mode):
+                            edges.append((base, j))
             continue
         m = len(idxs)
         for a in range(m):
@@ -127,6 +164,8 @@ def _structured_edges(items: List[Dict[str, Any]], overlap: str):
             qa = items[ia].get("quads", []) or []
             for b in range(a + 1, m):
                 ib = idxs[b]
+                if not _should_compare_entities(items[ia], items[ib], entity_overlap_mode):
+                    continue
                 qb = items[ib].get("quads", []) or []
                 dup = False
                 if overlap == "contain":
@@ -135,6 +174,14 @@ def _structured_edges(items: List[Dict[str, Any]], overlap: str):
                     dup = a_in_b(qa, qb) or a_in_b(qb, qa)
                 else:
                     dup = any(_rect_intersects(aq, bq) for aq in qa for bq in qb)
+                if (
+                    dup
+                    and entity_overlap_mode == "same"
+                    and _entity_key(items[ia]) != _entity_key(items[ib])
+                ):
+                    def a_in_b(A, B):
+                        return all(any(_rect_contains(bq, aq) for bq in B) for aq in A)
+                    dup = a_in_b(qa, qb) or a_in_b(qb, qa)
                 if dup:
                     edges.append((ia, ib))
     return n, edges
@@ -247,12 +294,17 @@ def dedupe_detections(
     origin_priority: Optional[List[str]] = None,
     length_pref: Optional[str] = None,
     position_pref: Optional[str] = None,
+    entity_overlap_mode: str = "any",
 ) -> Dict[str, List[Dict[str, Any]]]:
+    """``entity_overlap_mode`` ("any"|"same") はPresidioPDFの「対象重複判定」
+    に対応する。"any"(既定)は従来通り種別を問わず比較し、"same"は原則
+    同じ種別同士だけを重複候補にする(詳細は ``_should_compare_entities``)。
+    """
     plain = detections.get("plain", []) or []
     struct = detections.get("structured", []) or []
     pri_map = {name: i for i, name in enumerate(entity_priority or [])}
 
-    n_p, e_p = _plain_edges(plain, overlap)
+    n_p, e_p = _plain_edges(plain, overlap, entity_overlap_mode)
     comps_p = _components(n_p, e_p)
     kept_plain_idx = set()
     for c in comps_p:
@@ -266,7 +318,7 @@ def dedupe_detections(
             kept_plain_idx.add(_choose_kept(c, plain, "plain", keep or "widest", pri_map))
     plain_out = [d for i, d in enumerate(plain) if i in kept_plain_idx]
 
-    n_s, e_s = _structured_edges(struct, overlap)
+    n_s, e_s = _structured_edges(struct, overlap, entity_overlap_mode)
     comps_s = _components(n_s, e_s)
     kept_struct_idx = set()
     for c in comps_s:

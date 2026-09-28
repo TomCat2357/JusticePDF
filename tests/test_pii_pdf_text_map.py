@@ -242,3 +242,75 @@ def test_extract_text_under_shape_rectangle_no_text_area(tmp_path):
         opacity=1.0,
     )
     assert extract_text_under_shape(str(pdf_path), 0, shape) == ""
+
+
+# ---------------------------------------------------------------------------
+# テキスト前処理(ignore_newlines/ignore_whitespace, PresidioPDFの
+# 「テキスト前処理設定」を移植)
+# ---------------------------------------------------------------------------
+
+
+def _make_two_block_pdf(path) -> None:
+    """区切り文字の無い2つの離れたテキストブロックを持つPDFを作る。
+
+    表の別セルのように、区切り文字を挟まず連結される状況を模す
+    (架空のダミーテキストのみ使用)。
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=300)
+    page.insert_text((40, 100), "丸尾幸男", fontname="japan", fontsize=14)
+    page.insert_text((40, 140), "公務員", fontname="japan", fontsize=14)
+    doc.save(str(path))
+    doc.close()
+
+
+def test_ignore_newlines_default_does_not_insert_separator(tmp_path):
+    pdf_path = tmp_path / "two_block.pdf"
+    _make_two_block_pdf(pdf_path)
+    text, chars = get_page_text_and_chars(str(pdf_path), 0)
+    assert text == "丸尾幸男公務員"
+    assert len(text) == len(chars)
+
+
+def test_ignore_newlines_false_inserts_block_boundary_newline(tmp_path):
+    pdf_path = tmp_path / "two_block2.pdf"
+    _make_two_block_pdf(pdf_path)
+    text, chars = get_page_text_and_chars(str(pdf_path), 0, ignore_newlines=False)
+    assert text == "丸尾幸男\n公務員"
+    assert len(text) == len(chars)
+    # 挿入した改行はbboxを持たない実体の無い文字なので、quad生成には影響しない。
+    newline_entries = [c for c in chars if c["c"] == "\n"]
+    assert len(newline_entries) == 1
+    assert newline_entries[0]["bbox"] is None
+    quads = offset_span_to_quads(chars, 0, len(text))
+    assert all(q[2] > q[0] and q[3] > q[1] for q in quads)
+
+
+def _make_spaced_text_pdf(path, text: str) -> None:
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=200)
+    page.insert_text((50, 80), text, fontname="japan", fontsize=14)
+    doc.save(str(path))
+    doc.close()
+
+
+def test_ignore_whitespace_removes_space_characters(tmp_path):
+    pdf_path = tmp_path / "spaced.pdf"
+    _make_spaced_text_pdf(pdf_path, "公 務 員")
+    text, chars = get_page_text_and_chars(str(pdf_path), 0)
+    assert text == "公 務 員"
+
+    text2, chars2 = get_page_text_and_chars(str(pdf_path), 0, ignore_whitespace=True)
+    assert text2 == "公務員"
+    assert len(text2) == len(chars2)
+
+
+def test_ignore_whitespace_suppresses_inserted_newline_too(tmp_path):
+    """空白無視が有効なら、改行区切り自体(空白文字扱い)も挿入されないこと。"""
+    pdf_path = tmp_path / "two_block3.pdf"
+    _make_two_block_pdf(pdf_path)
+    text, chars = get_page_text_and_chars(
+        str(pdf_path), 0, ignore_newlines=False, ignore_whitespace=True
+    )
+    assert text == "丸尾幸男公務員"
+    assert "\n" not in text

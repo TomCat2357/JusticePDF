@@ -64,6 +64,12 @@ class PiiSettings:
     dedupe_enabled: bool = True
     dedupe_overlap: str = "overlap"  # overlap | exact | contain
     dedupe_keep: str = "widest"  # widest | first | last | entity-order
+    # 対象重複判定(PresidioPDFの「対象重複判定」に対応)。
+    # "any"  = 異なるエンティティ種別同士の重なりも重複とみなす(既定・従来動作)。
+    # "same" = 同じ種別同士の重なりのみ重複とみなす(異なる種別同士は、
+    #          一方がPROPER_NOUN〔汎用の固有名詞候補〕で、かつ一方が他方を
+    #          完全に包含する場合のみ例外的に重複扱いにする)。
+    entity_overlap_mode: str = "any"  # any | same
     entity_priority_order: list[str] = field(
         default_factory=lambda: [
             "INDIVIDUAL_NUMBER",
@@ -78,11 +84,23 @@ class PiiSettings:
     # SudachiPy
     sudachi_dict_type: str = "core"  # core | full | small
     sudachi_split_mode: str = "C"  # A | B | C
+    # テキスト前処理(PresidioPDFの「テキスト前処理設定」に対応)。
+    # ignore_newlines=True(既定・従来動作): ブロック境界に区切り文字を挿入
+    # しない(従来通りの見た目・オフセット)。False にすると、表の別セル等
+    # 区切り文字の無いブロック境界に改行(\n)を1文字挿入してから検出する
+    # (異なるセルの文字列が誤って連結されて検出されるのを防げる一方、
+    # 改行を挟んだ検出は行えなくなる)。
+    ignore_newlines: bool = True
+    # ignore_whitespace=True にすると、検出対象テキストから空白文字
+    # (半角/全角スペース等)を除去してから検出する(セル内の字間調整で
+    # 挿入された空白によって正規表現が一致しなくなるケースに対応)。
+    ignore_whitespace: bool = False
     # OCR（rapidocr が導入されている場合のみ実際に使われる）
     ocr_enabled: bool = False
     ocr_dpi: int = 300
+    # RapidOCRのモデル規模("light"=軽量/mobile、"heavy"=高精度/server)。
+    ocr_tier: str = "light"  # light | heavy
     # 検出エンジン(認識器)ごとのON/OFF。キーは src.pii.engines.ENGINE_KEYS。
-    # GiNZA/Janome等の任意エンジンは未導入なら選んでもエラーにならず0件を返す。
     enabled_engines: dict[str, bool] = field(default_factory=default_enabled_engines)
     # 検出ボタン押下時、既存の検出結果・手動追加分を消さずに新規検出分だけ
     # 追加するかどうか(オフなら従来通り、検出し直したページの既存結果を置換)。
@@ -142,6 +160,11 @@ class PiiSettings:
                 "enabled": self.dedupe_enabled,
                 "method": self.dedupe_overlap,
                 "entity_priority_order": list(self.entity_priority_order),
+                "entity_overlap_mode": self.entity_overlap_mode,
+            },
+            "text_preprocess": {
+                "ignore_newlines": self.ignore_newlines,
+                "ignore_whitespace": self.ignore_whitespace,
             },
             "engines": dict(self.enabled_engines),
         }
@@ -173,8 +196,15 @@ class PiiSettings:
         enabled_engines_raw = _load_json(s, "enabled_engines", None)
         enabled_engines = dict(default.enabled_engines)
         if isinstance(enabled_engines_raw, dict):
+            # 既知のエンジンキーだけ取り込む。以前 GiNZA/Janome エンジンを
+            # 選べた頃の設定ファイルに残っているキーは、対応するエンジンが
+            # 撤去された今は無害な未知キーとして無視する(エラーにしない)。
             enabled_engines.update(
-                {str(k): bool(v) for k, v in enabled_engines_raw.items()}
+                {
+                    str(k): bool(v)
+                    for k, v in enabled_engines_raw.items()
+                    if str(k) in enabled_engines
+                }
             )
 
         return PiiSettings(
@@ -194,6 +224,9 @@ class PiiSettings:
             ),
             dedupe_overlap=str(s.value(_key("dedupe_overlap"), default.dedupe_overlap, type=str)),
             dedupe_keep=str(s.value(_key("dedupe_keep"), default.dedupe_keep, type=str)),
+            entity_overlap_mode=str(
+                s.value(_key("entity_overlap_mode"), default.entity_overlap_mode, type=str)
+            ),
             entity_priority_order=list(
                 _load_json(s, "entity_priority_order", default.entity_priority_order)
                 or default.entity_priority_order
@@ -204,8 +237,15 @@ class PiiSettings:
             sudachi_split_mode=str(
                 s.value(_key("sudachi_split_mode"), default.sudachi_split_mode, type=str)
             ),
+            ignore_newlines=bool(
+                s.value(_key("ignore_newlines"), default.ignore_newlines, type=bool)
+            ),
+            ignore_whitespace=bool(
+                s.value(_key("ignore_whitespace"), default.ignore_whitespace, type=bool)
+            ),
             ocr_enabled=bool(s.value(_key("ocr_enabled"), False, type=bool)),
             ocr_dpi=int(s.value(_key("ocr_dpi"), default.ocr_dpi, type=int)),
+            ocr_tier=str(s.value(_key("ocr_tier"), default.ocr_tier, type=str)),
             enabled_engines=enabled_engines,
             keep_existing_on_detect=bool(
                 s.value(_key("keep_existing_on_detect"), False, type=bool)
@@ -225,11 +265,15 @@ class PiiSettings:
         s.setValue(_key("dedupe_enabled"), self.dedupe_enabled)
         s.setValue(_key("dedupe_overlap"), self.dedupe_overlap)
         s.setValue(_key("dedupe_keep"), self.dedupe_keep)
+        s.setValue(_key("entity_overlap_mode"), self.entity_overlap_mode)
         _save_json(s, "entity_priority_order", self.entity_priority_order)
         s.setValue(_key("sudachi_dict_type"), self.sudachi_dict_type)
         s.setValue(_key("sudachi_split_mode"), self.sudachi_split_mode)
+        s.setValue(_key("ignore_newlines"), self.ignore_newlines)
+        s.setValue(_key("ignore_whitespace"), self.ignore_whitespace)
         s.setValue(_key("ocr_enabled"), self.ocr_enabled)
         s.setValue(_key("ocr_dpi"), self.ocr_dpi)
+        s.setValue(_key("ocr_tier"), self.ocr_tier)
         _save_json(s, "enabled_engines", self.enabled_engines)
         s.setValue(_key("keep_existing_on_detect"), self.keep_existing_on_detect)
 

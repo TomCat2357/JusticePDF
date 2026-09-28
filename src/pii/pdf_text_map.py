@@ -17,14 +17,51 @@ from __future__ import annotations
 from src.utils.pdf_utils import _rotate_point, get_page_chars
 
 
-def get_page_text_and_chars(pdf_path: str, page_num: int) -> tuple[str, list[dict]]:
+def get_page_text_and_chars(
+    pdf_path: str,
+    page_num: int,
+    *,
+    ignore_newlines: bool = True,
+    ignore_whitespace: bool = False,
+) -> tuple[str, list[dict]]:
     """ページのテキストと、各文字に対応する座標情報を1対1で返す。
 
     戻り値の ``text[i]`` は ``chars[i]["c"]`` と対応する
     (``src.pii.analyzer.Analyzer.analyze_text`` に渡すオフセットが、
     そのまま ``chars`` のインデックスとして使える)。
+
+    ``ignore_newlines``/``ignore_whitespace`` は PresidioPDF の
+    「テキスト前処理設定」(``src.pii.settings.PiiSettings.ignore_newlines``/
+    ``ignore_whitespace``)に対応するテキスト前処理:
+
+    - ``ignore_newlines=False``: PDFのブロック境界(表の別セル等、区切り文字
+      無しで文字が連結されがちな箇所)に改行(``\\n``)を1文字挿入してから
+      返す。挿入した改行は実体の無い文字なので ``bbox=None`` を持ち、
+      :func:`offset_span_to_quads` は bbox の無い文字を無視するため、
+      quadの生成には影響しない(``get_page_chars`` の docstring 通り)。
+      既定(``True``)では何も挿入しない(従来通りの動作)。
+    - ``ignore_whitespace=True``: 空白文字(半角/全角スペース等、
+      ``str.isspace()``)をテキスト・座標の両方から除去してから返す
+      (字間調整で挿入された空白によって正規表現が一致しなくなるケースに
+      対応する)。既定(``False``)では何も除去しない(従来通りの動作)。
     """
-    chars = get_page_chars(pdf_path, page_num)
+    raw_chars = get_page_chars(pdf_path, page_num)
+    chars: list[dict] = []
+    prev_block_id: int | None = None
+    for ch in raw_chars:
+        block_id = ch.get("block_id")
+        if (
+            not ignore_newlines
+            and not ignore_whitespace  # 挿入する"\n"自体が空白文字のため
+            and prev_block_id is not None
+            and block_id != prev_block_id
+        ):
+            chars.append({"c": "\n", "bbox": None, "line_id": ch.get("line_id")})
+        prev_block_id = block_id
+        if ignore_whitespace and str(ch.get("c", "")).isspace():
+            continue
+        chars.append(ch)
+
     text = "".join(ch.get("c", "") for ch in chars)
     return text, chars
 

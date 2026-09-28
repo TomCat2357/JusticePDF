@@ -236,12 +236,17 @@ def get_page_chars(pdf_path: str, page_num: int) -> list[dict]:
 
     Returns a flat list in reading order. Each entry::
 
-        {"c": str, "bbox": (x0, y0, x1, y1), "line_id": int,
+        {"c": str, "bbox": (x0, y0, x1, y1), "line_id": int, "block_id": int,
          "wmode": int, "dir": (cos, sin)}
 
     Spaces are kept (needed to reproduce gaps faithfully); other control
     characters are dropped. ``line_id`` increments globally across the page so
-    consecutive entries with the same id belong to the same line.
+    consecutive entries with the same id belong to the same line. ``block_id``
+    likewise increments per PDF text block (a "block" in PyMuPDF's rawdict is
+    typically one paragraph/table-cell's worth of text as authored in the PDF's
+    content stream); ``src.pii.pdf_text_map`` uses it to optionally insert a
+    synthetic line break between blocks so unrelated table cells whose text is
+    otherwise concatenated with no separator don't get merged for detection.
     """
     chars: list[dict] = []
     try:
@@ -251,10 +256,12 @@ def get_page_chars(pdf_path: str, page_num: int) -> list[dict]:
             page = doc[page_num]
             raw = page.get_text("rawdict")
             line_id = 0
+            block_id = 0
             for block in raw.get("blocks", []):
                 # type 0 = text block; skip image blocks (type 1).
                 if block.get("type", 0) != 0:
                     continue
+                block_has_char = False
                 for line in block.get("lines", []):
                     wmode = line.get("wmode", 0)
                     direction = line.get("dir", (1.0, 0.0))
@@ -280,6 +287,7 @@ def get_page_chars(pdf_path: str, page_num: int) -> list[dict]:
                                         float(bbox[3]),
                                     ),
                                     "line_id": line_id,
+                                    "block_id": block_id,
                                     "wmode": int(wmode),
                                     "dir": (
                                         float(direction[0]),
@@ -288,8 +296,11 @@ def get_page_chars(pdf_path: str, page_num: int) -> list[dict]:
                                 }
                             )
                             has_char = True
+                            block_has_char = True
                     if has_char:
                         line_id += 1
+                if block_has_char:
+                    block_id += 1
             return chars
     except Exception:
         logger.debug(

@@ -118,3 +118,79 @@ def test_dedupe_options_round_trip(qtbot):
     result = dialog.result_settings()
     assert result.dedupe_enabled is False
     assert result.dedupe_overlap == "exact"
+
+
+def test_sudachi_dict_and_split_mode_round_trip(qtbot):
+    settings = PiiSettings()
+    settings.sudachi_dict_type = "small"
+    settings.sudachi_split_mode = "A"
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert dialog._sudachi_dict_combo.currentData() == "small"
+    assert dialog._sudachi_split_combo.currentData() == "A"
+
+    idx = dialog._sudachi_dict_combo.findData("core")
+    dialog._sudachi_dict_combo.setCurrentIndex(idx)
+    idx = dialog._sudachi_split_combo.findData("C")
+    dialog._sudachi_split_combo.setCurrentIndex(idx)
+
+    result = dialog.result_settings()
+    assert result.sudachi_dict_type == "core"
+    assert result.sudachi_split_mode == "C"
+
+
+def test_sudachi_full_dict_marked_uninstalled_when_unavailable(qtbot, monkeypatch):
+    import src.views.pii_settings_dialog as dialog_module
+
+    monkeypatch.setattr(
+        dialog_module, "sudachi_dict_available", lambda dt: dt != "full"
+    )
+    settings = PiiSettings()
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    idx = dialog._sudachi_dict_combo.findData("full")
+    assert "未インストール" in dialog._sudachi_dict_combo.itemText(idx)
+
+
+def test_entity_overlap_mode_round_trip(qtbot):
+    settings = PiiSettings()
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert dialog._entity_overlap_any_radio.isChecked() is True
+    dialog._entity_overlap_same_radio.setChecked(True)
+
+    result = dialog.result_settings()
+    assert result.entity_overlap_mode == "same"
+
+
+def test_text_preprocess_settings_round_trip(qtbot):
+    settings = PiiSettings()
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert dialog._ignore_newlines_check.isChecked() is True
+    assert dialog._ignore_whitespace_check.isChecked() is False
+
+    dialog._ignore_newlines_check.setChecked(False)
+    dialog._ignore_whitespace_check.setChecked(True)
+
+    result = dialog.result_settings()
+    assert result.ignore_newlines is False
+    assert result.ignore_whitespace is True
+
+
+def test_ocr_tier_round_trip(qtbot):
+    settings = PiiSettings()
+    settings.ocr_tier = "heavy"
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert dialog._ocr_tier_combo.currentData() == "heavy"
+
+    idx = dialog._ocr_tier_combo.findData("light")
+    dialog._ocr_tier_combo.setCurrentIndex(idx)
+    result = dialog.result_settings()
+    assert result.ocr_tier == "light"

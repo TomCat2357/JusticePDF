@@ -4,14 +4,18 @@
 JusticePDF へ移植した際に単一の固定パイプライン(正規表現+SudachiPy形態素解析+
 日時パターン、``src.pii.analyzer.Analyzer._analyze_text_single``)へ統合されて
 おり、選択できなくなっていた。本モジュールは「エンジン」を検出手法の単位
-(正規表現/形態素解析/日時パターン/外部NLPライブラリ)として定義し直し、
-``src.pii.settings.PiiSettings.enabled_engines`` 経由で個別にON/OFFできるように
-する。
+として定義し直し、``src.pii.settings.PiiSettings.enabled_engines`` 経由で
+個別にON/OFFできるようにする。
 
-GiNZA(spaCy日本語モデル)・Janome は任意依存(未導入でも動作)。``is_available``
-は実際に import できるかどうかで判定し、未導入の場合は設定ダイアログ側で
-チェックボックスをグレーアウトする(選択してもエラーにはならず、単に検出に
-寄与しない)。
+GiNZA(spaCy)・Janomeは一度追加したが撤去した。理由:
+    - GiNZA/spaCyはPresidioPDF自身も2026-06のPython 3.14移行時に撤去済みで、
+      本家がSudachiPyへ一本化した経緯を踏まえ、JusticePDFでも追随しないことにした。
+      加えて実機検証で、2026-09時点でもPython 3.14 + pydanticの組み合わせで
+      `import spacy` 自体が失敗する既知の上流未修正バグを確認しており、
+      必須依存にしても実質機能しなかった。
+    - JanomeはSudachiPyと同種の検出を重複して行うだけで、既定で有効な
+      SudachiPy(PresidioPDFと同じ検出エンジン)に対する明確な優位性が
+      確立できなかったため、依存を増やしてまで維持する理由が無いと判断した。
 """
 from __future__ import annotations
 
@@ -31,38 +35,6 @@ def _module_available(name: str) -> bool:
 
 def _sudachi_available() -> bool:
     return _module_available("sudachipy")
-
-
-def _ginza_available() -> bool:
-    """spaCy/GiNZAが実際に読み込めるかどうかを判定する。
-
-    パッケージが `pip`/`uv` で導入されていても、実行系のPythonバージョンと
-    依存(pydantic等)の組み合わせによっては import 自体が例外を送出することが
-    ある(実例: Python 3.14 と pydantic 2.x の組み合わせで、pydanticが内部で
-    使う ``typing._eval_type`` の引数がPython 3.14で非互換になり、spaCyの
-    import 中に ``TypeError`` が発生する。2026-09時点でPyPIに公開されている
-    最新版・ベータ版のpydanticでも未修正)。``find_spec`` によるモジュール
-    存在チェックだけでは「入っているのに動かない」状態を「利用可能」と誤判定
-    してしまうため、``src.pii.ginza_recognizer.is_ready()`` で実際に読み込みを
-    試みた結果を使う(初回のみコストがかかるが、結果はプロセス内でキャッシュ
-    されるため以降は一瞬で返る)。
-    """
-    try:
-        from src.pii.ginza_recognizer import is_ready
-
-        return is_ready()
-    except Exception:
-        return False
-
-
-def _janome_available() -> bool:
-    """Janomeが実際に読み込めるかどうかを判定する(理由は_ginza_availableと同様)。"""
-    try:
-        from src.pii.janome_recognizer import is_ready
-
-        return is_ready()
-    except Exception:
-        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,26 +68,6 @@ ENGINES: List[EngineInfo] = [
         description_ja="和暦・西暦の日付表現を正規表現で検出します。",
         default_enabled=True,
         is_available=lambda: True,
-    ),
-    EngineInfo(
-        key="ginza",
-        name_ja="GiNZA/spaCy",
-        description_ja=(
-            "GiNZA(spaCy日本語モデル)の統計的固有表現認識で人名・地名を補助的に検出します。"
-            "利用にはspaCyとja_ginza(またはja_ginza_electra)モデルの追加導入が必要です。"
-        ),
-        default_enabled=False,
-        is_available=_ginza_available,
-    ),
-    EngineInfo(
-        key="janome",
-        name_ja="Janome",
-        description_ja=(
-            "Janome形態素解析による固有名詞検出を補助的に使います"
-            "(SudachiPyが使えない環境向けの代替/補完)。利用にはjanomeの追加導入が必要です。"
-        ),
-        default_enabled=False,
-        is_available=_janome_available,
     ),
 ]
 

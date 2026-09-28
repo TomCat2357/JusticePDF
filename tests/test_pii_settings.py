@@ -35,8 +35,12 @@ def test_settings_round_trip_with_customizations():
     settings.dedupe_keep = "first"
     settings.ocr_enabled = True
     settings.ocr_dpi = 400
-    settings.enabled_engines["ginza"] = True
+    settings.ocr_tier = "heavy"
+    settings.enabled_engines["datetime"] = False
     settings.enabled_engines["sudachi"] = False
+    settings.entity_overlap_mode = "same"
+    settings.ignore_newlines = False
+    settings.ignore_whitespace = True
     settings.keep_existing_on_detect = True
     settings.save()
 
@@ -53,8 +57,12 @@ def test_settings_round_trip_with_customizations():
     assert loaded.dedupe_keep == "first"
     assert loaded.ocr_enabled is True
     assert loaded.ocr_dpi == 400
-    assert loaded.enabled_engines["ginza"] is True
+    assert loaded.ocr_tier == "heavy"
+    assert loaded.enabled_engines["datetime"] is False
     assert loaded.enabled_engines["sudachi"] is False
+    assert loaded.entity_overlap_mode == "same"
+    assert loaded.ignore_newlines is False
+    assert loaded.ignore_whitespace is True
     assert loaded.keep_existing_on_detect is True
 
 
@@ -82,16 +90,44 @@ def test_to_config_overrides_groups_additional_patterns_by_entity():
 def test_copy_deep_copies_enabled_engines():
     settings = PiiSettings()
     copy = settings.copy()
-    copy.enabled_engines["ginza"] = True
-    assert settings.enabled_engines["ginza"] is False
+    copy.enabled_engines["sudachi"] = False
+    assert settings.enabled_engines["sudachi"] is True
 
 
 def test_to_config_overrides_includes_engines():
     settings = PiiSettings()
-    settings.enabled_engines["janome"] = True
+    settings.enabled_engines["datetime"] = False
     overrides = settings.to_config_overrides()
-    assert overrides["engines"]["janome"] is True
+    assert overrides["engines"]["datetime"] is False
     assert overrides["engines"]["regex"] is True
+
+
+def test_to_config_overrides_includes_entity_overlap_mode_and_text_preprocess():
+    settings = PiiSettings()
+    settings.entity_overlap_mode = "same"
+    settings.ignore_newlines = False
+    settings.ignore_whitespace = True
+    overrides = settings.to_config_overrides()
+    assert overrides["deduplication"]["entity_overlap_mode"] == "same"
+    assert overrides["text_preprocess"] == {
+        "ignore_newlines": False,
+        "ignore_whitespace": True,
+    }
+
+
+def test_load_silently_drops_removed_engine_keys():
+    """要望: 旧設定にginza/janomeのキーが残っていてもエラーにならないこと。"""
+    settings = QSettings()
+    settings.setValue(
+        "pii/enabled_engines",
+        '{"regex": true, "sudachi": false, "ginza": true, "janome": true}',
+    )
+
+    loaded = PiiSettings.load()
+    assert loaded.enabled_engines["regex"] is True
+    assert loaded.enabled_engines["sudachi"] is False
+    assert "ginza" not in loaded.enabled_engines
+    assert "janome" not in loaded.enabled_engines
 
 
 def test_load_uses_isolated_qsettings_between_tests():

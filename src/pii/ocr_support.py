@@ -1,14 +1,23 @@
-"""OCR（RapidOCR）によるテキストレイヤ無しページの検出補助（任意機能）。
+"""OCR（RapidOCR）によるテキストレイヤ無しページの検出補助。
 
 Ported from PresidioPDF src/ocr/rapidocr_service.py / src/ocr/base.py の
 アイデアを踏襲するが、PresidioPDF 版は「OCR結果をPDFへ不可視テキストとして
 埋め込む」ためのものだった。JusticePDF はPDFへの書き込みを行わず、
 個人情報検出用のテキスト＋座標(quad)だけをその場で得られればよいため、
 必要な部分（画像化→RapidOCR実行→矩形の取得）だけを抜き出して書き直した。
+そのため PresidioPDF の「埋め込みテキスト色」「透明度」「Xオフセット/Y
+オフセット」「テキスト色を画像から自動検出」といった設定はJusticePDFでは
+意味を持たない(埋め込み機能自体が無いため)。移植したのは、両者に共通する
+「モデル規模(tier: 軽量mobile/高精度server)」の選択のみ。
 
-``rapidocr``（および推論バックエンドの ``onnxruntime``）は
-``pyproject.toml`` の ``ocr`` extra でのみ導入されるオプション機能なので、
-本モジュールは import 時に失敗しないよう遅延 import する。
+``rapidocr``（および推論バックエンドの ``onnxruntime``）は必須依存
+(``pyproject.toml``)だが、実行環境によっては導入に失敗している場合もある
+ため、本モジュールは import 時に失敗しないよう遅延 import する。
+
+``src.pii.detection_service.run_detection`` は、抽出したテキストが空
+(=テキストレイヤの無いページ)で ``PiiSettings.ocr_enabled`` が有効かつ
+本モジュールが利用可能な場合にのみ、ここでOCRへフォールバックする
+(通常のテキストがあるページではOCRを使わない)。
 """
 from __future__ import annotations
 
@@ -19,7 +28,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_engine = None  # RapidOCR エンジンは初期化が重いため遅延生成してキャッシュする
+# RapidOCR エンジンは初期化が重い(モデル読み込み)ため、tier(モデル規模)ごとに
+# 遅延生成してキャッシュする。tier を切り替えるたびに作り直す必要があるため、
+# 単一のグローバル変数ではなく tier をキーにした辞書で持つ。
+_engines: dict[str, object] = {}
 
 
 def is_ocr_available() -> bool:
@@ -33,17 +45,52 @@ def is_ocr_available() -> bool:
         return False
 
 
-def _get_engine():
-    global _engine
-    if _engine is None:
-        from rapidocr import RapidOCR  # noqa: PLC0415 - 任意依存の遅延import
+def _get_engine(tier: str = "light"):
+    """tier("light"=軽量/mobile、"heavy"=高精度/server)に応じたRapidOCRエンジン。
 
-        _engine = RapidOCR()
-    return _engine
+    Ported from PresidioPDF ``src/ocr/rapidocr_service.py`` のモデル選択方針
+    (検出はPP-OCRv5のmobile/server、日本語認識はPP-OCRv4+``LangRec.JAPAN``)。
+    """
+    tier_key = "heavy" if str(tier or "").lower() == "heavy" else "light"
+    engine = _engines.get(tier_key)
+    if engine is None:
+        from rapidocr import (  # noqa: PLC0415 - 任意依存の遅延import
+            EngineType,
+            LangRec,
+            ModelType,
+            OCRVersion,
+            RapidOCR,
+        )
+
+        model_type = ModelType.SERVER if tier_key == "heavy" else ModelType.MOBILE
+        lang_rec = getattr(LangRec, "JAPAN", "japan")
+        params = {
+            "Det.engine_type": EngineType.ONNXRUNTIME,
+            "Det.model_type": model_type,
+            "Det.ocr_version": OCRVersion.PPOCRV5,
+            "Rec.engine_type": EngineType.ONNXRUNTIME,
+            "Rec.lang_type": lang_rec,
+            "Rec.ocr_version": OCRVersion.PPOCRV4,
+            "Rec.model_type": model_type,
+        }
+        try:
+            engine = RapidOCR(params=params)
+        except Exception:
+            # PP-OCRv4 日本語recにSERVER版が無い等の場合、recのみmobileへ
+            # フォールバックする(PresidioPDFの同様のフォールバックを踏襲)。
+            logger.warning(
+                "RapidOCR(%s)のモデル構成に失敗。recをmobileにフォールバックします",
+                tier_key,
+                exc_info=True,
+            )
+            params["Rec.model_type"] = ModelType.MOBILE
+            engine = RapidOCR(params=params)
+        _engines[tier_key] = engine
+    return engine
 
 
 def ocr_page_text_and_chars(
-    pdf_path: str, page_num: int, *, dpi: int = 300
+    pdf_path: str, page_num: int, *, dpi: int = 300, tier: str = "light"
 ) -> tuple[str, list[dict]]:
     """OCR でページのテキストと文字相当の座標情報を取得する。
 
@@ -58,7 +105,7 @@ def ocr_page_text_and_chars(
     """
     import fitz
 
-    engine = _get_engine()
+    engine = _get_engine(tier)
     chars: list[dict] = []
     text_parts: list[str] = []
 

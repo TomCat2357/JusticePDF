@@ -227,7 +227,7 @@ class ConfigManager:
         """指定した検出エンジンが有効かどうかを返す。
 
         明示設定が無ければ ``src.pii.engines.default_enabled_engines()`` の
-        既定値を使う(GiNZA/Janome等の任意エンジンは既定でOFF)。
+        既定値を使う。
         """
         engines = self._safe_get_config("engines", {})
         if isinstance(engines, dict) and key in engines:
