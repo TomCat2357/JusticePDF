@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace as dataclass_replace
 
 from PyQt6.QtCore import QSettings
 
+from src.pii.engines import default_enabled_engines
 from src.pii.entity_types import ENTITY_TYPES, HIGHLIGHT_COLORS
 
 logger = logging.getLogger(__name__)
@@ -80,9 +81,18 @@ class PiiSettings:
     # OCR（rapidocr が導入されている場合のみ実際に使われる）
     ocr_enabled: bool = False
     ocr_dpi: int = 300
+    # 検出エンジン(認識器)ごとのON/OFF。キーは src.pii.engines.ENGINE_KEYS。
+    # GiNZA/Janome等の任意エンジンは未導入なら選んでもエラーにならず0件を返す。
+    enabled_engines: dict[str, bool] = field(default_factory=default_enabled_engines)
+    # 検出ボタン押下時、既存の検出結果・手動追加分を消さずに新規検出分だけ
+    # 追加するかどうか(オフなら従来通り、検出し直したページの既存結果を置換)。
+    keep_existing_on_detect: bool = False
 
     def is_entity_enabled(self, entity_type: str) -> bool:
         return bool(self.enabled_entities.get(entity_type, True))
+
+    def is_engine_enabled(self, engine_key: str) -> bool:
+        return bool(self.enabled_engines.get(engine_key, False))
 
     def enabled_entity_list(self) -> list[str]:
         return [et for et in ENTITY_TYPES if self.is_entity_enabled(et)]
@@ -133,6 +143,7 @@ class PiiSettings:
                 "method": self.dedupe_overlap,
                 "entity_priority_order": list(self.entity_priority_order),
             },
+            "engines": dict(self.enabled_engines),
         }
 
     @staticmethod
@@ -158,6 +169,13 @@ class PiiSettings:
             str(k): [str(x) for x in v]
             for k, v in (entity_exclusions_raw or {}).items()
         } if isinstance(entity_exclusions_raw, dict) else {}
+
+        enabled_engines_raw = _load_json(s, "enabled_engines", None)
+        enabled_engines = dict(default.enabled_engines)
+        if isinstance(enabled_engines_raw, dict):
+            enabled_engines.update(
+                {str(k): bool(v) for k, v in enabled_engines_raw.items()}
+            )
 
         return PiiSettings(
             enabled_entities=(
@@ -188,6 +206,10 @@ class PiiSettings:
             ),
             ocr_enabled=bool(s.value(_key("ocr_enabled"), False, type=bool)),
             ocr_dpi=int(s.value(_key("ocr_dpi"), default.ocr_dpi, type=int)),
+            enabled_engines=enabled_engines,
+            keep_existing_on_detect=bool(
+                s.value(_key("keep_existing_on_detect"), False, type=bool)
+            ),
         )
 
     def save(self, settings: QSettings | None = None) -> None:
@@ -208,6 +230,8 @@ class PiiSettings:
         s.setValue(_key("sudachi_split_mode"), self.sudachi_split_mode)
         s.setValue(_key("ocr_enabled"), self.ocr_enabled)
         s.setValue(_key("ocr_dpi"), self.ocr_dpi)
+        _save_json(s, "enabled_engines", self.enabled_engines)
+        s.setValue(_key("keep_existing_on_detect"), self.keep_existing_on_detect)
 
     def copy(self) -> "PiiSettings":
         """独立編集用のディープコピーを返す(可変フィールドの参照共有を避ける)。
@@ -228,4 +252,5 @@ class PiiSettings:
             additional_patterns=list(self.additional_patterns),
             custom_names=list(self.custom_names),
             entity_priority_order=list(self.entity_priority_order),
+            enabled_engines=dict(self.enabled_engines),
         )

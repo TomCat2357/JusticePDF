@@ -54,6 +54,9 @@ class ConfigManager:
                 "chunk_delimiter": "。",
                 "chunk_max_chars": 15000,
             },
+            # 検出エンジン(認識器)ごとのON/OFF。キーは src.pii.engines.ENGINE_KEYS。
+            # 空辞書のまま(未設定)なら src.pii.engines.default_enabled_engines() を使う。
+            "engines": {},
             "deduplication": {
                 "enabled": False,
                 "method": "overlap",  # overlap | exact | contain
@@ -217,6 +220,21 @@ class ConfigManager:
 
     def get_chunk_max_chars(self) -> int:
         return self._safe_get_config("nlp.chunk_max_chars", 15000)
+
+    # --- 検出エンジン(認識器)のON/OFF ------------------------------------
+
+    def is_engine_enabled(self, key: str) -> bool:
+        """指定した検出エンジンが有効かどうかを返す。
+
+        明示設定が無ければ ``src.pii.engines.default_enabled_engines()`` の
+        既定値を使う(GiNZA/Janome等の任意エンジンは既定でOFF)。
+        """
+        engines = self._safe_get_config("engines", {})
+        if isinstance(engines, dict) and key in engines:
+            return bool(engines[key])
+        from src.pii.engines import default_enabled_engines
+
+        return bool(default_enabled_engines().get(key, False))
 
     # --- 重複除去 -----------------------------------------------------------
 

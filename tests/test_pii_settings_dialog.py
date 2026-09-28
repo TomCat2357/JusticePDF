@@ -47,6 +47,65 @@ def test_add_and_remove_additional_pattern(qtbot):
     assert result_after_remove.additional_patterns == []
 
 
+def test_entities_tab_select_all_and_deselect_all(qtbot):
+    settings = PiiSettings()
+    settings.enabled_entities["PERSON"] = False
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    dialog._set_all_entity_checks(True)
+    assert all(box.isChecked() for box in dialog._entity_checks.values())
+
+    dialog._set_all_entity_checks(False)
+    assert all(not box.isChecked() for box in dialog._entity_checks.values())
+
+
+def test_manual_entity_has_color_button_but_no_checkbox(qtbot):
+    settings = PiiSettings()
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert "MANUAL" not in dialog._entity_checks
+    assert "MANUAL" in dialog._entity_color_btns
+
+
+def test_engines_tab_lists_always_available_engines_checked_by_default(qtbot):
+    settings = PiiSettings()
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert dialog._engine_checks["regex"].isChecked() is True
+    assert dialog._engine_checks["regex"].isEnabled() is True
+    assert dialog._engine_checks["datetime"].isChecked() is True
+
+
+def test_engines_tab_select_all_only_affects_available_engines(qtbot):
+    settings = PiiSettings()
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    dialog._set_all_engine_checks(False)
+    dialog._set_all_engine_checks(True)
+    for key, checkbox in dialog._engine_checks.items():
+        assert checkbox.isChecked() == checkbox.isEnabled(), key
+
+    result = dialog.result_settings()
+    for key, checkbox in dialog._engine_checks.items():
+        assert result.enabled_engines[key] == checkbox.isChecked()
+
+
+def test_toggling_engine_checkbox_is_reflected_in_result(qtbot):
+    settings = PiiSettings()
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+
+    dialog._engine_checks["regex"].setChecked(False)
+    result = dialog.result_settings()
+    assert result.enabled_engines["regex"] is False
+    # 元のオブジェクトは変更されない(ダイアログはコピー上で編集する)。
+    assert settings.enabled_engines["regex"] is True
+
+
 def test_dedupe_options_round_trip(qtbot):
     settings = PiiSettings()
     dialog = PiiSettingsDialog(settings)
