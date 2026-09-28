@@ -170,6 +170,73 @@ def _pixel_size_to_pointf(pixel_size: int) -> float:
 
 
 
+# ページ一覧のサムネイルは小さいため、拡大表示(塗り0.32)より濃く塗って
+# 塗りつぶし対象の位置が一目で分かるようにする。
+_THUMBNAIL_MASK_FILL_ALPHA = 0.55
+
+
+def paint_pii_mask_overlay(
+    pixmap: QPixmap,
+    targets: "list[TextMarkupAnnotData | ShapeAnnotData]",
+    page_size: tuple[float, float],
+) -> QPixmap:
+    """ページ一覧のサムネイルに塗りつぶし候補・塗りつぶし用図形を重ねて描く。
+
+    サムネイルは PDF 注釈を焼き込んで描画するが、塗りつぶし対象の実PDF注釈は
+    外部ビューア向けに暗く薄い色(マーカーは種別色の35%・不透明度0.35)で
+    保存しているため、縮小すると位置がほぼ判別できない。拡大表示
+    (``ZoomPageWidget._paint_mask_candidate_rects`` / ``_paint_shape_annotation``)
+    と同じ「種別色の塗り+濃い枠」をここで重ねる。呼び出し側は該当注釈を
+    ``hide_xrefs`` でページ画像から隠しておくこと(二重描画を避けるため)。
+    ``page_size`` は表示座標系(回転適用後)のページ幅・高さ。
+    """
+    page_w, page_h = page_size
+    if pixmap.isNull() or not targets or page_w <= 0 or page_h <= 0:
+        return pixmap
+    scale = pixmap.width() / page_w
+    result = QPixmap(pixmap)
+    painter = QPainter(result)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    try:
+        for target in targets:
+            if isinstance(target, ShapeAnnotData):
+                accent_rgb = target.stroke_color
+            else:
+                accent_rgb = target.color
+            accent = (
+                QColor.fromRgbF(*(max(0.0, min(1.0, float(c))) for c in accent_rgb))
+                if accent_rgb
+                else QColor(200, 200, 200)
+            )
+            fill, border = ZoomPageWidget._mask_candidate_colors(accent)
+            fill.setAlphaF(_THUMBNAIL_MASK_FILL_ALPHA)
+            painter.setPen(QPen(border, 1.0))
+            painter.setBrush(QBrush(fill))
+            if isinstance(target, ShapeAnnotData):
+                x0, y0, x1, y1 = target.rect
+                rect = QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+                painter.save()
+                rotation = float(target.rotation or 0.0)
+                if rotation:
+                    center = rect.center()
+                    painter.translate(center)
+                    painter.rotate(rotation)
+                    rect = QRectF(-rect.width() / 2, -rect.height() / 2, rect.width(), rect.height())
+                if target.shape_type == ShapeType.ELLIPSE:
+                    painter.drawEllipse(rect)
+                else:
+                    painter.drawRect(rect)
+                painter.restore()
+            else:
+                for x0, y0, x1, y1 in target.quads:
+                    painter.drawRect(
+                        QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+                    )
+    finally:
+        painter.end()
+    return result
+
+
 class PageThumbnail(QFrame):
     """Widget representing a single PDF page."""
 
@@ -2124,7 +2191,12 @@ class ZoomPageWidget(QWidget):
                 painter.drawLine(p1, p2)
             else:
                 preview_rect = self._page_rect_to_widget_rect(self._annotation_create_preview_rect)
-                painter.drawRect(preview_rect)
+                # 円(通常の図形ツール・個人情報検出の「塗り丸」共通)は確定後と
+                # 同じ楕円で予告する(以前は外接する四角を描いていた)。
+                if self._annotation_create_shape_type == ShapeType.ELLIPSE:
+                    painter.drawEllipse(preview_rect)
+                else:
+                    painter.drawRect(preview_rect)
         if self._paste_annotation is not None and self._paste_preview_rect is not None:
             preview_rect = self._annotation_widget_rect(self._paste_annotation, self._paste_preview_rect)
             if isinstance(self._paste_annotation, ShapeAnnotData):
@@ -2453,9 +2525,31 @@ class ZoomPageWidget(QWidget):
                     if quad_rect.contains(QPointF(pos)):
                         return annot
             elif isinstance(annot, ShapeAnnotData):
-                if self._annotation_widget_rect(annot).contains(QPointF(pos)):
+                if self._mask_shape_contains(annot, QPointF(pos)):
                     return annot
         return None
+
+    def _mask_shape_contains(self, shape: ShapeAnnotData, point: QPointF) -> bool:
+        """塗りつぶし用図形の内側に点があるか(楕円は外接矩形の角を含めない)。"""
+        rect = self._annotation_widget_rect(shape)
+        if shape.shape_type != ShapeType.ELLIPSE:
+            return rect.contains(point)
+        rx = rect.width() / 2.0
+        ry = rect.height() / 2.0
+        if rx <= 0.0 or ry <= 0.0:
+            return False
+        # 描画(_paint_shape_annotation)は中心回りに rotation 度回すので、
+        # 点を逆回転させて軸に沿った楕円の方程式で判定する。
+        center = rect.center()
+        dx = point.x() - center.x()
+        dy = point.y() - center.y()
+        rotation = float(shape.rotation or 0.0)
+        if rotation:
+            rad = math.radians(-rotation)
+            cos_r = math.cos(rad)
+            sin_r = math.sin(rad)
+            dx, dy = dx * cos_r - dy * sin_r, dx * sin_r + dy * cos_r
+        return (dx / rx) ** 2 + (dy / ry) ** 2 <= 1.0
 
     def _update_pii_hover(self, pos: QPoint) -> None:
         """塗りつぶし候補にカーソルが乗っている間、種別・語句をツールチップで表示する。"""

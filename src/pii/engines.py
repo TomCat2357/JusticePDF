@@ -4,14 +4,14 @@
 JusticePDF へ移植した際に単一の固定パイプライン(正規表現+SudachiPy形態素解析+
 日時パターン、``src.pii.analyzer.Analyzer._analyze_text_single``)へ統合されて
 おり、選択できなくなっていた。本モジュールは「エンジン」を検出手法の単位
-(正規表現/形態素解析/日時パターン/外部NLPライブラリ)として定義し直し、
+(正規表現/形態素解析/日時パターン)として定義し直し、
 ``src.pii.settings.PiiSettings.enabled_engines`` 経由で個別にON/OFFできるように
 する。
 
-GiNZA(spaCy日本語モデル)・Janome は任意依存(未導入でも動作)。``is_available``
-は実際に import できるかどうかで判定し、未導入の場合は設定ダイアログ側で
-チェックボックスをグレーアウトする(選択してもエラーにはならず、単に検出に
-寄与しない)。
+``is_available`` は実際に import できるかどうかで判定し、未導入の場合は設定
+ダイアログ側でチェックボックスをグレーアウトする。以前は GiNZA(spaCy)・Janome も
+任意エンジンとして並べていたが、どちらも依存関係に含めておらず通常の導入では
+常に選択不可だったため削除した(旧設定に残るキーは読み込み時に無視される)。
 """
 from __future__ import annotations
 
@@ -32,17 +32,6 @@ def _module_available(name: str) -> bool:
 def _sudachi_available() -> bool:
     return _module_available("sudachipy")
 
-
-def _ginza_available() -> bool:
-    # GiNZA本体はspaCyのモデルパッケージ(ja_ginza / ja_ginza_electra)として
-    # 配布されるため、spaCyとモデルの両方が入っているかで判定する。
-    return _module_available("spacy") and (
-        _module_available("ja_ginza") or _module_available("ja_ginza_electra")
-    )
-
-
-def _janome_available() -> bool:
-    return _module_available("janome")
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,26 +65,6 @@ ENGINES: List[EngineInfo] = [
         description_ja="和暦・西暦の日付表現を正規表現で検出します。",
         default_enabled=True,
         is_available=lambda: True,
-    ),
-    EngineInfo(
-        key="ginza",
-        name_ja="GiNZA/spaCy",
-        description_ja=(
-            "GiNZA(spaCy日本語モデル)の統計的固有表現認識で人名・地名を補助的に検出します。"
-            "利用にはspaCyとja_ginza(またはja_ginza_electra)モデルの追加導入が必要です。"
-        ),
-        default_enabled=False,
-        is_available=_ginza_available,
-    ),
-    EngineInfo(
-        key="janome",
-        name_ja="Janome",
-        description_ja=(
-            "Janome形態素解析による固有名詞検出を補助的に使います"
-            "(SudachiPyが使えない環境向けの代替/補完)。利用にはjanomeの追加導入が必要です。"
-        ),
-        default_enabled=False,
-        is_available=_janome_available,
     ),
 ]
 

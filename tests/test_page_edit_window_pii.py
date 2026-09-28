@@ -321,3 +321,76 @@ def test_add_pattern_and_detect_all_pages(qtbot, monkeypatch, tmp_path):
 
     annots = list_pii_markup_annots(str(pdf_path))
     assert any(a.pii_text == "公務員" and a.pii_entity == "PERSON" for a in annots)
+
+
+def test_pii_mask_overlay_paints_markup_and_ellipse_only_inside():
+    """ページ一覧サムネイル用の重ね描き: マーカーは矩形、塗り丸は楕円の内側だけを塗る。"""
+    from PyQt6.QtGui import QColor, QPixmap
+
+    from src.utils.pdf_utils import MarkupType, ShapeAnnotData, ShapeType, TextMarkupAnnotData
+    from src.views.page_edit_widgets import paint_pii_mask_overlay
+
+    base = QPixmap(100, 50)
+    base.fill(QColor("white"))
+    markup = TextMarkupAnnotData(
+        page_num=0,
+        xref=1,
+        quads=((20.0, 20.0, 60.0, 40.0),),
+        markup_type=MarkupType.HIGHLIGHT,
+        color=(1.0, 0.0, 0.0),
+        opacity=0.35,
+        pii_entity="PERSON",
+    )
+    ellipse = ShapeAnnotData(
+        page_num=0,
+        xref=2,
+        rect=(100.0, 0.0, 200.0, 100.0),
+        shape_type=ShapeType.ELLIPSE,
+        stroke_color=(0.0, 0.0, 1.0),
+        fill_color=(0.0, 0.0, 0.0),
+        stroke_width=1.2,
+        opacity=0.35,
+        pii_entity="LOCATION",
+    )
+    image = paint_pii_mask_overlay(base, [markup, ellipse], (200.0, 100.0)).toImage()
+
+    marker_px = image.pixelColor(20, 15)  # quad の内側(縮尺0.5)
+    assert marker_px.red() > 200 and marker_px.green() < 200
+    center_px = image.pixelColor(75, 25)  # 楕円の中心
+    assert center_px.blue() > 200 and center_px.red() < 200
+    corner_px = image.pixelColor(51, 1)  # 外接矩形の角(楕円の外側)は塗らない
+    assert (corner_px.red(), corner_px.green(), corner_px.blue()) == (255, 255, 255)
+
+
+def test_page_list_thumbnail_shows_pii_mask_targets(qtbot, tmp_path):
+    """ページ一覧のサムネイルにも塗りつぶし対象が種別色で重ね描きされる。"""
+    from src.utils.pdf_utils import MarkupType, TextMarkupAnnotData, create_markup_annot
+
+    pdf_path = tmp_path / "pii_thumb.pdf"
+    _make_pii_pdf(pdf_path)
+    create_markup_annot(
+        str(pdf_path),
+        TextMarkupAnnotData(
+            page_num=0,
+            xref=0,
+            quads=((0.0, 0.0, 400.0, 200.0),),
+            markup_type=MarkupType.HIGHLIGHT,
+            color=(1.0, 0.0, 0.0),
+            opacity=0.35,
+            pii_entity="PERSON",
+            pii_text="山田太郎",
+        ),
+    )
+    window = _create_window(qtbot, pdf_path)
+    window._reset_thumbnail_render_queue()
+    window._thumbnails[0].invalidate_thumbnail()
+    window._thumb_render_queue.append(0)
+    window._thumb_render_queue_set.add(0)
+    window._process_thumbnail_render_queue()
+    thumb = window._thumbnails[0]
+    assert thumb.thumbnail_loaded
+
+    image = thumb._image_label.pixmap().toImage()
+    px = image.pixelColor(image.width() // 2, 2)
+    # 実PDF注釈(種別色の35%・不透明度0.35=暗い灰色)ではなく、赤系の重ね描きになる。
+    assert px.red() > 200 and px.green() < 200 and px.blue() < 200

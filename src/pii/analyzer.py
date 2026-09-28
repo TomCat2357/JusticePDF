@@ -107,10 +107,9 @@ class Analyzer:
             occupied.append((s, e))
             add_selected.append({k: v for k, v in cand.items() if not k.startswith("_")})
 
-        # 2) モデル検出（正規表現認識器 + 形態素 NE + 日時 + 任意エンジン）。
+        # 2) モデル検出（正規表現認識器 + 形態素 NE + 日時）。
         # どのエンジンを実行するかは設定(src.pii.settings.PiiSettings.enabled_engines)
-        # に従う。GiNZA/Janomeは未導入でも例外を出さず0件を返すだけなので、
-        # 有効化されていても未導入なら実質何もしない。
+        # に従う。
         analyzer_results: List[Dict] = []
         cm = self.config_manager
         if cm.is_engine_enabled("regex"):
@@ -119,14 +118,6 @@ class Analyzer:
             analyzer_results += detect_pos_entities(self._get_tokenizer(), text, entities)
         if cm.is_engine_enabled("datetime"):
             analyzer_results += detect_datetime(text, entities)
-        if cm.is_engine_enabled("ginza"):
-            from src.pii.ginza_recognizer import detect_ginza_entities
-
-            analyzer_results += detect_ginza_entities(text, entities)
-        if cm.is_engine_enabled("janome"):
-            from src.pii.janome_recognizer import detect_janome_entities
-
-            analyzer_results += detect_janome_entities(text, entities)
 
         # 3) モデル結果に除外適用＆追加と重複するものを抑制
         def overlaps_any(span):
