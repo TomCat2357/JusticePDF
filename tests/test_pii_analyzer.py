@@ -92,9 +92,10 @@ def test_entity_filter_excludes_disabled_types():
     assert "PHONE_NUMBER" in entity_types
 
 
-def test_text_exclusion_removes_matching_word():
+def test_text_exclusion_regex_removes_partially_matching_word():
     settings = PiiSettings()
-    settings.text_exclusions = ["090-1234-5678"]
+    # re.search による部分一致: 検出語(電話番号全体)の一部にマッチすれば除外。
+    settings.text_exclusions_regex = ["1234-5678"]
     results = _analyze("電話番号は090-1234-5678です。", settings)
     phone_hits = [r for r in results if r["entity_type"] == "PHONE_NUMBER"]
     assert phone_hits == []
