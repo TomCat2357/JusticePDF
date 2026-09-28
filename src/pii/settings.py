@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field, replace as dataclass_replace
 
 from PyQt6.QtCore import QSettings
@@ -59,7 +60,6 @@ class PiiSettings:
     # マーカー色（エンティティ別、RGB 0.0-1.0）。未指定は entity_types の既定色。
     colors: dict[str, tuple[float, float, float]] = field(default_factory=dict)
     # 除外設定
-    text_exclusions: list[str] = field(default_factory=list)
     text_exclusions_regex: list[str] = field(default_factory=list)
     entity_exclusions: dict[str, list[str]] = field(default_factory=dict)
     # 追加検出パターン: (entity_type, regex) のリスト（左が高優先）
@@ -90,7 +90,6 @@ class PiiSettings:
     ocr_enabled: bool = False
     ocr_dpi: int = 300
     # 検出エンジン(認識器)ごとのON/OFF。キーは src.pii.engines.ENGINE_KEYS。
-    # GiNZA/Janome等の任意エンジンは未導入なら選んでもエラーにならず0件を返す。
     enabled_engines: dict[str, bool] = field(default_factory=default_enabled_engines)
     # 検出ボタン押下時、既存の検出結果・手動追加分を消さずに新規検出分だけ
     # 追加するかどうか(オフなら従来通り、検出し直したページの既存結果を置換)。
@@ -139,7 +138,6 @@ class PiiSettings:
                 "use_with_auto_detection": True,
             },
             "exclusions": {
-                "text_exclusions": list(self.text_exclusions),
                 "text_exclusions_regex": list(self.text_exclusions_regex),
                 "entity_exclusions": {
                     k: list(v) for k, v in self.entity_exclusions.items()
@@ -184,9 +182,25 @@ class PiiSettings:
         enabled_engines_raw = _load_json(s, "enabled_engines", None)
         enabled_engines = dict(default.enabled_engines)
         if isinstance(enabled_engines_raw, dict):
+            # 削除済みエンジン(旧GiNZA/Janome等)のキーは読み捨てる。
             enabled_engines.update(
-                {str(k): bool(v) for k, v in enabled_engines_raw.items()}
+                {
+                    str(k): bool(v)
+                    for k, v in enabled_engines_raw.items()
+                    if str(k) in enabled_engines
+                }
             )
+
+        # 旧「除外ワード(部分一致)」は除外パターン(re.search=部分一致)と機能が
+        # 重複していたため廃止した。保存済みの除外ワードは記号をエスケープして
+        # 除外パターンへ移し、同じ除外が効き続けるようにする。
+        text_exclusions_regex = [
+            str(x) for x in (_load_json(s, "text_exclusions_regex", []) or [])
+        ]
+        for word in _load_json(s, "text_exclusions", []) or []:
+            escaped = re.escape(str(word))
+            if word and escaped not in text_exclusions_regex:
+                text_exclusions_regex.append(escaped)
 
         return PiiSettings(
             enabled_entities=(
@@ -195,8 +209,7 @@ class PiiSettings:
                 else dict(default.enabled_entities)
             ),
             colors=colors,
-            text_exclusions=list(_load_json(s, "text_exclusions", []) or []),
-            text_exclusions_regex=list(_load_json(s, "text_exclusions_regex", []) or []),
+            text_exclusions_regex=text_exclusions_regex,
             entity_exclusions=entity_exclusions,
             additional_patterns=additional_patterns,
             custom_names=list(_load_json(s, "custom_names", []) or []),
@@ -231,8 +244,10 @@ class PiiSettings:
         s = settings or QSettings()
         _save_json(s, "enabled_entities", self.enabled_entities)
         _save_json(s, "colors", {k: list(v) for k, v in self.colors.items()})
-        _save_json(s, "text_exclusions", self.text_exclusions)
         _save_json(s, "text_exclusions_regex", self.text_exclusions_regex)
+        # 旧「除外ワード」は load 時に除外パターンへ移行済みなので消しておく
+        # (残すと次回 load で再移行され、削除した除外パターンが復活してしまう)。
+        s.remove(_key("text_exclusions"))
         _save_json(s, "entity_exclusions", self.entity_exclusions)
         _save_json(s, "additional_patterns", [list(p) for p in self.additional_patterns])
         _save_json(s, "custom_names", self.custom_names)
@@ -261,7 +276,6 @@ class PiiSettings:
             self,
             enabled_entities=dict(self.enabled_entities),
             colors=dict(self.colors),
-            text_exclusions=list(self.text_exclusions),
             text_exclusions_regex=list(self.text_exclusions_regex),
             entity_exclusions={k: list(v) for k, v in self.entity_exclusions.items()},
             additional_patterns=list(self.additional_patterns),

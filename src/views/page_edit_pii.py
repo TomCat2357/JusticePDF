@@ -110,6 +110,8 @@ class PiiDrawerMixin:
         settings.save()
         self._pii_settings_cache = settings
         self._apply_pii_display_mode(mode)
+        # ページ一覧のサムネイルも同じ表示モードで描き直す。
+        self._invalidate_and_requeue_thumbnails()
 
     def _apply_pii_display_mode(self, mode: str) -> None:
         """ズームビューの塗りつぶし候補の見た目(マーキング/黒塗り/非表示)を切り替える。"""
@@ -661,7 +663,7 @@ class PiiDrawerMixin:
     ) -> None:
         """追加パターン1件だけを使って対象ページを部分再検出し、結果に追加する。
 
-        他の検出エンジン(正規表現/形態素解析/日時/GiNZA/Janome)は無効化し、
+        他の検出エンジン(正規表現/形態素解析/日時)は無効化し、
         他の種別の検出も行わない(この操作は「登録したパターンで追加検出する」
         ためのものであり、通常の全種別検出をやり直すものではない)。
         件数が少なく軽量な処理のため、バックグラウンドワーカーは使わず同期実行する。
