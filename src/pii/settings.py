@@ -40,6 +40,14 @@ def _save_json(settings: QSettings, name: str, value) -> None:
     settings.setValue(_key(name), json.dumps(value, ensure_ascii=False))
 
 
+_DISPLAY_MODES = ("mark", "black", "hidden")
+
+
+def _normalize_display_mode(value) -> str:
+    value = str(value or "")
+    return value if value in _DISPLAY_MODES else "mark"
+
+
 @dataclass(slots=True)
 class PiiSettings:
     """個人情報検出の設定一式。"""
@@ -87,6 +95,9 @@ class PiiSettings:
     # 検出ボタン押下時、既存の検出結果・手動追加分を消さずに新規検出分だけ
     # 追加するかどうか(オフなら従来通り、検出し直したページの既存結果を置換)。
     keep_existing_on_detect: bool = False
+    # ズームビュー上の塗りつぶし候補の見た目("mark" | "black" | "hidden")。
+    # 表示上の切り替えのみで、PDF・エクスポート結果には影響しない。
+    display_mode: str = "mark"
 
     def is_entity_enabled(self, entity_type: str) -> bool:
         return bool(self.enabled_entities.get(entity_type, True))
@@ -210,6 +221,9 @@ class PiiSettings:
             keep_existing_on_detect=bool(
                 s.value(_key("keep_existing_on_detect"), False, type=bool)
             ),
+            display_mode=_normalize_display_mode(
+                s.value(_key("display_mode"), default.display_mode, type=str)
+            ),
         )
 
     def save(self, settings: QSettings | None = None) -> None:
@@ -232,6 +246,7 @@ class PiiSettings:
         s.setValue(_key("ocr_dpi"), self.ocr_dpi)
         _save_json(s, "enabled_engines", self.enabled_engines)
         s.setValue(_key("keep_existing_on_detect"), self.keep_existing_on_detect)
+        s.setValue(_key("display_mode"), self.display_mode)
 
     def copy(self) -> "PiiSettings":
         """独立編集用のディープコピーを返す(可変フィールドの参照共有を避ける)。

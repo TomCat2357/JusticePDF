@@ -11,7 +11,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from PyQt6.QtCore import Qt, QSignalBlocker, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QSignalBlocker, pyqtSignal
+from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -40,6 +41,19 @@ from src.utils.pdf_utils import ShapeAnnotData, ShapeType, TextMarkupAnnotData
 logger = logging.getLogger(__name__)
 
 _ANNOT_ROLE = Qt.ItemDataRole.UserRole
+
+# 塗りつぶし候補の表示モード(ズームビュー上の見た目のみ。PDFには影響しない)。
+PII_DISPLAY_MODE_MARK = "mark"
+PII_DISPLAY_MODE_BLACK = "black"
+PII_DISPLAY_MODE_HIDDEN = "hidden"
+PII_DISPLAY_MODES: tuple[tuple[str, str], ...] = (
+    (PII_DISPLAY_MODE_MARK, "マーキング"),
+    (PII_DISPLAY_MODE_BLACK, "黒塗り"),
+    (PII_DISPLAY_MODE_HIDDEN, "非表示"),
+)
+
+_COLUMN_TO_SORT_FIELD = {0: "text", 1: "entity", 2: "page"}
+_SORT_FIELD_TO_COLUMN = {v: k for k, v in _COLUMN_TO_SORT_FIELD.items()}
 
 
 @dataclass(slots=True)
@@ -77,7 +91,7 @@ class PiiPanel(QFrame):
     mask_ellipse_tool_toggled(bool)
         「塗り丸」ツールのON/OFF。
     remove_selected_requested()
-        「選択を削除」ボタン押下時。
+        「選択を削除」ボタン押下時、または結果一覧でDeleteキー押下時。
     remove_all_requested()
         「すべて削除」ボタン押下時。
     delete_same_text_requested(str)
@@ -95,6 +109,9 @@ class PiiPanel(QFrame):
     result_activated(object)
         結果一覧の項目がクリックされたとき、対応する注釈データを伴って発火
         (``TextMarkupAnnotData`` または ``ShapeAnnotData``)。
+    display_mode_changed(str)
+        「表示」コンボで塗りつぶし候補の見た目を切り替えたとき
+        ("mark" | "black" | "hidden")。
     """
 
     open_changed = pyqtSignal(bool)
@@ -113,6 +130,7 @@ class PiiPanel(QFrame):
     export_rasterize_requested = pyqtSignal()
     export_redact_requested = pyqtSignal()
     result_activated = pyqtSignal(object)
+    display_mode_changed = pyqtSignal(str)
 
     DRAWER_WIDTH = 340
 
@@ -217,25 +235,27 @@ class PiiPanel(QFrame):
 
         # --- 結果一覧 ---
         panel_layout.addWidget(QLabel("検出結果・塗りつぶし対象"))
-        sort_row = QHBoxLayout()
-        sort_row.addWidget(QLabel("並び替え:"))
+        display_row = QHBoxLayout()
+        display_row.addWidget(QLabel("表示:"))
+        self._display_mode_combo = QComboBox()
+        for mode, label in PII_DISPLAY_MODES:
+            self._display_mode_combo.addItem(label, mode)
+        self._display_mode_combo.setToolTip(
+            "ページ上の塗りつぶし候補の見た目を切り替えます。\n"
+            "マーキング: 種別色の薄い塗り+枠線(下の文字が読める)\n"
+            "黒塗り: 黒で塗りつぶした仕上がりイメージ\n"
+            "非表示: 候補を描かずに元のページを確認する\n"
+            "(表示上の切り替えのみで、PDFやエクスポート結果は変わりません)"
+        )
+        self._display_mode_combo.currentIndexChanged.connect(self._on_display_mode_changed)
+        display_row.addWidget(self._display_mode_combo, 1)
+        panel_layout.addLayout(display_row)
+
+        # 並び替えは列ヘッダのクリックで行う(同じ列の再クリックで昇順/降順を反転)。
         self._sort_field = "page"
         self._sort_ascending = True
-        self._sort_combo = QComboBox()
-        self._sort_combo.addItem("ページ順", "page")
-        self._sort_combo.addItem("語句順", "text")
-        self._sort_combo.addItem("種別順", "entity")
-        self._sort_combo.currentIndexChanged.connect(self._on_sort_field_changed)
-        sort_row.addWidget(self._sort_combo, 1)
-        self._sort_order_btn = QToolButton()
-        self._sort_order_btn.setCheckable(True)
-        self._sort_order_btn.setText("昇順 ▲")
-        self._sort_order_btn.setToolTip("並び順(昇順/降順)を切り替えます。")
-        self._sort_order_btn.toggled.connect(self._on_sort_order_toggled)
-        sort_row.addWidget(self._sort_order_btn)
-        panel_layout.addLayout(sort_row)
-
-        self._result_tree = QTreeWidget()
+        self._result_tree = _ResultTree()
+        self._result_tree.setObjectName("piiResultTree")
         self._result_tree.setColumnCount(3)
         self._result_tree.setHeaderLabels(["語句", "種別", "ページ"])
         self._result_tree.setRootIsDecorated(False)
@@ -244,10 +264,12 @@ class PiiPanel(QFrame):
         self._result_tree.itemClicked.connect(self._on_result_item_clicked)
         self._result_tree.itemSelectionChanged.connect(self._update_button_states)
         self._result_tree.customContextMenuRequested.connect(self._on_result_context_menu)
-        # 列ヘッダクリックでも並び替えできるようにする(明示的なコンボ/ボタンと併用)。
+        self._result_tree.delete_pressed.connect(self._on_result_delete_pressed)
         header = self._result_tree.header()
         header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
         header.sectionClicked.connect(self._on_result_header_clicked)
+        self._update_sort_indicator()
         panel_layout.addWidget(self._result_tree, 1)
 
         # --- 操作ボタン ---
@@ -332,6 +354,17 @@ class PiiPanel(QFrame):
         with self._signal_blockers(self._keep_existing_check):
             self._keep_existing_check.setChecked(bool(checked))
 
+    def display_mode(self) -> str:
+        """塗りつぶし候補の表示モード("mark" | "black" | "hidden")を返す。"""
+        data = self._display_mode_combo.currentData()
+        return str(data) if data else PII_DISPLAY_MODE_MARK
+
+    def set_display_mode(self, mode: str) -> None:
+        """表示モードを設定する(シグナルは発火しない)。未知の値は「マーキング」扱い。"""
+        idx = self._display_mode_combo.findData(mode)
+        with self._signal_blockers(self._display_mode_combo):
+            self._display_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
     def selected_manual_entity(self) -> str:
         """手動追加ツール(テキスト候補/塗り四角/塗り丸)用に選択中のエンティティ種別。"""
         data = self._manual_entity_combo.currentData()
@@ -363,29 +396,35 @@ class PiiPanel(QFrame):
     def _signal_blockers(self, *widgets):
         return _MultiSignalBlocker(widgets)
 
-    def _on_sort_field_changed(self, _index: int) -> None:
-        data = self._sort_combo.currentData()
-        self._sort_field = str(data) if data else "page"
-        self._rebuild_result_tree()
-
-    def _on_sort_order_toggled(self, checked: bool) -> None:
-        self._sort_order_btn.setText("降順 ▼" if checked else "昇順 ▲")
-        self._sort_ascending = not checked
+    def set_sort(self, field: str, ascending: bool = True) -> None:
+        """並び替えキー("page" | "text" | "entity")と方向を設定して再描画する。"""
+        self._sort_field = field if field in _SORT_FIELD_TO_COLUMN else "page"
+        self._sort_ascending = bool(ascending)
+        self._update_sort_indicator()
         self._rebuild_result_tree()
 
     def _on_result_header_clicked(self, column: int) -> None:
-        """列ヘッダクリックでもコンボ/昇降順ボタンと同じ並び替えを行えるようにする。
+        """列ヘッダクリックで並び替える。
 
         同じ列を続けてクリックしたときは昇順/降順を反転し、別の列をクリック
-        したときはその列の並び替えキーへ切り替える(方向は維持)。
+        したときはその列の昇順に切り替える。
         """
-        field = {0: "text", 1: "entity", 2: "page"}.get(column, "page")
+        field = _COLUMN_TO_SORT_FIELD.get(column, "page")
         if field == self._sort_field:
-            self._sort_order_btn.setChecked(not self._sort_order_btn.isChecked())
-            return
-        idx = self._sort_combo.findData(field)
-        if idx >= 0:
-            self._sort_combo.setCurrentIndex(idx)  # _on_sort_field_changed 経由で再描画される
+            self.set_sort(field, not self._sort_ascending)
+        else:
+            self.set_sort(field, True)
+
+    def _update_sort_indicator(self) -> None:
+        order = Qt.SortOrder.AscendingOrder if self._sort_ascending else Qt.SortOrder.DescendingOrder
+        self._result_tree.header().setSortIndicator(_SORT_FIELD_TO_COLUMN[self._sort_field], order)
+
+    def _on_display_mode_changed(self, _index: int) -> None:
+        self.display_mode_changed.emit(self.display_mode())
+
+    def _on_result_delete_pressed(self) -> None:
+        if self._result_tree.selectedItems():
+            self.remove_selected_requested.emit()
 
     def _sort_key(self, row: "PiiResultRow"):
         entity_ja = get_entity_type_name_ja(row.entity or "OTHER")
@@ -440,6 +479,37 @@ class PiiPanel(QFrame):
         self._remove_all_btn.setEnabled(has_results)
         self._export_btn.setEnabled(has_results)
         self._remove_selected_btn.setEnabled(bool(self._result_tree.selectedItems()))
+
+
+class _ResultTree(QTreeWidget):
+    """結果一覧。Ctrl+A / Delete をウィンドウのショートカットより優先して受け取る。
+
+    ページ編集ウィンドウには Ctrl+A(全ページ選択)・Delete(ページ削除)の
+    ウィンドウショートカットがあり、そのままでは一覧にフォーカスがあっても
+    そちらが発火してしまう。ShortcutOverride を受理して一覧側で処理する。
+    """
+
+    delete_pressed = pyqtSignal()
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.Type.ShortcutOverride and (
+            event.matches(QKeySequence.StandardKey.SelectAll)
+            or event.matches(QKeySequence.StandardKey.Delete)
+        ):
+            event.accept()
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.StandardKey.SelectAll):
+            self.selectAll()
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Delete):
+            self.delete_pressed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class _MultiSignalBlocker:

@@ -321,3 +321,52 @@ def test_add_pattern_and_detect_all_pages(qtbot, monkeypatch, tmp_path):
 
     annots = list_pii_markup_annots(str(pdf_path))
     assert any(a.pii_text == "公務員" and a.pii_entity == "PERSON" for a in annots)
+
+
+# ---------------------------------------------------------------------------
+# 塗りつぶし候補の表示モード(マーキング / 黒塗り / 非表示)
+# ---------------------------------------------------------------------------
+
+
+def test_display_mode_switches_zoom_rendering_and_persists(qtbot, tmp_path):
+    from PyQt6.QtCore import QPoint
+
+    pdf_path = tmp_path / "pii-display-mode.pdf"
+    _make_pii_pdf(pdf_path)
+    window = _create_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+    window._on_pii_detect_current_page()
+    qtbot.waitUntil(lambda: window._pii_worker is None, timeout=15000)
+
+    zoom = window._zoom_label
+    target = next(a for a in zoom._annotations if getattr(a, "pii_entity", ""))
+    quad_rect = zoom._page_rect_to_widget_rect(zoom._rect_tuple_to_qrectf(target.quads[0]))
+    center = QPoint(int(quad_rect.center().x()), int(quad_rect.center().y()))
+    assert zoom.pii_display_mode() == "mark"
+    assert zoom._annotation_hit_test(center)[0] is target
+
+    combo = window._pii_panel._display_mode_combo
+    images = {}
+    for mode in ("mark", "black", "hidden"):
+        combo.setCurrentIndex(combo.findData(mode))
+        assert zoom.pii_display_mode() == mode
+        images[mode] = zoom.grab().toImage()
+    assert images["mark"] != images["black"]
+    assert images["mark"] != images["hidden"]
+    assert images["black"] != images["hidden"]
+
+    # 黒塗りモードでは候補の中心が黒く塗られる。
+    combo.setCurrentIndex(combo.findData("black"))
+    pixel = zoom.grab().toImage().pixelColor(center)
+    assert (pixel.red(), pixel.green(), pixel.blue()) == (0, 0, 0)
+
+    # 非表示モードでは候補がクリックを奪わない(下のテキストを選択できる)。
+    combo.setCurrentIndex(combo.findData("hidden"))
+    assert zoom._annotation_hit_test(center)[0] is None
+    assert window._pii_settings().display_mode == "hidden"
+
+    # 設定は次回ウィンドウを開いたときにも引き継がれる。
+    window2 = _create_window(qtbot, pdf_path)
+    assert window2._pii_panel.display_mode() == "hidden"
+    assert window2._zoom_label.pii_display_mode() == "hidden"

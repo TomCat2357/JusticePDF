@@ -450,3 +450,15 @@ QRubberBand {
     border: 1px solid #4f46e5;
     background-color: rgba(79, 70, 229, 0.08);
 }
+
+/* ---------- 個人情報検出: 結果一覧の選択行 ------------------------------- */
+/* 既定の選択色は薄く、フォーカスが外れると灰色になって見づらいため、
+   フォーカスの有無に関わらずアクセント色でくっきり表示する。 */
+QTreeWidget#piiResultTree::item:selected,
+QTreeWidget#piiResultTree::item:selected:!active {
+    background-color: #4f46e5;
+    color: #ffffff;
+}
+QTreeWidget#piiResultTree::item:hover:!selected {
+    background-color: #eef2ff;
+}
