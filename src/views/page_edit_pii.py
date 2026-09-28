@@ -89,9 +89,13 @@ class PiiDrawerMixin:
         self._pii_panel.export_redact_requested.connect(self._on_pii_export_redact_requested)
         self._pii_panel.result_activated.connect(self._on_pii_result_activated)
         self._pii_panel.open_changed.connect(self._on_pii_drawer_open_changed)
+        self._pii_panel.display_mode_changed.connect(self._on_pii_display_mode_changed)
         # 開閉トグルはツールバーの「個人情報検出」ボタンへ移設するため内蔵トグルを隠す
         self._pii_panel.use_external_toggle()
         self._pii_panel.set_keep_existing_checked(self._pii_settings().keep_existing_on_detect)
+        display_mode = self._pii_settings().display_mode
+        self._pii_panel.set_display_mode(display_mode)
+        self._apply_pii_display_mode(display_mode)
         return self._pii_panel
 
     def _on_pii_keep_existing_toggled(self, checked: bool) -> None:
@@ -99,6 +103,21 @@ class PiiDrawerMixin:
         settings.keep_existing_on_detect = checked
         settings.save()
         self._pii_settings_cache = settings
+
+    def _on_pii_display_mode_changed(self, mode: str) -> None:
+        settings = self._pii_settings().copy()
+        settings.display_mode = mode
+        settings.save()
+        self._pii_settings_cache = settings
+        self._apply_pii_display_mode(mode)
+        # ページ一覧のサムネイルも同じ表示モードで描き直す。
+        self._invalidate_and_requeue_thumbnails()
+
+    def _apply_pii_display_mode(self, mode: str) -> None:
+        """ズームビューの塗りつぶし候補の見た目(マーキング/黒塗り/非表示)を切り替える。"""
+        zoom_label = getattr(self, "_zoom_label", None)
+        if zoom_label is not None:
+            zoom_label.set_pii_display_mode(mode)
 
     def _manual_mask_entity(self) -> str:
         """手動追加ツール(テキスト候補/塗り四角/塗り丸)向けに選択中の種別。"""
