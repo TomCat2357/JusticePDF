@@ -15,19 +15,29 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
-from PyQt6.QtWidgets import QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
-from src.pii.detection_service import PiiDetection, run_detection
-from src.pii.entity_types import ENTITY_TYPES, MANUAL_ENTITY_TYPE, get_entity_type_name_ja
+from src.pii.detection_service import PiiDetection, expand_quads_for_ocr, run_detection
+from src.pii.entity_types import (
+    ENTITY_TYPES,
+    ENTITY_TYPES_WITH_MANUAL,
+    MANUAL_ENTITY_TYPE,
+    get_entity_type_name_ja,
+)
 from src.pii.engines import ENGINE_KEYS
 from src.pii.pdf_text_map import text_under_ellipse, text_under_rect
 from src.pii.settings import PiiSettings
+from src.pii.text_normalize import normalize_1to1
 from src.views.page_edit_annotations import CreateMode, _AnnotRef
 from src.utils.pdf_utils import (
     MarkupType,
+    PdfWritePermissionError,
     ShapeAnnotData,
     ShapeType,
     TextMarkupAnnotData,
@@ -37,29 +47,32 @@ from src.utils.pdf_utils import (
     delete_markup_annot,
     delete_markup_annots,
     delete_shape_annot,
+    export_pages_as_images,
+    export_pdf_compressed,
     get_page_chars,
     get_page_count,
     list_pii_mask_shapes,
     list_pii_markup_annots,
     rasterize_pdf,
     redact_pdf_remove_text,
+    restyle_pii_annots,
+    set_pii_annot_style,
 )
-from src.views.pii_panel import PiiPanel, PiiResultRow
+from src.views.export_dialog import ExportOptionsDialog
+from src.views.pii_panel import PiiPanel, PiiResultRow, ScopeChoiceDialog
 from src.views.pii_settings_dialog import PiiSettingsDialog
 from src.workers.pii_detect_worker import PiiDetectWorker
 
 logger = logging.getLogger(__name__)
 
 # PIIハイライトの既定の透明度。手動マーカーより薄くして、下の文字を
-# 読みながら検出範囲を確認しやすくする。実際の見た目(種別色の薄い塗り+濃い枠)は
-# page_edit_widgets.ZoomPageWidget._paint_markup_annotation/_paint_shape_annotation
-# が pii_entity の有無を見て描き分けるため、この不透明度は主にPDF側の見た目
-# (Acrobat等の外部ビューア)に効く。
+# 読みながら検出範囲を確認しやすくする。ズームビュー上の実際の見た目(設定の
+# 色・透明度)は page_edit_widgets.ZoomPageWidget._paint_markup_annotation/
+# _paint_shape_annotation が pii_entity の有無を見て描き分けるため、この不透明度は
+# 主にPDF側の見た目(Acrobat等の外部ビューア)に効く。
 PII_HIGHLIGHT_OPACITY = 0.35
-# 手動で追加する塗りつぶし対象(テキスト候補/図形)の既定エンティティ種別
-# (ドロワーのコンボボックスで他の種別に変更できる。既定は「手動」)。
+# 手動で追加する塗りつぶし対象(テキスト候補/図形)の種別。常に「手動」固定。
 MANUAL_MASK_ENTITY = MANUAL_ENTITY_TYPE
-MASK_SHAPE_FILL_COLOR = (0.0, 0.0, 0.0)
 MASK_SHAPE_STROKE_WIDTH = 1.2
 MASK_SHAPE_OPACITY = 0.35
 
@@ -73,6 +86,7 @@ class PiiDrawerMixin:
     def _build_pii_drawer(self) -> "PiiPanel":
         """個人情報検出ドロワーを組み立てる。"""
         self._pii_panel = PiiPanel()
+        self._pii_worker = None  # 実行中の検出ワーカー(無ければ None)
         self._pii_panel.detect_current_page_requested.connect(self._on_pii_detect_current_page)
         self._pii_panel.detect_all_pages_requested.connect(self._on_pii_detect_all_pages)
         self._pii_panel.keep_existing_toggled.connect(self._on_pii_keep_existing_toggled)
@@ -80,22 +94,20 @@ class PiiDrawerMixin:
         self._pii_panel.mask_rect_tool_toggled.connect(self._on_pii_mask_rect_toggled)
         self._pii_panel.mask_ellipse_tool_toggled.connect(self._on_pii_mask_ellipse_toggled)
         self._pii_panel.remove_selected_requested.connect(self._on_pii_remove_selected)
-        self._pii_panel.remove_all_requested.connect(self._on_pii_remove_all)
         self._pii_panel.delete_same_text_requested.connect(self._on_pii_delete_same_text)
-        self._pii_panel.add_exclusion_requested.connect(self._on_pii_add_exclusion)
-        self._pii_panel.add_pattern_requested.connect(self._on_pii_add_pattern_requested)
+        self._pii_panel.add_exclude_word_requested.connect(self._on_pii_add_exclude_word)
+        self._pii_panel.add_detect_word_requested.connect(self._on_pii_add_detect_word)
         self._pii_panel.settings_requested.connect(self._on_pii_settings_requested)
-        self._pii_panel.export_rasterize_requested.connect(self._on_pii_export_rasterize_requested)
-        self._pii_panel.export_redact_requested.connect(self._on_pii_export_redact_requested)
+        self._pii_panel.export_requested.connect(self._on_pii_export_requested)
         self._pii_panel.result_activated.connect(self._on_pii_result_activated)
         self._pii_panel.open_changed.connect(self._on_pii_drawer_open_changed)
-        self._pii_panel.display_mode_changed.connect(self._on_pii_display_mode_changed)
+        self._pii_panel.entity_visibility_changed.connect(self._on_pii_entity_visibility_changed)
+        self._pii_panel.mask_color_changed.connect(self._on_pii_mask_color_changed)
+        self._pii_panel.mask_transparency_changed.connect(self._on_pii_mask_transparency_changed)
         # 開閉トグルはツールバーの「個人情報検出」ボタンへ移設するため内蔵トグルを隠す
         self._pii_panel.use_external_toggle()
         self._pii_panel.set_keep_existing_checked(self._pii_settings().keep_existing_on_detect)
-        display_mode = self._pii_settings().display_mode
-        self._pii_panel.set_display_mode(display_mode)
-        self._apply_pii_display_mode(display_mode)
+        self._sync_pii_panel_from_settings()
         return self._pii_panel
 
     def _on_pii_keep_existing_toggled(self, checked: bool) -> None:
@@ -104,27 +116,113 @@ class PiiDrawerMixin:
         settings.save()
         self._pii_settings_cache = settings
 
-    def _on_pii_display_mode_changed(self, mode: str) -> None:
-        settings = self._pii_settings().copy()
-        settings.display_mode = mode
-        settings.save()
-        self._pii_settings_cache = settings
-        self._apply_pii_display_mode(mode)
-        # ページ一覧のサムネイルも同じ表示モードで描き直す。
-        self._invalidate_and_requeue_thumbnails()
-
-    def _apply_pii_display_mode(self, mode: str) -> None:
-        """ズームビューの塗りつぶし候補の見た目(マーキング/黒塗り/非表示)を切り替える。"""
-        zoom_label = getattr(self, "_zoom_label", None)
-        if zoom_label is not None:
-            zoom_label.set_pii_display_mode(mode)
-
-    def _manual_mask_entity(self) -> str:
-        """手動追加ツール(テキスト候補/塗り四角/塗り丸)向けに選択中の種別。"""
+    def _sync_pii_panel_from_settings(self) -> None:
+        """設定(種別の表示/検出・色・透明度)をパネルとズームビューへ反映する。"""
+        settings = self._pii_settings()
         panel = getattr(self, "_pii_panel", None)
         if panel is not None:
-            return panel.selected_manual_entity()
-        return MANUAL_MASK_ENTITY
+            panel.set_entity_visibility(
+                {et: settings.is_entity_visible(et) for et in ENTITY_TYPES_WITH_MANUAL}
+            )
+            panel.set_mask_style(settings.mask_color, settings.mask_transparency)
+            panel.set_manual_tools_enabled(settings.manual_visible)
+        self._apply_pii_visual_settings()
+
+    def _apply_pii_visual_settings(self) -> None:
+        """塗りつぶし候補の色・透明度と、非表示にする種別をズームビューへ反映する。"""
+        settings = self._pii_settings()
+        self._sync_pii_annot_style_registry()
+        zoom_label = getattr(self, "_zoom_label", None)
+        if zoom_label is not None:
+            zoom_label.set_pii_mask_style(settings.mask_color, settings.mask_opacity)
+            zoom_label.set_pii_hidden_entities(settings.hidden_entities())
+
+    def _sync_pii_annot_style_registry(self) -> None:
+        """PDFへ書くPII注釈の色・不透明度・非表示種別(他のPDFソフト向け)を、現在の設定に合わせる。
+
+        ユーティリティ層(``pdf_utils.annotations``)の注釈作成関数がこの値を参照する
+        (Undo/Redoによる再作成も同じ経路のため、常に最新の設定で書かれる)。
+        """
+        settings = self._pii_settings()
+        set_pii_annot_style(
+            settings.mask_color, settings.mask_opacity, settings.hidden_entities()
+        )
+
+    def _restyle_pii_annots_in_pdf(self) -> None:
+        """ファイル内のPII注釈を、現在の色・透明度・チェック状態に揃える(Undo対象外)。
+
+        設定は全ファイル共通、注釈はファイルごとに持つため、設定の確定時と
+        個人情報検出ドロワーを開いたときに呼ぶ。他のPDFソフトで開いたとき、
+        チェック中の種別は選んだ色・透明度の注釈として表示され、チェックを外した
+        種別は見えなくなる。書き込めないPDFでは何もせずヒントだけ表示する。
+        """
+        settings = self._pii_settings()
+        self._sync_pii_annot_style_registry()
+        try:
+            changed = restyle_pii_annots(
+                self._pdf_path,
+                settings.mask_color,
+                settings.mask_opacity,
+                settings.hidden_entities(),
+            )
+        except PdfWritePermissionError:
+            logger.warning("PII注釈の色・表示状態を更新できませんでした(書き込み不可): %s", self._pdf_path)
+            self._flash_zoom_hint("PDFに書き込めないため、他のPDFソフト向けの注釈の色・表示状態は更新されません")
+            return
+        except Exception:  # noqa: BLE001 - 見た目の同期失敗で操作を止めない
+            logger.warning("PII注釈の色・表示状態の更新に失敗しました", exc_info=True)
+            return
+        if changed:
+            # 画面上のデータ(注釈の色・不透明度)もファイルに合わせて読み直す。
+            self._refresh_current_zoom_page()
+
+    def _on_pii_entity_visibility_changed(self, entity: str, checked: bool) -> None:
+        """種別チェックボックスの操作。設定へ即保存し、一覧・ページ上・サムネイルを更新する。"""
+        settings = self._pii_settings().copy()
+        if entity == MANUAL_ENTITY_TYPE:
+            settings.manual_visible = bool(checked)
+        elif entity in ENTITY_TYPES:
+            settings.enabled_entities[entity] = bool(checked)
+        else:
+            return
+        settings.save()
+        self._pii_settings_cache = settings
+        self._apply_pii_visual_settings()
+        self._restyle_pii_annots_in_pdf()
+        selected = self._selected_zoom_annotation
+        if not checked and selected is not None and getattr(selected, "pii_entity", "") == entity:
+            # 非表示にした種別の注釈が選択中のままだと、見えないのに Delete で消せてしまう。
+            self._set_selected_zoom_annotation(None)
+        if entity == MANUAL_ENTITY_TYPE:
+            panel = getattr(self, "_pii_panel", None)
+            if panel is not None:
+                panel.set_manual_tools_enabled(bool(checked))
+            if not checked and self._create_mode in (CreateMode.MASK_MARKUP, CreateMode.MASK_SHAPE):
+                # 手動が非表示の間は追加しても見えないため、装着中のツールは解除する。
+                self._activate_create_mode(CreateMode.NONE)
+        self._reload_pii_results()
+        self._invalidate_and_requeue_thumbnails()
+
+    def _on_pii_mask_color_changed(self, color: object) -> None:
+        settings = self._pii_settings().copy()
+        settings.mask_color = (float(color[0]), float(color[1]), float(color[2]))
+        settings.save()
+        self._pii_settings_cache = settings
+        self._apply_pii_visual_settings()
+        self._restyle_pii_annots_in_pdf()
+        self._invalidate_and_requeue_thumbnails()
+
+    def _on_pii_mask_transparency_changed(self, value: int, commit: bool) -> None:
+        """透明度スライダ。ドラッグ中は画面へ即時反映するだけで、保存は確定時に行う。"""
+        settings = self._pii_settings().copy()
+        settings.mask_transparency = int(value)
+        if commit:
+            settings.save()
+        self._pii_settings_cache = settings
+        self._apply_pii_visual_settings()
+        if commit:
+            self._restyle_pii_annots_in_pdf()
+            self._invalidate_and_requeue_thumbnails()
 
     def _toggle_pii_drawer(self) -> None:
         panel = getattr(self, "_pii_panel", None)
@@ -134,6 +232,7 @@ class PiiDrawerMixin:
     def _on_pii_drawer_open_changed(self, is_open: bool) -> None:
         if getattr(self, "_zoom_pii_btn", None) is not None:
             self._zoom_pii_btn.setChecked(is_open)
+        self._sync_zoom_panel_button()
         if is_open:
             # 横幅を確保するため、他のドロワーは閉じる(付箋/しおりと排他)。
             if self._zoom_annotation_open:
@@ -141,6 +240,12 @@ class PiiDrawerMixin:
             bookmarks_panel = getattr(self, "_bookmarks_panel", None)
             if bookmarks_panel is not None and bookmarks_panel.is_open:
                 bookmarks_panel.set_open(False)
+            ocr_panel = getattr(self, "_ocr_panel", None)
+            if ocr_panel is not None and ocr_panel.is_open:
+                ocr_panel.set_open(False)
+            # 設定は全ファイル共通・注釈はファイルごとなので、開いたファイルの
+            # PII注釈を現在の設定(色・透明度・チェック)に揃える。
+            self._restyle_pii_annots_in_pdf()
             self._reload_pii_results()
         else:
             # ドロワーを閉じたら手動ツール(テキスト候補/塗り四角/塗り丸)も解除する。
@@ -170,8 +275,19 @@ class PiiDrawerMixin:
         self._run_pii_detection(list(range(page_count)))
 
     def _run_pii_detection(self, page_indices: list[int]) -> None:
-        if getattr(self, "_pii_worker", None) is not None:
+        if getattr(self, "_pii_worker", None) is not None or self._ocr_busy():
             return  # 実行中は多重起動しない
+        # 設定「テキストレイヤの無いページはOCRしてから検出する」: 先にOCR(バックグラウンド)
+        # → 結果をメインスレッドで埋め込み → 検出、の順に進める。
+        if self._pii_settings().ocr_enabled and self._start_ocr_before_detect(
+            page_indices, lambda: self._start_pii_detection_worker(page_indices)
+        ):
+            return
+        self._start_pii_detection_worker(page_indices)
+
+    def _start_pii_detection_worker(self, page_indices: list[int]) -> None:
+        if getattr(self, "_pii_worker", None) is not None:
+            return
         panel = getattr(self, "_pii_panel", None)
         if panel is not None:
             panel.set_busy(True, "検出を開始しています...")
@@ -206,13 +322,14 @@ class PiiDrawerMixin:
             panel.set_busy(False)
 
         settings = self._pii_settings()
+        self._sync_pii_annot_style_registry()
         new_items = [
             TextMarkupAnnotData(
                 page_num=d.page_num,
                 xref=0,
                 quads=d.quads,
                 markup_type=MarkupType.HIGHLIGHT,
-                color=settings.color_for(d.entity_type),
+                color=settings.mask_color,
                 opacity=PII_HIGHLIGHT_OPACITY,
                 pii_entity=d.entity_type,
                 pii_text=d.text,
@@ -234,9 +351,12 @@ class PiiDrawerMixin:
 
         # 従来通りの動作: 再検出したページ上の既存PIIハイライトは置き換える
         # (同じ範囲が何度も重ねて追加されるのを防ぐ)。
+        # ただし、パネルでチェックが外れている種別(検出対象外)は触らない。
         target_pages = set(page_indices)
         old_annots = [
-            a for a in list_pii_markup_annots(self._pdf_path) if a.page_num in target_pages
+            a
+            for a in list_pii_markup_annots(self._pdf_path)
+            if a.page_num in target_pages and settings.is_entity_visible(a.pii_entity)
         ]
 
         if not old_annots and not new_items:
@@ -325,6 +445,7 @@ class PiiDrawerMixin:
         """既存の塗りつぶし候補は変更せず、新規マーカーだけを追加する(Undo対応)。"""
         if not new_items:
             return
+        self._sync_pii_annot_style_registry()
         new_refs: list[_AnnotRef | None] = [None] * len(new_items)
 
         def do_apply() -> None:
@@ -354,6 +475,16 @@ class PiiDrawerMixin:
     # 手動追加: テキスト候補 / 塗り四角 / 塗り丸
     # ------------------------------------------------------------------
     def _on_pii_mask_markup_toggled(self, checked: bool) -> None:
+        if checked and self._zoom_label is not None and self._zoom_label._selected_char_indices:
+            # 先にページ上でテキストを選択してから「テキスト候補」を押した場合は、
+            # その場で候補を作って連続モードには入らない(ボタンは押下前の状態へ戻す)。
+            # _activate_create_mode は選択を消してしまうため、必ずその前に読む。
+            self._create_mask_candidate_from_selection()
+            self._zoom_label.clear_text_selection()
+            panel = getattr(self, "_pii_panel", None)
+            if panel is not None:
+                panel.set_mask_markup_tool_active(False)
+            return
         self._activate_create_mode(CreateMode.MASK_MARKUP if checked else CreateMode.NONE)
 
     def _on_pii_mask_rect_toggled(self, checked: bool) -> None:
@@ -381,17 +512,20 @@ class PiiDrawerMixin:
         if not quads:
             self._flash_zoom_hint("塗りつぶし候補にするテキストを選択してください")
             return
+        # OCRで埋め込んだ文字を選択した場合は、自動検出と同じくOCRの位置誤差を見込んだ
+        # 余白ぶん広げる(通常のテキストの quad はそのまま)。
+        quads = expand_quads_for_ocr(self._pdf_path, self._zoom_page_num, list(quads))
         matched_text = self._zoom_label.selected_text()
         settings = self._pii_settings()
-        entity_type = self._manual_mask_entity()
+        self._sync_pii_annot_style_registry()
         template = TextMarkupAnnotData(
             page_num=self._zoom_page_num,
             xref=0,
             quads=tuple(quads),
             markup_type=MarkupType.HIGHLIGHT,
-            color=settings.color_for(entity_type),
+            color=settings.mask_color,
             opacity=PII_HIGHLIGHT_OPACITY,
-            pii_entity=entity_type,
+            pii_entity=MANUAL_MASK_ENTITY,
             pii_text=matched_text,
         )
         self._run_zoom_create(
@@ -416,21 +550,21 @@ class PiiDrawerMixin:
             matched_text = text_under_ellipse(chars, rect_tuple)
         else:
             matched_text = text_under_rect(chars, rect_tuple)
-        entity_type = self._manual_mask_entity()
         settings = self._pii_settings()
+        self._sync_pii_annot_style_registry()
         template = ShapeAnnotData(
             page_num=self._zoom_page_num,
             xref=0,
             rect=rect_tuple,
             shape_type=shape_type,
-            # 枠線色は選んだ種別の設定色を使う(実際の画面上の見た目は
-            # ZoomPageWidget._paint_shape_annotation がこの色を元に「薄い塗り+
-            # 濃い枠」へ描き分ける)。塗り色は実PDF注釈用の既定(黒)のまま。
-            stroke_color=settings.color_for(entity_type),
-            fill_color=MASK_SHAPE_FILL_COLOR,
+            # PDF上の注釈の色は作成時点の設定色(全種別共通)にする。ズームビュー上の
+            # 実際の見た目は ZoomPageWidget._paint_shape_annotation が常に現在の
+            # 設定色・透明度で描くため、後から色を変えても既存の図形が追従する。
+            stroke_color=settings.mask_color,
+            fill_color=settings.mask_color,
             stroke_width=MASK_SHAPE_STROKE_WIDTH,
             opacity=MASK_SHAPE_OPACITY,
-            pii_entity=entity_type,
+            pii_entity=MANUAL_MASK_ENTITY,
             pii_text=matched_text,
         )
         shape_label = "楕円" if shape_type == ShapeType.ELLIPSE else "四角"
@@ -452,6 +586,7 @@ class PiiDrawerMixin:
         """
         rows: list[PiiResultRow] = []
         chars_cache: dict[int, list[dict]] = {}
+        settings = self._pii_settings()
 
         def chars_for(page_num: int) -> list[dict]:
             cached = chars_cache.get(page_num)
@@ -461,6 +596,8 @@ class PiiDrawerMixin:
             return cached
 
         for annot in list_pii_markup_annots(self._pdf_path):
+            if not settings.is_entity_visible(annot.pii_entity):
+                continue  # パネルでチェックが外れた種別は一覧に出さない
             text = annot.pii_text
             if not text:
                 text = text_under_rect(chars_for(annot.page_num), annot.rect)
@@ -475,6 +612,8 @@ class PiiDrawerMixin:
             )
 
         for shape in list_pii_mask_shapes(self._pdf_path):
+            if not settings.is_entity_visible(shape.pii_entity):
+                continue
             # 図形は移動/リサイズ(dataclasses.replaceでrectだけ変わる)できるため、
             # 作成時にキャッシュした shape.pii_text は移動後は古くなり得る。
             # 図形は文字数も少なく再抽出が軽いため、常にその場で計算し直す
@@ -524,14 +663,6 @@ class PiiDrawerMixin:
         ]
         if selected:
             self._remove_mask_targets(selected, "塗りつぶし対象を削除")
-
-    def _on_pii_remove_all(self) -> None:
-        all_targets: list[TextMarkupAnnotData | ShapeAnnotData] = [
-            *list_pii_markup_annots(self._pdf_path),
-            *list_pii_mask_shapes(self._pdf_path),
-        ]
-        if all_targets:
-            self._remove_mask_targets(all_targets, "塗りつぶし対象をすべて削除")
 
     def _on_pii_delete_same_text(self, text: str) -> None:
         """結果一覧の右クリックメニュー「同じ語句をすべて削除」。"""
@@ -585,80 +716,144 @@ class PiiDrawerMixin:
         self._push_undoable(description, do_delete, undo_delete)
 
     # ------------------------------------------------------------------
-    # 除外語句への登録
+    # 結果一覧の右クリックメニュー: 除外語に追加 / 検出語に追加
     # ------------------------------------------------------------------
-    def _on_pii_add_exclusion(self, entity: str, text: str) -> None:
-        if not entity or not text:
-            return
-        settings = self._pii_settings().copy()
-        existing = settings.entity_exclusions.setdefault(entity, [])
-        if text in existing:
-            QMessageBox.information(
-                self, "個人情報検出", f"「{text}」は既に除外語句に登録済みです。"
-            )
-            return
-        existing.append(text)
-        settings.save()
-        self._pii_settings_cache = settings
-        QMessageBox.information(
+    def _ask_pii_exclude_scope(self, text: str) -> str:
+        """「除外語に追加」の後の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
+
+        テストからはこのメソッドを差し替えてモーダル表示を避ける。
+        """
+        return ScopeChoiceDialog.ask(
+            "除外語に追加",
+            "除外語に追加しました(今後の検出から除外されます)。\n"
+            "すでに検出済みのこの語句の結果を削除しますか?(手動で追加した分は削除しません)",
+            text,
+            ("全ページの検出済みを削除", "このページだけ削除", "削除しない"),
             self,
-            "個人情報検出",
-            f"「{text}」を除外語句({get_entity_type_name_ja(entity)})に登録しました。\n"
-            "次回以降の検出から反映されます。",
         )
 
-    # ------------------------------------------------------------------
-    # 追加パターンへの登録(結果一覧の右クリックメニュー)
-    # ------------------------------------------------------------------
-    def _on_pii_add_pattern_requested(self, entity: str, text: str) -> None:
-        """結果一覧の右クリックメニュー「追加パターンに登録」。
+    def _ask_pii_detect_scope(self, text: str, entity: str) -> str:
+        """「検出語に追加」の後の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
 
-        選んだ語句をそのまま(``re.escape`` した)追加検出パターンとして設定に
-        登録し、続けて「全ページ/このページだけ/登録のみ」を尋ねて必要なら
-        そのパターンだけで部分再検出する(既存の検出結果はそのまま、重複しない
-        新規分だけを追加する)。
+        テストからはこのメソッドを差し替えてモーダル表示を避ける。
         """
-        if not entity or not text or entity not in ENTITY_TYPES:
+        return ScopeChoiceDialog.ask(
+            "検出語に追加",
+            f"検出語({get_entity_type_name_ja(entity)})に追加しました。\n"
+            "この語句を今すぐ検出して塗りつぶし候補に追加しますか?",
+            text,
+            ("全ページで検出", "このページだけ検出", "検出しない"),
+            self,
+        )
+
+    @staticmethod
+    def _drop_exclusions_for_text(settings: PiiSettings, text: str) -> bool:
+        """``text`` を検出語へ追加するとき、同じ語句の除外設定をすべて取り除く。
+
+        除外語(``excluded_words``)・種別別の除外語(``entity_exclusions``。空に
+        なったリストは項目ごと消す)・除外パターン(``text_exclusions_regex`` の
+        ``re.escape(text)`` および ``^re.escape(text)$``)から外す。除外が追加より
+        優先されるため、残っていると追加した語句が検出されなくなってしまう。
+        何か取り除いたら True。
+        """
+        removed = False
+        target = text.strip()
+        # 検出は全角→半角へ1文字ずつ揃えた文字列に対して行われるため、元の表記と
+        # 正規化後の表記のどちらで登録されていても同じ語句として扱う。
+        variants = {text, target, normalize_1to1(text), normalize_1to1(target)}
+        kept_words = [
+            w for w in settings.excluded_words if w.strip() not in variants
+        ]
+        if len(kept_words) != len(settings.excluded_words):
+            settings.excluded_words = kept_words
+            removed = True
+        for key in list(settings.entity_exclusions):
+            words = settings.entity_exclusions[key]
+            if any(w in variants for w in words):
+                words = [w for w in words if w not in variants]
+                removed = True
+            if words:
+                settings.entity_exclusions[key] = words
+            else:
+                del settings.entity_exclusions[key]
+        drop: set[str] = set()
+        for variant in variants:
+            escaped = re.escape(variant)
+            drop.update({escaped, f"^{escaped}$"})
+        kept_regex = [rx for rx in settings.text_exclusions_regex if rx not in drop]
+        if len(kept_regex) != len(settings.text_exclusions_regex):
+            settings.text_exclusions_regex = kept_regex
+            removed = True
+        return removed
+
+    def _on_pii_add_exclude_word(self, text: str) -> None:
+        """右クリック「除外語に追加」。
+
+        語句を除外語に登録し(追加パターン=検出語には触れない)、範囲を選ばせて、
+        すでに検出済みの同じ語句の結果(手動追加分を除く)をまとめて削除する
+        (Undo は1回分)。
+        """
+        if not text or not text.strip():
             return
-        pattern = re.escape(text)
+        settings = self._pii_settings().copy()
+        if text.strip() not in {w.strip() for w in settings.excluded_words}:
+            settings.excluded_words.append(text.strip())
+            settings.save()
+            self._pii_settings_cache = settings
+
+        scope = self._ask_pii_exclude_scope(text)
+        if scope == ScopeChoiceDialog.SCOPE_NONE:
+            return
+        page_filter: int | None = None
+        if scope == ScopeChoiceDialog.SCOPE_PAGE:
+            if self._zoom_page_num is None:
+                return
+            page_filter = self._zoom_page_num
+        targets = [
+            r.annot
+            for r in self._build_pii_result_rows()
+            if r.entity != MANUAL_ENTITY_TYPE
+            and r.text.strip() == text.strip()
+            and (page_filter is None or r.page_num == page_filter)
+        ]
+        if targets:
+            self._remove_mask_targets(targets, f"除外語「{text.strip()}」の検出済みを削除")
+
+    def _on_pii_add_detect_word(self, entity: str, text: str) -> None:
+        """右クリック「検出語に追加」(種別はサブメニューで選択済み)。
+
+        選んだ語句をそのまま(``re.escape`` した)追加検出パターンとして登録し、
+        同じ語句の除外設定を取り除く。続けて範囲(全ページ/このページだけ/検出しない)
+        を選ばせ、選ばれたら、そのパターンだけで部分再検出する(既存の検出結果は
+        そのまま、重複しない新規分だけを追加する)。
+        """
+        if not text or not text.strip() or entity not in ENTITY_TYPES:
+            return
+        # パターンは、全角→半角へ1文字ずつ揃えた検出用テキストに対して使われるため、
+        # 語句も同じ正規化をかけてから(記号をエスケープして)登録する。
+        pattern = re.escape(normalize_1to1(text))
         settings = self._pii_settings().copy()
         entry = (entity, pattern)
-        if entry in settings.additional_patterns:
-            QMessageBox.information(
-                self, "個人情報検出", f"「{text}」は既に追加パターンに登録済みです。"
-            )
-            return
-        settings.additional_patterns.append(entry)
-        settings.save()
-        self._pii_settings_cache = settings
+        added = entry not in settings.additional_patterns
+        if added:
+            settings.additional_patterns.append(entry)
+        removed_exclusion = self._drop_exclusions_for_text(settings, text)
+        if added or removed_exclusion:
+            settings.save()
+            self._pii_settings_cache = settings
 
-        box = QMessageBox(self)
-        box.setWindowTitle("個人情報検出")
-        box.setText(
-            f"「{text}」を追加検出パターン({get_entity_type_name_ja(entity)})に"
-            "登録しました。\nこのパターンでどの範囲を追加検出しますか?"
-        )
-        # ボタン文言は右上の検出範囲ボタン("全ページ"/"このページだけ")と揃え、
-        # 短くすることで(旧文言は長く、環境によってはボタン内で文字が
-        # 見切れていた)必ず全文が表示されるようにする。
-        all_btn = box.addButton("全ページ", QMessageBox.ButtonRole.AcceptRole)
-        page_btn = box.addButton("このページだけ", QMessageBox.ButtonRole.AcceptRole)
-        none_btn = box.addButton("登録のみ", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(all_btn)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is none_btn or clicked is None:
-            return
-
-        if clicked is page_btn:
+        scope = self._ask_pii_detect_scope(text, entity)
+        if scope == ScopeChoiceDialog.SCOPE_PAGE:
             if self._zoom_page_num is None:
                 return
             page_indices = [self._zoom_page_num]
-        else:
+        elif scope == ScopeChoiceDialog.SCOPE_ALL:
             page_count = get_page_count(self._pdf_path)
             if page_count <= 0:
                 return
             page_indices = list(range(page_count))
+        else:
+            return
         self._run_pattern_only_detection(entity, pattern, page_indices)
 
     def _run_pattern_only_detection(
@@ -669,19 +864,25 @@ class PiiDrawerMixin:
         他の検出エンジン(正規表現/形態素解析/日時)は無効化し、
         他の種別の検出も行わない(この操作は「登録したパターンで追加検出する」
         ためのものであり、通常の全種別検出をやり直すものではない)。
+        除外設定は現在の設定をそのまま引き継ぐ(除外が追加より優先されるため、
+        まだ除外に入っている語句は検出されない)。
         件数が少なく軽量な処理のため、バックグラウンドワーカーは使わず同期実行する。
         """
+        current = self._pii_settings()
         enabled_entities = {et: (et == entity) for et in ENTITY_TYPES}
         pattern_settings = PiiSettings(
             enabled_entities=enabled_entities,
             additional_patterns=[(entity, pattern)],
+            text_exclusions_regex=list(current.text_exclusions_regex),
+            entity_exclusions={k: list(v) for k, v in current.entity_exclusions.items()},
+            excluded_words=list(current.excluded_words),
             enabled_engines={key: False for key in ENGINE_KEYS},
             dedupe_enabled=False,
         )
         try:
             detections = run_detection(self._pdf_path, page_indices, pattern_settings)
         except Exception as error:  # noqa: BLE001 - ダイアログで詳細を提示する
-            logger.warning("追加パターンでの検出に失敗しました: %s", error, exc_info=True)
+            logger.warning("検出語での検出に失敗しました: %s", error, exc_info=True)
             QMessageBox.warning(self, "個人情報検出", f"追加検出に失敗しました。\n\n{error}")
             return
 
@@ -692,7 +893,7 @@ class PiiDrawerMixin:
                 xref=0,
                 quads=d.quads,
                 markup_type=MarkupType.HIGHLIGHT,
-                color=settings.color_for(d.entity_type),
+                color=settings.mask_color,
                 opacity=PII_HIGHLIGHT_OPACITY,
                 pii_entity=d.entity_type,
                 pii_text=d.text,
@@ -703,7 +904,7 @@ class PiiDrawerMixin:
         if not new_items:
             QMessageBox.information(self, "個人情報検出", "新しく検出された箇所はありませんでした。")
             return
-        self._append_new_pii_markups(new_items, f"追加パターンで検出 ({len(new_items)}件)")
+        self._append_new_pii_markups(new_items, f"検出語で検出 ({len(new_items)}件)")
 
     # ------------------------------------------------------------------
     # 設定
@@ -714,116 +915,105 @@ class PiiDrawerMixin:
             new_settings = dialog.result_settings()
             new_settings.save()
             self._pii_settings_cache = new_settings
+            self._sync_pii_panel_from_settings()
 
     # ------------------------------------------------------------------
-    # エクスポート: 黒塗りして画像のみ
+    # エクスポート(黒塗り+文字削除 → 形式・解像度・圧縮を選んで書き出し)
     # ------------------------------------------------------------------
     def _collect_mask_targets(
         self,
-    ) -> tuple[list[TextMarkupAnnotData], list[ShapeAnnotData]]:
-        return list_pii_markup_annots(self._pdf_path), list_pii_mask_shapes(self._pdf_path)
+    ) -> tuple[
+        list[TextMarkupAnnotData],
+        list[ShapeAnnotData],
+        list["TextMarkupAnnotData | ShapeAnnotData"],
+    ]:
+        """エクスポート対象の塗りつぶし候補/図形と、対象外にした注釈の一覧を返す。
 
-    def _on_pii_export_rasterize_requested(self) -> None:
-        markup_targets, shape_targets = self._collect_mask_targets()
+        パネルでチェックが外れている種別は対象外(黒塗り・文字削除は行わない)。
+        ただし対象外の注釈も含め、PII注釈は出力からすべて取り除かれる
+        (注釈のSubjectに検出した語句が入っているため、出力に残さない)。
+        """
+        settings = self._pii_settings()
+        markups = list_pii_markup_annots(self._pdf_path)
+        shapes = list_pii_mask_shapes(self._pdf_path)
+        markup_targets = [a for a in markups if settings.is_entity_visible(a.pii_entity)]
+        shape_targets = [a for a in shapes if settings.is_entity_visible(a.pii_entity)]
+        skipped = [
+            a for a in (*markups, *shapes) if not settings.is_entity_visible(a.pii_entity)
+        ]
+        return markup_targets, shape_targets, skipped
+
+    @staticmethod
+    def _skipped_note(skipped_annots: list) -> str:
+        """完了メッセージに添える「非表示の種別は対象外」の注記(0件なら空文字)。"""
+        count = len(skipped_annots)
+        if count <= 0:
+            return ""
+        return f"\n\n非表示の種別 {count} 件は対象外です。"
+
+    def _ask_pii_export_options(self) -> "dict | None":
+        """エクスポート設定ダイアログ(通常のエクスポートと同じもの)を開き、選択を返す。
+
+        キャンセル時は None。テストからはこのメソッドを差し替えてモーダル表示を避ける。
+        """
+        dialog = ExportOptionsDialog(
+            self, note="チェック中の種別は黒塗りし、下の文字を削除します。"
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.get_options()
+
+    def _on_pii_export_requested(self) -> None:
+        """「エクスポート...」。
+
+        チェック中の種別の塗りつぶし対象は常に黒で塗りつぶし、下の文字を削除する
+        (パネルの色・透明度は関係しない)。その結果に対し、通常のエクスポートと
+        同じ設定(画像化・解像度・圧縮・PNG/JPEG等)を適用して書き出す。
+        """
+        markup_targets, shape_targets, skipped = self._collect_mask_targets()
         if not markup_targets and not shape_targets:
             QMessageBox.information(
-                self, "個人情報検出", "黒塗りする塗りつぶし対象がありません。"
+                self,
+                "個人情報検出",
+                "黒塗りする塗りつぶし対象がありません。" + self._skipped_note(skipped),
             )
+            return
+
+        options = self._ask_pii_export_options()
+        if options is None:
             return
 
         src_path = Path(self._pdf_path)
-        default_path = str(src_path.parent / f"{src_path.stem}_黒塗り.pdf")
-        output_path, _ = QFileDialog.getSaveFileName(
-            self, "黒塗りして画像のみエクスポート", default_path, "PDF Files (*.pdf)"
-        )
-        if not output_path:
-            return
-
-        # 塗りつぶし対象の注釈自体は非表示にし(hide_xrefs)、その位置へ実際の
-        # 黒塗り(add_redact_annot は使わない)を描画してからラスタライズする。
-        # 塗りつぶし用の楕円は外接矩形ではなく実際の楕円として塗る。
-        hide_xrefs: dict[int, list[int]] = {}
-        black_fill_regions: dict[int, list[tuple[float, float, float, float]]] = {}
-        black_fill_ellipses: dict[int, list[tuple[float, float, float, float]]] = {}
-        padding = 1.0
-        for annot in markup_targets:
-            hide_xrefs.setdefault(annot.page_num, []).append(annot.xref)
-            # annot.rect(全quadの外接矩形)ではなく、quadごとに黒塗りする。
-            # 複数行にまたがる検出は外接矩形が行間の無関係な文字まで覆ってしまうため。
-            for x0, y0, x1, y1 in annot.quads:
-                black_fill_regions.setdefault(annot.page_num, []).append(
-                    (x0 - padding, y0 - padding, x1 + padding, y1 + padding)
-                )
-        for shape in shape_targets:
-            hide_xrefs.setdefault(shape.page_num, []).append(shape.xref)
-            # rotation を末尾に付けて渡す(回転していない図形は0.0で従来通り)。
-            # 図形が回転していても外接矩形ではなく実際の輪郭が黒塗りされるよう
-            # rasterize_pdf 側で解釈される(shape.rect は回転前の矩形のため)。
-            region = (*shape.rect, shape.rotation)
-            if shape.shape_type == ShapeType.ELLIPSE:
-                black_fill_ellipses.setdefault(shape.page_num, []).append(region)
-            else:
-                black_fill_regions.setdefault(shape.page_num, []).append(region)
-
-        try:
-            rasterize_pdf(
-                self._pdf_path,
-                output_path,
-                dpi=150,
-                hide_xrefs=hide_xrefs,
-                black_fill_regions=black_fill_regions,
-                black_fill_ellipses=black_fill_ellipses,
+        fmt = options["format"]
+        output_path = ""
+        out_dir = ""
+        if fmt == "pdf":
+            default_path = str(src_path.parent / f"{src_path.stem}_黒塗り.pdf")
+            output_path, _ = QFileDialog.getSaveFileName(
+                self, "黒塗りしてエクスポート", default_path, "PDF Files (*.pdf)"
             )
-        except Exception as error:  # noqa: BLE001 - ダイアログで詳細を提示する
-            logger.warning("PII黒塗りエクスポートに失敗しました: %s", error, exc_info=True)
-            QMessageBox.warning(
-                self, "個人情報検出", f"エクスポートに失敗しました。\n\n{error}"
-            )
-            return
+            if not output_path:
+                return
+        else:
+            out_dir = QFileDialog.getExistingDirectory(self, "エクスポート先フォルダを選択")
+            if not out_dir:
+                return
 
-        QMessageBox.information(
-            self,
-            "個人情報検出",
-            f"黒塗り済み・画像のみのPDFを書き出しました。\n\n{output_path}",
-        )
-
-    # ------------------------------------------------------------------
-    # エクスポート: 文字を削除してテキストPDFとして
-    # ------------------------------------------------------------------
-    def _on_pii_export_redact_requested(self) -> None:
-        markup_targets, shape_targets = self._collect_mask_targets()
-        if not markup_targets and not shape_targets:
-            QMessageBox.information(
-                self, "個人情報検出", "削除する塗りつぶし対象がありません。"
-            )
-            return
-
-        src_path = Path(self._pdf_path)
-        default_path = str(src_path.parent / f"{src_path.stem}_文字削除.pdf")
-        output_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "文字を削除してテキストPDFとしてエクスポート",
-            default_path,
-            "PDF Files (*.pdf)",
-        )
-        if not output_path:
-            return
-
+        # 黒塗り+文字削除の対象領域。quadごとに(複数行にまたがる検出は外接矩形だと
+        # 行間の無関係な文字まで覆ってしまうため)、図形は rotation を末尾に付けて渡す。
         remove_xrefs: dict[int, list[int]] = {}
-        redact_rects: dict[int, list[tuple[float, float, float, float]]] = {}
-        redact_ellipses: dict[int, list[tuple[float, float, float, float]]] = {}
+        redact_rects: dict[int, list[tuple[float, ...]]] = {}
+        redact_ellipses: dict[int, list[tuple[float, ...]]] = {}
         padding = 1.0
-        for annot in markup_targets:
+        # 対象外の種別を含め、PII注釈は出力からすべて取り除く(塗りつぶしは対象のみ)。
+        for annot in (*markup_targets, *shape_targets, *skipped):
             remove_xrefs.setdefault(annot.page_num, []).append(annot.xref)
+        for annot in markup_targets:
             for x0, y0, x1, y1 in annot.quads:
                 redact_rects.setdefault(annot.page_num, []).append(
                     (x0 - padding, y0 - padding, x1 + padding, y1 + padding)
                 )
         for shape in shape_targets:
-            remove_xrefs.setdefault(shape.page_num, []).append(shape.xref)
-            # rotation を末尾に付けて渡す(回転していない図形は0.0で従来通り)。
-            # 図形が回転していても外接矩形ではなく実際の輪郭がredact/黒塗り
-            # されるよう redact_pdf_remove_text 側で解釈される。
             region = (*shape.rect, shape.rotation)
             if shape.shape_type == ShapeType.ELLIPSE:
                 redact_ellipses.setdefault(shape.page_num, []).append(region)
@@ -831,22 +1021,70 @@ class PiiDrawerMixin:
                 redact_rects.setdefault(shape.page_num, []).append(region)
 
         try:
-            redact_pdf_remove_text(
-                self._pdf_path,
-                output_path,
-                remove_xrefs=remove_xrefs,
-                redact_rects=redact_rects,
-                redact_ellipses=redact_ellipses,
-            )
+            # 画像名(<元名>_黒塗り_pN.png 等)が正しくなるよう、一時フォルダ内に
+            # 最終名と同じ stem で黒塗り済みPDFを作り、そこから書き出す。
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_pdf = os.path.join(tmp_dir, f"{src_path.stem}_黒塗り.pdf")
+                redact_pdf_remove_text(
+                    self._pdf_path,
+                    tmp_pdf,
+                    remove_xrefs=remove_xrefs,
+                    redact_rects=redact_rects,
+                    redact_ellipses=redact_ellipses,
+                    fill_color=(0.0, 0.0, 0.0),
+                )
+                created = self._write_pii_export(tmp_pdf, options, output_path, out_dir)
         except Exception as error:  # noqa: BLE001 - ダイアログで詳細を提示する
-            logger.warning("PII文字削除エクスポートに失敗しました: %s", error, exc_info=True)
+            logger.warning("PIIエクスポートに失敗しました: %s", error, exc_info=True)
             QMessageBox.warning(
                 self, "個人情報検出", f"エクスポートに失敗しました。\n\n{error}"
             )
             return
 
+        if fmt == "pdf":
+            message = (
+                "黒塗り済みのPDFを書き出しました(元のファイルは変更されていません)。"
+                f"\n\n{output_path}"
+            )
+        else:
+            message = (
+                f"黒塗り済みの画像を {len(created)} ページ分書き出しました"
+                f"(元のファイルは変更されていません)。\n\n{out_dir}"
+            )
         QMessageBox.information(
-            self,
-            "個人情報検出",
-            f"文字を削除したPDFを書き出しました(元のファイルは変更されていません)。\n\n{output_path}",
+            self, "個人情報検出", message + self._skipped_note(skipped)
         )
+
+    @staticmethod
+    def _write_pii_export(
+        tmp_pdf: str, options: dict, output_path: str, out_dir: str
+    ) -> list[str]:
+        """黒塗り済みの一時PDFへ、通常のエクスポートと同じ形式・圧縮設定を適用して書き出す。"""
+        fmt = options["format"]
+        if fmt != "pdf":
+            return export_pages_as_images(
+                tmp_pdf,
+                out_dir,
+                fmt=fmt,
+                dpi=options["dpi"],
+                quality=options["jpeg_quality"],
+            )
+        if options["rasterize"]:
+            rasterize_pdf(
+                tmp_pdf,
+                output_path,
+                dpi=options["pdf_image_dpi"],
+                image_format=options["rasterize_format"],
+                jpeg_quality=options["pdf_image_quality"],
+            )
+        elif options["pdf_optimize_level"] > 0:
+            export_pdf_compressed(
+                tmp_pdf,
+                output_path,
+                optimize_level=options["pdf_optimize_level"],
+                image_dpi=options["pdf_image_dpi"],
+                image_quality=options["pdf_image_quality"],
+            )
+        else:
+            shutil.copy2(tmp_pdf, output_path)
+        return [output_path]

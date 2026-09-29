@@ -59,11 +59,15 @@ def test_zoom_drawer_starts_closed_and_can_create_freetext(qtbot, tmp_path):
     open_zoom(window, qtbot)
 
     assert window._zoom_annotation_open is False
-    assert window._zoom_object_btn.isVisible()
+    assert window._zoom_panel_btn.isVisible()
+    assert window._zoom_panel_btn.text() == "パネル"
 
-    qtbot.mouseClick(window._zoom_object_btn, Qt.MouseButton.LeftButton)
+    # パネルのドロップダウンから「アノテーション」を選ぶ(QAction)。
+    window._zoom_object_btn.trigger()
     assert window._zoom_annotation_open is True
     assert window._zoom_object_btn.isChecked() is True
+    assert window._zoom_panel_btn.text() == "アノテーション"
+    assert window._zoom_panel_btn.isChecked() is True
 
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
     assert window._zoom_annotation_new_btn.isChecked() is True
@@ -304,7 +308,7 @@ def test_zoom_delete_key_in_editor_deletes_char_not_annotation(qtbot, tmp_path):
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
 
-    qtbot.mouseClick(window._zoom_object_btn, Qt.MouseButton.LeftButton)
+    window._zoom_object_btn.trigger()
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
     _drag_on_zoom_label(qtbot, window, (60, 80), (160, 140))
     qtbot.waitUntil(lambda: window._zoom_label.has_active_text_editor())
@@ -976,7 +980,7 @@ def test_created_freetext_uses_and_persists_spin_fontsize(qtbot, tmp_path):
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
 
-    qtbot.mouseClick(window._zoom_object_btn, Qt.MouseButton.LeftButton)
+    window._zoom_object_btn.trigger()
     window._zoom_annotation_fontsize_spin.setValue(18)
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
     _drag_on_zoom_label(qtbot, window, (60, 80), (160, 150))

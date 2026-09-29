@@ -305,3 +305,27 @@ def test_redact_removes_only_target_annot_keeps_normal_ones(tmp_path):
         assert len(remaining) == 1
         stroke = remaining[0].colors.get("stroke")
         assert stroke is not None and tuple(round(c, 2) for c in stroke) == (1.0, 1.0, 0.0)
+
+
+def test_redact_fill_color_paints_chosen_color_for_rect_and_ellipse(tmp_path):
+    """fill_color 指定時、redact後の塗りつぶしが黒ではなく指定色になること。"""
+    src = tmp_path / "src.pdf"
+    out = tmp_path / "out.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=200, height=200)
+    page.draw_rect(fitz.Rect(0, 0, 200, 200), color=(1, 1, 1), fill=(1, 1, 1))
+    doc.save(str(src))
+    doc.close()
+
+    redact_pdf_remove_text(
+        str(src),
+        str(out),
+        redact_rects={0: [(10.0, 10.0, 60.0, 60.0)]},
+        redact_ellipses={0: [(100.0, 10.0, 190.0, 100.0)]},
+        fill_color=(0.0, 0.0, 1.0),
+    )
+
+    with fitz.open(str(out)) as out_doc:
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(70, 70)[:3] == (0, 0, 255)
+        assert pix.pixel(290, 110)[:3] == (0, 0, 255)

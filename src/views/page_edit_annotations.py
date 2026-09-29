@@ -879,6 +879,12 @@ class ZoomAnnotationMixin:
         if self._zoom_annotation_open and getattr(self, "_pii_panel", None):
             if self._pii_panel.is_open:
                 self._pii_panel.set_open(False)
+        if self._zoom_annotation_open and getattr(self, "_ocr_panel", None):
+            if self._ocr_panel.is_open:
+                self._ocr_panel.set_open(False)
+        sync_panel_button = getattr(self, "_sync_zoom_panel_button", None)
+        if sync_panel_button is not None:
+            sync_panel_button()
     def _toggle_zoom_annotation_drawer(self) -> None:
         self._set_zoom_annotation_drawer_open(not self._zoom_annotation_open)
     @property

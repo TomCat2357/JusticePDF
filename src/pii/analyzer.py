@@ -14,6 +14,7 @@ from typing import List, Dict
 from src.pii.config_manager import ConfigManager
 from src.pii.regex_match_utils import resolve_mark_span
 from src.pii.sudachi_tokenizer import SudachiTokenizer
+from src.pii.text_normalize import normalize_pattern
 from src.pii.regex_recognizers import detect_regex_entities
 from src.pii.pos_ne_recognizer import detect_pos_entities
 from src.pii.datetime_recognizer import detect_datetime
@@ -63,7 +64,7 @@ class Analyzer:
         return self._analyze_text_single(text, entities)
 
     def _analyze_text_single(self, text: str, entities: List[str]) -> List[Dict]:
-        """単一テキストの個人情報解析（追加>モデル>除外）"""
+        """単一テキストの個人情報解析(除外が最優先。残った結果は 追加>モデル の順)"""
         import re
 
         # 1) 追加パターンの適用（右→左適用、左定義が高優先、長さ無視）
@@ -79,13 +80,20 @@ class Analyzer:
         # 探索: 右→左
         for etype, idx, pat in reversed(priority_seq):
             try:
-                cre = re.compile(pat, re.MULTILINE)
+                # 検出は全角→半角へ1文字ずつ揃えたテキストに対して行うため、パターンも
+                # 同じ規則で揃える(全角の記号はリテラルのまま)。
+                cre = re.compile(normalize_pattern(pat), re.MULTILINE)
             except re.error as e:
                 logger.warning(f"無効な追加正規表現をスキップ: {pat}: {e}")
                 continue
             for m in cre.finditer(text):
                 s, e = resolve_mark_span(m)
                 if s == e:
+                    continue
+                # 除外は追加パターン(カスタム人名を含む)の結果にも適用する
+                # (除外に入っている語句は、追加登録されていても検出しない)。
+                if self.config_manager.is_entity_excluded(etype, text[s:e]):
+                    logger.debug(f"追加パターンの結果を除外: '{text[s:e]}' ({etype})")
                     continue
                 add_candidates.append(
                     {
@@ -146,7 +154,7 @@ class Analyzer:
                     f"エンティティ候補を妥当性検証で除外: '{refined_text}' ({entity_type})"
                 )
                 continue
-            # 除外はモデル結果のみに適用
+            # 除外はモデル結果にも適用(追加パターンの結果にも上で適用済み)
             if self.config_manager.is_entity_excluded(entity_type, refined_text):
                 logger.debug(f"エンティティ除外: '{refined_text}' ({entity_type})")
                 continue

@@ -170,61 +170,62 @@ def _pixel_size_to_pointf(pixel_size: int) -> float:
 
 
 
-# ページ一覧のサムネイルは小さいため、拡大表示(塗り0.32)より濃く塗って
-# 塗りつぶし対象の位置が一目で分かるようにする。
-_THUMBNAIL_MASK_FILL_ALPHA = 0.55
+def mask_fill_style(
+    color: tuple[float, float, float], opacity: float
+) -> tuple[QColor, QColor | None]:
+    """塗りつぶし候補の「塗り色」「枠色」を、全種別共通の色と不透明度から作る。
+
+    塗りは ``color`` を ``opacity``(0.0=透明〜1.0=不透明)で塗る。不透明度1.0
+    (設定の透明度0)は黒塗りエクスポートと同じベタ塗りなので枠は付けない
+    (プレビューとエクスポート結果を一致させるため)。それ以外は、透明度が
+    高くて塗りがほとんど見えなくても位置が分かるよう、同色の枠線を付ける。
+    """
+    try:
+        r, g, b = (max(0.0, min(1.0, float(c))) for c in color)
+    except (TypeError, ValueError):
+        r, g, b = 0.0, 0.0, 0.0
+    opacity = max(0.0, min(1.0, float(opacity)))
+    fill = QColor.fromRgbF(r, g, b, opacity)
+    if opacity >= 1.0:
+        return fill, None
+    border = QColor.fromRgbF(r, g, b, min(0.85, 0.35 + opacity * 0.5))
+    return fill, border
 
 
 def paint_pii_mask_overlay(
     pixmap: QPixmap,
     targets: "list[TextMarkupAnnotData | ShapeAnnotData]",
     page_size: tuple[float, float],
-    display_mode: str = "mark",
+    color: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    opacity: float = 0.3,
+    hidden_entities: "frozenset[str] | set[str] | tuple[str, ...]" = (),
 ) -> QPixmap:
     """ページ一覧のサムネイルに塗りつぶし候補・塗りつぶし用図形を重ねて描く。
 
     サムネイルは PDF 注釈を焼き込んで描画するが、塗りつぶし対象の実PDF注釈は
-    外部ビューア向けに暗く薄い色(マーカーは種別色の35%・不透明度0.35)で
-    保存しているため、縮小すると位置がほぼ判別できない。拡大表示
-    (``ZoomPageWidget._paint_mask_candidate_rects`` / ``_paint_shape_annotation``)
-    と同じ「種別色の塗り+濃い枠」をここで重ねる。呼び出し側は該当注釈を
-    ``hide_xrefs`` でページ画像から隠しておくこと(二重描画を避けるため)。
+    外部ビューア向けに暗く薄い色で保存しているため、縮小すると位置がほぼ
+    判別できない。拡大表示(``ZoomPageWidget._paint_mask_candidate_rects`` /
+    ``_paint_shape_annotation``)と同じ「全種別共通の色・不透明度」をここで
+    重ねる(注釈自体が持つ色ではなく設定の色を使うので、色や透明度を変えると
+    すべての候補が一斉に変わる)。呼び出し側は該当注釈を ``hide_xrefs`` で
+    ページ画像から隠しておくこと(二重描画を避けるため)。
     ``page_size`` は表示座標系(回転適用後)のページ幅・高さ。
-    ``display_mode`` は拡大表示と同じ表示モード("mark" | "black" | "hidden")。
-    "black" は黒で塗りつぶし、"hidden" は何も重ねない(元のページを見せる)。
+    ``hidden_entities`` に含まれる種別(パネルでチェックが外れている種別)の
+    対象は描かない。
     """
     page_w, page_h = page_size
-    if (
-        pixmap.isNull()
-        or not targets
-        or page_w <= 0
-        or page_h <= 0
-        or display_mode == "hidden"
-    ):
+    targets = [t for t in targets if t.pii_entity not in hidden_entities]
+    if pixmap.isNull() or not targets or page_w <= 0 or page_h <= 0:
         return pixmap
     scale = pixmap.width() / page_w
     result = QPixmap(pixmap)
     painter = QPainter(result)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     try:
+        fill, border = mask_fill_style(color, opacity)
+        painter.setPen(Qt.PenStyle.NoPen if border is None else QPen(border, 1.0))
+        painter.setBrush(QBrush(fill))
         for target in targets:
-            if isinstance(target, ShapeAnnotData):
-                accent_rgb = target.stroke_color
-            else:
-                accent_rgb = target.color
-            accent = (
-                QColor.fromRgbF(*(max(0.0, min(1.0, float(c))) for c in accent_rgb))
-                if accent_rgb
-                else QColor(200, 200, 200)
-            )
-            if display_mode == "black":
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(QColor(0, 0, 0)))
-            else:
-                fill, border = ZoomPageWidget._mask_candidate_colors(accent)
-                fill.setAlphaF(_THUMBNAIL_MASK_FILL_ALPHA)
-                painter.setPen(QPen(border, 1.0))
-                painter.setBrush(QBrush(fill))
             if isinstance(target, ShapeAnnotData):
                 x0, y0, x1, y1 = target.rect
                 rect = QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
@@ -650,7 +651,11 @@ class ZoomPageWidget(QWidget):
         self._hover_pii_key: tuple | None = None
         # 塗りつぶし候補の表示モード("mark": 種別色の薄い塗り+枠 / "black": 黒塗り /
         # "hidden": 描かない)。表示上の切り替えのみでPDFには影響しない。
-        self._pii_display_mode = "mark"
+        # 塗りつぶし候補・図形の見た目(全種別共通の色と不透明度)と、パネルで
+        # チェックが外れている(=描画・クリック・ホバーの対象外の)種別。
+        self._pii_mask_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._pii_mask_opacity: float = 0.3
+        self._pii_hidden_entities: frozenset[str] = frozenset()
         # 校正コールアウト配置モード（クリックで挿入位置を指定）。
         self._callout_create_mode = False
         # マークアップ/消しゴムの連続モード。有効時は注釈のヒットテスト・リンク操作を
@@ -1331,11 +1336,11 @@ class ZoomPageWidget(QWidget):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if annot.pii_entity and annot.markup_type == MarkupType.HIGHLIGHT:
-            # 塗りつぶし候補: 通常のマーカーと混同しないよう、種別色の薄い塗り+
-            # 濃い枠線で描く(種別ラベルの文字は描かず、下の文字を隠さない)。
-            # 表示モードが「黒塗り」なら黒で塗りつぶし、「非表示」なら描かない。
+            # 塗りつぶし候補: 通常のマーカーと混同しないよう、設定の色・透明度で
+            # 描く(注釈自体が持つ色は使わない。種別ラベルの文字は描かず、
+            # 透明度が高ければ下の文字が読める)。
             self._paint_mask_candidate_rects(
-                painter, [self._rect_tuple_to_qrectf(q) for q in annot.quads], base
+                painter, [self._rect_tuple_to_qrectf(q) for q in annot.quads]
             )
         elif annot.markup_type == MarkupType.HIGHLIGHT:
             fill = QColor(base)
@@ -1361,53 +1366,31 @@ class ZoomPageWidget(QWidget):
                 painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
         painter.restore()
 
-    @staticmethod
-    def _mask_candidate_colors(accent: QColor) -> tuple[QColor, QColor]:
-        """塗りつぶし候補の「薄い塗り色」「濃い枠色」を種別色(accent)から作る。
-
-        以前の実装は種別に関わらず常に同じ暗い塗り(黒、不透明度0.42)を使って
-        いたため、設定で種別ごとに色を変えても見た目がほぼ同じ(暗い灰色)に
-        なってしまっていた(色分けの主因はこの固定塗りで、枠線の薄い既定色
-        だけでは違いが目立たなかった)。ここでは塗り自体をaccent色の薄い
-        ティントにし、枠線はaccentを暗く/濃くした色にすることで、下の文字を
-        読める薄さを保ったまま種別ごとの色分けがはっきり見えるようにする。
-        """
-        fill = QColor(accent)
-        fill.setAlphaF(0.32)
-        r, g, b, _ = accent.getRgb()
-        border = QColor(max(0, int(r * 0.55)), max(0, int(g * 0.55)), max(0, int(b * 0.55)))
-        border.setAlphaF(0.95)
-        return fill, border
-
     def _paint_mask_candidate_rects(
         self,
         painter: QPainter,
         page_rects: list[QRectF],
-        accent: QColor,
     ) -> None:
         """塗りつぶし候補(マーカー)・塗りつぶし用図形に共通の「見た目」を描く。
 
-        通常のマーカー/図形と混同されないよう、種別色の薄い塗り+濃い枠線に
-        する(下の文字が読める不透明度)。種別ラベルの文字は描かない
-        (本文を隠してしまうため。種別はホバー時のツールチップで確認できる)。
-        ``page_rects`` はPDF座標系(display座標系)の矩形群。
+        色・透明度は全種別共通の設定値(``set_pii_mask_style``)を使う。透明度0
+        (不透明)ならベタ塗りで、黒塗りエクスポートの仕上がりと一致する。
+        種別ラベルの文字は描かない(本文を隠してしまうため。種別はホバー時の
+        ツールチップで確認できる)。``page_rects`` はPDF座標系(display座標系)の
+        矩形群。
         """
-        if not page_rects or self._pii_display_mode == "hidden":
+        if not page_rects:
             return
-        if self._pii_display_mode == "black":
+        fill, border = mask_fill_style(self._pii_mask_color, self._pii_mask_opacity)
+        if border is None:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(0, 0, 0))
-            for page_rect in page_rects:
-                painter.drawRect(self._page_rect_to_widget_rect(page_rect))
-            return
-        fill, border = self._mask_candidate_colors(accent)
-        pen = QPen(border)
-        pen.setWidthF(max(1.4, 1.4 * self._zoom_factor))
-        painter.setPen(pen)
+        else:
+            pen = QPen(border)
+            pen.setWidthF(max(1.4, 1.4 * self._zoom_factor))
+            painter.setPen(pen)
         painter.setBrush(fill)
         for page_rect in page_rects:
-            rect = self._page_rect_to_widget_rect(page_rect)
-            painter.drawRect(rect)
+            painter.drawRect(self._page_rect_to_widget_rect(page_rect))
 
     def selected_markup_quads(self) -> list[tuple[float, float, float, float]]:
         """Return PDF-space quads (x0, y0, x1, y1) for the current text selection.
@@ -1557,25 +1540,18 @@ class ZoomPageWidget(QWidget):
 
         if shape.pii_entity and shape.shape_type in (ShapeType.RECTANGLE, ShapeType.ELLIPSE):
             # 塗りつぶし用図形: 塗りつぶし候補のマーカーと同じ「見た目の言語」
-            # (種別色の薄い塗り+濃い枠線)に統一する(通常図形と混同させないため)。
-            # 色は図形自体が保持する stroke_color(作成時に設定の種別色を反映済み。
-            # 以前は種別の既定色テーブルを直接参照しており、設定でのカスタム色が
-            # 反映されない不具合があった)を使う。種別ラベルの文字は描かない
+            # (設定の色・透明度)に統一する(通常図形と混同させないため)。
+            # 図形自体が保持する色ではなく全種別共通の設定値を使うので、色や
+            # 透明度を変えると既存の図形も一斉に変わる。種別ラベルの文字は描かない
             # (下の文字を隠してしまうため。ホバー時のツールチップで確認できる)。
-            # 表示モードが「黒塗り」なら黒で塗りつぶし、「非表示」なら描かない。
-            if self._pii_display_mode == "hidden":
-                painter.restore()
-                return
-            if self._pii_display_mode == "black":
+            fill, border = mask_fill_style(self._pii_mask_color, self._pii_mask_opacity)
+            if border is None:
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(QColor(0, 0, 0)))
             else:
-                accent = self._annotation_color(shape.stroke_color, opacity=1.0) or QColor(200, 200, 200)
-                fill, border = self._mask_candidate_colors(accent)
                 pen = QPen(border)
                 pen.setWidthF(max(1.4, 1.4 * self._zoom_factor))
                 painter.setPen(pen)
-                painter.setBrush(QBrush(fill))
+            painter.setBrush(QBrush(fill))
             if shape.shape_type == ShapeType.ELLIPSE:
                 painter.drawEllipse(paint_rect)
             else:
@@ -1794,7 +1770,7 @@ class ZoomPageWidget(QWidget):
 
     def _annotation_hit_test(self, pos: QPoint) -> tuple[FreeTextAnnotData | None, str | None]:
         selected = self._annotation_by_xref(self._selected_annotation_xref)
-        if selected is not None:
+        if selected is not None and not self._pii_hidden(selected):
             if isinstance(selected, ShapeAnnotData) and selected.shape_type == ShapeType.LINE:
                 for handle, handle_rect in self._line_handle_rects(selected).items():
                     if handle_rect.adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
@@ -2117,6 +2093,8 @@ class ZoomPageWidget(QWidget):
                         painter.drawRect(merged.translated(offset_pt))
 
             for annot in self._annotations:
+                if self._pii_hidden(annot):
+                    continue  # パネルでチェックが外れた種別は描かない(選択枠も含む)
                 preview_rect: QRectF | None = None
                 dragging_this = annot.xref == self._drag_annotation_xref
                 if (
@@ -2543,23 +2521,42 @@ class ZoomPageWidget(QWidget):
             logger.exception("Error in ZoomPageWidget.mouseMoveEvent")
         event.accept()
 
-    def pii_display_mode(self) -> str:
-        return self._pii_display_mode
+    def pii_hidden_entities(self) -> frozenset[str]:
+        return self._pii_hidden_entities
 
-    def set_pii_display_mode(self, mode: str) -> None:
-        """塗りつぶし候補の表示モードを切り替える("mark" | "black" | "hidden")。"""
-        mode = mode if mode in ("mark", "black", "hidden") else "mark"
-        if mode == self._pii_display_mode:
+    def set_pii_hidden_entities(self, entities) -> None:
+        """パネルでチェックが外れている種別を設定する。
+
+        該当種別の塗りつぶし候補・図形は、描画・クリック(選択)・ホバーの
+        いずれの対象にもならない(下のテキストを選択できる)。
+        """
+        hidden = frozenset(str(e) for e in (entities or ()))
+        if hidden == self._pii_hidden_entities:
             return
-        self._pii_display_mode = mode
+        self._pii_hidden_entities = hidden
         if self._hover_pii_key is not None:
             self._hover_pii_key = None
             QToolTip.hideText()
         self.update()
 
+    def pii_mask_style(self) -> tuple[tuple[float, float, float], float]:
+        """(色, 不透明度)を返す。"""
+        return self._pii_mask_color, self._pii_mask_opacity
+
+    def set_pii_mask_style(self, color: tuple[float, float, float], opacity: float) -> None:
+        """塗りつぶし候補・図形の色(RGB 0.0-1.0)と不透明度(0.0=透明〜1.0=不透明)を設定する。"""
+        color = (float(color[0]), float(color[1]), float(color[2]))
+        opacity = max(0.0, min(1.0, float(opacity)))
+        if color == self._pii_mask_color and opacity == self._pii_mask_opacity:
+            return
+        self._pii_mask_color = color
+        self._pii_mask_opacity = opacity
+        self.update()
+
     def _pii_hidden(self, annot) -> bool:
-        """非表示モードで、描画・ヒットテストの対象外にする塗りつぶし候補か。"""
-        return self._pii_display_mode == "hidden" and bool(getattr(annot, "pii_entity", ""))
+        """パネルでチェックが外れた種別の塗りつぶし候補/図形か(描画・ヒットテストの対象外)。"""
+        entity = getattr(annot, "pii_entity", "")
+        return bool(entity) and entity in self._pii_hidden_entities
 
     def _pii_target_at(self, pos: QPoint) -> "TextMarkupAnnotData | ShapeAnnotData | None":
         """塗りつぶし候補(マーカー)・塗りつぶし用図形のうち、指定位置にあるものを返す。
@@ -2567,11 +2564,10 @@ class ZoomPageWidget(QWidget):
         種別ラベルの文字をボックス内に描かなくなった代わりに、ホバー時の
         ツールチップ表示に使うヒットテスト(``_annotation_hit_test`` の
         マーカー/矩形判定を、pii_entity付きのものだけに絞った簡易版)。
+        チェックが外れた種別は対象外。
         """
-        if self._pii_display_mode == "hidden":
-            return None
         for annot in reversed(self._annotations):
-            if not getattr(annot, "pii_entity", ""):
+            if not getattr(annot, "pii_entity", "") or self._pii_hidden(annot):
                 continue
             if isinstance(annot, TextMarkupAnnotData):
                 for quad in annot.quads:

@@ -1,10 +1,16 @@
 """画像エクスポート・PDF圧縮・ラスタライズ。"""
+import json
 import logging
 import os
 
 import fitz
 
-from .annotations import _ellipse_vertices, _rectangle_vertices, _rotate_point
+from .annotations import (
+    JUSTICEPDF_OCR_SUBJECT_PREFIX,
+    _ellipse_vertices,
+    _rectangle_vertices,
+    _rotate_point,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -65,8 +71,70 @@ def _bbox_of_points(
     return (min(xs), min(ys), max(xs), max(ys))
 
 
-def _draw_filled_polygon(page: fitz.Page, points: list[tuple[float, float]]) -> None:
-    """回転した図形(矩形/楕円)の実際の輪郭を黒く塗りつぶす。
+def _ocr_annot_line_rect(page: fitz.Page, annot: fitz.Annot) -> fitz.Rect:
+    """OCR注釈が表す行の矩形(表示座標)。Subject の JSON(埋め込み時の行矩形)を優先する。"""
+    subject = str((annot.info or {}).get("subject", "") or "")
+    body = subject[len(JUSTICEPDF_OCR_SUBJECT_PREFIX):]
+    if body.startswith(":"):
+        try:
+            raw = json.loads(body[1:]).get("rect")
+            if isinstance(raw, list) and len(raw) == 4:
+                return fitz.Rect(*[float(v) for v in raw])
+        except (ValueError, AttributeError, TypeError):
+            pass
+    rect = fitz.Rect(annot.rect) * page.rotation_matrix
+    rect.normalize()
+    return rect
+
+
+def _scrub_ocr_annots(
+    page: fitz.Page, regions: "list[tuple[float, float, float, float]]"
+) -> int:
+    """黒塗り/文字削除の領域(表示座標)と重なるOCR注釈(見えないFreeText)を削除する。
+
+    ``apply_redactions`` はページ本体の文字・画像を消すが、FreeText 注釈の
+    /Contents や外観ストリームの文字は消さない。OCRで認識した文字は
+    そこに保持されているため、領域と重なる行は注釈ごと取り除き、削除した
+    はずの文字が ``get_text()`` などで取り出せてしまうのを防ぐ。
+    (領域と重ならない行のOCRテキストはそのまま残る。)
+    """
+    if not regions:
+        return 0
+    targets = [fitz.Rect(*r) for r in regions]
+    removed = 0
+    for annot in list(page.annots(types=[fitz.PDF_ANNOT_FREE_TEXT]) or []):
+        subject = str((annot.info or {}).get("subject", "") or "")
+        if not subject.startswith(JUSTICEPDF_OCR_SUBJECT_PREFIX):
+            continue
+        line = _ocr_annot_line_rect(page, annot)
+        # 欧数字を含む行は文字boxが行矩形より少し上下にはみ出すため、縦に余裕を持たせる。
+        margin = max(1.0, line.height * 0.15)
+        probe = fitz.Rect(line.x0, line.y0 - margin, line.x1, line.y1 + margin)
+        if any(probe.intersects(target) for target in targets):
+            page.delete_annot(annot)
+            removed += 1
+    return removed
+
+
+def _normalize_fill_color(fill_color) -> tuple[float, float, float]:
+    """塗りつぶし色(RGB 0.0-1.0)を PyMuPDF に渡せる 3 要素タプルへ正規化する。"""
+    try:
+        r, g, b = fill_color
+        return (
+            max(0.0, min(1.0, float(r))),
+            max(0.0, min(1.0, float(g))),
+            max(0.0, min(1.0, float(b))),
+        )
+    except (TypeError, ValueError):
+        return (0.0, 0.0, 0.0)
+
+
+def _draw_filled_polygon(
+    page: fitz.Page,
+    points: list[tuple[float, float]],
+    fill_color: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> None:
+    """回転した図形(矩形/楕円)の実際の輪郭を指定色(既定は黒)で塗りつぶす。
 
     ``Page.draw_rect``/``Page.draw_oval`` と同じ ``Page.new_shape()`` 経由
     (``fitz.Shape``)の描画のため、座標系も同じ(derotation_matrix等の
@@ -74,8 +142,8 @@ def _draw_filled_polygon(page: fitz.Page, points: list[tuple[float, float]]) -> 
     """
     page.draw_polyline(
         [fitz.Point(p) for p in points],
-        color=(0, 0, 0),
-        fill=(0, 0, 0),
+        color=fill_color,
+        fill=fill_color,
         width=0,
         closePath=True,
     )
@@ -327,6 +395,7 @@ def rasterize_pdf(
     hide_xrefs: "dict[int, list[int]] | None" = None,
     black_fill_regions: "dict[int, list[tuple[float, ...]]] | None" = None,
     black_fill_ellipses: "dict[int, list[tuple[float, ...]]] | None" = None,
+    fill_color: "tuple[float, float, float]" = (0.0, 0.0, 0.0),
 ) -> None:
     """Create a rasterized (image-only) copy of a PDF.
 
@@ -373,7 +442,11 @@ def rasterize_pdf(
             shape's actual outline instead of a bounding-box rectangle. Also
             accepts the optional trailing rotation element, in which case the
             ellipse is rotated around its own center before being filled.
+        fill_color: RGB (0.0-1.0) used for every ``black_fill_*`` fill. Defaults
+            to black; the "個人情報検出" drawer passes the user's chosen mask
+            colour so a 透明度0 preview matches the export exactly.
     """
+    fill_color = _normalize_fill_color(fill_color)
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
     try:
@@ -387,18 +460,22 @@ def rasterize_pdf(
             for item in (black_fill_regions or {}).get(page_num, ()):
                 rect, rotation = _split_region(item)
                 if rotation:
-                    _draw_filled_polygon(page, _rotated_rect_vertices(rect, rotation))
+                    _draw_filled_polygon(
+                        page, _rotated_rect_vertices(rect, rotation), fill_color
+                    )
                 else:
                     page.draw_rect(
-                        fitz.Rect(*rect), color=(0, 0, 0), fill=(0, 0, 0), width=0
+                        fitz.Rect(*rect), color=fill_color, fill=fill_color, width=0
                     )
             for item in (black_fill_ellipses or {}).get(page_num, ()):
                 rect, rotation = _split_region(item)
                 if rotation:
-                    _draw_filled_polygon(page, _rotated_ellipse_vertices(rect, rotation))
+                    _draw_filled_polygon(
+                        page, _rotated_ellipse_vertices(rect, rotation), fill_color
+                    )
                 else:
                     page.draw_oval(
-                        fitz.Rect(*rect), color=(0, 0, 0), fill=(0, 0, 0), width=0
+                        fitz.Rect(*rect), color=fill_color, fill=fill_color, width=0
                     )
             img_data, _ = _render_page_to_image_bytes(
                 page, dpi, image_format=image_format, jpeg_quality=jpeg_quality
@@ -426,6 +503,8 @@ def redact_pdf_remove_text(
     remove_xrefs: "dict[int, list[int]] | None" = None,
     redact_rects: "dict[int, list[tuple[float, ...]]] | None" = None,
     redact_ellipses: "dict[int, list[tuple[float, ...]]] | None" = None,
+    fill_color: "tuple[float, float, float]" = (0.0, 0.0, 0.0),
+    scrub_ocr_annots: bool = True,
 ) -> None:
     """PresidioPDF ``run_mask`` 相当の「文字を本当に削除」するエクスポート。
 
@@ -457,10 +536,16 @@ def redact_pdf_remove_text(
             redactした上で、見た目を丸に揃えるため楕円を上から黒く描画する。
             ``redact_rects`` と同様に5要素目の回転角(度)を受け付け、回転
             している場合は判定・描画のどちらも回転した楕円の向きで行う。
+        fill_color: 塗りつぶし(黒塗りの見た目)に使う RGB(0.0-1.0)。既定は黒。
+        scrub_ocr_annots: True(既定)なら、黒塗り/文字削除の領域と重なるOCR注釈
+            (``src.ocr`` が埋め込んだ見えない FreeText。認識した文字を保持している)
+            を取り除く。redaction は注釈の文字を消さないため、これが無いと消した
+            はずの文字が出力から取り出せてしまう。
     """
     from src.pii.pdf_text_map import chars_under_ellipse, chars_under_rect
     from src.utils.pdf_utils.rendering import get_page_chars
 
+    fill_color = _normalize_fill_color(fill_color)
     doc = fitz.open(src_path)
     try:
         page_indices = sorted(
@@ -480,6 +565,24 @@ def redact_pdf_remove_text(
 
             rects = list((redact_rects or {}).get(page_num, ()))
             ellipse_rects = list((redact_ellipses or {}).get(page_num, ()))
+
+            if scrub_ocr_annots:
+                scrub_regions: list[tuple[float, float, float, float]] = []
+                for item in rects:
+                    rect, rotation = _split_region(item)
+                    scrub_regions.append(
+                        _bbox_of_points(_rotated_rect_vertices(rect, rotation))
+                        if rotation
+                        else rect
+                    )
+                for item in ellipse_rects:
+                    rect, rotation = _split_region(item)
+                    scrub_regions.append(
+                        _bbox_of_points(_rotated_ellipse_vertices(rect, rotation))
+                        if rotation
+                        else rect
+                    )
+                _scrub_ocr_annots(page, scrub_regions)
 
             def _to_internal(rect: tuple[float, float, float, float]) -> fitz.Rect:
                 # add_redact_annot は他の注釈(add_highlight_annot等)と同じく
@@ -517,14 +620,14 @@ def redact_pdf_remove_text(
                         r = _to_internal(bbox)
                         if r.is_empty or r.is_infinite:
                             continue
-                        page.add_redact_annot(r, fill=(0, 0, 0))
+                        page.add_redact_annot(r, fill=fill_color)
                         had_redaction = True
                     rotated_rects.append((rect, rotation))
                     continue
                 r = _to_internal(rect)
                 if r.is_empty or r.is_infinite:
                     continue
-                page.add_redact_annot(r, fill=(0, 0, 0))
+                page.add_redact_annot(r, fill=fill_color)
                 had_redaction = True
 
             ellipse_char_count = 0
@@ -537,7 +640,7 @@ def redact_pdf_remove_text(
                     r = _to_internal(bbox)
                     if r.is_empty or r.is_infinite:
                         continue
-                    page.add_redact_annot(r, fill=(0, 0, 0))
+                    page.add_redact_annot(r, fill=fill_color)
                     had_redaction = True
                     ellipse_char_count += 1
 
@@ -588,21 +691,25 @@ def redact_pdf_remove_text(
             for item in ellipse_rects:
                 rect, rotation = _split_region(item)
                 if rotation:
-                    _draw_filled_polygon(page, _rotated_ellipse_vertices(rect, rotation))
+                    _draw_filled_polygon(
+                        page, _rotated_ellipse_vertices(rect, rotation), fill_color
+                    )
                     continue
                 r = _to_internal(rect)
                 if r.is_empty or r.is_infinite:
                     continue
                 shape = page.new_shape()
                 shape.draw_oval(r)
-                shape.finish(color=(0, 0, 0), fill=(0, 0, 0), width=0)
+                shape.finish(color=fill_color, fill=fill_color, width=0)
                 shape.commit()
 
             # 回転した矩形は外接矩形ではなく実際に回転した四角形の輪郭で
             # 黒く塗り直す(draw_rect/draw_oval と同じ表示座標系のため
             # derotation_matrix 等の追加変換は不要)。
             for rect, rotation in rotated_rects:
-                _draw_filled_polygon(page, _rotated_rect_vertices(rect, rotation))
+                _draw_filled_polygon(
+                    page, _rotated_rect_vertices(rect, rotation), fill_color
+                )
 
         doc.save(output_path, garbage=4, deflate=True, clean=True)
     finally:
