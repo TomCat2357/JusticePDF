@@ -1,8 +1,8 @@
 """個人情報検出の設定ダイアログ。
 
 設定項目の構成は PresidioPDF の設定ダイアログ
-(``PresidioPDF/src/gui_pyqt/views/config_dialog.py``: 検出対象エンティティ・
-色・除外/追加パターン・重複除去・OCR)に倣うが、実装はJusticePDFのUI規約
+(``PresidioPDF/src/gui_pyqt/views/config_dialog.py``: 検出エンジン・
+除外/追加パターン・重複除去・OCR)に倣うが、実装はJusticePDFのUI規約
 (``src.views.settings_dialog.SettingsDialog`` と同じ ``build_accept_cancel_box``
 パターン)に合わせて新規に書いている。
 
@@ -10,10 +10,13 @@
 開く独立ダイアログとして提供する(JusticePDFのメイン設定ダイアログは
 「デフォルトで開くフォルダ」1項目だけの小型ダイアログのため、タブ化した
 このダイアログを別立てにする方が自然)。
+
+以前の「検出対象・色」タブは、種別ごとの検出対象チェックボックスを
+個人情報検出ドロワー(``PiiPanel`` の「表示・検出する種別」)へ、色を
+ドロワーの「色」「透明度」(全種別共通)へ移したため廃止した。
 """
 from __future__ import annotations
 
-from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -31,23 +34,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.pii import ocr_support
+from src.ocr import is_ocr_available
 from src.pii.engines import ENGINES, is_engine_available
-from src.pii.entity_types import ENTITY_TYPES, MANUAL_ENTITY_TYPE, get_entity_type_name_ja
+from src.pii.entity_types import ENTITY_TYPES, get_entity_type_name_ja
 from src.pii.settings import PiiSettings
 from src.views.view_helpers import build_accept_cancel_box
-
-
-def _color_to_qcolor(rgb: tuple[float, float, float]) -> QColor:
-    return QColor(
-        max(0, min(255, round(rgb[0] * 255))),
-        max(0, min(255, round(rgb[1] * 255))),
-        max(0, min(255, round(rgb[2] * 255))),
-    )
-
-
-def _qcolor_to_color(color: QColor) -> tuple[float, float, float]:
-    return (color.redF(), color.greenF(), color.blueF())
 
 
 class PiiSettingsDialog(QDialog):
@@ -65,7 +56,6 @@ class PiiSettingsDialog(QDialog):
         tabs = QTabWidget()
         layout.addWidget(tabs, 1)
 
-        tabs.addTab(self._build_entities_tab(), "検出対象・色")
         tabs.addTab(self._build_engines_tab(), "検出エンジン")
         tabs.addTab(self._build_exclusions_tab(), "除外・追加パターン")
         tabs.addTab(self._build_dedupe_tab(), "重複除去")
@@ -73,78 +63,6 @@ class PiiSettingsDialog(QDialog):
 
         btn_box, self._ok_btn = build_accept_cancel_box(self, "OK")
         layout.addWidget(btn_box)
-
-    # ------------------------------------------------------------------
-    # タブ: 検出対象エンティティ・色
-    # ------------------------------------------------------------------
-    def _build_entities_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.addWidget(QLabel("チェックした種別のみ検出します。色はマーカーの色になります。"))
-
-        select_row = QHBoxLayout()
-        select_all_btn = QPushButton("すべて選択")
-        select_all_btn.clicked.connect(lambda: self._set_all_entity_checks(True))
-        select_row.addWidget(select_all_btn)
-        deselect_all_btn = QPushButton("すべて解除")
-        deselect_all_btn.clicked.connect(lambda: self._set_all_entity_checks(False))
-        select_row.addWidget(deselect_all_btn)
-        select_row.addStretch()
-        layout.addLayout(select_row)
-
-        self._entity_checks: dict[str, QCheckBox] = {}
-        self._entity_color_btns: dict[str, QPushButton] = {}
-        for entity_type in ENTITY_TYPES:
-            row = QHBoxLayout()
-            checkbox = QCheckBox(get_entity_type_name_ja(entity_type))
-            checkbox.setChecked(self._settings.is_entity_enabled(entity_type))
-            row.addWidget(checkbox, 1)
-
-            color_btn = QPushButton("色...")
-            color_btn.clicked.connect(
-                lambda _checked=False, et=entity_type: self._on_pick_color(et)
-            )
-            self._apply_color_preview(color_btn, self._settings.color_for(entity_type))
-            row.addWidget(color_btn)
-
-            layout.addLayout(row)
-            self._entity_checks[entity_type] = checkbox
-            self._entity_color_btns[entity_type] = color_btn
-
-        # 「手動」は自動検出の対象ではない(チェックボックスは出さない)ため、
-        # 色だけを設定できるようにする(手動追加ツールの既定種別・見た目に使う)。
-        manual_row = QHBoxLayout()
-        manual_row.addWidget(QLabel(f"{get_entity_type_name_ja(MANUAL_ENTITY_TYPE)}(手動追加分の色)"), 1)
-        manual_color_btn = QPushButton("色...")
-        manual_color_btn.clicked.connect(
-            lambda _checked=False: self._on_pick_color(MANUAL_ENTITY_TYPE)
-        )
-        self._apply_color_preview(manual_color_btn, self._settings.color_for(MANUAL_ENTITY_TYPE))
-        manual_row.addWidget(manual_color_btn)
-        layout.addLayout(manual_row)
-        self._entity_color_btns[MANUAL_ENTITY_TYPE] = manual_color_btn
-
-        layout.addStretch()
-        return widget
-
-    def _set_all_entity_checks(self, checked: bool) -> None:
-        for checkbox in self._entity_checks.values():
-            checkbox.setChecked(checked)
-
-    def _apply_color_preview(self, button: QPushButton, rgb: tuple[float, float, float]) -> None:
-        qcolor = _color_to_qcolor(rgb)
-        button.setStyleSheet(f"background-color: {qcolor.name()};")
-        button.setToolTip(qcolor.name())
-
-    def _on_pick_color(self, entity_type: str) -> None:
-        from PyQt6.QtWidgets import QColorDialog
-
-        current = _color_to_qcolor(self._settings.color_for(entity_type))
-        color = QColorDialog.getColor(current, self, f"{get_entity_type_name_ja(entity_type)}の色")
-        if not color.isValid():
-            return
-        self._settings.colors[entity_type] = _qcolor_to_color(color)
-        self._apply_color_preview(self._entity_color_btns[entity_type], self._settings.colors[entity_type])
 
     # ------------------------------------------------------------------
     # タブ: 検出エンジン
@@ -200,6 +118,20 @@ class PiiSettingsDialog(QDialog):
     def _build_exclusions_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+
+        layout.addWidget(
+            QLabel("除外語(完全一致。追加パターンや人名リストで検出される語句よりも優先して除外)")
+        )
+        self._excluded_words_list = QListWidget()
+        self._excluded_words_list.addItems(self._settings.excluded_words)
+        layout.addWidget(self._excluded_words_list)
+        layout.addLayout(
+            self._build_add_remove_row(
+                self._excluded_words_list,
+                self._settings.excluded_words,
+                "除外語を入力",
+            )
+        )
 
         layout.addWidget(
             QLabel("除外パターン(正規表現・部分一致で検出結果から除外。記号は \\ でエスケープ)")
@@ -343,7 +275,7 @@ class PiiSettingsDialog(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        available = ocr_support.is_ocr_available()
+        available = is_ocr_available()
         group = QGroupBox("OCR (RapidOCR) - 任意機能")
         group_layout = QVBoxLayout(group)
         if available:
@@ -357,6 +289,8 @@ class PiiSettingsDialog(QDialog):
             status.setWordWrap(True)
         group_layout.addWidget(status)
 
+        # 有効にすると「検出」の前に、テキストレイヤの無いページだけを自動でOCRして
+        # (見えないテキストとして埋め込み)から検出する。手動のOCRはOCRパネルから行う。
         self._ocr_enabled_check = QCheckBox("テキストレイヤの無いページはOCRしてから検出する")
         self._ocr_enabled_check.setChecked(self._settings.ocr_enabled)
         self._ocr_enabled_check.setEnabled(available)
@@ -383,8 +317,6 @@ class PiiSettingsDialog(QDialog):
     # ------------------------------------------------------------------
     def result_settings(self) -> PiiSettings:
         """ダイアログで編集した内容を反映した ``PiiSettings`` を返す。"""
-        for entity_type, checkbox in self._entity_checks.items():
-            self._settings.enabled_entities[entity_type] = checkbox.isChecked()
         for engine_key, checkbox in self._engine_checks.items():
             # 未導入(disabled)のチェックボックスは常に未チェックなので、そのまま
             # 保存してもis_engine_enabled()側の既定値解決には影響しない

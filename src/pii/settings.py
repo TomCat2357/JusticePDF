@@ -15,7 +15,12 @@ from dataclasses import dataclass, field, replace as dataclass_replace
 from PyQt6.QtCore import QSettings
 
 from src.pii.engines import default_enabled_engines
-from src.pii.entity_types import ENTITY_TYPES, HIGHLIGHT_COLORS
+from src.pii.entity_types import (
+    ENTITY_TYPES,
+    ENTITY_TYPES_WITH_MANUAL,
+    HIGHLIGHT_COLORS,
+    MANUAL_ENTITY_TYPE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,26 @@ def _save_json(settings: QSettings, name: str, value) -> None:
 
 _DISPLAY_MODES = ("mark", "black", "hidden")
 
+DEFAULT_MASK_COLOR: tuple[float, float, float] = (0.0, 0.0, 0.0)
+DEFAULT_MASK_TRANSPARENCY = 70
+
+
+def _clamp_transparency(value) -> int:
+    try:
+        return max(0, min(100, int(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_MASK_TRANSPARENCY
+
+
+def _normalize_mask_color(value) -> tuple[float, float, float]:
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        try:
+            r, g, b = (max(0.0, min(1.0, float(c))) for c in value)
+            return (r, g, b)
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_MASK_COLOR
+
 
 def _normalize_display_mode(value) -> str:
     value = str(value or "")
@@ -57,11 +82,16 @@ class PiiSettings:
     enabled_entities: dict[str, bool] = field(
         default_factory=lambda: {et: True for et in ENTITY_TYPES}
     )
-    # マーカー色（エンティティ別、RGB 0.0-1.0）。未指定は entity_types の既定色。
+    # 旧「種別別のマーカー色」(RGB 0.0-1.0)。塗りつぶし候補の色は単一の
+    # ``mask_color`` に統一したため現在の UI は使わないが、旧設定を読み込める
+    # よう(および ``color_for`` の後方互換のため)フィールドは残している。
     colors: dict[str, tuple[float, float, float]] = field(default_factory=dict)
     # 除外設定
     text_exclusions_regex: list[str] = field(default_factory=list)
     entity_exclusions: dict[str, list[str]] = field(default_factory=dict)
+    # 除外語: 種別を問わない完全一致の除外語(前後の空白は無視)。追加パターンに
+    # 登録した語句でも、除外語に入っていれば検出されない(除外が追加より優先)。
+    excluded_words: list[str] = field(default_factory=list)
     # 追加検出パターン: (entity_type, regex) のリスト（左が高優先）
     additional_patterns: list[tuple[str, str]] = field(default_factory=list)
     # 追加の人名リスト（PERSON として検出）
@@ -94,12 +124,35 @@ class PiiSettings:
     # 検出ボタン押下時、既存の検出結果・手動追加分を消さずに新規検出分だけ
     # 追加するかどうか(オフなら従来通り、検出し直したページの既存結果を置換)。
     keep_existing_on_detect: bool = False
-    # ズームビュー上の塗りつぶし候補の見た目("mark" | "black" | "hidden")。
-    # 表示上の切り替えのみで、PDF・エクスポート結果には影響しない。
+    # 旧「表示」コンボ("mark" | "black" | "hidden")。UI では使わなくなった
+    # (色と透明度に置き換え、「非表示」は種別チェックボックスで代替)。旧設定から
+    # ``mask_transparency`` を移行するためだけに読み込む。
     display_mode: str = "mark"
+    # 塗りつぶし候補・図形の色(全種別共通、RGB 0.0-1.0)。
+    mask_color: tuple[float, float, float] = DEFAULT_MASK_COLOR
+    # 塗りつぶし候補の透明度(0=不透明のベタ塗り / 100=完全に透明)。
+    mask_transparency: int = DEFAULT_MASK_TRANSPARENCY
+    # 「手動」種別(手動で追加した候補・図形)を一覧/ページ上で表示・出力の
+    # 対象にするか。自動検出の8種別は ``enabled_entities`` が持つ。
+    manual_visible: bool = True
 
     def is_entity_enabled(self, entity_type: str) -> bool:
         return bool(self.enabled_entities.get(entity_type, True))
+
+    def is_entity_visible(self, entity_type: str) -> bool:
+        """種別が「表示・検出する」状態か(自動検出8種別は enabled_entities、手動は manual_visible)。"""
+        if entity_type == MANUAL_ENTITY_TYPE:
+            return bool(self.manual_visible)
+        return self.is_entity_enabled(entity_type)
+
+    def hidden_entities(self) -> set[str]:
+        """非表示(チェックが外れている)種別の集合。手動も含む。"""
+        return {et for et in ENTITY_TYPES_WITH_MANUAL if not self.is_entity_visible(et)}
+
+    @property
+    def mask_opacity(self) -> float:
+        """塗りつぶしの不透明度(0.0-1.0)。透明度0 -> 1.0、透明度100 -> 0.0。"""
+        return (100 - _clamp_transparency(self.mask_transparency)) / 100.0
 
     def is_engine_enabled(self, engine_key: str) -> bool:
         return bool(self.enabled_engines.get(engine_key, False))
@@ -142,6 +195,7 @@ class PiiSettings:
                 "entity_exclusions": {
                     k: list(v) for k, v in self.entity_exclusions.items()
                 },
+                "excluded_words": list(self.excluded_words),
             },
             "nlp": {
                 "sudachi_dict_type": self.sudachi_dict_type,
@@ -191,6 +245,13 @@ class PiiSettings:
                 }
             )
 
+        excluded_words_raw = _load_json(s, "excluded_words", None)
+        excluded_words = (
+            [str(x) for x in excluded_words_raw if str(x)]
+            if isinstance(excluded_words_raw, list)
+            else []
+        )
+
         # 旧「除外ワード(部分一致)」は除外パターン(re.search=部分一致)と機能が
         # 重複していたため廃止した。保存済みの除外ワードは記号をエスケープして
         # 除外パターンへ移し、同じ除外が効き続けるようにする。
@@ -202,6 +263,20 @@ class PiiSettings:
             if word and escaped not in text_exclusions_regex:
                 text_exclusions_regex.append(escaped)
 
+        display_mode = _normalize_display_mode(
+            s.value(_key("display_mode"), default.display_mode, type=str)
+        )
+        # 旧設定からの移行: 新キーが無く旧「黒塗り」モードだった場合は透明度0
+        # (不透明のベタ塗り)、それ以外は既定値にする。
+        if s.contains(_key("mask_transparency")):
+            mask_transparency = _clamp_transparency(
+                s.value(_key("mask_transparency"), default.mask_transparency, type=int)
+            )
+        elif display_mode == "black":
+            mask_transparency = 0
+        else:
+            mask_transparency = default.mask_transparency
+
         return PiiSettings(
             enabled_entities=(
                 {str(k): bool(v) for k, v in enabled_entities.items()}
@@ -211,6 +286,7 @@ class PiiSettings:
             colors=colors,
             text_exclusions_regex=text_exclusions_regex,
             entity_exclusions=entity_exclusions,
+            excluded_words=excluded_words,
             additional_patterns=additional_patterns,
             custom_names=list(_load_json(s, "custom_names", []) or []),
             dedupe_enabled=bool(
@@ -234,9 +310,10 @@ class PiiSettings:
             keep_existing_on_detect=bool(
                 s.value(_key("keep_existing_on_detect"), False, type=bool)
             ),
-            display_mode=_normalize_display_mode(
-                s.value(_key("display_mode"), default.display_mode, type=str)
-            ),
+            display_mode=display_mode,
+            mask_color=_normalize_mask_color(_load_json(s, "mask_color", None)),
+            mask_transparency=mask_transparency,
+            manual_visible=bool(s.value(_key("manual_visible"), True, type=bool)),
         )
 
     def save(self, settings: QSettings | None = None) -> None:
@@ -249,6 +326,7 @@ class PiiSettings:
         # (残すと次回 load で再移行され、削除した除外パターンが復活してしまう)。
         s.remove(_key("text_exclusions"))
         _save_json(s, "entity_exclusions", self.entity_exclusions)
+        _save_json(s, "excluded_words", self.excluded_words)
         _save_json(s, "additional_patterns", [list(p) for p in self.additional_patterns])
         _save_json(s, "custom_names", self.custom_names)
         s.setValue(_key("dedupe_enabled"), self.dedupe_enabled)
@@ -262,6 +340,9 @@ class PiiSettings:
         _save_json(s, "enabled_engines", self.enabled_engines)
         s.setValue(_key("keep_existing_on_detect"), self.keep_existing_on_detect)
         s.setValue(_key("display_mode"), self.display_mode)
+        _save_json(s, "mask_color", list(_normalize_mask_color(self.mask_color)))
+        s.setValue(_key("mask_transparency"), _clamp_transparency(self.mask_transparency))
+        s.setValue(_key("manual_visible"), self.manual_visible)
 
     def copy(self) -> "PiiSettings":
         """独立編集用のディープコピーを返す(可変フィールドの参照共有を避ける)。
@@ -278,6 +359,7 @@ class PiiSettings:
             colors=dict(self.colors),
             text_exclusions_regex=list(self.text_exclusions_regex),
             entity_exclusions={k: list(v) for k, v in self.entity_exclusions.items()},
+            excluded_words=list(self.excluded_words),
             additional_patterns=list(self.additional_patterns),
             custom_names=list(self.custom_names),
             entity_priority_order=list(self.entity_priority_order),

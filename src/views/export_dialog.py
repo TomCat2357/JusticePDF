@@ -40,12 +40,20 @@ class ExportOptionsDialog(QDialog):
         7: (60, 10),
     }
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, note: str = "") -> None:
+        """``note`` を指定すると、ダイアログ上部に説明文を1行(折り返し可)表示する
+        (個人情報検出ドロワーの「エクスポート...」が黒塗りの旨を示すために使う)。"""
         super().__init__(parent)
         self.setWindowTitle("エクスポート設定")
         self.setMinimumWidth(360)
 
         layout = QVBoxLayout(self)
+
+        self._note_label: QLabel | None = None
+        if note:
+            self._note_label = QLabel(note)
+            self._note_label.setWordWrap(True)
+            layout.addWidget(self._note_label)
 
         form = QFormLayout()
         layout.addLayout(form)

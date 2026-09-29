@@ -8,7 +8,6 @@ import fitz
 import pytest
 from PyQt6.QtCore import Qt
 
-from src.pii.settings import PiiSettings
 from src.utils.pdf_utils import (
     MarkupType,
     ShapeType,
@@ -297,123 +296,468 @@ def test_delete_same_text_removes_all_matching_candidates(qtbot, tmp_path):
     assert len(list_pii_markup_annots(str(pdf_path), 0)) == 2
 
 
+# ---------------------------------------------------------------------------
+# 「テキスト候補」ボタン: 先に選択済みならその場で追加 / 未選択なら連続モード
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.usefixtures("qtbot")
-def test_add_exclusion_registers_text_in_pii_settings(qtbot, monkeypatch, tmp_path):
-    pdf_path = tmp_path / "mask-exclusion.pdf"
+def test_mask_markup_button_with_preselected_text_creates_candidate_without_arming(
+    qtbot, tmp_path
+):
+    pdf_path = tmp_path / "mask-markup-preselected.pdf"
+    _make_text_pdf(pdf_path)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+    btn = window._pii_panel._mask_markup_btn
+
+    _select_chars(window, _char_indices_for_substring(window, "SECRET"))
+    btn.click()
+
+    candidates = list_pii_markup_annots(str(pdf_path), 0)
+    assert len(candidates) == 1
+    assert candidates[0].pii_entity == "MANUAL"
+    assert candidates[0].pii_text == "SECRET"
+    # 連続モードには入らず、ボタンは押下前(未チェック)へ戻り、選択も解除される。
+    assert window._create_mode is CreateMode.NONE
+    assert btn.isChecked() is False
+    assert not window._zoom_label._selected_char_indices
+
+    # 1回分のUndoで元に戻る。
+    window._undo_manager.undo()
+    assert list_pii_markup_annots(str(pdf_path), 0) == []
+    window._undo_manager.redo()
+    assert len(list_pii_markup_annots(str(pdf_path), 0)) == 1
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_mask_markup_button_survives_real_drag_selection_then_click(qtbot, tmp_path):
+    """実際にページ上でドラッグ選択してからボタンをクリックしても、選択が残っていて追加される
+    (ボタンのクリックで選択が消える/フォーカスを奪われることが無い)。"""
+    pdf_path = tmp_path / "mask-markup-real-drag.pdf"
     _make_text_pdf(pdf_path)
 
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
     window._toggle_pii_drawer()
 
-    monkeypatch.setattr(
-        page_edit_pii_module.QMessageBox, "information", staticmethod(lambda *a, **k: None)
-    )
-    window._on_pii_add_exclusion("PERSON", "架空太郎")
+    _drag_on_zoom_label(qtbot, window, (30, 95), (200, 95))
+    assert window._zoom_label._selected_char_indices
 
-    reloaded = PiiSettings.load()
-    assert "架空太郎" in reloaded.entity_exclusions.get("PERSON", [])
-    assert "架空太郎" in window._pii_settings().entity_exclusions.get("PERSON", [])
+    qtbot.mouseClick(window._pii_panel._mask_markup_btn, Qt.MouseButton.LeftButton)
 
-
-# ---------------------------------------------------------------------------
-# エクスポート(黒塗り画像 / 文字削除テキストPDF)
-# ---------------------------------------------------------------------------
+    candidates = list_pii_markup_annots(str(pdf_path), 0)
+    assert len(candidates) == 1
+    assert candidates[0].pii_text.strip()
+    assert window._create_mode is CreateMode.NONE
+    assert window._pii_panel._mask_markup_btn.isChecked() is False
 
 
 @pytest.mark.usefixtures("qtbot")
-def test_export_rasterize_hides_candidates_and_fills_mask_shapes(qtbot, monkeypatch, tmp_path):
-    pdf_path = tmp_path / "mask-export-raster.pdf"
-    _make_text_pdf(pdf_path, "SECRET KEEPME")
+def test_mask_markup_button_without_selection_arms_continuous_mode(qtbot, tmp_path):
+    pdf_path = tmp_path / "mask-markup-arm.pdf"
+    _make_text_pdf(pdf_path)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+    btn = window._pii_panel._mask_markup_btn
+
+    btn.click()
+    assert window._create_mode is CreateMode.MASK_MARKUP
+    assert btn.isChecked() is True
+    assert list_pii_markup_annots(str(pdf_path), 0) == []
+
+    # 連続モード中は選択するたびに追加される。
+    _select_chars(window, _char_indices_for_substring(window, "SECRET"))
+    window._on_zoom_text_selection_released()
+    assert len(list_pii_markup_annots(str(pdf_path), 0)) == 1
+    assert window._create_mode is CreateMode.MASK_MARKUP
+
+    # 再クリックで解除。
+    btn.click()
+    assert window._create_mode is CreateMode.NONE
+    assert btn.isChecked() is False
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_mask_shape_buttons_always_arm_even_with_text_selected(qtbot, tmp_path):
+    pdf_path = tmp_path / "mask-shape-arm.pdf"
+    _make_text_pdf(pdf_path)
 
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
     window._toggle_pii_drawer()
 
+    _select_chars(window, _char_indices_for_substring(window, "SECRET"))
+    window._pii_panel._mask_rect_btn.click()
+    assert window._create_mode is CreateMode.MASK_SHAPE
+    assert window._pii_panel._mask_rect_btn.isChecked() is True
+    assert list_pii_markup_annots(str(pdf_path), 0) == []
+
+    window._pii_panel._mask_ellipse_btn.click()
+    assert window._mask_shape_pending_type == ShapeType.ELLIPSE
+    assert window._pii_panel._mask_rect_btn.isChecked() is False
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_manual_candidates_use_global_mask_color_and_manual_entity(qtbot, tmp_path):
+    pdf_path = tmp_path / "mask-color.pdf"
+    _make_text_pdf(pdf_path)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+    window._on_pii_mask_color_changed((0.2, 0.4, 0.6))
+
     window._activate_create_mode(CreateMode.MASK_MARKUP)
     _select_chars(window, _char_indices_for_substring(window, "SECRET"))
     window._on_zoom_text_selection_released()
-
     window._activate_create_mode(CreateMode.MASK_SHAPE, ShapeType.RECTANGLE)
     _drag_on_zoom_label(qtbot, window, (250, 80), (330, 115))
 
-    assert len(list_pii_markup_annots(str(pdf_path), 0)) == 1
-    assert len(list_pii_mask_shapes(str(pdf_path), 0)) == 1
+    (markup,) = list_pii_markup_annots(str(pdf_path), 0)
+    (shape,) = list_pii_mask_shapes(str(pdf_path), 0)
+    assert markup.pii_entity == "MANUAL" and shape.pii_entity == "MANUAL"
+    assert markup.color == pytest.approx((0.2, 0.4, 0.6), abs=0.01)
+    assert shape.stroke_color == pytest.approx((0.2, 0.4, 0.6), abs=0.01)
 
-    out_path = tmp_path / "out_raster.pdf"
+
+# ---------------------------------------------------------------------------
+# エクスポート(黒塗り+文字削除 → 形式・解像度・圧縮を選んで書き出し)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_EXPORT_OPTIONS = {
+    "format": "pdf",
+    "dpi": 150,
+    "jpeg_quality": 85,
+    "pdf_optimize_level": 0,
+    "pdf_image_dpi": 150,
+    "pdf_image_quality": 75,
+    "rasterize": False,
+    "rasterize_format": "png",
+}
+
+
+def _word_center(pdf_path, word: str) -> tuple[float, float]:
+    with fitz.open(str(pdf_path)) as doc:
+        rect = doc[0].search_for(word)[0]
+    return ((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+
+
+def _add_pii_markup(pdf_path, word: str, entity: str) -> None:
+    with fitz.open(str(pdf_path)) as doc:
+        rect = doc[0].search_for(word)[0]
+    create_markup_annot(
+        str(pdf_path),
+        TextMarkupAnnotData(
+            page_num=0,
+            xref=0,
+            quads=((rect.x0, rect.y0, rect.x1, rect.y1),),
+            markup_type=MarkupType.HIGHLIGHT,
+            color=(0.0, 0.0, 0.0),
+            opacity=0.35,
+            pii_entity=entity,
+            pii_text=word,
+        ),
+    )
+
+
+def _patch_export(window, monkeypatch, *, out_path=None, out_dir=None, **option_overrides):
+    """エクスポートのダイアログ類を差し替える。戻り値は (完了メッセージ一覧, 呼び出し記録)。"""
+    options = {**_DEFAULT_EXPORT_OPTIONS, **option_overrides}
+    calls = {"options": 0, "save": 0, "dir": 0}
+    shown: list[str] = []
+
+    def ask_options():
+        calls["options"] += 1
+        return options
+
+    def get_save(*a, **k):
+        calls["save"] += 1
+        return (str(out_path), "")
+
+    def get_dir(*a, **k):
+        calls["dir"] += 1
+        return str(out_dir)
+
+    window._ask_pii_export_options = ask_options
     monkeypatch.setattr(
-        page_edit_pii_module.QFileDialog,
-        "getSaveFileName",
-        staticmethod(lambda *a, **k: (str(out_path), "")),
+        page_edit_pii_module.QFileDialog, "getSaveFileName", staticmethod(get_save)
     )
     monkeypatch.setattr(
-        page_edit_pii_module.QMessageBox, "information", staticmethod(lambda *a, **k: None)
+        page_edit_pii_module.QFileDialog, "getExistingDirectory", staticmethod(get_dir)
     )
     monkeypatch.setattr(
-        page_edit_pii_module.QMessageBox, "warning", staticmethod(lambda *a, **k: None)
+        page_edit_pii_module.QMessageBox,
+        "information",
+        staticmethod(lambda *a, **k: shown.append(str(a[2]))),
     )
-
-    window._on_pii_export_rasterize_requested()
-
-    assert out_path.exists()
-    with fitz.open(str(out_path)) as out_doc:
-        page = out_doc[0]
-        assert page.get_text().strip() == ""  # ラスタライズ済み
-        assert (page.annots() or []) == [] or all(
-            a.info.get("subject", "") == "" for a in (page.annots() or [])
-        )
+    monkeypatch.setattr(
+        page_edit_pii_module.QMessageBox, "warning", staticmethod(lambda *a, **k: shown.append("WARN:" + str(a[2])))
+    )
+    return shown, calls
 
 
-@pytest.mark.usefixtures("qtbot")
-def test_export_redact_removes_masked_text_keeps_other_text_and_normal_annots(
-    qtbot, monkeypatch, tmp_path
-):
-    pdf_path = tmp_path / "mask-export-redact.pdf"
-    _make_text_pdf(pdf_path, "SECRET KEEPME")
-
+def _open_export_window(qtbot, pdf_path):
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
     window._toggle_pii_drawer()
+    return window
 
-    # 通常のマーカー(塗りつぶし対象ではない)を1件作っておく。
-    normal_annot = TextMarkupAnnotData(
-        page_num=0,
-        xref=0,
-        quads=((250.0, 80.0, 330.0, 115.0),),
-        markup_type=MarkupType.HIGHLIGHT,
-        color=(1.0, 1.0, 0.0),
-        opacity=0.4,
+
+def _all_object_text(pdf_path) -> str:
+    """出力PDFの全オブジェクトを文字列化する(注釈のSubject等の取り残しを探すため)。"""
+    parts = []
+    with fitz.open(str(pdf_path)) as doc:
+        for xref in range(1, doc.xref_length()):
+            try:
+                parts.append(doc.xref_object(xref, compressed=False))
+            except Exception:  # noqa: BLE001
+                continue
+    return "\n".join(parts)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_export_redact_keeps_text_layer_deletes_target_and_leaves_no_pii_annots(
+    qtbot, monkeypatch, tmp_path
+):
+    pdf_path = tmp_path / "export-redact.pdf"
+    _make_text_pdf(pdf_path, "SECRET KEEPME")
+    _add_pii_markup(pdf_path, "SECRET", "MANUAL")
+    # 通常のマーカー(塗りつぶし対象ではない)は残る。
+    with fitz.open(str(pdf_path)) as doc:
+        keep_rect = doc[0].search_for("KEEPME")[0]
+    create_markup_annot(
+        str(pdf_path),
+        TextMarkupAnnotData(
+            page_num=0,
+            xref=0,
+            quads=((keep_rect.x0, keep_rect.y0, keep_rect.x1, keep_rect.y1),),
+            markup_type=MarkupType.HIGHLIGHT,
+            color=(1.0, 1.0, 0.0),
+            opacity=0.4,
+        ),
     )
-    create_markup_annot(str(pdf_path), normal_annot)
+    secret_center = _word_center(pdf_path, "SECRET")
+    original_bytes = pdf_path.read_bytes()
 
-    window._activate_create_mode(CreateMode.MASK_MARKUP)
-    _select_chars(window, _char_indices_for_substring(window, "SECRET"))
-    window._on_zoom_text_selection_released()
-
+    window = _open_export_window(qtbot, pdf_path)
     out_path = tmp_path / "out_redact.pdf"
-    monkeypatch.setattr(
-        page_edit_pii_module.QFileDialog,
-        "getSaveFileName",
-        staticmethod(lambda *a, **k: (str(out_path), "")),
-    )
-    monkeypatch.setattr(
-        page_edit_pii_module.QMessageBox, "information", staticmethod(lambda *a, **k: None)
-    )
-    monkeypatch.setattr(
-        page_edit_pii_module.QMessageBox, "warning", staticmethod(lambda *a, **k: None)
-    )
+    shown, _calls = _patch_export(window, monkeypatch, out_path=out_path)
 
-    window._on_pii_export_redact_requested()
+    window._on_pii_export_requested()
 
     assert out_path.exists()
     with fitz.open(str(out_path)) as out_doc:
-        remaining_text = out_doc[0].get_text()
-        assert "SECRET" not in remaining_text
-        assert "KEEPME" in remaining_text
-        remaining_annots = list(out_doc[0].annots() or [])
-        # 塗りつぶし候補(SECRETのハイライト)は消え、通常マーカーは残る。
-        assert len(remaining_annots) == 1
+        text = out_doc[0].get_text()
+        assert "SECRET" not in text
+        assert "KEEPME" in text
+        # PII注釈はすべて取り除かれ、通常のマーカー1件だけが残る。
+        annots = list(out_doc[0].annots() or [])
+        assert len(annots) == 1
+        assert "pii_" not in annots[0].info.get("subject", "")
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(int(secret_center[0] * 2), int(secret_center[1] * 2))[:3] == (0, 0, 0)
+    everything = _all_object_text(out_path)
+    assert "pii_entity" not in everything and "pii_text" not in everything
+    assert any("黒塗り済みのPDF" in message for message in shown)
+    # 元ファイルは変更されない。
+    assert pdf_path.read_bytes() == original_bytes
 
-    # 元ファイルは変更されていない。
-    with fitz.open(str(pdf_path)) as src_doc:
-        assert "SECRET" in src_doc[0].get_text()
+
+@pytest.mark.usefixtures("qtbot")
+def test_export_is_always_black_regardless_of_mask_color_and_transparency(
+    qtbot, monkeypatch, tmp_path
+):
+    pdf_path = tmp_path / "export-black.pdf"
+    _make_text_pdf(pdf_path, "SECRET KEEPME")
+    _add_pii_markup(pdf_path, "SECRET", "MANUAL")
+    secret_center = _word_center(pdf_path, "SECRET")
+
+    window = _open_export_window(qtbot, pdf_path)
+    window._on_pii_mask_color_changed((1.0, 0.0, 0.0))
+    window._pii_panel._transparency_slider.setValue(100)  # 完全に透明
+    out_path = tmp_path / "out_black.pdf"
+    _patch_export(window, monkeypatch, out_path=out_path)
+
+    window._on_pii_export_requested()
+
+    with fitz.open(str(out_path)) as out_doc:
+        assert "SECRET" not in out_doc[0].get_text()
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(int(secret_center[0] * 2), int(secret_center[1] * 2))[:3] == (0, 0, 0)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_export_rasterize_option_gives_image_only_pdf(qtbot, monkeypatch, tmp_path):
+    pdf_path = tmp_path / "export-raster.pdf"
+    _make_text_pdf(pdf_path, "SECRET KEEPME")
+    _add_pii_markup(pdf_path, "SECRET", "MANUAL")
+    secret_center = _word_center(pdf_path, "SECRET")
+
+    window = _open_export_window(qtbot, pdf_path)
+    out_path = tmp_path / "out_raster.pdf"
+    _patch_export(
+        window,
+        monkeypatch,
+        out_path=out_path,
+        rasterize=True,
+        rasterize_format="png",
+        pdf_image_dpi=100,
+    )
+
+    window._on_pii_export_requested()
+
+    with fitz.open(str(out_path)) as out_doc:
+        assert out_doc[0].get_text().strip() == ""  # 画像のみ
+        assert list(out_doc[0].annots() or []) == []
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(int(secret_center[0] * 2), int(secret_center[1] * 2))[:3] == (0, 0, 0)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_export_compress_option_keeps_text_and_black_fill(qtbot, monkeypatch, tmp_path):
+    pdf_path = tmp_path / "export-compress.pdf"
+    _make_text_pdf(pdf_path, "SECRET KEEPME")
+    _add_pii_markup(pdf_path, "SECRET", "MANUAL")
+    secret_center = _word_center(pdf_path, "SECRET")
+
+    window = _open_export_window(qtbot, pdf_path)
+    out_path = tmp_path / "out_compress.pdf"
+    _patch_export(window, monkeypatch, out_path=out_path, pdf_optimize_level=1)
+
+    window._on_pii_export_requested()
+
+    with fitz.open(str(out_path)) as out_doc:
+        text = out_doc[0].get_text()
+        assert "SECRET" not in text and "KEEPME" in text
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(int(secret_center[0] * 2), int(secret_center[1] * 2))[:3] == (0, 0, 0)
+    assert "pii_entity" not in _all_object_text(out_path)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_export_image_format_writes_named_black_images(qtbot, monkeypatch, tmp_path):
+    from PyQt6.QtGui import QImage
+
+    pdf_path = tmp_path / "export-images.pdf"
+    _make_text_pdf(pdf_path, "SECRET KEEPME")
+    _add_pii_markup(pdf_path, "SECRET", "MANUAL")
+    secret_center = _word_center(pdf_path, "SECRET")
+
+    window = _open_export_window(qtbot, pdf_path)
+    out_dir = tmp_path / "images"
+    out_dir.mkdir()
+    shown, calls = _patch_export(
+        window, monkeypatch, out_dir=out_dir, format="png", dpi=100
+    )
+
+    window._on_pii_export_requested()
+
+    assert calls["dir"] == 1 and calls["save"] == 0
+    image_path = out_dir / "export-images_黒塗り_p1.png"
+    assert image_path.exists()
+    image = QImage(str(image_path))
+    scale = 100 / 72
+    pixel = image.pixelColor(int(secret_center[0] * scale), int(secret_center[1] * scale))
+    assert (pixel.red(), pixel.green(), pixel.blue()) == (0, 0, 0)
+    assert any("1 ページ" in message for message in shown)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_export_skips_unchecked_entities_removes_their_annots_and_reports_count(
+    qtbot, monkeypatch, tmp_path
+):
+    pdf_path = tmp_path / "export-skip.pdf"
+    _make_text_pdf(pdf_path, "SECRET KEEPME")
+    _add_pii_markup(pdf_path, "SECRET", "MANUAL")
+    _add_pii_markup(pdf_path, "KEEPME", "PERSON")
+    keep_center = _word_center(pdf_path, "KEEPME")
+
+    window = _open_export_window(qtbot, pdf_path)
+    window._pii_panel._entity_checks["PERSON"].setChecked(False)
+    out_path = tmp_path / "out_skip.pdf"
+    shown, _calls = _patch_export(window, monkeypatch, out_path=out_path)
+
+    window._on_pii_export_requested()
+
+    with fitz.open(str(out_path)) as out_doc:
+        text = out_doc[0].get_text()
+        assert "SECRET" not in text
+        assert "KEEPME" in text  # チェックが外れた種別は黒塗り・文字削除しない
+        assert list(out_doc[0].annots() or []) == []  # 注釈は出力から取り除く
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(int(keep_center[0] * 2), int(keep_center[1] * 2))[:3] != (0, 0, 0)
+        # 対象外の語句の上端の余白に、注釈の塗りが残っていない。
+        with fitz.open(str(pdf_path)) as src_doc:
+            keep_rect = src_doc[0].search_for("KEEPME")[0]
+        strip = fitz.Rect(keep_rect.x0 + 1, keep_rect.y0 + 0.5, keep_rect.x1, keep_rect.y0 + 2.5)
+        assert min(out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2), clip=strip).samples) >= 250
+    everything = _all_object_text(out_path)
+    assert "KEEPME" not in "".join(
+        line for line in everything.splitlines() if "Subj" in line
+    )
+    assert "pii_entity" not in everything
+    assert any("非表示の種別 1 件は対象外" in message for message in shown)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_export_with_no_targets_shows_message_and_asks_nothing(qtbot, monkeypatch, tmp_path):
+    pdf_path = tmp_path / "export-none.pdf"
+    _make_text_pdf(pdf_path, "SECRET KEEPME")
+    _add_pii_markup(pdf_path, "KEEPME", "PERSON")
+
+    window = _open_export_window(qtbot, pdf_path)
+    window._pii_panel._entity_checks["PERSON"].setChecked(False)
+    out_path = tmp_path / "out_none.pdf"
+    shown, calls = _patch_export(window, monkeypatch, out_path=out_path)
+
+    window._on_pii_export_requested()
+
+    assert not out_path.exists()
+    assert calls == {"options": 0, "save": 0, "dir": 0}
+    assert any("黒塗りする塗りつぶし対象がありません" in message for message in shown)
+    assert any("非表示の種別 1 件は対象外" in message for message in shown)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_export_cancelled_options_writes_nothing(qtbot, monkeypatch, tmp_path):
+    pdf_path = tmp_path / "export-cancel.pdf"
+    _make_text_pdf(pdf_path, "SECRET KEEPME")
+    _add_pii_markup(pdf_path, "SECRET", "MANUAL")
+
+    window = _open_export_window(qtbot, pdf_path)
+    out_path = tmp_path / "out_cancel.pdf"
+    _shown, calls = _patch_export(window, monkeypatch, out_path=out_path)
+    window._ask_pii_export_options = lambda: None  # ダイアログをキャンセル
+
+    window._on_pii_export_requested()
+
+    assert calls["save"] == 0 and not out_path.exists()
+
+
+def test_export_options_dialog_shows_note_and_panel_has_single_export_button(qtbot):
+    from src.views.export_dialog import ExportOptionsDialog
+    from src.views.pii_panel import PiiPanel
+
+    dialog = ExportOptionsDialog(note="チェック中の種別は黒塗りし、下の文字を削除します。")
+    qtbot.addWidget(dialog)
+    assert dialog._note_label is not None
+    assert "黒塗り" in dialog._note_label.text()
+    assert ExportOptionsDialog()._note_label is None
+
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    assert panel._export_btn.text() == "エクスポート..."
+    assert panel._export_btn.menu() is None
+    assert not hasattr(panel, "export_rasterize_requested")
+    assert not hasattr(panel, "export_redact_requested")
+    fired = []
+    panel.export_requested.connect(lambda: fired.append(True))
+    panel.set_results([])
+    panel._export_btn.setEnabled(True)
+    panel._export_btn.click()
+    assert fired == [True]

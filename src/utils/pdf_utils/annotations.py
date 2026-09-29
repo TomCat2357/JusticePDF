@@ -5,7 +5,7 @@ import logging
 import math
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from enum import Enum
 from typing import Any, Callable
 
@@ -28,8 +28,67 @@ JUSTICEPDF_FREETEXT_SUBJECT_PREFIX = "JusticePDF-FreeText:"
 JUSTICEPDF_SHAPE_SUBJECT_PREFIX = "JusticePDF-Shape:"
 JUSTICEPDF_MARKUP_SUBJECT_PREFIX = "JusticePDF-Markup:"
 JUSTICEPDF_NOTE_SUBJECT_PREFIX = "JusticePDF-Note:"
+# OCR(src.ocr)が埋め込む見えない FreeText 注釈の Subject 接頭辞。ユーザーの
+# 注釈(FreeText)としては扱わず、一覧/選択/編集/消しゴム/コピーの対象から除外する。
+JUSTICEPDF_OCR_SUBJECT_PREFIX = "JusticePDF-OCR"
 # 付箋アイコンの公称サイズ（PDF ポイント）。ヒットテスト用の矩形に使う。
 NOTE_ICON_PDF_SIZE = 18.0
+
+
+# --- 個人情報(PII)注釈のスタイル(色・不透明度・非表示種別) --------------------
+#
+# 塗りつぶし候補/図形(``pii_entity`` 付きの注釈)は、他のPDFソフトで開いたときに
+# 「パネルで選んだ色・透明度」で表示され、チェックを外した種別は非表示になる
+# ようにしたい。このユーティリティ層は設定(PiiSettings)を知らないうえ、Undo/Redo
+# (削除→再作成)もこの層の ``_add_*_annot_to_page`` を経由するため、現在のスタイル
+# をモジュール内に保持し、PII注釈を書き込むたびにそれを参照する。
+# 個人情報検出ドロワー(PiiDrawerMixin)が設定変更時・ドロワーを開いたとき・PII注釈を
+# 書く前に ``set_pii_annot_style`` で更新する。ファイル内の既存注釈への反映は
+# ``restyle_pii_annots`` が行う。
+_PII_ANNOT_STYLE: dict = {
+    "color": (0.0, 0.0, 0.0),
+    "opacity": 0.3,
+    "hidden": frozenset(),
+}
+
+
+def set_pii_annot_style(
+    color: tuple[float, float, float],
+    opacity: float,
+    hidden_entities=(),
+) -> None:
+    """PII注釈へ書き込む色(RGB 0.0-1.0)・不透明度(0.0-1.0)・非表示にする種別を設定する。"""
+    _PII_ANNOT_STYLE["color"] = (
+        max(0.0, min(1.0, float(color[0]))),
+        max(0.0, min(1.0, float(color[1]))),
+        max(0.0, min(1.0, float(color[2]))),
+    )
+    _PII_ANNOT_STYLE["opacity"] = max(0.0, min(1.0, float(opacity)))
+    _PII_ANNOT_STYLE["hidden"] = frozenset(str(e) for e in (hidden_entities or ()))
+
+
+def get_pii_annot_style() -> tuple[tuple[float, float, float], float, frozenset]:
+    """現在の (色, 不透明度, 非表示にする種別) を返す。"""
+    return (
+        _PII_ANNOT_STYLE["color"],
+        _PII_ANNOT_STYLE["opacity"],
+        _PII_ANNOT_STYLE["hidden"],
+    )
+
+
+def reset_pii_annot_style() -> None:
+    """既定(黒・不透明度0.3・非表示なし)へ戻す(主にテスト用)。"""
+    set_pii_annot_style((0.0, 0.0, 0.0), 0.3, ())
+
+
+def _set_hidden_flag(annot: fitz.Annot, hidden: bool) -> None:
+    """注釈の Hidden フラグを設定/解除する(他のフラグは変えない)。"""
+    flags = annot.flags
+    new_flags = (
+        flags | fitz.PDF_ANNOT_IS_HIDDEN if hidden else flags & ~fitz.PDF_ANNOT_IS_HIDDEN
+    )
+    if new_flags != flags:
+        annot.set_flags(new_flags)
 
 
 @dataclass(slots=True)
@@ -340,10 +399,13 @@ def _extract_freetext_data(
     doc: fitz.Document,
     page_num: int,
     annot: fitz.Annot,
-) -> FreeTextAnnotData:
+) -> FreeTextAnnotData | None:
     xref = annot.xref
     info = annot.info
     subject = info.get("subject", "")
+    if subject.startswith(JUSTICEPDF_OCR_SUBJECT_PREFIX):
+        # OCRテキスト(見えない検索用の注釈)はユーザーの注釈ではない。
+        return None
     metadata = _decode_subject_metadata(subject) or {}
 
     _, da_value = doc.xref_get_key(xref, "DA")
@@ -816,6 +878,15 @@ def _line_ending_code(arrow: bool) -> int:
 
 
 def _add_shape_annot_to_page(page: fitz.Page, data: ShapeAnnotData) -> fitz.Annot:
+    pii_hidden = False
+    if data.pii_entity:
+        # 塗りつぶし用図形: 色・不透明度は保存時点のパネル設定(全種別共通)で書く
+        # (他のPDFソフトで開いたときにも同じ見た目になる)。メタデータも揃えて往復させる。
+        style_color, style_opacity, style_hidden = get_pii_annot_style()
+        data = dataclass_replace(
+            data, stroke_color=style_color, fill_color=style_color, opacity=style_opacity
+        )
+        pii_hidden = data.pii_entity in style_hidden
     opacity = max(0.0, min(1.0, float(data.opacity)))
     stroke_width = max(0.0, float(data.stroke_width))
     # 透明枠（stroke_color is None）は stroke=[] を渡して /C [] を明示書き込みする。
@@ -894,6 +965,9 @@ def _add_shape_annot_to_page(page: fitz.Page, data: ShapeAnnotData) -> fitz.Anno
         annot.set_border(width=stroke_width)
     annot.set_opacity(opacity)
     annot.update()
+    if data.pii_entity:
+        # チェックを外した種別は他のPDFソフトでも見えないよう Hidden にする。
+        _set_hidden_flag(annot, pii_hidden)
     annot.set_info(subject=_encode_shape_metadata(data, page_rotation=creation_page_rotation))
     return annot
 
@@ -1378,6 +1452,14 @@ def _add_markup_annot_to_page(page: fitz.Page, data: TextMarkupAnnotData) -> fit
     else:
         creation_page_rotation = page.rotation
 
+    pii_hidden = False
+    if data.pii_entity:
+        # 塗りつぶし候補: 色・不透明度は保存時点のパネル設定(全種別共通)で書く
+        # (他のPDFソフトで開いたときにも同じ見た目になる)。メタデータも揃えて往復させる。
+        style_color, style_opacity, style_hidden = get_pii_annot_style()
+        data = dataclass_replace(data, color=style_color, opacity=style_opacity)
+        pii_hidden = data.pii_entity in style_hidden
+
     pdf_type = _MARKUP_TYPE_TO_PDF[data.markup_type]
     if pdf_type == fitz.PDF_ANNOT_HIGHLIGHT:
         annot = page.add_highlight_annot(quads=quads)
@@ -1386,15 +1468,12 @@ def _add_markup_annot_to_page(page: fitz.Page, data: TextMarkupAnnotData) -> fit
     else:
         annot = page.add_strikeout_annot(quads=quads)
 
-    if data.pii_entity:
-        # 塗りつぶし候補は通常のマーカーと混同されないよう、実PDF上の色も暗く
-        # 落として見た目を変える(JusticePDF自前描画はさらにダッシュ枠等で強調する)。
-        # メタデータの data.color 自体はエンティティ色のまま保持し往復させる。
-        annot.set_colors(stroke=[c * 0.35 for c in data.color])
-    else:
-        annot.set_colors(stroke=list(data.color))
+    annot.set_colors(stroke=list(data.color))
     annot.set_opacity(max(0.0, min(1.0, float(data.opacity))))
     annot.update()
+    if data.pii_entity:
+        # チェックを外した種別は他のPDFソフトでも見えないよう Hidden にする。
+        _set_hidden_flag(annot, pii_hidden)
     annot.set_info(subject=_encode_markup_metadata(data, page_rotation=creation_page_rotation))
     return annot
 
@@ -1544,6 +1623,117 @@ def delete_markup_annots(pdf_path: str, refs: list[tuple[int, int]]) -> int:
         if deleted:
             _save_document_in_place(doc, pdf_path)
         return deleted
+    finally:
+        doc.close()
+
+
+def _pii_annot_needs_restyle(
+    doc: fitz.Document,
+    annot: fitz.Annot,
+    metadata: dict,
+    *,
+    is_markup: bool,
+    color: tuple[float, float, float],
+    opacity: float,
+    hidden: bool,
+) -> bool:
+    """PII注釈の色・不透明度・Hiddenフラグが、指定のスタイルと(実質)同じか調べる。"""
+
+    def close(a, b) -> bool:
+        return abs(float(a) - float(b)) < 0.005
+
+    def same_color(value) -> bool:
+        return (
+            isinstance(value, (list, tuple))
+            and len(value) == 3
+            and all(close(v, c) for v, c in zip(value, color))
+        )
+
+    meta_key = "color" if is_markup else "stroke_color"
+    if not same_color(metadata.get(meta_key)):
+        return True
+    if not is_markup and not same_color(metadata.get("fill_color")):
+        return True
+    stroke = (annot.colors or {}).get("stroke")
+    if not same_color(stroke):
+        return True
+    _, ca_value = doc.xref_get_key(annot.xref, "CA")
+    try:
+        current_opacity = 1.0 if ca_value == "null" else float(ca_value)
+    except ValueError:
+        return True
+    if not close(current_opacity, opacity):
+        return True
+    is_hidden = bool(annot.flags & fitz.PDF_ANNOT_IS_HIDDEN)
+    return is_hidden != hidden
+
+
+def restyle_pii_annots(
+    pdf_path: str,
+    color: tuple[float, float, float],
+    opacity: float,
+    hidden_entities=(),
+) -> int:
+    """ファイル内のPII注釈(塗りつぶし候補/図形)の色・不透明度・表示状態を揃える。
+
+    ``color``(RGB 0.0-1.0)・``opacity``(0.0-1.0)を全PII注釈へ書き、
+    ``hidden_entities`` の種別の注釈は Hidden フラグを立てる(それ以外は解除)。
+    他のPDFソフトで開いたときの見た目を、パネルの設定(色・透明度・チェック)に
+    合わせるためのもの。ドキュメントを1回だけ開き、変更が必要な注釈があった場合
+    だけ1回保存する。変更した注釈の件数を返す(保存が必要なかったら0)。
+    ``PdfWritePermissionError`` は呼び出し側で処理する。
+    """
+    color = (
+        max(0.0, min(1.0, float(color[0]))),
+        max(0.0, min(1.0, float(color[1]))),
+        max(0.0, min(1.0, float(color[2]))),
+    )
+    opacity = max(0.0, min(1.0, float(opacity)))
+    hidden_set = frozenset(str(e) for e in (hidden_entities or ()))
+    changed = 0
+    doc = fitz.open(pdf_path)
+    try:
+        for page in doc:
+            annots = page.annots(types=[*_MARKUP_ANNOT_TYPES, *_SHAPE_ANNOT_TYPES])
+            if annots is None:
+                continue
+            for annot in annots:
+                subject = annot.info.get("subject", "")
+                metadata = _decode_markup_metadata(subject)
+                is_markup = metadata is not None
+                if metadata is None:
+                    metadata = _decode_shape_metadata(subject)
+                if metadata is None or not metadata.get("pii_entity"):
+                    continue
+                hidden = str(metadata["pii_entity"]) in hidden_set
+                if not _pii_annot_needs_restyle(
+                    doc,
+                    annot,
+                    metadata,
+                    is_markup=is_markup,
+                    color=color,
+                    opacity=opacity,
+                    hidden=hidden,
+                ):
+                    continue
+                if is_markup:
+                    annot.set_colors(stroke=list(color))
+                    metadata["color"] = list(color)
+                    metadata["opacity"] = opacity
+                    prefix = JUSTICEPDF_MARKUP_SUBJECT_PREFIX
+                else:
+                    annot.set_colors(stroke=list(color), fill=list(color))
+                    metadata["stroke_color"] = list(color)
+                    metadata["fill_color"] = list(color)
+                    prefix = JUSTICEPDF_SHAPE_SUBJECT_PREFIX
+                annot.set_opacity(opacity)
+                annot.update()
+                _set_hidden_flag(annot, hidden)
+                annot.set_info(subject=_encode_prefixed_json(prefix, metadata))
+                changed += 1
+        if changed:
+            _save_document_in_place(doc, pdf_path)
+        return changed
     finally:
         doc.close()
 
