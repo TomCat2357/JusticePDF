@@ -9,7 +9,7 @@ PresidioPDF の GUI 非依存な検出エンジンを JusticePDF に統合する
     - ``settings.PiiSettings``: 検出設定(QSettingsへの永続化を含む)
     - ``detection_service.run_detection`` / ``PiiDetection``: 検出実行
     - ``pdf_text_map``: ページテキスト⇔quad座標変換
-    - ``ocr_support``: 任意のOCR(RapidOCR)によるテキストレイヤ補完
+    - OCR(RapidOCR)は ``src.ocr`` パッケージ(任意依存)へ移した
 """
 from src.pii.entity_types import (
     ENTITY_TYPES,

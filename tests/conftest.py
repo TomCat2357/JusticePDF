@@ -26,6 +26,16 @@ def _isolated_qsettings(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _reset_pii_annot_style():
+    """PII注釈のスタイル(モジュール内の共有状態)をテストごとに既定へ戻す。"""
+    from src.utils.pdf_utils import reset_pii_annot_style
+
+    reset_pii_annot_style()
+    yield
+    reset_pii_annot_style()
+
+
+@pytest.fixture(autouse=True)
 def _isolated_order_store(tmp_path, monkeypatch):
     """order_store の保存先をテストごとの一時ファイルへ向け、本番の %APPDATA% を汚さない。"""
     monkeypatch.setattr(order_store, "DEFAULT_STORE_PATH", tmp_path / "folder_order.json")

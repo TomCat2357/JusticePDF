@@ -30,12 +30,17 @@ def test_spread_toggle_sets_view_only_and_label(qtbot, tmp_path):
     assert window._zoom_label._view_only is True
     # 見開き中はアノテーション(付箋)ドロワーを無効化する。
     assert window._zoom_object_btn.isEnabled() is False
+    assert window._zoom_pii_btn.isEnabled() is False
+    assert window._zoom_ocr_action.isEnabled() is False
+    assert window._zoom_panel_btn.isEnabled() is False
     assert window._zoom_page_label.text() == "1-2 / 4"
 
     window._toggle_zoom_spread_view()
 
     assert window._zoom_label._view_only is False
     assert window._zoom_object_btn.isEnabled() is True
+    assert window._zoom_pii_btn.isEnabled() is True
+    assert window._zoom_panel_btn.isEnabled() is True
     assert window._zoom_page_label.text() == "1 / 4"
 
 
@@ -169,6 +174,8 @@ def test_exit_zoom_resets_spread_mode(qtbot, tmp_path):
     assert window._zoom_page_layout is ZoomPageLayout.SINGLE
     assert window._zoom_label._view_only is False
     assert window._zoom_object_btn.isEnabled() is True
+    assert window._zoom_pii_btn.isEnabled() is True
+    assert window._zoom_panel_btn.isEnabled() is True
 
     # 再度開くと単ページで開始する。
     window._open_zoom_view(0)
