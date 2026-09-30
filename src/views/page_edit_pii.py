@@ -32,8 +32,13 @@ from src.pii.entity_types import (
 )
 from src.pii.engines import ENGINE_KEYS
 from src.pii.pdf_text_map import text_under_ellipse, text_under_rect
-from src.pii.settings import PiiSettings, exact_match_pattern
-from src.pii.text_normalize import normalize_1to1
+from src.pii.settings import (
+    WHITESPACE_MODES,
+    PiiSettings,
+    exact_match_pattern,
+    literal_to_pattern,
+)
+from src.pii.text_normalize import normalize_1to1, normalize_pattern
 from src.views.page_edit_annotations import CreateMode, _AnnotRef
 from src.utils.pdf_utils import (
     MarkupType,
@@ -781,6 +786,10 @@ class PiiDrawerMixin:
         for variant in variants:
             escaped = re.escape(variant)
             drop.update({escaped, f"^{escaped}$"})
+            # 空白の扱い(4通り)で登録された除外パターンも、同じ語句として外す。
+            for mode, _label in WHITESPACE_MODES:
+                body = literal_to_pattern(variant, mode)
+                drop.update({body, f"^{body}$"})
         kept_regex = [rx for rx in settings.text_exclusions_regex if rx not in drop]
         if len(kept_regex) != len(settings.text_exclusions_regex):
             settings.text_exclusions_regex = kept_regex
@@ -798,7 +807,8 @@ class PiiDrawerMixin:
         if not text or not text.strip():
             return
         settings = self._pii_settings().copy()
-        if settings.add_exclusion(exact_match_pattern(text)):
+        pattern = exact_match_pattern(text, settings.pattern_whitespace_mode)
+        if settings.add_exclusion(pattern):
             settings.save()
             self._pii_settings_cache = settings
 
@@ -810,11 +820,14 @@ class PiiDrawerMixin:
             if self._zoom_page_num is None:
                 return
             page_filter = self._zoom_page_num
+        # 検出は normalize_1to1 済みテキストに対して行われるため、登録した除外パターン
+        # (空白の扱いによっては ``\s*`` などを含む)も同じ正規化をかけて完全一致で比べる。
+        compiled = re.compile(normalize_pattern(pattern[1:-1]))
         targets = [
             r.annot
             for r in self._build_pii_result_rows()
             if r.entity != MANUAL_ENTITY_TYPE
-            and r.text.strip() == text.strip()
+            and compiled.fullmatch(normalize_1to1(r.text.strip()))
             and (page_filter is None or r.page_num == page_filter)
         ]
         if targets:
@@ -832,8 +845,8 @@ class PiiDrawerMixin:
             return
         # パターンは、全角→半角へ1文字ずつ揃えた検出用テキストに対して使われるため、
         # 語句も同じ正規化をかけてから(記号をエスケープして)登録する。
-        pattern = re.escape(normalize_1to1(text))
         settings = self._pii_settings().copy()
+        pattern = literal_to_pattern(normalize_1to1(text), settings.pattern_whitespace_mode)
         entry = (entity, pattern)
         added = settings.add_additional_pattern(*entry)
         removed_exclusion = self._drop_exclusions_for_text(settings, text)
