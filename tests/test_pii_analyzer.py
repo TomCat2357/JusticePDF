@@ -273,12 +273,12 @@ def test_space_next_to_alphanumerics_is_not_removed():
 
 def test_regex_person_is_not_extended_across_space():
     """regex の PERSON(敬称付き)は元のテキストに適用する。空白除去の影響を受けず、
-    「○○会長　皆さん」が「○○会長皆さん」のように過大検出されない。"""
+    「○○会長　田中さん」が「○○会長田中さん」のように過大検出されない。"""
     for sep in (FULLWIDTH_SPACE, " "):
-        text = f"青山会長{sep}皆さん、ありがとうございます。"
+        text = f"青山会長{sep}田中さん、ありがとうございます。"
         results = _analyze(text)
         person_hits = _person_hits(results)
-        assert [r["text"] for r in person_hits] == ["皆さん"], results
+        assert [r["text"] for r in person_hits] == ["田中さん"], results
         assert all(text[r["start"] : r["end"]] == r["text"] for r in results)
 
 

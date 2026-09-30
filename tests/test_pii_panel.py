@@ -307,7 +307,12 @@ def test_result_context_menu_has_copy_first(qtbot, monkeypatch):
     panel._on_result_context_menu(panel._result_tree.visualItemRect(item).center())
 
     assert seen["texts"][0] == "コピー"
-    assert seen["texts"][1:] == ["検出語に追加", "除外パターンに追加"]
+    assert seen["texts"][1:] == [
+        "検出語に追加",
+        "手動扱いで検出(検出語に登録しない)",
+        "除外パターンに追加",
+        "検出結果から削除(除外に登録しない)",
+    ]
     assert "同じ語句をすべて削除" not in seen["texts"]
     # 旧メニュー項目は撤去済み。
     assert "追加パターンに登録" not in seen["texts"]

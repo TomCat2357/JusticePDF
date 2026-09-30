@@ -67,6 +67,9 @@ class PiiResultRow:
     entity: str
     text: str  # マッチした文字列(無ければ空文字)
     kind: str  # "markup" | "shape"
+    # ページ内の出現位置(x0, y0, x1, y1)。一覧の並び(ページ内の読み順)にだけ使う隠しデータ
+    # (マーカーは先頭quad、図形は矩形。ページの表示座標系=回転ページでは回転後)。
+    bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
 
     @property
     def display_text(self) -> str:
@@ -81,6 +84,64 @@ class PiiResultRow:
                     return single[: DISPLAY_TEXT_MAX_CHARS - 1] + "…"
                 return single
         return "[図形]" if self.kind == "shape" else "(テキストなし)"
+
+
+def reading_order_keys(
+    rows: "list[PiiResultRow]", vertical: bool = False
+) -> "list[tuple[int, float]]":
+    """各行のページ内の読み順キー ``(行/列の番号, 行内/列内の位置)`` を ``rows`` と同じ並びで返す。
+
+    ページごとに独立して番号を振る。横書きは上→下(同じ行は左→右)、縦書きは
+    右の列→左の列(同じ列は上→下)。文字の高さ(縦書きは幅)が微妙にずれた語が
+    左右(上下)逆転しないよう、中心座標でソートしてから、先頭の要素の高さ(幅)の
+    半分以内のものを同じ行(列)にまとめて番号を振る。図形(塗り四角など)は大きいことが
+    あるため、上端(縦書きは右端)を位置とし、行(列)をまとめる基準には使わない。
+    """
+    keys: list[tuple[int, float]] = [(0, 0.0)] * len(rows)
+    by_page: dict[int, list[int]] = {}
+    for i, row in enumerate(rows):
+        by_page.setdefault(row.page_num, []).append(i)
+    for indices in by_page.values():
+        if vertical:
+            # 列の軸は x(右ほど先)。列の幅=矩形の幅、列内の位置は上(y0)から。
+            def center(i: int) -> float:
+                b = rows[i].bbox
+                if rows[i].kind == "shape":
+                    return -b[2]  # 図形は右端を位置にする
+                return -(b[0] + b[2]) / 2
+
+            def extent(i: int) -> float:
+                b = rows[i].bbox
+                # 大きな図形が列の基準になって、別の列の文字を巻き込まないよう許容幅は0
+                return 0.0 if rows[i].kind == "shape" else b[2] - b[0]
+
+            def within(i: int) -> float:
+                return rows[i].bbox[1]
+        else:
+            def center(i: int) -> float:
+                b = rows[i].bbox
+                if rows[i].kind == "shape":
+                    return b[1]  # 図形は上端を位置にする
+                return (b[1] + b[3]) / 2
+
+            def extent(i: int) -> float:
+                b = rows[i].bbox
+                # 大きな図形が行の基準になって、別の行の文字を巻き込まないよう許容幅は0
+                return 0.0 if rows[i].kind == "shape" else b[3] - b[1]
+
+            def within(i: int) -> float:
+                return rows[i].bbox[0]
+
+        line_no = -1
+        anchor = 0.0
+        tolerance = 0.0
+        for i in sorted(indices, key=center):
+            if line_no < 0 or center(i) - anchor > tolerance:
+                line_no += 1
+                anchor = center(i)
+                tolerance = extent(i) / 2
+            keys[i] = (line_no, within(i))
+    return keys
 
 
 def _tsv_cell(text: str) -> str:
@@ -198,6 +259,12 @@ class PiiPanel(QFrame):
         (entity_type, text) を伴う。
     add_exclude_word_requested(str)
         結果一覧の右クリックメニュー「除外パターンに追加」。text を伴う。
+    detect_manual_requested(str)
+        結果一覧の右クリックメニュー「手動扱いで検出(検出語に登録しない)」。
+        text を伴う。設定は保存せず、手動扱いの候補として検出する。
+    remove_detected_requested(str)
+        結果一覧の右クリックメニュー「検出結果から削除(除外に登録しない)」。
+        text を伴う。設定は保存せず、検出済みの同じ語句の結果だけを削除する。
     settings_requested()
         「設定...」ボタン押下時。
     export_requested()
@@ -224,6 +291,8 @@ class PiiPanel(QFrame):
     remove_selected_requested = pyqtSignal()
     add_detect_word_requested = pyqtSignal(str, str)
     add_exclude_word_requested = pyqtSignal(str)
+    detect_manual_requested = pyqtSignal(str)
+    remove_detected_requested = pyqtSignal(str)
     settings_requested = pyqtSignal()
     export_requested = pyqtSignal()
     result_activated = pyqtSignal(object)
@@ -394,6 +463,7 @@ class PiiPanel(QFrame):
         # 並び替えは列ヘッダのクリックで行う(同じ列の再クリックで昇順/降順を反転)。
         self._sort_field = "page"
         self._sort_ascending = True
+        self._result_order_vertical = False  # ページ内の並び順(False=横書き)
         self._result_tree = _ResultTree()
         self._result_tree.setObjectName("piiResultTree")
         self._result_tree.setColumnCount(3)
@@ -651,18 +721,33 @@ class PiiPanel(QFrame):
         if self._result_tree.selectedItems():
             self.remove_selected_requested.emit()
 
-    def _sort_key(self, row: "PiiResultRow"):
+    def _sort_key(self, row: "PiiResultRow", order: "tuple[int, float]"):
+        """並び替えキー。``order`` はページ内の読み順(``reading_order_keys``)。"""
         entity_ja = get_entity_type_name_ja(row.entity or "OTHER")
+        # ページ内は語句順ではなく、文書上の出現位置(読み順)にする。
         if self._sort_field == "text":
-            return (row.display_text, row.page_num, entity_ja)
+            return (row.display_text, row.page_num, order, entity_ja)
         if self._sort_field == "entity":
-            return (entity_ja, row.page_num, row.display_text)
-        return (row.page_num, row.display_text, entity_ja)  # "page"(既定)
+            return (entity_ja, row.page_num, order, row.display_text)
+        return (row.page_num, order, row.display_text, entity_ja)  # "page"(既定)
+
+    def set_result_order_mode(self, mode: str) -> None:
+        """ページ内の並び順("horizontal" 横書き | "vertical" 縦書き)を設定して再描画する。"""
+        vertical = mode == "vertical"
+        if vertical == self._result_order_vertical:
+            return
+        self._result_order_vertical = vertical
+        self._rebuild_result_tree()
 
     def _rebuild_result_tree(self) -> None:
         self._result_tree.clear()
-        rows = sorted(self._rows, key=self._sort_key, reverse=not self._sort_ascending)
-        for row in rows:
+        orders = reading_order_keys(self._rows, self._result_order_vertical)
+        keyed = sorted(
+            zip(self._rows, orders),
+            key=lambda pair: self._sort_key(pair[0], pair[1]),
+            reverse=not self._sort_ascending,
+        )
+        for row, _order in keyed:
             entity_ja = get_entity_type_name_ja(row.entity or "OTHER")
             item = QTreeWidgetItem([row.display_text, entity_ja, f"p.{row.page_num + 1}"])
             if row.text and row.display_text != row.text:
@@ -694,8 +779,14 @@ class PiiPanel(QFrame):
         for entity_type in ENTITY_TYPES:
             action = detect_menu.addAction(get_entity_type_name_ja(entity_type))
             detect_actions[action] = entity_type
+        # 設定を保存しない版(検出語/除外パターンに登録せず、この場限りで扱う)は、
+        # 対応する永続版のすぐ隣に置く。
+        manual_action = menu.addAction("手動扱いで検出(検出語に登録しない)")
+        manual_action.setEnabled(bool(row.text))
         exclude_action = menu.addAction("除外パターンに追加")
         exclude_action.setEnabled(bool(row.text))
+        remove_action = menu.addAction("検出結果から削除(除外に登録しない)")
+        remove_action.setEnabled(bool(row.text))
         chosen = menu.exec(self._result_tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
@@ -703,6 +794,10 @@ class PiiPanel(QFrame):
             self.copy_results_to_clipboard()
         elif chosen is exclude_action:
             self.add_exclude_word_requested.emit(row.text)
+        elif chosen is manual_action:
+            self.detect_manual_requested.emit(row.text)
+        elif chosen is remove_action:
+            self.remove_detected_requested.emit(row.text)
         elif chosen in detect_actions:
             self.add_detect_word_requested.emit(detect_actions[chosen], row.text)
 

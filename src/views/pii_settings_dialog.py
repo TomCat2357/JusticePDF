@@ -45,10 +45,12 @@ from src.ocr import is_ocr_available
 from src.pii.engines import ENGINES, is_engine_available
 from src.pii.entity_types import ENTITY_TYPES, get_entity_type_name_ja
 from src.pii.settings import (
+    RESULT_ORDER_MODES,
     WHITESPACE_MODES,
     PiiSettings,
     format_added_at,
     normalize_ocr_model_tier,
+    normalize_result_order_mode,
     parse_added_at,
     pattern_key,
 )
@@ -365,6 +367,20 @@ class PiiSettingsDialog(QDialog):
         whitespace_row.addWidget(self._whitespace_mode_combo, 1)
         layout.addLayout(whitespace_row)
 
+        result_order_row = QHBoxLayout()
+        result_order_row.addWidget(QLabel("結果一覧の並び順(ページ内):"))
+        self._result_order_combo = QComboBox()
+        for key, label in RESULT_ORDER_MODES:
+            self._result_order_combo.addItem(label, key)
+        self._set_combo_value(self._result_order_combo, self._settings.result_order_mode)
+        self._result_order_combo.setToolTip(
+            "個人情報検出パネルの結果一覧で、同じページ内の項目を並べる順序です。\n"
+            "横書き: 上から下へ、同じ行は左から右へ。\n"
+            "縦書き: 右の列から左の列へ、同じ列は上から下へ。"
+        )
+        result_order_row.addWidget(self._result_order_combo, 1)
+        layout.addLayout(result_order_row)
+
         return widget
 
     def _on_add_exclusion(self) -> None:
@@ -578,6 +594,9 @@ class PiiSettingsDialog(QDialog):
         self._settings.dedupe_overlap = self._dedupe_overlap_combo.currentData()
         self._settings.dedupe_keep = self._dedupe_keep_combo.currentData()
         self._settings.pattern_whitespace_mode = self._whitespace_mode_combo.currentData()
+        self._settings.result_order_mode = normalize_result_order_mode(
+            self._result_order_combo.currentData()
+        )
         self._settings.ocr_enabled = self._ocr_enabled_check.isChecked()
         self._settings.ocr_dpi = self._ocr_dpi_spin.value()
         self._settings.ocr_model_tier = normalize_ocr_model_tier(

@@ -66,6 +66,21 @@ DEFAULT_WHITESPACE_MODE = "optional"
 _WHITESPACE_MODE_KEYS = tuple(key for key, _ in WHITESPACE_MODES)
 
 
+# 結果一覧のページ内の並び順(キー, 表示名)。既定は横書き。
+RESULT_ORDER_MODES: tuple[tuple[str, str], ...] = (
+    ("horizontal", "横書き(上→下・左→右)"),
+    ("vertical", "縦書き(右→左・上→下)"),
+)
+DEFAULT_RESULT_ORDER_MODE = "horizontal"
+_RESULT_ORDER_MODE_KEYS = tuple(key for key, _ in RESULT_ORDER_MODES)
+
+
+def normalize_result_order_mode(value) -> str:
+    """不正な並び順は既定値(``horizontal``)にする。"""
+    value = str(value or "")
+    return value if value in _RESULT_ORDER_MODE_KEYS else DEFAULT_RESULT_ORDER_MODE
+
+
 OCR_MODEL_TIERS: tuple[str, ...] = ("light", "heavy")
 
 
@@ -244,6 +259,9 @@ class PiiSettings:
     # 右クリックで語句を検出/除外パターンへ登録するときの空白の扱い
     # (``WHITESPACE_MODES`` のキー。``literal_to_pattern`` 参照)。
     pattern_whitespace_mode: str = DEFAULT_WHITESPACE_MODE
+    # 結果一覧のページ内の並び順(``RESULT_ORDER_MODES`` のキー)。
+    # horizontal: 上→下・同じ行は左→右 / vertical: 右の列→左の列・同じ列は上→下。
+    result_order_mode: str = DEFAULT_RESULT_ORDER_MODE
 
     def add_exclusion(self, pattern: str, added_at: str | None = None) -> bool:
         """除外パターンを追加し追加日時を記録する。すでにあれば何もせず False。"""
@@ -543,6 +561,13 @@ class PiiSettings:
                     type=str,
                 )
             ),
+            result_order_mode=normalize_result_order_mode(
+                s.value(
+                    _key("result_order_mode"),
+                    default.result_order_mode,
+                    type=str,
+                )
+            ),
         )
 
     def save(self, settings: QSettings | None = None) -> None:
@@ -591,6 +616,10 @@ class PiiSettings:
         s.setValue(
             _key("pattern_whitespace_mode"),
             normalize_whitespace_mode(self.pattern_whitespace_mode),
+        )
+        s.setValue(
+            _key("result_order_mode"),
+            normalize_result_order_mode(self.result_order_mode),
         )
 
     def copy(self) -> "PiiSettings":

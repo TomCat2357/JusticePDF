@@ -102,6 +102,8 @@ class PiiDrawerMixin:
         self._pii_panel.remove_selected_requested.connect(self._on_pii_remove_selected)
         self._pii_panel.add_exclude_word_requested.connect(self._on_pii_add_exclude_word)
         self._pii_panel.add_detect_word_requested.connect(self._on_pii_add_detect_word)
+        self._pii_panel.detect_manual_requested.connect(self._on_pii_detect_manual)
+        self._pii_panel.remove_detected_requested.connect(self._on_pii_remove_detected)
         self._pii_panel.settings_requested.connect(self._on_pii_settings_requested)
         self._pii_panel.export_requested.connect(self._on_pii_export_requested)
         self._pii_panel.result_activated.connect(self._on_pii_result_activated)
@@ -131,6 +133,7 @@ class PiiDrawerMixin:
             )
             panel.set_mask_style(settings.mask_color, settings.mask_transparency)
             panel.set_manual_tools_enabled(settings.manual_visible)
+            panel.set_result_order_mode(settings.result_order_mode)
         self._apply_pii_visual_settings()
 
     def _apply_pii_visual_settings(self) -> None:
@@ -618,6 +621,8 @@ class PiiDrawerMixin:
             text = annot.pii_text
             if not text:
                 text = text_under_rect(chars_for(annot.page_num), annot.rect)
+            # 並び順用の位置は先頭のquad(quadsは読み順)。無ければ全体の外接矩形。
+            bbox = annot.quads[0] if annot.quads else annot.rect
             rows.append(
                 PiiResultRow(
                     annot=annot,
@@ -625,6 +630,7 @@ class PiiDrawerMixin:
                     entity=annot.pii_entity,
                     text=text,
                     kind="markup",
+                    bbox=tuple(float(v) for v in bbox),
                 )
             )
 
@@ -649,6 +655,7 @@ class PiiDrawerMixin:
                     entity=shape.pii_entity,
                     text=text,
                     kind="shape",
+                    bbox=tuple(float(v) for v in shape.rect),
                 )
             )
 
@@ -781,6 +788,78 @@ class PiiDrawerMixin:
             self,
         )
 
+    def _ask_pii_manual_detect_scope(self, text: str) -> str:
+        """「手動扱いで検出」の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
+
+        テストからはこのメソッドを差し替えてモーダル表示を避ける。
+        """
+        return ScopeChoiceDialog.ask(
+            "手動扱いで検出",
+            "この語句を検出して、手動扱いの塗りつぶし候補に追加しますか?\n"
+            "(検出語には登録しません。除外パターンに入っている語句でも検出します)",
+            text,
+            ("全ページで検出", "このページだけ検出", "検出しない"),
+            self,
+        )
+
+    def _ask_pii_remove_detected_scope(self, text: str) -> str:
+        """「検出結果から削除」の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
+
+        テストからはこのメソッドを差し替えてモーダル表示を避ける。
+        """
+        return ScopeChoiceDialog.ask(
+            "検出結果から削除",
+            "検出済みのこの語句の結果を削除しますか?\n"
+            "(除外パターンには登録しません。手動で追加した分は削除しません)",
+            text,
+            ("全ページの同じ語句を削除", "このページだけ削除", "削除しない"),
+            self,
+        )
+
+    def _pii_page_indices_for_scope(self, scope: str) -> list[int] | None:
+        """範囲(``ScopeChoiceDialog.SCOPE_*``)を対象ページ番号のリストにする。
+
+        「しない」、対象のページが無い場合は None(何もしない)。
+        """
+        if scope == ScopeChoiceDialog.SCOPE_PAGE:
+            if self._zoom_page_num is None:
+                return None
+            return [self._zoom_page_num]
+        if scope == ScopeChoiceDialog.SCOPE_ALL:
+            page_count = get_page_count(self._pdf_path)
+            if page_count <= 0:
+                return None
+            return list(range(page_count))
+        return None
+
+    def _remove_detected_same_text(
+        self, text: str, pattern: str, scope: str, description: str
+    ) -> None:
+        """範囲内で、``pattern``(``^...$`` の完全一致)に合う検出済みの結果をまとめて削除する。
+
+        手動追加分は削除しない。Undo は1回分。``scope`` が「しない」なら何もしない。
+        「除外パターンに追加」と「検出結果から削除」で共用する。
+        """
+        if scope == ScopeChoiceDialog.SCOPE_NONE:
+            return
+        page_filter: int | None = None
+        if scope == ScopeChoiceDialog.SCOPE_PAGE:
+            if self._zoom_page_num is None:
+                return
+            page_filter = self._zoom_page_num
+        # 検出は normalize_1to1 済みテキストに対して行われるため、パターン
+        # (空白の扱いによっては ``\\s*`` などを含む)も同じ正規化をかけて完全一致で比べる。
+        compiled = re.compile(normalize_pattern(pattern[1:-1]))
+        targets = [
+            r.annot
+            for r in self._build_pii_result_rows()
+            if r.entity != MANUAL_ENTITY_TYPE
+            and compiled.fullmatch(normalize_1to1(r.text.strip()))
+            and (page_filter is None or r.page_num == page_filter)
+        ]
+        if targets:
+            self._remove_mask_targets(targets, description)
+
     @staticmethod
     def _drop_exclusions_for_text(settings: PiiSettings, text: str) -> bool:
         """``text`` を検出語へ追加するとき、同じ語句の除外設定をすべて取り除く。
@@ -836,25 +915,49 @@ class PiiDrawerMixin:
             self._pii_settings_cache = settings
 
         scope = self._ask_pii_exclude_scope(text)
-        if scope == ScopeChoiceDialog.SCOPE_NONE:
+        self._remove_detected_same_text(
+            text, pattern, scope, f"除外パターン「{text.strip()}」の検出済みを削除"
+        )
+
+    def _on_pii_remove_detected(self, text: str) -> None:
+        """右クリック「検出結果から削除(除外に登録しない)」。
+
+        設定(除外パターン)は変えず、範囲を選ばせて、すでに検出済みの同じ語句の結果
+        (手動追加分を除く)をまとめて削除する(Undo は1回分)。
+        """
+        if not text or not text.strip():
             return
-        page_filter: int | None = None
-        if scope == ScopeChoiceDialog.SCOPE_PAGE:
-            if self._zoom_page_num is None:
-                return
-            page_filter = self._zoom_page_num
-        # 検出は normalize_1to1 済みテキストに対して行われるため、登録した除外パターン
-        # (空白の扱いによっては ``\s*`` などを含む)も同じ正規化をかけて完全一致で比べる。
-        compiled = re.compile(normalize_pattern(pattern[1:-1]))
-        targets = [
-            r.annot
-            for r in self._build_pii_result_rows()
-            if r.entity != MANUAL_ENTITY_TYPE
-            and compiled.fullmatch(normalize_1to1(r.text.strip()))
-            and (page_filter is None or r.page_num == page_filter)
-        ]
-        if targets:
-            self._remove_mask_targets(targets, f"除外パターン「{text.strip()}」の検出済みを削除")
+        pattern = exact_match_pattern(text, self._pii_settings().pattern_whitespace_mode)
+        scope = self._ask_pii_remove_detected_scope(text)
+        self._remove_detected_same_text(
+            text, pattern, scope, f"検出結果「{text.strip()}」を削除"
+        )
+
+    def _on_pii_detect_manual(self, text: str) -> None:
+        """右クリック「手動扱いで検出(検出語に登録しない)」。
+
+        設定(検出語・除外パターン)は変えず、範囲を選ばせて、その語句を検出し、
+        結果を種別「手動」の塗りつぶし候補として追加する(重複しない新規分だけ)。
+        除外設定は無視する(除外に入っている語句でも検出できる)。
+        """
+        if not text or not text.strip():
+            return
+        scope = self._ask_pii_manual_detect_scope(text)
+        page_indices = self._pii_page_indices_for_scope(scope)
+        if page_indices is None:
+            return
+        pattern = literal_to_pattern(
+            normalize_1to1(text), self._pii_settings().pattern_whitespace_mode
+        )
+        # 手動は自動検出の対象種別ではないため、実在の種別(その他)で検出して手動へ付け替える。
+        self._run_pattern_only_detection(
+            "OTHER",
+            pattern,
+            page_indices,
+            result_entity=MANUAL_ENTITY_TYPE,
+            ignore_exclusions=True,
+            description="手動扱いで検出",
+        )
 
     def _on_pii_add_detect_word(self, entity: str, text: str) -> None:
         """右クリック「検出語に追加」(種別はサブメニューで選択済み)。
@@ -878,21 +981,19 @@ class PiiDrawerMixin:
             self._pii_settings_cache = settings
 
         scope = self._ask_pii_detect_scope(text, entity)
-        if scope == ScopeChoiceDialog.SCOPE_PAGE:
-            if self._zoom_page_num is None:
-                return
-            page_indices = [self._zoom_page_num]
-        elif scope == ScopeChoiceDialog.SCOPE_ALL:
-            page_count = get_page_count(self._pdf_path)
-            if page_count <= 0:
-                return
-            page_indices = list(range(page_count))
-        else:
+        page_indices = self._pii_page_indices_for_scope(scope)
+        if page_indices is None:
             return
         self._run_pattern_only_detection(entity, pattern, page_indices)
 
     def _run_pattern_only_detection(
-        self, entity: str, pattern: str, page_indices: list[int]
+        self,
+        entity: str,
+        pattern: str,
+        page_indices: list[int],
+        result_entity: str | None = None,
+        ignore_exclusions: bool = False,
+        description: str = "検出語で検出",
     ) -> None:
         """追加パターン1件だけを使って対象ページを部分再検出し、結果に追加する。
 
@@ -901,6 +1002,9 @@ class PiiDrawerMixin:
         ためのものであり、通常の全種別検出をやり直すものではない)。
         除外設定は現在の設定をそのまま引き継ぐ(除外が追加より優先されるため、
         まだ除外に入っている語句は検出されない)。
+        ``result_entity`` を指定すると、生成する塗りつぶし候補の種別をそれに差し替える
+        (検出そのものは ``entity`` で行う。「手動」は検出対象の種別ではないため)。
+        ``ignore_exclusions`` が True なら除外設定を空にして検出する。
         件数が少なく軽量な処理のため、バックグラウンドワーカーは使わず同期実行する。
         """
         current = self._pii_settings()
@@ -908,8 +1012,12 @@ class PiiDrawerMixin:
         pattern_settings = PiiSettings(
             enabled_entities=enabled_entities,
             additional_patterns=[(entity, pattern)],
-            text_exclusions_regex=list(current.text_exclusions_regex),
-            entity_exclusions={k: list(v) for k, v in current.entity_exclusions.items()},
+            text_exclusions_regex=[] if ignore_exclusions else list(current.text_exclusions_regex),
+            entity_exclusions=(
+                {}
+                if ignore_exclusions
+                else {k: list(v) for k, v in current.entity_exclusions.items()}
+            ),
             enabled_engines={key: False for key in ENGINE_KEYS},
             dedupe_enabled=False,
             cross_page_detection=current.cross_page_detection,
@@ -930,7 +1038,7 @@ class PiiDrawerMixin:
                 markup_type=MarkupType.HIGHLIGHT,
                 color=settings.mask_color,
                 opacity=PII_HIGHLIGHT_OPACITY,
-                pii_entity=d.entity_type,
+                pii_entity=result_entity or d.entity_type,
                 pii_text=d.text,
             )
             for d in detections
@@ -939,7 +1047,7 @@ class PiiDrawerMixin:
         if not new_items:
             QMessageBox.information(self, "個人情報検出", "新しく検出された箇所はありませんでした。")
             return
-        self._append_new_pii_markups(new_items, f"検出語で検出 ({len(new_items)}件)")
+        self._append_new_pii_markups(new_items, f"{description} ({len(new_items)}件)")
 
     # ------------------------------------------------------------------
     # 設定
