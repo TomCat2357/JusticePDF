@@ -1776,6 +1776,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         )
         hit_rects = self._search_hits.get(self._zoom_page_num, [])
         self._zoom_label.set_search_hit_rects(hit_rects)
+        self._sync_ocr_overlay()
         self._set_selected_zoom_annotation(current_selection)
         self._update_note_list_widget()
 
@@ -1898,6 +1899,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         )
         # 合成画像にはページ座標系が無いため検索ハイライトは出さない。
         self._zoom_label.set_search_hit_rects([])
+        self._sync_ocr_overlay()  # 複数ページ表示では空になる(重ね表示は単ページのみ)
         # 複数ページ表示中は付箋編集UI(B一覧)を対象外にするため注釈状態をクリアする。
         self._zoom_annotations = []
         self._update_note_list_widget()

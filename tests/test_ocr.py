@@ -892,3 +892,179 @@ def test_ocr_run_finding_nothing_keeps_existing_ocr_and_pushes_no_undo(qtbot, mo
     assert count_ocr_lines(str(pdf_path)) == 1  # 以前の結果は残る
     assert window._undo_manager.undo_count() == undo_depth  # 変化が無いのでUndoに積まない
     assert "認識できませんでした" in window._ocr_panel.status_text()
+
+
+# ---------------------------------------------------------------------------
+# 認識した文字の重ね表示(色・透明度。表示専用、事後変更可)
+# ---------------------------------------------------------------------------
+
+
+def _ink_bbox(image, min_alpha_diff: int = 8):
+    """白背景のQImageで、白以外の画素の外接矩形(x0, y0, x1, y1)。無ければ None。"""
+    xs: list[int] = []
+    ys: list[int] = []
+    for y in range(image.height()):
+        for x in range(image.width()):
+            c = image.pixelColor(x, y)
+            if 255 - min(c.red(), c.green(), c.blue()) >= min_alpha_diff:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return None
+    return min(xs), min(ys), max(xs) + 1, max(ys) + 1
+
+
+def _paint_overlay_image(lines, color, opacity, size=(420, 160)):
+    from PyQt6.QtGui import QImage, QPainter
+
+    from src.views.ocr_overlay import paint_ocr_lines
+
+    image = QImage(size[0], size[1], QImage.Format.Format_RGB32)
+    image.fill(0xFFFFFFFF)
+    painter = QPainter(image)
+    drawn = paint_ocr_lines(painter, lines, color, opacity)
+    painter.end()
+    return image, drawn
+
+
+def _require_japanese_font():
+    """日本語グリフの描画を検証するテスト用。フォントの無い環境(一部のCI/offscreen)ではスキップ。"""
+    from PyQt6.QtGui import QFontDatabase
+
+    if not QFontDatabase.families(QFontDatabase.WritingSystem.Japanese):
+        pytest.skip("日本語フォントが無い環境")
+
+
+@pytest.mark.parametrize("text", ["山田太郎 090-1234-5678", "Hello World", "東京都千代田区"])
+def test_overlay_text_is_fitted_to_the_line_rect(text):
+    from PyQt6.QtCore import QRectF
+
+    if any(ord(c) > 0x3000 for c in text):
+        _require_japanese_font()
+
+    rect = QRectF(40, 40, 300, 50)
+    image, drawn = _paint_overlay_image([(text, rect)], (0.0, 0.0, 0.0), 1.0)
+    assert drawn == 1
+    x0, y0, x1, y1 = _ink_bbox(image)
+    # 字面(インク)の外接矩形が行の矩形にほぼ一致する(縦横とも数px以内)。
+    assert abs(x0 - rect.left()) <= 3 and abs(x1 - rect.right()) <= 3
+    assert abs(y0 - rect.top()) <= 3 and abs(y1 - rect.bottom()) <= 3
+
+
+def test_overlay_uses_given_color_and_opacity_and_zero_draws_nothing():
+    from PyQt6.QtCore import QRectF
+
+    line = [("山田太郎", QRectF(20, 20, 200, 60))]
+    hidden, drawn = _paint_overlay_image(line, (1.0, 0.0, 0.0), 0.0)
+    assert drawn == 0 and _ink_bbox(hidden) is None
+
+    def darkest(image):
+        best = None
+        for y in range(image.height()):
+            for x in range(image.width()):
+                c = image.pixelColor(x, y)
+                if best is None or c.green() < best.green():
+                    best = c
+        return best
+
+    strong, _ = _paint_overlay_image(line, (1.0, 0.0, 0.0), 1.0)
+    faint, _ = _paint_overlay_image(line, (1.0, 0.0, 0.0), 0.3)
+    blue, _ = _paint_overlay_image(line, (0.0, 0.0, 1.0), 1.0)
+    s, f, b = darkest(strong), darkest(faint), darkest(blue)
+    assert s.red() > 200 and s.green() < 60 and s.blue() < 60  # ほぼ純粋な赤
+    assert f.green() > s.green() + 80  # 透明度が上がるほど白に近い
+    assert b.blue() > 200 and b.red() < 60  # 色の変更が反映される
+
+
+def test_overlay_vertical_line_stacks_characters():
+    from PyQt6.QtCore import QRectF
+
+    _require_japanese_font()
+
+    rect = QRectF(50, 10, 40, 140)
+    image, drawn = _paint_overlay_image([("山田太郎です", rect)], (0.0, 0.0, 0.0), 1.0)
+    assert drawn == 1
+    x0, y0, x1, y1 = _ink_bbox(image)
+    assert x0 >= rect.left() - 3 and x1 <= rect.right() + 3
+    assert y0 >= rect.top() - 3 and y1 <= rect.bottom() + 3
+    assert (y1 - y0) > rect.height() * 0.6  # 縦に並んでいる(横書きで潰れていない)
+
+
+def test_ocr_text_style_settings_roundtrip_and_clamp():
+    settings = PiiSettings()
+    assert settings.ocr_text_visible is False
+    settings.ocr_text_visible = True
+    settings.ocr_text_color = (0.1, 0.5, 0.9)
+    settings.ocr_text_transparency = 25
+    settings.save()
+    loaded = PiiSettings.load()
+    assert loaded.ocr_text_visible is True
+    assert loaded.ocr_text_color == pytest.approx((0.1, 0.5, 0.9))
+    assert loaded.ocr_text_transparency == 25
+    assert loaded.ocr_text_opacity == pytest.approx(0.75)
+    loaded.ocr_text_transparency = 500
+    assert loaded.ocr_text_opacity == 0.0
+
+
+def test_ocr_text_overlay_follows_panel_style_without_touching_pdf(qtbot, tmp_path):
+    pdf_path = tmp_path / "overlay-window.pdf"
+    _blank_pdf(pdf_path)
+    replace_ocr_in_file(
+        str(pdf_path),
+        None,
+        [OCRResult("山田太郎", 40, 60, 80, 20, 0, 0.9), OCRResult("Hello", 40, 100, 60, 20, 0, 0.9)],
+    )
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+    panel = window._ocr_panel
+    before = pdf_path.read_bytes()
+
+    # 既定は非表示(従来どおり何も重ならない)。
+    assert label._ocr_lines == [] or label._ocr_text_opacity == 0.0
+
+    # 表示をオン: OCR済みの行が、再OCRなしで重なる(不透明度=1-透明度)。
+    panel._text_visible_check.setChecked(True)
+    assert [t for t, _ in label._ocr_lines] == ["山田太郎", "Hello"]
+    assert label._ocr_text_opacity == pytest.approx(0.5)
+    assert label._ocr_lines[0][1] == pytest.approx((40.0, 60.0, 120.0, 80.0))
+
+    # 事後に色・透明度を変える。画面へ即時反映し、設定へ保存する。
+    panel._text_transparency_slider.setValue(20)
+    assert label._ocr_text_opacity == pytest.approx(0.8)
+    panel._text_color = (0.0, 0.0, 1.0)
+    panel._emit_text_style()
+    assert label._ocr_text_color == (0.0, 0.0, 1.0)
+    saved = PiiSettings.load()
+    assert saved.ocr_text_visible and saved.ocr_text_color == pytest.approx((0.0, 0.0, 1.0))
+    assert saved.ocr_text_transparency == 20
+
+    # 表示するページを描き直しても重ね表示は維持され、オフにすると消える。
+    window._refresh_current_zoom_page()
+    assert len(label._ocr_lines) == 2 and label._ocr_text_opacity == pytest.approx(0.8)
+    panel._text_visible_check.setChecked(False)
+    assert label._ocr_lines == []
+
+    # 表示専用: PDFのバイト列は一切変わらない。
+    assert pdf_path.read_bytes() == before
+
+
+def test_ocr_text_overlay_restores_saved_style_and_undo_of_ocr_updates_it(qtbot, tmp_path):
+    saved = PiiSettings()
+    saved.ocr_text_visible = True
+    saved.ocr_text_color = (0.0, 0.6, 0.0)
+    saved.ocr_text_transparency = 10
+    saved.save()
+    pdf_path = tmp_path / "overlay-restore.pdf"
+    _blank_pdf(pdf_path)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+    assert window._ocr_panel.text_style() == (True, pytest.approx((0.0, 0.6, 0.0)), 10)
+    assert label._ocr_lines == []  # OCR前は何も無い
+
+    window._apply_ocr_lines([0], [OCRResult("山田太郎", 40, 60, 80, 20, 0, 0.9)], "OCR")
+    assert [t for t, _ in label._ocr_lines] == ["山田太郎"]  # OCR実行直後から色付きで重なる
+    assert label._ocr_text_opacity == pytest.approx(0.9)
+    window._undo_manager.undo()
+    assert label._ocr_lines == []
