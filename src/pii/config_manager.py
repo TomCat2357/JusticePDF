@@ -47,7 +47,6 @@ class ConfigManager:
             "exclusions": {
                 "text_exclusions_regex": [],
                 "entity_exclusions": {},
-                "excluded_words": [],
             },
             "nlp": {
                 "sudachi_dict_type": "core",   # core | full | small
@@ -178,29 +177,17 @@ class ConfigManager:
             return entity_exclusions.get(entity_type, [])
         return entity_exclusions
 
-    def get_excluded_words(self) -> List[str]:
-        """種別を問わない完全一致の除外語(``PiiSettings.excluded_words``)。"""
-        words = self._safe_get_config("exclusions.excluded_words", [])
-        return words if isinstance(words, list) else []
-
     def is_entity_excluded(self, entity_type: str, text: str) -> bool:
         """指定されたテキストが除外対象かどうかを判定する。
 
-        追加パターン・モデル検出のどちらの結果にも適用される(除外が最優先)。
+        追加パターン・人名リスト・モデル検出のどちらの結果にも適用される
+        (除外パターンが追加パターンより優先)。
 
-        - excluded_words: 種別を問わない完全一致
-        - text_exclusions_regex: 正規表現(``re.search`` なので部分一致)
+        - text_exclusions_regex: 正規表現(``re.search`` なので部分一致。完全一致に
+          したいときは ``^語句$``)
         - entity_exclusions: エンティティ別の完全一致
         """
         text = text.strip()
-
-        # 検出は全角→半角へ1文字ずつ揃えた文字列に対して行われるため、除外語も同じ
-        # 正規化をかけた形で比べる(全角で登録した語が半角化された検出語に一致する)。
-        for word in self.get_excluded_words():
-            if isinstance(word, str) and word.strip():
-                stripped = word.strip()
-                if text == stripped or text == normalize_1to1(stripped):
-                    return True
 
         for pattern in self.get_text_exclusions_regex():
             if not pattern:

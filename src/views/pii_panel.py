@@ -54,6 +54,10 @@ _SORT_FIELD_TO_COLUMN = {v: k for k, v in _COLUMN_TO_SORT_FIELD.items()}
 _TSV_HEADER = "語句\t種別\tページ"
 
 
+# 結果一覧の「語句」列に出す最大文字数(超えた分は「…」で省略)。
+DISPLAY_TEXT_MAX_CHARS = 60
+
+
 @dataclass(slots=True)
 class PiiResultRow:
     """結果一覧1行分の表示用データ(マーカー/図形どちらも同じ形で扱う)。"""
@@ -66,8 +70,16 @@ class PiiResultRow:
 
     @property
     def display_text(self) -> str:
+        """一覧に出す1行の語句(改行・連続空白は空白1つにまとめ、長ければ省略する)。
+
+        保存済みのデータに改行が含まれていても、行が縦に伸びないようにする。
+        """
         if self.text:
-            return self.text
+            single = " ".join(self.text.split())
+            if single:
+                if len(single) > DISPLAY_TEXT_MAX_CHARS:
+                    return single[: DISPLAY_TEXT_MAX_CHARS - 1] + "…"
+                return single
         return "[図形]" if self.kind == "shape" else "(テキストなし)"
 
 
@@ -83,7 +95,7 @@ def rows_to_tsv(rows: "list[PiiResultRow]") -> str:
         lines.append(
             "\t".join(
                 (
-                    _tsv_cell(row.display_text),
+                    _tsv_cell(row.text or row.display_text),  # 省略せず全文
                     _tsv_cell(get_entity_type_name_ja(row.entity or "OTHER")),
                     str(row.page_num + 1),
                 )
@@ -93,7 +105,7 @@ def rows_to_tsv(rows: "list[PiiResultRow]") -> str:
 
 
 class ScopeChoiceDialog(QDialog):
-    """「検出語に追加」「除外語に追加」の後に開く、範囲選択の小さなダイアログ。
+    """「検出語に追加」「除外パターンに追加」の後に開く、範囲選択の小さなダイアログ。
 
     語句(読み取り専用)と説明文を示し、「全ページ / このページだけ / しない」の
     3択(ボタン文言は呼び出し側が指定)から選ばせる。ダイアログを閉じた場合は
@@ -185,7 +197,7 @@ class PiiPanel(QFrame):
         結果一覧の右クリックメニュー「検出語に追加」の種別サブメニュー選択時。
         (entity_type, text) を伴う。
     add_exclude_word_requested(str)
-        結果一覧の右クリックメニュー「除外語に追加」。text を伴う。
+        結果一覧の右クリックメニュー「除外パターンに追加」。text を伴う。
     settings_requested()
         「設定...」ボタン押下時。
     export_requested()
@@ -653,6 +665,8 @@ class PiiPanel(QFrame):
         for row in rows:
             entity_ja = get_entity_type_name_ja(row.entity or "OTHER")
             item = QTreeWidgetItem([row.display_text, entity_ja, f"p.{row.page_num + 1}"])
+            if row.text and row.display_text != row.text:
+                item.setToolTip(0, row.text)  # 省略・整形前の全文
             item.setData(0, _ANNOT_ROLE, row)
             self._result_tree.addTopLevelItem(item)
         for col in range(3):
@@ -680,7 +694,7 @@ class PiiPanel(QFrame):
         for entity_type in ENTITY_TYPES:
             action = detect_menu.addAction(get_entity_type_name_ja(entity_type))
             detect_actions[action] = entity_type
-        exclude_action = menu.addAction("除外語に追加")
+        exclude_action = menu.addAction("除外パターンに追加")
         exclude_action.setEnabled(bool(row.text))
         chosen = menu.exec(self._result_tree.viewport().mapToGlobal(pos))
         if chosen is None:

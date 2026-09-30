@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime
 from dataclasses import dataclass, field, replace as dataclass_replace
 
 from PyQt6.QtCore import QSettings
@@ -25,6 +26,41 @@ from src.pii.entity_types import (
 logger = logging.getLogger(__name__)
 
 _PREFIX = "pii/"
+
+
+def now_iso() -> str:
+    """追加日時の保存形式(秒精度のローカル時刻 ISO 8601、例 ``2026-09-30T11:23:45``)。"""
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def parse_added_at(value) -> datetime | None:
+    """保存された追加日時を datetime へ。未記録・不正な値は None。"""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def format_added_at(value) -> str:
+    """一覧表示用の追加日時(``2026-09-30 11:23``)。未記録は空文字。"""
+    parsed = parse_added_at(value)
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed else ""
+
+
+def pattern_key(entity_type: str, regex: str) -> str:
+    """検出パターン (種別, 正規表現) を追加日時辞書のキー文字列にする。"""
+    return entity_type + "\t" + regex
+
+
+def exact_match_pattern(text: str) -> str:
+    """語句そのものに完全一致する除外パターン(``^語句$``、記号はエスケープ済み)を返す。
+
+    除外パターンは ``re.search``(部分一致)で使われるため、旧「除外語」(完全一致)の
+    移行や右クリック「除外パターンに追加」ではこの形で登録する。
+    """
+    return "^" + re.escape(text.strip()) + "$"
 
 
 def _key(name: str) -> str:
@@ -89,11 +125,14 @@ class PiiSettings:
     # 除外設定
     text_exclusions_regex: list[str] = field(default_factory=list)
     entity_exclusions: dict[str, list[str]] = field(default_factory=dict)
-    # 除外語: 種別を問わない完全一致の除外語(前後の空白は無視)。追加パターンに
-    # 登録した語句でも、除外語に入っていれば検出されない(除外が追加より優先)。
-    excluded_words: list[str] = field(default_factory=list)
-    # 追加検出パターン: (entity_type, regex) のリスト（左が高優先）
+    # 検出パターン(旧称: 追加検出パターン): (entity_type, regex) のリスト（左が高優先）。
+    # 除外パターン(text_exclusions_regex)に一致した結果は、検出パターン由来でも除外される。
     additional_patterns: list[tuple[str, str]] = field(default_factory=list)
+    # 追加日時(ISO文字列)。リスト本体(旧形式の文字列/タプルのまま)とは別に、
+    # 除外パターンは ``{パターン: 日時}``、検出パターンは ``{pattern_key(): 日時}`` で持つ。
+    # 旧設定(日時なし)はキーが無いだけで、そのまま読み込める。
+    text_exclusions_added_at: dict[str, str] = field(default_factory=dict)
+    additional_patterns_added_at: dict[str, str] = field(default_factory=dict)
     # 追加の人名リスト（PERSON として検出）
     custom_names: list[str] = field(default_factory=list)
     # 重複除去（src.pii.dedupe.dedupe_detections への橋渡し）。
@@ -135,6 +174,38 @@ class PiiSettings:
     # 「手動」種別(手動で追加した候補・図形)を一覧/ページ上で表示・出力の
     # 対象にするか。自動検出の8種別は ``enabled_entities`` が持つ。
     manual_visible: bool = True
+
+    def add_exclusion(self, pattern: str, added_at: str | None = None) -> bool:
+        """除外パターンを追加し追加日時を記録する。すでにあれば何もせず False。"""
+        if not pattern or pattern in self.text_exclusions_regex:
+            return False
+        self.text_exclusions_regex.append(pattern)
+        self.text_exclusions_added_at[pattern] = added_at or now_iso()
+        return True
+
+    def add_additional_pattern(
+        self, entity_type: str, regex: str, added_at: str | None = None
+    ) -> bool:
+        """検出パターンを追加し追加日時を記録する。すでにあれば何もせず False。"""
+        entry = (entity_type, regex)
+        if not entity_type or not regex or entry in self.additional_patterns:
+            return False
+        self.additional_patterns.append(entry)
+        self.additional_patterns_added_at[pattern_key(entity_type, regex)] = (
+            added_at or now_iso()
+        )
+        return True
+
+    def prune_added_at(self) -> None:
+        """一覧から消えたパターンの追加日時を捨てる(削除後の残骸を保存しない)。"""
+        live = set(self.text_exclusions_regex)
+        self.text_exclusions_added_at = {
+            k: v for k, v in self.text_exclusions_added_at.items() if k in live
+        }
+        live_keys = {pattern_key(e, rx) for e, rx in self.additional_patterns}
+        self.additional_patterns_added_at = {
+            k: v for k, v in self.additional_patterns_added_at.items() if k in live_keys
+        }
 
     def is_entity_enabled(self, entity_type: str) -> bool:
         return bool(self.enabled_entities.get(entity_type, True))
@@ -195,7 +266,6 @@ class PiiSettings:
                 "entity_exclusions": {
                     k: list(v) for k, v in self.entity_exclusions.items()
                 },
-                "excluded_words": list(self.excluded_words),
             },
             "nlp": {
                 "sudachi_dict_type": self.sudachi_dict_type,
@@ -245,12 +315,15 @@ class PiiSettings:
                 }
             )
 
-        excluded_words_raw = _load_json(s, "excluded_words", None)
-        excluded_words = (
-            [str(x) for x in excluded_words_raw if str(x)]
-            if isinstance(excluded_words_raw, list)
-            else []
-        )
+        # 追加日時。旧設定には無いので、無ければ空(表示は空欄)。
+        def _load_added_at(name: str) -> dict[str, str]:
+            raw = _load_json(s, name, None)
+            if not isinstance(raw, dict):
+                return {}
+            return {str(k): str(v) for k, v in raw.items() if parse_added_at(v)}
+
+        text_exclusions_added_at = _load_added_at("text_exclusions_added_at")
+        additional_patterns_added_at = _load_added_at("additional_patterns_added_at")
 
         # 旧「除外ワード(部分一致)」は除外パターン(re.search=部分一致)と機能が
         # 重複していたため廃止した。保存済みの除外ワードは記号をエスケープして
@@ -258,10 +331,26 @@ class PiiSettings:
         text_exclusions_regex = [
             str(x) for x in (_load_json(s, "text_exclusions_regex", []) or [])
         ]
+        migrated_at = now_iso()  # 移行した項目の追加日時(=移行した時刻)
         for word in _load_json(s, "text_exclusions", []) or []:
             escaped = re.escape(str(word))
             if word and escaped not in text_exclusions_regex:
                 text_exclusions_regex.append(escaped)
+                text_exclusions_added_at[escaped] = migrated_at
+
+        # 旧「除外語」(完全一致)も除外パターンへ移す。除外パターンは部分一致
+        # (re.search)なので、完全一致の意味を保つため ``^語句$`` にする。
+        # 検出語の前後の空白は除いて比べていたため、語句も strip してから移す。
+        excluded_words_raw = _load_json(s, "excluded_words", None)
+        if isinstance(excluded_words_raw, list):
+            for word in excluded_words_raw:
+                word = str(word).strip()
+                if not word:
+                    continue
+                anchored = exact_match_pattern(word)
+                if anchored not in text_exclusions_regex:
+                    text_exclusions_regex.append(anchored)
+                    text_exclusions_added_at[anchored] = migrated_at
 
         display_mode = _normalize_display_mode(
             s.value(_key("display_mode"), default.display_mode, type=str)
@@ -286,8 +375,9 @@ class PiiSettings:
             colors=colors,
             text_exclusions_regex=text_exclusions_regex,
             entity_exclusions=entity_exclusions,
-            excluded_words=excluded_words,
             additional_patterns=additional_patterns,
+            text_exclusions_added_at=text_exclusions_added_at,
+            additional_patterns_added_at=additional_patterns_added_at,
             custom_names=list(_load_json(s, "custom_names", []) or []),
             dedupe_enabled=bool(
                 s.value(_key("dedupe_enabled"), default.dedupe_enabled, type=bool)
@@ -321,12 +411,16 @@ class PiiSettings:
         s = settings or QSettings()
         _save_json(s, "enabled_entities", self.enabled_entities)
         _save_json(s, "colors", {k: list(v) for k, v in self.colors.items()})
+        self.prune_added_at()
         _save_json(s, "text_exclusions_regex", self.text_exclusions_regex)
+        _save_json(s, "text_exclusions_added_at", self.text_exclusions_added_at)
+        _save_json(s, "additional_patterns_added_at", self.additional_patterns_added_at)
         # 旧「除外ワード」は load 時に除外パターンへ移行済みなので消しておく
         # (残すと次回 load で再移行され、削除した除外パターンが復活してしまう)。
         s.remove(_key("text_exclusions"))
         _save_json(s, "entity_exclusions", self.entity_exclusions)
-        _save_json(s, "excluded_words", self.excluded_words)
+        # 旧「除外語」も load 時に除外パターン(^語句$)へ移行済みなので消しておく。
+        s.remove(_key("excluded_words"))
         _save_json(s, "additional_patterns", [list(p) for p in self.additional_patterns])
         _save_json(s, "custom_names", self.custom_names)
         s.setValue(_key("dedupe_enabled"), self.dedupe_enabled)
@@ -359,8 +453,9 @@ class PiiSettings:
             colors=dict(self.colors),
             text_exclusions_regex=list(self.text_exclusions_regex),
             entity_exclusions={k: list(v) for k, v in self.entity_exclusions.items()},
-            excluded_words=list(self.excluded_words),
             additional_patterns=list(self.additional_patterns),
+            text_exclusions_added_at=dict(self.text_exclusions_added_at),
+            additional_patterns_added_at=dict(self.additional_patterns_added_at),
             custom_names=list(self.custom_names),
             entity_priority_order=list(self.entity_priority_order),
             enabled_engines=dict(self.enabled_engines),

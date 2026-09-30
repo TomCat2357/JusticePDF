@@ -803,3 +803,67 @@ def test_export_options_dialog_shows_note_and_panel_has_single_export_button(qtb
     panel._export_btn.setEnabled(True)
     panel._export_btn.click()
     assert fired == [True]
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_mask_markup_tool_excludes_leading_and_trailing_whitespace(qtbot, tmp_path):
+    """行頭・行末の空白は候補の語句にも塗りつぶしの範囲にも含めない。"""
+    pdf_path = tmp_path / "mask-markup-trim.pdf"
+    _make_text_pdf(pdf_path, "  (TOSHIN)    ")
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+    label = window._zoom_label
+    chars = label._chars
+    assert chars[0]["c"] == " " and chars[-1]["c"] == " "
+
+    window._activate_create_mode(CreateMode.MASK_MARKUP)
+    _select_chars(window, list(range(len(chars))))  # 空白ごと全選択
+    window._on_zoom_text_selection_released()
+
+    candidates = list_pii_markup_annots(str(pdf_path), 0)
+    assert len(candidates) == 1
+    assert candidates[0].pii_text == "(TOSHIN)"
+    glyph = [c for c in chars if c["c"].strip()]
+    (quad,) = candidates[0].quads
+    assert quad[0] == pytest.approx(min(c["bbox"][0] for c in glyph), abs=0.5)
+    assert quad[2] == pytest.approx(max(c["bbox"][2] for c in glyph), abs=0.5)
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_selected_glyph_text_and_quads_trim_each_line_and_keep_inner_spaces(qtbot, tmp_path):
+    pdf_path = tmp_path / "mask-markup-trim-lines.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=200)
+    page.insert_text((40, 60), "AB CD   ", fontsize=18)
+    page.insert_text((40, 120), "  EF", fontsize=18)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    label = window._zoom_label
+    _select_chars(window, list(range(len(label._chars))))
+
+    assert label.selected_glyph_text() == "AB CD\nEF"  # 行間の改行と語中の空白は残す
+    assert len(label.selected_glyph_quads()) == 2  # 行ごとに1つ、空白のぶんは含まない
+    # 従来の selected_* は空白を含んだまま(一般のマーカーなどが使う)。
+    assert label.selected_text().startswith("AB CD ")
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_mask_markup_tool_creates_nothing_for_whitespace_only_selection(qtbot, tmp_path):
+    pdf_path = tmp_path / "mask-markup-blank.pdf"
+    _make_text_pdf(pdf_path, "AB      ")
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+    window._activate_create_mode(CreateMode.MASK_MARKUP)
+    blanks = [i for i, c in enumerate(window._zoom_label._chars) if not c["c"].strip()]
+    assert blanks
+    _select_chars(window, blanks)
+    window._on_zoom_text_selection_released()
+
+    assert list_pii_markup_annots(str(pdf_path), 0) == []

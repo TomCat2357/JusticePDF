@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 from PyQt6.QtCore import QSettings
 
+from src.pii.config_manager import ConfigManager
 from src.pii.settings import PiiSettings
 
 
@@ -185,16 +186,62 @@ def test_hidden_entities_include_manual_and_disabled_entities():
     assert "MANUAL" not in settings.enabled_entity_list()
 
 
-def test_excluded_words_round_trip_copy_and_overrides():
-    settings = PiiSettings()
-    assert settings.excluded_words == []
-    settings.excluded_words = ["架空太郎", "テスト語"]
-    settings.save()
+def test_legacy_excluded_words_migrate_to_anchored_exclusion_patterns():
+    """旧「除外語」(完全一致)は ``^語句$``(記号エスケープ)の除外パターンへ移行される。"""
+    import json
+
+    from src.pii.settings import exact_match_pattern
+
+    s = QSettings()
+    s.setValue("pii/excluded_words", json.dumps(["架空太郎", " 山田(仮) ", "", "架空太郎"], ensure_ascii=False))
+    s.setValue("pii/text_exclusions_regex", json.dumps(["既存", "^架空太郎$"], ensure_ascii=False))
 
     loaded = PiiSettings.load()
-    assert loaded.excluded_words == ["架空太郎", "テスト語"]
-    assert loaded.to_config_overrides()["exclusions"]["excluded_words"] == ["架空太郎", "テスト語"]
+    assert not hasattr(loaded, "excluded_words")
+    assert loaded.text_exclusions_regex == ["既存", "^架空太郎$", exact_match_pattern("山田(仮)")]
+    assert exact_match_pattern("山田(仮)") == r"^山田\(仮\)$"
+    # 移行した項目には追加日時が付き、既存項目(日時なし)はそのまま。
+    assert exact_match_pattern("山田(仮)") in loaded.text_exclusions_added_at
+    assert "既存" not in loaded.text_exclusions_added_at
+    # 移行後の除外は完全一致として働く。
+    cm = ConfigManager(loaded.to_config_overrides())
+    assert cm.is_entity_excluded("PERSON", "山田(仮)") is True
+    assert cm.is_entity_excluded("PERSON", "山田(仮)さん") is False
+    assert "excluded_words" not in loaded.to_config_overrides()["exclusions"]
 
-    clone = loaded.copy()
-    clone.excluded_words.append("別語")
-    assert loaded.excluded_words == ["架空太郎", "テスト語"]  # コピーは独立
+    # 保存すると旧キーは消え、再読込しても増えない。
+    loaded.save()
+    assert not QSettings().contains("pii/excluded_words")
+    again = PiiSettings.load()
+    assert again.text_exclusions_regex == loaded.text_exclusions_regex
+
+
+def test_legacy_settings_without_timestamps_load_and_new_entries_round_trip_timestamps():
+    import json
+
+    from src.pii.settings import format_added_at, pattern_key
+
+    s = QSettings()
+    s.setValue("pii/text_exclusions_regex", json.dumps(["旧"], ensure_ascii=False))
+    s.setValue("pii/additional_patterns", json.dumps([["PERSON", "旧検出"]], ensure_ascii=False))
+    loaded = PiiSettings.load()
+    assert loaded.text_exclusions_regex == ["旧"]
+    assert loaded.additional_patterns == [("PERSON", "旧検出")]
+    assert loaded.text_exclusions_added_at == {} and loaded.additional_patterns_added_at == {}
+
+    assert loaded.add_exclusion("新", "2026-09-30T11:23:45") is True
+    assert loaded.add_exclusion("新") is False  # 重複は追加しない
+    assert loaded.add_additional_pattern("LOCATION", "新検出", "2026-09-30T11:24:00") is True
+    loaded.add_exclusion("消える", "2026-09-30T11:25:00")
+    loaded.text_exclusions_regex.remove("消える")  # 削除後の日時は保存されない
+    loaded.save()
+
+    again = PiiSettings.load()
+    assert again.text_exclusions_added_at == {"新": "2026-09-30T11:23:45"}
+    assert again.additional_patterns_added_at == {pattern_key("LOCATION", "新検出"): "2026-09-30T11:24:00"}
+    assert format_added_at("2026-09-30T11:23:45") == "2026-09-30 11:23"
+    assert format_added_at(None) == "" and format_added_at("bad") == ""
+
+    clone = again.copy()
+    clone.add_exclusion("別")
+    assert "別" not in again.text_exclusions_added_at  # コピーは独立

@@ -2,7 +2,7 @@
 
 設定項目の構成は PresidioPDF の設定ダイアログ
 (``PresidioPDF/src/gui_pyqt/views/config_dialog.py``: 検出エンジン・
-除外/追加パターン・重複除去・OCR)に倣うが、実装はJusticePDFのUI規約
+除外/検出パターン・重複除去・OCR)に倣うが、実装はJusticePDFのUI規約
 (``src.views.settings_dialog.SettingsDialog`` と同じ ``build_accept_cancel_box``
 パターン)に合わせて新規に書いている。
 
@@ -17,18 +17,25 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
+
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -37,8 +44,86 @@ from PyQt6.QtWidgets import (
 from src.ocr import is_ocr_available
 from src.pii.engines import ENGINES, is_engine_available
 from src.pii.entity_types import ENTITY_TYPES, get_entity_type_name_ja
-from src.pii.settings import PiiSettings
+from src.pii.settings import PiiSettings, format_added_at, parse_added_at, pattern_key
 from src.views.view_helpers import build_accept_cancel_box
+
+_SORT_ROLE = Qt.ItemDataRole.UserRole + 1
+_PAYLOAD_ROLE = Qt.ItemDataRole.UserRole
+
+
+class _SortItem(QTableWidgetItem):
+    """並べ替えキー(UserRole+1)で比べるセル。日時は表示文字列ではなく datetime で並べる。"""
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        mine = self.data(_SORT_ROLE)
+        theirs = other.data(_SORT_ROLE)
+        if mine is None or theirs is None:
+            return super().__lt__(other)
+        return mine < theirs
+
+
+class _PatternTable(QTableWidget):
+    """パターン一覧の表(行選択・複数選択・見出しクリックで並べ替え・読み取り専用)。
+
+    最後の列が「追加日時」。各行の先頭セルの UserRole に元のデータ(除外パターンの
+    文字列/検出パターンの (種別, 正規表現))を持たせ、並べ替えで行が入れ替わっても
+    削除時に元データを取り違えないようにする。追加日時が未記録の項目は空欄で、
+    昇順では最も古い扱い(先頭)に並ぶ。
+    """
+
+    delete_requested = pyqtSignal()
+
+    def __init__(self, headers: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(0, len(headers), parent)
+        self.setHorizontalHeaderLabels(headers)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.verticalHeader().setVisible(False)
+        header = self.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(len(headers) - 2, QHeaderView.ResizeMode.Stretch)
+        header.setSortIndicatorShown(True)
+        # 見出しクリックで昇順/降順を切り替える(初期は保存順のまま)。
+        self.setSortingEnabled(True)
+        header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.setMinimumHeight(110)
+
+    def append_entry(self, payload, cells: list[str], added_at: str | None) -> None:
+        """1行追加する。``cells`` は日時列より前の表示文字列。"""
+        sorting = self.isSortingEnabled()
+        self.setSortingEnabled(False)  # 挿入中に行が入れ替わらないようにする
+        row = self.rowCount()
+        self.insertRow(row)
+        for col, text in enumerate(cells):
+            item = _SortItem(text)
+            item.setData(_SORT_ROLE, text)
+            self.setItem(row, col, item)
+        parsed = parse_added_at(added_at)
+        date_item = _SortItem(format_added_at(added_at))
+        date_item.setData(_SORT_ROLE, parsed if parsed is not None else datetime.min)
+        self.setItem(row, len(cells), date_item)
+        self.item(row, 0).setData(_PAYLOAD_ROLE, payload)
+        self.setSortingEnabled(sorting)
+
+    def selected_rows(self) -> list[int]:
+        return sorted({index.row() for index in self.selectionModel().selectedRows()})
+
+    def take_selected_payloads(self) -> list:
+        """選択中の行をすべて表から取り除き、元データのリストを返す。"""
+        rows = self.selected_rows()
+        payloads = [self.item(row, 0).data(_PAYLOAD_ROLE) for row in rows]
+        for row in reversed(rows):  # 大きい行番号から消して番号のずれを防ぐ
+            self.removeRow(row)
+        return payloads
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.key() == Qt.Key.Key_Delete:
+            self.delete_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class PiiSettingsDialog(QDialog):
@@ -57,7 +142,7 @@ class PiiSettingsDialog(QDialog):
         layout.addWidget(tabs, 1)
 
         tabs.addTab(self._build_engines_tab(), "検出エンジン")
-        tabs.addTab(self._build_exclusions_tab(), "除外・追加パターン")
+        tabs.addTab(self._build_exclusions_tab(), "除外・検出パターン")
         tabs.addTab(self._build_dedupe_tab(), "重複除去")
         tabs.addTab(self._build_ocr_tab(), "OCR")
 
@@ -113,45 +198,55 @@ class PiiSettingsDialog(QDialog):
                 checkbox.setChecked(checked)
 
     # ------------------------------------------------------------------
-    # タブ: 除外・追加パターン
+    # タブ: 除外・検出パターン
     # ------------------------------------------------------------------
     def _build_exclusions_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
         layout.addWidget(
-            QLabel("除外語(完全一致。追加パターンや人名リストで検出される語句よりも優先して除外)")
-        )
-        self._excluded_words_list = QListWidget()
-        self._excluded_words_list.addItems(self._settings.excluded_words)
-        layout.addWidget(self._excluded_words_list)
-        layout.addLayout(
-            self._build_add_remove_row(
-                self._excluded_words_list,
-                self._settings.excluded_words,
-                "除外語を入力",
+            QLabel(
+                "除外パターン(正規表現・部分一致で検出結果から除外。記号は \\ でエスケープ。"
+                "完全一致なら ^語句$ の形。検出パターンや人名リストの検出結果よりも優先されます)"
             )
         )
+        self._exclusion_table = _PatternTable(["パターン", "追加日時"])
+        for regex in self._settings.text_exclusions_regex:
+            self._exclusion_table.append_entry(
+                regex, [regex], self._settings.text_exclusions_added_at.get(regex)
+            )
+        self._exclusion_table.delete_requested.connect(self._on_remove_exclusion)
+        layout.addWidget(self._exclusion_table)
+
+        exclusion_row = QHBoxLayout()
+        self._exclusion_edit = QLineEdit()
+        self._exclusion_edit.setPlaceholderText("正規表現を入力")
+        exclusion_row.addWidget(self._exclusion_edit, 1)
+        add_exclusion_btn = QPushButton("追加")
+        add_exclusion_btn.clicked.connect(self._on_add_exclusion)
+        exclusion_row.addWidget(add_exclusion_btn)
+        remove_exclusion_btn = QPushButton("削除")
+        remove_exclusion_btn.clicked.connect(self._on_remove_exclusion)
+        exclusion_row.addWidget(remove_exclusion_btn)
+        layout.addLayout(exclusion_row)
 
         layout.addWidget(
-            QLabel("除外パターン(正規表現・部分一致で検出結果から除外。記号は \\ でエスケープ)")
-        )
-        self._exclusion_regex_list = QListWidget()
-        self._exclusion_regex_list.addItems(self._settings.text_exclusions_regex)
-        layout.addWidget(self._exclusion_regex_list)
-        layout.addLayout(
-            self._build_add_remove_row(
-                self._exclusion_regex_list,
-                self._settings.text_exclusions_regex,
-                "正規表現を入力",
+            QLabel(
+                "検出パターン(エンティティ種別 + 正規表現。"
+                "除外パターンに一致する結果は除外されます)"
             )
         )
-
-        layout.addWidget(QLabel("追加検出パターン(エンティティ種別 + 正規表現)"))
-        self._pattern_list = QListWidget()
+        self._pattern_table = _PatternTable(["種類", "パターン", "追加日時"])
         for entity_type, regex in self._settings.additional_patterns:
-            self._pattern_list.addItem(f"{get_entity_type_name_ja(entity_type)}: {regex}")
-        layout.addWidget(self._pattern_list)
+            self._pattern_table.append_entry(
+                (entity_type, regex),
+                [get_entity_type_name_ja(entity_type), regex],
+                self._settings.additional_patterns_added_at.get(
+                    pattern_key(entity_type, regex)
+                ),
+            )
+        self._pattern_table.delete_requested.connect(self._on_remove_pattern)
+        layout.addWidget(self._pattern_table)
 
         pattern_row = QHBoxLayout()
         self._pattern_entity_combo = QComboBox()
@@ -171,52 +266,42 @@ class PiiSettingsDialog(QDialog):
 
         return widget
 
-    def _build_add_remove_row(
-        self, list_widget: QListWidget, backing_list: list[str], placeholder: str
-    ) -> QHBoxLayout:
-        row = QHBoxLayout()
-        edit = QLineEdit()
-        edit.setPlaceholderText(placeholder)
-        row.addWidget(edit, 1)
+    def _on_add_exclusion(self) -> None:
+        text = self._exclusion_edit.text().strip()
+        if not text:
+            return
+        if self._settings.add_exclusion(text):
+            self._exclusion_table.append_entry(
+                text, [text], self._settings.text_exclusions_added_at.get(text)
+            )
+        self._exclusion_edit.clear()
 
-        def on_add() -> None:
-            text = edit.text().strip()
-            if not text:
-                return
-            backing_list.append(text)
-            list_widget.addItem(text)
-            edit.clear()
-
-        def on_remove() -> None:
-            for item in list_widget.selectedItems():
-                idx = list_widget.row(item)
-                list_widget.takeItem(idx)
-                if 0 <= idx < len(backing_list):
-                    backing_list.pop(idx)
-
-        add_btn = QPushButton("追加")
-        add_btn.clicked.connect(on_add)
-        row.addWidget(add_btn)
-        remove_btn = QPushButton("削除")
-        remove_btn.clicked.connect(on_remove)
-        row.addWidget(remove_btn)
-        return row
+    def _on_remove_exclusion(self) -> None:
+        for regex in self._exclusion_table.take_selected_payloads():
+            if regex in self._settings.text_exclusions_regex:
+                self._settings.text_exclusions_regex.remove(regex)
+        self._settings.prune_added_at()
 
     def _on_add_pattern(self) -> None:
         regex = self._pattern_regex_edit.text().strip()
         if not regex:
             return
         entity_type = self._pattern_entity_combo.currentData()
-        self._settings.additional_patterns.append((entity_type, regex))
-        self._pattern_list.addItem(f"{get_entity_type_name_ja(entity_type)}: {regex}")
+        if self._settings.add_additional_pattern(entity_type, regex):
+            self._pattern_table.append_entry(
+                (entity_type, regex),
+                [get_entity_type_name_ja(entity_type), regex],
+                self._settings.additional_patterns_added_at.get(
+                    pattern_key(entity_type, regex)
+                ),
+            )
         self._pattern_regex_edit.clear()
 
     def _on_remove_pattern(self) -> None:
-        for item in self._pattern_list.selectedItems():
-            idx = self._pattern_list.row(item)
-            self._pattern_list.takeItem(idx)
-            if 0 <= idx < len(self._settings.additional_patterns):
-                self._settings.additional_patterns.pop(idx)
+        for entry in self._pattern_table.take_selected_payloads():
+            if entry in self._settings.additional_patterns:
+                self._settings.additional_patterns.remove(entry)
+        self._settings.prune_added_at()
 
     # ------------------------------------------------------------------
     # タブ: 重複除去
@@ -327,4 +412,5 @@ class PiiSettingsDialog(QDialog):
         self._settings.dedupe_keep = self._dedupe_keep_combo.currentData()
         self._settings.ocr_enabled = self._ocr_enabled_check.isChecked()
         self._settings.ocr_dpi = self._ocr_dpi_spin.value()
+        self._settings.prune_added_at()
         return self._settings

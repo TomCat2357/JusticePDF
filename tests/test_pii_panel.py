@@ -307,7 +307,7 @@ def test_result_context_menu_has_copy_first(qtbot, monkeypatch):
     panel._on_result_context_menu(panel._result_tree.visualItemRect(item).center())
 
     assert seen["texts"][0] == "コピー"
-    assert seen["texts"][1:] == ["検出語に追加", "除外語に追加"]
+    assert seen["texts"][1:] == ["検出語に追加", "除外パターンに追加"]
     assert "同じ語句をすべて削除" not in seen["texts"]
     # 旧メニュー項目は撤去済み。
     assert "追加パターンに登録" not in seen["texts"]
@@ -454,7 +454,7 @@ def test_context_menu_exclude_word_emits_text(qtbot, monkeypatch):
     captured = []
     panel.add_exclude_word_requested.connect(captured.append)
 
-    _open_context_menu(panel, monkeypatch, "除外語に追加")
+    _open_context_menu(panel, monkeypatch, "除外パターンに追加")
 
     assert captured == ["山田太郎"]
 
@@ -467,7 +467,7 @@ def test_context_menu_word_actions_disabled_when_no_text(qtbot, monkeypatch):
     opened = _open_context_menu(panel, monkeypatch, None)
 
     assert _find_action(opened["menu"], "検出語に追加").isEnabled() is False
-    assert _find_action(opened["menu"], "除外語に追加").isEnabled() is False
+    assert _find_action(opened["menu"], "除外パターンに追加").isEnabled() is False
 
 
 def test_scope_choice_dialog_labels_and_scopes(qtbot):
@@ -496,3 +496,20 @@ def test_old_context_menu_signals_removed(qtbot):
     qtbot.addWidget(panel)
     assert not hasattr(panel, "add_pattern_requested")
     assert not hasattr(panel, "add_exclusion_requested")
+
+
+def test_result_row_display_text_is_always_a_single_line():
+    from src.views.pii_panel import DISPLAY_TEXT_MAX_CHARS, PiiResultRow
+
+    def row(text):
+        return PiiResultRow(annot=None, page_num=0, entity="MANUAL", text=text, kind="markup")
+
+    assert row("申）\n ").display_text == "申）"
+    assert row("（答申\n）　").display_text == "（答申 ）"
+    assert row("a\r\n\t b").display_text == "a b"
+    assert row("\n 　").display_text == "(テキストなし)"
+    long = row("あ" * 200).display_text
+    assert len(long) == DISPLAY_TEXT_MAX_CHARS and long.endswith("…")
+    assert "\n" not in row("x\ny").display_text
+    # 元のデータ(右クリックの除外/検出登録に使う text)は変えない。
+    assert row("申）\n").text == "申）\n"

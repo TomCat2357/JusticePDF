@@ -139,12 +139,12 @@ def _no_engines(settings: PiiSettings) -> PiiSettings:
     return settings
 
 
-def test_excluded_word_beats_additional_pattern():
+def test_exact_exclusion_pattern_beats_additional_pattern():
     settings = _no_engines(PiiSettings())
     settings.additional_patterns = [("OTHER", "公務員")]
     assert [r["text"] for r in _analyze("丸尾幸男は公務員です。", settings)] == ["公務員"]
 
-    settings.excluded_words = ["公務員"]
+    settings.text_exclusions_regex = ["^公務員$"]
     assert _analyze("丸尾幸男は公務員です。", settings) == []
 
 
@@ -167,22 +167,22 @@ def test_exclusion_regex_beats_additional_pattern():
     assert len(_analyze("社員番号1234と社員番号5678", settings)) == 1
 
 
-def test_excluded_word_beats_custom_names():
+def test_exact_exclusion_pattern_beats_custom_names():
     settings = _no_engines(PiiSettings())
     settings.custom_names = ["架空太郎"]
     assert [r["text"] for r in _analyze("架空太郎さんが来た。", settings)] == ["架空太郎"]
 
-    settings.excluded_words = ["架空太郎"]
+    settings.text_exclusions_regex = ["^架空太郎$"]
     assert _analyze("架空太郎さんが来た。", settings) == []
 
 
-def test_excluded_word_is_exact_match_after_strip_and_applies_to_model_results():
+def test_anchored_exclusion_pattern_is_exact_match_and_applies_to_model_results():
     settings = PiiSettings()
-    settings.excluded_words = [" 090-1234-5678 "]
+    settings.text_exclusions_regex = ["^090-1234-5678$"]
     results = _analyze("電話番号は090-1234-5678です。", settings)
     assert [r for r in results if r["entity_type"] == "PHONE_NUMBER"] == []
 
     # 完全一致なので、部分的に一致するだけの語では除外されない。
-    settings.excluded_words = ["1234-5678"]
+    settings.text_exclusions_regex = ["^1234-5678$"]
     results = _analyze("電話番号は090-1234-5678です。", settings)
     assert [r["text"] for r in results if r["entity_type"] == "PHONE_NUMBER"] == ["090-1234-5678"]
