@@ -238,3 +238,45 @@ def test_rasterize_hide_xrefs_hides_annotation_before_render(tmp_path):
         hidden_pix = hidden_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
         cx, cy = 100 * 2, 100 * 2
         assert vis_pix.pixel(cx, cy)[:3] != hidden_pix.pixel(cx, cy)[:3]
+
+
+def _make_blank_pdf(path, size=200) -> None:
+    doc = fitz.open()
+    page = doc.new_page(width=size, height=size)
+    page.draw_rect(fitz.Rect(0, 0, size, size), color=(1, 1, 1), fill=(1, 1, 1))
+    doc.save(str(path))
+    doc.close()
+
+
+def test_rasterize_fill_color_applies_to_rect_ellipse_and_rotated(tmp_path):
+    """fill_color 指定時は黒ではなく指定色で塗られること(矩形/楕円/回転矩形)。"""
+    src = tmp_path / "src.pdf"
+    out = tmp_path / "out.pdf"
+    _make_blank_pdf(src)
+
+    rasterize_pdf(
+        str(src),
+        str(out),
+        dpi=100,
+        black_fill_regions={0: [(10.0, 10.0, 60.0, 60.0), (10.0, 130.0, 60.0, 190.0, 30.0)]},
+        black_fill_ellipses={0: [(100.0, 10.0, 190.0, 100.0)]},
+        fill_color=(1.0, 0.0, 0.0),
+    )
+
+    with fitz.open(str(out)) as out_doc:
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(70, 70)[:3] == (255, 0, 0)  # 矩形の中心
+        assert pix.pixel(290, 110)[:3] == (255, 0, 0)  # 楕円の中心
+        assert pix.pixel(70, 320)[:3] == (255, 0, 0)  # 回転矩形の中心
+
+
+def test_rasterize_default_fill_color_is_black(tmp_path):
+    src = tmp_path / "src.pdf"
+    out = tmp_path / "out.pdf"
+    _make_blank_pdf(src)
+
+    rasterize_pdf(str(src), str(out), dpi=100, black_fill_regions={0: [(10.0, 10.0, 60.0, 60.0)]})
+
+    with fitz.open(str(out)) as out_doc:
+        pix = out_doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+        assert pix.pixel(70, 70)[:3] == (0, 0, 0)

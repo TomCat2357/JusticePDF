@@ -3,6 +3,16 @@ import sys
 import argparse
 import logging
 from pathlib import Path
+
+# Windows環境で PyQt6 と onnxruntime(OCR用の任意依存)のDLLが衝突するのを避けるため、
+# PyQt6 より先に onnxruntime と cv2 を import する(PresidioPDF の main.py と同じ対処)。
+# OCR(`uv sync --extra ocr`)を導入していない環境では ImportError になるので無視する。
+try:
+    import onnxruntime  # noqa: F401
+    import cv2  # noqa: F401
+except ImportError:
+    pass
+
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QApplication
 from src.utils import app_settings, order_store

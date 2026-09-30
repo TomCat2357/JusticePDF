@@ -126,3 +126,63 @@ def test_additional_pattern_detected_even_when_immediately_adjacent_to_date():
     entity_types_by_text = {r["text"]: r["entity_type"] for r in results}
     assert entity_types_by_text.get("公務員") == "PERSON"
     assert "DATE_TIME" in {r["entity_type"] for r in results}
+
+
+# ---------------------------------------------------------------------------
+# 除外が最優先(追加パターン/カスタム人名の結果にも除外が効く)
+# ---------------------------------------------------------------------------
+
+
+def _no_engines(settings: PiiSettings) -> PiiSettings:
+    for key in settings.enabled_engines:
+        settings.enabled_engines[key] = False
+    return settings
+
+
+def test_excluded_word_beats_additional_pattern():
+    settings = _no_engines(PiiSettings())
+    settings.additional_patterns = [("OTHER", "公務員")]
+    assert [r["text"] for r in _analyze("丸尾幸男は公務員です。", settings)] == ["公務員"]
+
+    settings.excluded_words = ["公務員"]
+    assert _analyze("丸尾幸男は公務員です。", settings) == []
+
+
+def test_entity_exclusion_beats_additional_pattern_for_that_entity_only():
+    settings = _no_engines(PiiSettings())
+    settings.additional_patterns = [("PERSON", "公務員")]
+    settings.entity_exclusions = {"PERSON": ["公務員"]}
+    assert _analyze("丸尾幸男は公務員です。", settings) == []
+
+    # 別の種別の除外は、この種別の追加パターンには効かない(従来の種別別除外の意味を保つ)。
+    settings.entity_exclusions = {"LOCATION": ["公務員"]}
+    assert [r["text"] for r in _analyze("丸尾幸男は公務員です。", settings)] == ["公務員"]
+
+
+def test_exclusion_regex_beats_additional_pattern():
+    settings = _no_engines(PiiSettings())
+    settings.additional_patterns = [("OTHER", r"社員番号[0-9]{4}")]
+    settings.text_exclusions_regex = ["1234"]
+    assert _analyze("社員番号1234と社員番号5678", settings)[0]["text"] == "社員番号5678"
+    assert len(_analyze("社員番号1234と社員番号5678", settings)) == 1
+
+
+def test_excluded_word_beats_custom_names():
+    settings = _no_engines(PiiSettings())
+    settings.custom_names = ["架空太郎"]
+    assert [r["text"] for r in _analyze("架空太郎さんが来た。", settings)] == ["架空太郎"]
+
+    settings.excluded_words = ["架空太郎"]
+    assert _analyze("架空太郎さんが来た。", settings) == []
+
+
+def test_excluded_word_is_exact_match_after_strip_and_applies_to_model_results():
+    settings = PiiSettings()
+    settings.excluded_words = [" 090-1234-5678 "]
+    results = _analyze("電話番号は090-1234-5678です。", settings)
+    assert [r for r in results if r["entity_type"] == "PHONE_NUMBER"] == []
+
+    # 完全一致なので、部分的に一致するだけの語では除外されない。
+    settings.excluded_words = ["1234-5678"]
+    results = _analyze("電話番号は090-1234-5678です。", settings)
+    assert [r["text"] for r in results if r["entity_type"] == "PHONE_NUMBER"] == ["090-1234-5678"]

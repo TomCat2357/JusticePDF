@@ -22,11 +22,12 @@ ENTITY_TYPES: List[str] = [
 
 # 手動で追加した塗りつぶし候補(テキスト候補/塗り四角/塗り丸)の既定エンティティ種別。
 # 自動検出エンジンの対象にはしない(``ENTITY_TYPES`` には含めない)ため、
-# 「検出対象・色」タブのチェックボックス一覧には出さず、色設定のみ扱う。
+# 検出対象(``PiiSettings.enabled_entities``)には混ぜず、表示の有無だけを
+# ``PiiSettings.manual_visible`` で扱う。
 MANUAL_ENTITY_TYPE: str = "MANUAL"
 
-# 手動追加ツールの種別選択コンボボックス等、UI側で「通常のエンティティ種別
-# + 手動」をまとめて扱いたい箇所向けの一覧(手動を末尾に置く)。
+# 個人情報検出ドロワーの「表示・検出する種別」チェックボックス等、UI側で
+# 「通常のエンティティ種別 + 手動」をまとめて扱いたい箇所向けの一覧(手動を末尾に置く)。
 ENTITY_TYPES_WITH_MANUAL: List[str] = ENTITY_TYPES + [MANUAL_ENTITY_TYPE]
 
 # --- CLI小文字エイリアス → 正式名 ---

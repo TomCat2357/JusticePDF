@@ -16,6 +16,7 @@ import re
 from typing import Any, Dict, List, Optional, Union
 
 from src.pii.entity_types import ENTITY_TYPES
+from src.pii.text_normalize import normalize_1to1, normalize_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ class ConfigManager:
             "exclusions": {
                 "text_exclusions_regex": [],
                 "entity_exclusions": {},
+                "excluded_words": [],
             },
             "nlp": {
                 "sudachi_dict_type": "core",   # core | full | small
@@ -176,25 +178,42 @@ class ConfigManager:
             return entity_exclusions.get(entity_type, [])
         return entity_exclusions
 
+    def get_excluded_words(self) -> List[str]:
+        """種別を問わない完全一致の除外語(``PiiSettings.excluded_words``)。"""
+        words = self._safe_get_config("exclusions.excluded_words", [])
+        return words if isinstance(words, list) else []
+
     def is_entity_excluded(self, entity_type: str, text: str) -> bool:
         """指定されたテキストが除外対象かどうかを判定する。
 
+        追加パターン・モデル検出のどちらの結果にも適用される(除外が最優先)。
+
+        - excluded_words: 種別を問わない完全一致
         - text_exclusions_regex: 正規表現(``re.search`` なので部分一致)
         - entity_exclusions: エンティティ別の完全一致
         """
         text = text.strip()
 
+        # 検出は全角→半角へ1文字ずつ揃えた文字列に対して行われるため、除外語も同じ
+        # 正規化をかけた形で比べる(全角で登録した語が半角化された検出語に一致する)。
+        for word in self.get_excluded_words():
+            if isinstance(word, str) and word.strip():
+                stripped = word.strip()
+                if text == stripped or text == normalize_1to1(stripped):
+                    return True
+
         for pattern in self.get_text_exclusions_regex():
             if not pattern:
                 continue
             try:
-                if re.search(pattern, text):
+                if re.search(normalize_pattern(pattern), text):
                     return True
             except re.error as e:
                 logger.warning(f"無効な除外正規表現をスキップ: {pattern}: {e}")
 
-        if text in self.get_entity_exclusions(entity_type):
-            return True
+        for word in self.get_entity_exclusions(entity_type):
+            if isinstance(word, str) and text in (word, normalize_1to1(word)):
+                return True
 
         return False
 
