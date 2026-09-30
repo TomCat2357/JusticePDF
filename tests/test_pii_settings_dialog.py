@@ -302,3 +302,137 @@ def test_header_click_toggles_sort_order(qtbot):
     second = _texts(table, 0)
     assert first == ["a", "b", "c"]
     assert second == ["c", "b", "a"]
+
+
+def test_exclusion_select_fills_edit_and_update_replaces_in_place(qtbot):
+    settings = PiiSettings()
+    settings.text_exclusions_regex = ["a", "b", "c"]
+    settings.text_exclusions_added_at = {"b": "2026-01-01T00:00:00"}
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._exclusion_table
+    assert not dialog._update_exclusion_btn.isEnabled()
+
+    _select(table, [1])
+    assert dialog._exclusion_edit.text() == "b"
+    assert dialog._update_exclusion_btn.isEnabled()
+
+    dialog._exclusion_edit.setText("B2")
+    dialog._update_exclusion_btn.click()
+    assert _texts(table, 0) == ["a", "B2", "c"]  # 位置を維持・重複追加なし
+    assert dialog._exclusion_edit.text() == ""
+    assert not dialog._update_exclusion_btn.isEnabled()
+    result = dialog.result_settings()
+    assert result.text_exclusions_regex == ["a", "B2", "c"]
+    assert "b" not in result.text_exclusions_added_at
+    assert result.text_exclusions_added_at["B2"] > "2026-01-01T00:00:00"
+    assert settings.text_exclusions_regex == ["a", "b", "c"]  # 元は不変
+
+
+def test_exclusion_update_disabled_for_multi_or_none_and_add_stays_new(qtbot):
+    settings = PiiSettings()
+    settings.text_exclusions_regex = ["a", "b"]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._exclusion_table
+    _select(table, [0, 1])
+    assert not dialog._update_exclusion_btn.isEnabled()
+    table.clearSelection()
+    assert not dialog._update_exclusion_btn.isEnabled()
+
+    _select(table, [0])
+    dialog._exclusion_edit.setText("new")
+    dialog._on_add_exclusion()  # 選択中でも「追加」は新規追加
+    assert dialog.result_settings().text_exclusions_regex == ["a", "b", "new"]
+
+
+def test_exclusion_update_duplicate_or_empty_is_ignored(qtbot):
+    settings = PiiSettings()
+    settings.text_exclusions_regex = ["a", "b"]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._exclusion_table
+    _select(table, [0])
+    dialog._exclusion_edit.setText("b")  # 他の項目と重複
+    dialog._on_update_exclusion()
+    dialog._exclusion_edit.setText("  ")
+    dialog._on_update_exclusion()
+    assert _texts(table, 0) == ["a", "b"]
+    assert dialog.result_settings().text_exclusions_regex == ["a", "b"]
+
+
+def test_exclusion_update_after_sort_replaces_the_right_entry(qtbot):
+    from PyQt6.QtCore import Qt
+
+    settings = PiiSettings()
+    settings.text_exclusions_regex = ["b", "c", "a"]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._exclusion_table
+    table.sortItems(0, Qt.SortOrder.AscendingOrder)
+    _select(table, [0])  # "a"
+    assert dialog._exclusion_edit.text() == "a"
+    dialog._exclusion_edit.setText("a2")
+    dialog._on_update_exclusion()
+    assert dialog.result_settings().text_exclusions_regex == ["b", "c", "a2"]
+    assert sorted(_texts(table, 0)) == ["a2", "b", "c"]
+
+
+def test_pattern_select_fills_type_and_regex_and_update_replaces(qtbot):
+    from src.pii.settings import pattern_key
+
+    settings = PiiSettings()
+    settings.additional_patterns = [("PERSON", "x"), ("LOCATION", "y"), ("PERSON", "z")]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._pattern_table
+    _select(table, [1])
+    assert dialog._pattern_entity_combo.currentData() == "LOCATION"
+    assert dialog._pattern_regex_edit.text() == "y"
+    assert dialog._update_pattern_btn.isEnabled()
+
+    dialog._pattern_entity_combo.setCurrentIndex(dialog._pattern_entity_combo.findData("PHONE_NUMBER"))
+    dialog._pattern_regex_edit.setText("y2")
+    dialog._update_pattern_btn.click()
+    result = dialog.result_settings()
+    assert result.additional_patterns == [("PERSON", "x"), ("PHONE_NUMBER", "y2"), ("PERSON", "z")]
+    assert _texts(table, 1) == ["x", "y2", "z"]
+    assert pattern_key("LOCATION", "y") not in result.additional_patterns_added_at
+    assert pattern_key("PHONE_NUMBER", "y2") in result.additional_patterns_added_at
+    assert not dialog._update_pattern_btn.isEnabled()
+
+
+def test_pattern_update_type_only_change_and_duplicate(qtbot):
+    settings = PiiSettings()
+    settings.additional_patterns = [("PERSON", "x"), ("LOCATION", "x")]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._pattern_table
+    _select(table, [0])
+    # 種別だけ変えて他項目と同じ (LOCATION, x) になる -> 重複なので無視
+    dialog._pattern_entity_combo.setCurrentIndex(dialog._pattern_entity_combo.findData("LOCATION"))
+    dialog._on_update_pattern()
+    assert dialog.result_settings().additional_patterns == [("PERSON", "x"), ("LOCATION", "x")]
+    # 種別だけの変更は更新できる
+    dialog._pattern_entity_combo.setCurrentIndex(dialog._pattern_entity_combo.findData("PHONE_NUMBER"))
+    dialog._on_update_pattern()
+    assert dialog.result_settings().additional_patterns == [("PHONE_NUMBER", "x"), ("LOCATION", "x")]
+
+
+def test_settings_replace_methods_keep_position():
+    s = PiiSettings()
+    s.add_exclusion("a", "2026-01-01T00:00:00")
+    s.add_exclusion("b")
+    assert s.replace_exclusion("a", "c", "2026-02-02T00:00:00")
+    assert s.text_exclusions_regex == ["c", "b"]
+    assert s.text_exclusions_added_at["c"] == "2026-02-02T00:00:00"
+    assert "a" not in s.text_exclusions_added_at
+    assert not s.replace_exclusion("c", "b") and not s.replace_exclusion("c", "c")
+    assert not s.replace_exclusion("zzz", "q") and not s.replace_exclusion("c", "")
+
+    s.add_additional_pattern("PERSON", "x")
+    s.add_additional_pattern("PERSON", "y")
+    assert s.replace_additional_pattern(("PERSON", "x"), ("LOCATION", "x2"))
+    assert s.additional_patterns == [("LOCATION", "x2"), ("PERSON", "y")]
+    assert not s.replace_additional_pattern(("LOCATION", "x2"), ("PERSON", "y"))
+    assert not s.replace_additional_pattern(("NOPE", "q"), ("PERSON", "r"))

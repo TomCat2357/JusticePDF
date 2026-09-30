@@ -96,6 +96,17 @@ class _PatternTable(QTableWidget):
         self.setSortingEnabled(False)  # 挿入中に行が入れ替わらないようにする
         row = self.rowCount()
         self.insertRow(row)
+        self._fill_row(row, payload, cells, added_at)
+        self.setSortingEnabled(sorting)
+
+    def update_entry(self, row: int, payload, cells: list[str], added_at: str | None) -> None:
+        """``row`` 行の内容を置き換える(行の位置はそのまま)。"""
+        sorting = self.isSortingEnabled()
+        self.setSortingEnabled(False)  # 書き換え中に行が入れ替わらないようにする
+        self._fill_row(row, payload, cells, added_at)
+        self.setSortingEnabled(sorting)
+
+    def _fill_row(self, row: int, payload, cells: list[str], added_at: str | None) -> None:
         for col, text in enumerate(cells):
             item = _SortItem(text)
             item.setData(_SORT_ROLE, text)
@@ -105,7 +116,13 @@ class _PatternTable(QTableWidget):
         date_item.setData(_SORT_ROLE, parsed if parsed is not None else datetime.min)
         self.setItem(row, len(cells), date_item)
         self.item(row, 0).setData(_PAYLOAD_ROLE, payload)
-        self.setSortingEnabled(sorting)
+
+    def selected_payload(self):
+        """ちょうど1行だけ選択されているときその元データを返す。それ以外は None。"""
+        rows = self.selected_rows()
+        if len(rows) != 1:
+            return None
+        return self.item(rows[0], 0).data(_PAYLOAD_ROLE)
 
     def selected_rows(self) -> list[int]:
         return sorted({index.row() for index in self.selectionModel().selectedRows()})
@@ -216,6 +233,7 @@ class PiiSettingsDialog(QDialog):
                 regex, [regex], self._settings.text_exclusions_added_at.get(regex)
             )
         self._exclusion_table.delete_requested.connect(self._on_remove_exclusion)
+        self._exclusion_table.itemSelectionChanged.connect(self._on_exclusion_selection_changed)
         layout.addWidget(self._exclusion_table)
 
         exclusion_row = QHBoxLayout()
@@ -225,6 +243,12 @@ class PiiSettingsDialog(QDialog):
         add_exclusion_btn = QPushButton("追加")
         add_exclusion_btn.clicked.connect(self._on_add_exclusion)
         exclusion_row.addWidget(add_exclusion_btn)
+        # 一覧で1件だけ選ぶと入力欄にその内容が入り、編集して「更新」で置き換える。
+        self._update_exclusion_btn = QPushButton("更新")
+        self._update_exclusion_btn.setToolTip("一覧で選んだ項目を、入力欄の内容で置き換えます")
+        self._update_exclusion_btn.setEnabled(False)
+        self._update_exclusion_btn.clicked.connect(self._on_update_exclusion)
+        exclusion_row.addWidget(self._update_exclusion_btn)
         remove_exclusion_btn = QPushButton("削除")
         remove_exclusion_btn.clicked.connect(self._on_remove_exclusion)
         exclusion_row.addWidget(remove_exclusion_btn)
@@ -246,6 +270,7 @@ class PiiSettingsDialog(QDialog):
                 ),
             )
         self._pattern_table.delete_requested.connect(self._on_remove_pattern)
+        self._pattern_table.itemSelectionChanged.connect(self._on_pattern_selection_changed)
         layout.addWidget(self._pattern_table)
 
         pattern_row = QHBoxLayout()
@@ -259,6 +284,11 @@ class PiiSettingsDialog(QDialog):
         add_pattern_btn = QPushButton("追加")
         add_pattern_btn.clicked.connect(self._on_add_pattern)
         pattern_row.addWidget(add_pattern_btn)
+        self._update_pattern_btn = QPushButton("更新")
+        self._update_pattern_btn.setToolTip("一覧で選んだ項目を、入力欄の内容で置き換えます")
+        self._update_pattern_btn.setEnabled(False)
+        self._update_pattern_btn.clicked.connect(self._on_update_pattern)
+        pattern_row.addWidget(self._update_pattern_btn)
         remove_pattern_btn = QPushButton("削除")
         remove_pattern_btn.clicked.connect(self._on_remove_pattern)
         pattern_row.addWidget(remove_pattern_btn)
@@ -275,6 +305,26 @@ class PiiSettingsDialog(QDialog):
                 text, [text], self._settings.text_exclusions_added_at.get(text)
             )
         self._exclusion_edit.clear()
+
+    def _on_exclusion_selection_changed(self) -> None:
+        """1件だけ選ばれたら入力欄へ反映し「更新」を有効にする(複数・未選択は無効)。"""
+        regex = self._exclusion_table.selected_payload()
+        self._update_exclusion_btn.setEnabled(regex is not None)
+        if regex is not None:
+            self._exclusion_edit.setText(regex)
+
+    def _on_update_exclusion(self) -> None:
+        old = self._exclusion_table.selected_payload()
+        new = self._exclusion_edit.text().strip()
+        if old is None or not new:
+            return
+        if self._settings.replace_exclusion(old, new):
+            row = self._exclusion_table.selected_rows()[0]
+            self._exclusion_table.update_entry(
+                row, new, [new], self._settings.text_exclusions_added_at.get(new)
+            )
+            self._exclusion_table.clearSelection()
+            self._exclusion_edit.clear()
 
     def _on_remove_exclusion(self) -> None:
         for regex in self._exclusion_table.take_selected_payloads():
@@ -296,6 +346,32 @@ class PiiSettingsDialog(QDialog):
                 ),
             )
         self._pattern_regex_edit.clear()
+
+    def _on_pattern_selection_changed(self) -> None:
+        """1件だけ選ばれたら種別・正規表現を入力欄へ反映し「更新」を有効にする。"""
+        entry = self._pattern_table.selected_payload()
+        self._update_pattern_btn.setEnabled(entry is not None)
+        if entry is not None:
+            entity_type, regex = entry
+            self._set_combo_value(self._pattern_entity_combo, entity_type)
+            self._pattern_regex_edit.setText(regex)
+
+    def _on_update_pattern(self) -> None:
+        old = self._pattern_table.selected_payload()
+        regex = self._pattern_regex_edit.text().strip()
+        if old is None or not regex:
+            return
+        new = (self._pattern_entity_combo.currentData(), regex)
+        if self._settings.replace_additional_pattern(old, new):
+            row = self._pattern_table.selected_rows()[0]
+            self._pattern_table.update_entry(
+                row,
+                new,
+                [get_entity_type_name_ja(new[0]), regex],
+                self._settings.additional_patterns_added_at.get(pattern_key(*new)),
+            )
+            self._pattern_table.clearSelection()
+            self._pattern_regex_edit.clear()
 
     def _on_remove_pattern(self) -> None:
         for entry in self._pattern_table.take_selected_payloads():
