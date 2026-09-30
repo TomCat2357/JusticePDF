@@ -208,6 +208,43 @@ class PiiSettings:
         )
         return True
 
+    def replace_exclusion(self, old: str, new: str, added_at: str | None = None) -> bool:
+        """除外パターン ``old`` を ``new`` に置き換える(一覧上の位置は維持、追加日時は更新)。
+
+        ``old`` が無い・``new`` が空・``new`` が ``old`` と同じ・すでに他の項目にある
+        (重複になる)ときは何もせず False。
+        """
+        if not new or new == old or old not in self.text_exclusions_regex:
+            return False
+        if new in self.text_exclusions_regex:
+            return False
+        self.text_exclusions_regex[self.text_exclusions_regex.index(old)] = new
+        self.text_exclusions_added_at.pop(old, None)
+        self.text_exclusions_added_at[new] = added_at or now_iso()
+        return True
+
+    def replace_additional_pattern(
+        self,
+        old: tuple[str, str],
+        new: tuple[str, str],
+        added_at: str | None = None,
+    ) -> bool:
+        """検出パターン ``old`` を ``new`` に置き換える(位置は維持、追加日時は更新)。
+
+        ``old`` が無い・``new`` の種別/正規表現が空・同じ内容・すでに他の項目にある
+        (重複になる)ときは何もせず False。
+        """
+        old = (old[0], old[1])
+        new = (new[0], new[1])
+        if not new[0] or not new[1] or new == old or old not in self.additional_patterns:
+            return False
+        if new in self.additional_patterns:
+            return False
+        self.additional_patterns[self.additional_patterns.index(old)] = new
+        self.additional_patterns_added_at.pop(pattern_key(*old), None)
+        self.additional_patterns_added_at[pattern_key(*new)] = added_at or now_iso()
+        return True
+
     def prune_added_at(self) -> None:
         """一覧から消えたパターンの追加日時を捨てる(削除後の残骸を保存しない)。"""
         live = set(self.text_exclusions_regex)
