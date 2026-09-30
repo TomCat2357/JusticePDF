@@ -267,8 +267,10 @@ def test_mask_shape_tool_does_not_create_normal_shape(qtbot, tmp_path):
 
 
 @pytest.mark.usefixtures("qtbot")
-def test_delete_same_text_removes_all_matching_candidates(qtbot, tmp_path):
-    pdf_path = tmp_path / "mask-bulk.pdf"
+def test_clicking_pii_markup_on_page_reveals_row_in_results_list(qtbot, tmp_path):
+    """ページ上で塗りつぶし候補をクリックしても注釈ドロワーは開かず、
+    個人情報検出ドロワーの結果一覧の該当行がアクティブになる。"""
+    pdf_path = tmp_path / "mask-click.pdf"
     _make_text_pdf(pdf_path, "SECRET SECRET")  # 同じ語句が2箇所
 
     window = create_page_edit_window(qtbot, pdf_path)
@@ -287,13 +289,53 @@ def test_delete_same_text_removes_all_matching_candidates(qtbot, tmp_path):
     _select_chars(window, list(range(second, second + len("SECRET"))))
     window._on_zoom_text_selection_released()
 
-    assert len(list_pii_markup_annots(str(pdf_path), 0)) == 2
+    annots = list_pii_markup_annots(str(pdf_path), 0)
+    assert len(annots) == 2
 
-    window._on_pii_delete_same_text("SECRET")
-    assert list_pii_markup_annots(str(pdf_path), 0) == []
+    # アノテーションドロワーだけが開いている状態にしてからクリック相当の通知を送る。
+    window._set_zoom_annotation_drawer_open(True)
+    assert not window._pii_panel.is_open
 
-    window._undo_manager.undo()
-    assert len(list_pii_markup_annots(str(pdf_path), 0)) == 2
+    window._on_zoom_annotation_selected(annots[1])
+
+    assert window._pii_panel.is_open
+    assert not window._zoom_annotation_open
+    assert window._selected_zoom_annotation.xref == annots[1].xref
+    tree = window._pii_panel._result_tree
+    selected = tree.selectedItems()
+    assert len(selected) == 1
+    row = selected[0].data(0, Qt.ItemDataRole.UserRole)
+    assert (row.annot.page_num, row.annot.xref) == (annots[1].page_num, annots[1].xref)
+    assert tree.currentItem() is selected[0]
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_clicking_non_pii_markup_still_opens_annotation_drawer(qtbot, tmp_path):
+    from src.utils.pdf_utils import MarkupType, TextMarkupAnnotData, create_markup_annots
+
+    pdf_path = tmp_path / "plain-markup-click.pdf"
+    _make_text_pdf(pdf_path, "SECRET")
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    created = create_markup_annots(
+        str(pdf_path),
+        [
+            TextMarkupAnnotData(
+                page_num=0,
+                xref=0,
+                quads=((72.0, 100.0, 140.0, 120.0),),
+                markup_type=MarkupType.HIGHLIGHT,
+                color=(1.0, 1.0, 0.0),
+            )
+        ],
+    )
+    window._refresh_current_zoom_page()
+
+    window._on_zoom_annotation_selected(created[0])
+
+    assert window._zoom_annotation_open
+    assert not window._pii_panel.is_open
 
 
 # ---------------------------------------------------------------------------

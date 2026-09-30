@@ -1204,6 +1204,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if page_count == 0:
             return
 
+        self._refresh_page_bound_views()
+
         # ズームビューのページ番号を調整
         if self._zoom_page_num is not None and self._zoom_page_num >= page_count:
             self._zoom_page_num = max(0, page_count - 1)
@@ -1232,6 +1234,15 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._enqueue_all_thumbnail_renders()
             if self._zoom_view and self._zoom_view.isVisible():
                 self._render_zoom()
+
+    def _refresh_page_bound_views(self) -> None:
+        """ページ構成が変わった(並べ替え・削除・挿入・Undo/Redo)後に、ページ番号を持つ表示を追従させる。
+
+        注釈・OCR・しおりの実体は PDF 側にありページと一緒に動くが、個人情報検出の結果一覧
+        (行が ``page_num`` を持つ)としおりツリーは画面側のコピーなので作り直す。
+        """
+        self._reload_pii_results()
+        self._reload_bookmarks_tree()
 
     def _page_edit_window_title(self) -> str:
         return f"JusticePDF - 編集:{os.path.basename(self._pdf_path)}"
