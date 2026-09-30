@@ -186,3 +186,107 @@ def test_anchored_exclusion_pattern_is_exact_match_and_applies_to_model_results(
     settings.text_exclusions_regex = ["^1234-5678$"]
     results = _analyze("電話番号は090-1234-5678です。", settings)
     assert [r["text"] for r in results if r["entity_type"] == "PHONE_NUMBER"] == ["090-1234-5678"]
+
+
+# --- 姓名の間に空白が入る場合(PDF抽出で「姓　名」になる)の検出 -----------------
+# Sudachi へ渡す入力だけ、CJK 文字に挟まれた空白を除いて解析する
+# (src.pii.pos_ne_recognizer.strip_cjk_gaps)。氏名は架空。
+
+FULLWIDTH_SPACE = chr(0x3000)
+
+
+def _person_hits(results):
+    return [r for r in results if r["entity_type"] == "PERSON"]
+
+
+def test_strip_cjk_gaps_removes_only_spaces_between_cjk_characters():
+    from src.pii.pos_ne_recognizer import strip_cjk_gaps
+
+    text = f"小林{FULLWIDTH_SPACE}雄大 と  清水 あい"
+    stripped, orig_idx = strip_cjk_gaps(text)
+    assert stripped == "小林雄大と清水あい"
+    assert [text[i] for i in orig_idx] == list(stripped)
+
+    # 英字・数字に隣接する空白、CJK でない記号(中黒)に隣接する空白は残す。
+    for keep in ["T0 法人", "法人 T0", "1 2", "山田 X", "ア ・ イ", "A B", "山田\n太郎"]:
+        assert strip_cjk_gaps(keep)[0] == keep
+    # 長音符・々もCJK扱い。
+    assert strip_cjk_gaps("ラー メン 佐々 木")[0] == "ラーメン佐々木"
+    # 空白なしなら恒等の対応表。
+    assert strip_cjk_gaps("山田太郎") == ("山田太郎", [0, 1, 2, 3])
+
+
+def test_map_span_to_original_uses_last_char_not_next_index():
+    from src.pii.pos_ne_recognizer import map_span_to_original, strip_cjk_gaps
+
+    text = f"甲乙{FULLWIDTH_SPACE}丙丁{FULLWIDTH_SPACE}{FULLWIDTH_SPACE}戊己"
+    stripped, orig_idx = strip_cjk_gaps(text)
+    assert stripped == "甲乙丙丁戊己"
+    # 空白直前で終わるスパン(乙まで)は元テキストの空白の手前で終わる。
+    assert map_span_to_original(0, 2, orig_idx) == (0, 2)
+    # 空白をまたぐスパンは空白を含む範囲になる。
+    assert map_span_to_original(1, 3, orig_idx) == (1, 4)
+    assert text[1:4] == f"乙{FULLWIDTH_SPACE}丙"
+    # 空白連続の後から始まるスパン。
+    assert map_span_to_original(4, 6, orig_idx) == (7, 9)
+
+
+def test_given_name_detected_when_separated_by_fullwidth_space():
+    """姓と名の間の全角空白で名側が検出されなくなる(空白が独立トークンになる)問題の回帰テスト。"""
+    for family, given in [("小林", "雄大"), ("清水", "あい")]:
+        text = f"議長は{family}{FULLWIDTH_SPACE}{given}です。"
+        hits = _person_hits(_analyze(text))
+        assert [(r["text"], r["start"], r["end"]) for r in hits] == [
+            (family, 3, 5),
+            (given, 6, 6 + len(given)),
+        ], hits
+        assert all(text[r["start"] : r["end"]] == r["text"] for r in hits)
+
+
+def test_given_name_detected_when_separated_by_halfwidth_space():
+    text = "議長は小林 雄大です。"
+    hits = _person_hits(_analyze(text))
+    assert [(r["text"], r["start"], r["end"]) for r in hits] == [
+        ("小林", 3, 5),
+        ("雄大", 6, 8),
+    ]
+
+
+def test_offsets_are_original_positions_after_gap_removal():
+    """空白除去で添字がずれても、結果のオフセットは元テキスト上の位置を指す。"""
+    text = f"出席者{FULLWIDTH_SPACE}小林{FULLWIDTH_SPACE}雄大{FULLWIDTH_SPACE}清水 あい、以上。"
+    hits = _person_hits(_analyze(text))
+    assert [r["text"] for r in hits] == ["小林", "雄大", "清水", "あい"]
+    for r in hits:
+        assert text[r["start"] : r["end"]] == r["text"]
+
+
+def test_space_next_to_alphanumerics_is_not_removed():
+    from src.pii.pos_ne_recognizer import strip_cjk_gaps
+
+    text = "T0 法人 小林 雄大"
+    stripped, _ = strip_cjk_gaps(text)
+    assert stripped == "T0 法人小林雄大"
+    hits = _person_hits(_analyze(text))
+    assert all(text[r["start"] : r["end"]] == r["text"] for r in hits)
+
+
+def test_regex_person_is_not_extended_across_space():
+    """regex の PERSON(敬称付き)は元のテキストに適用する。空白除去の影響を受けず、
+    「○○会長　皆さん」が「○○会長皆さん」のように過大検出されない。"""
+    for sep in (FULLWIDTH_SPACE, " "):
+        text = f"青山会長{sep}皆さん、ありがとうございます。"
+        results = _analyze(text)
+        person_hits = _person_hits(results)
+        assert [r["text"] for r in person_hits] == ["皆さん"], results
+        assert all(text[r["start"] : r["end"]] == r["text"] for r in results)
+
+
+def test_refine_entity_text_trims_only_the_ends():
+    """PERSON/LOCATION の補正は端だけ。内部の空白を消すとテキストとオフセット長が食い違う。"""
+    analyzer = Analyzer(ConfigManager(PiiSettings().to_config_overrides()))
+    inner = f"甲野{FULLWIDTH_SPACE}乙夫"
+    full = f" 12-{inner}3 "
+    refined = analyzer._refine_entity_text(full, "PERSON", full, 0, len(full))
+    assert refined == inner
+    assert analyzer._calculate_refined_positions(full, 0, len(full), refined) == (4, 4 + len(inner))
