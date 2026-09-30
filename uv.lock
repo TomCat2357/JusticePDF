@@ -144,15 +144,36 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+all = [
+    { name = "onnxruntime" },
+    { name = "pillow" },
+    { name = "rapidocr" },
+    { name = "sudachidict-full" },
+    { name = "sudachidict-small" },
+]
 ocr = [
     { name = "onnxruntime" },
+    { name = "pillow" },
     { name = "rapidocr" },
+]
+sudachi-full = [
+    { name = "sudachidict-full" },
+]
+sudachi-small = [
+    { name = "sudachidict-small" },
+]
+
+[package.dev-dependencies]
+full = [
+    { name = "justicepdf", extra = ["all"] },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "justicepdf", extras = ["ocr", "sudachi-small", "sudachi-full"], marker = "extra == 'all'" },
     { name = "onnxruntime", marker = "extra == 'ocr'", specifier = ">=1.22.0" },
     { name = "phonenumbers", specifier = ">=8.13.0" },
+    { name = "pillow", marker = "extra == 'ocr'", specifier = ">=10.0.0" },
     { name = "pymupdf", specifier = "==1.27.2.3" },
     { name = "pyqt6", specifier = "==6.11.0" },
     { name = "pytest", specifier = "==9.0.2" },
@@ -161,10 +182,15 @@ requires-dist = [
     { name = "rapidocr", marker = "extra == 'ocr'", specifier = ">=3.8.1" },
     { name = "send2trash", specifier = "==2.1.0" },
     { name = "sudachidict-core", specifier = ">=20240409" },
+    { name = "sudachidict-full", marker = "extra == 'sudachi-full'", specifier = ">=20240409" },
+    { name = "sudachidict-small", marker = "extra == 'sudachi-small'", specifier = ">=20240409" },
     { name = "sudachipy", specifier = ">=0.6.11" },
     { name = "watchdog", specifier = "==6.0.0" },
 ]
-provides-extras = ["ocr"]
+provides-extras = ["ocr", "sudachi-small", "sudachi-full", "all"]
+
+[package.metadata.requires-dev]
+full = [{ name = "justicepdf", extras = ["all"] }]
 
 [[package]]
 name = "numpy"
@@ -561,6 +587,27 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9c/b5/ddf1c54817572a24ee4172a6290dc574146f9049b2330fac112c25e00f0d/sudachidict_core-20260723.1.tar.gz", hash = "sha256:06605ab827f0ea3f37aaa5dee7fa2e5324f0a2d5bc7662e78a0a597b7eac7955", size = 9144, upload-time = "2026-09-18T08:52:32.613Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/85/af/ba8419f684865b8cca587e01cedb41ba83fbdc985d75ab9e6ff38fdedf1a/sudachidict_core-20260723.1-py3-none-any.whl", hash = "sha256:2b711055dca03423869e491eca0ddbe3e17c4d7418ed738fd7c75d4e0eb9e4b1", size = 76938227, upload-time = "2026-09-24T00:25:03.364Z" },
+]
+
+[[package]]
+name = "sudachidict-full"
+version = "20260723.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "sudachipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/06/60/47f8657b998d059f8959f19dba1590276fd7964482119e6d83163e09fee4/sudachidict_full-20260723.1.tar.gz", hash = "sha256:50ae15cb46ebd7657b3ca64419d728175701924f70a7229af17b1af4fd53ff4e", size = 9156, upload-time = "2026-09-18T08:52:33.751Z" }
+
+[[package]]
+name = "sudachidict-small"
+version = "20260723.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "sudachipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/88/80/669bf600599aaec9edd1d91f6b44fd6463074d79ede5c28128818982f338/sudachidict_small-20260723.1.tar.gz", hash = "sha256:c013ebbe70836d106f5380c14d483f1b30d6da7249474e548973351f7688bb2b", size = 9140, upload-time = "2026-09-18T08:52:34.592Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/72/32/0c842a0a7b2f11a418da541a2978f892d5862b010c0774d7bff710fa6bd7/sudachidict_small-20260723.1-py3-none-any.whl", hash = "sha256:edd526165c6b154529bc40ceff184909e1bd40beb3f26583a304da4fb57234a0", size = 42479750, upload-time = "2026-09-24T00:24:29.569Z" },
 ]
 
 [[package]]
