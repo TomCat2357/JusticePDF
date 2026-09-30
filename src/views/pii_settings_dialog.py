@@ -48,9 +48,11 @@ from src.pii.settings import (
     WHITESPACE_MODES,
     PiiSettings,
     format_added_at,
+    normalize_ocr_model_tier,
     parse_added_at,
     pattern_key,
 )
+from src.pii.sudachi_tokenizer import SUDACHI_DICT_LABELS, sudachi_dict_available
 from src.views.view_helpers import build_accept_cancel_box
 
 _SORT_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -212,8 +214,55 @@ class PiiSettingsDialog(QDialog):
             layout.addWidget(checkbox)
             self._engine_checks[engine.key] = checkbox
 
+        layout.addWidget(self._build_sudachi_dict_group())
+
+        # ページ末尾と次ページ先頭で分かれた語(氏名など)も検出する。検出対象のうち
+        # ページ番号が連続する範囲ごとに本文を連結して解析する。
+        self._cross_page_check = QCheckBox("ページをまたぐ語も検出する")
+        self._cross_page_check.setToolTip(
+            "ページ末尾と次のページ先頭で分かれた氏名などを検出します。"
+            "検出対象のうち、ページ番号が連続している範囲ごとに本文をつなげて解析します。"
+            "結果は、ページごとに分かれた通常のマーカーとして保存されます。"
+        )
+        self._cross_page_check.setChecked(self._settings.cross_page_detection)
+        layout.addWidget(self._cross_page_check)
+
         layout.addStretch()
         return widget
+
+    def _build_sudachi_dict_group(self) -> QGroupBox:
+        """形態素解析(SudachiPy)の辞書の選択。未導入の辞書は選べない。"""
+        group = QGroupBox("形態素解析の辞書")
+        group_layout = QVBoxLayout(group)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("辞書:"))
+        self._sudachi_dict_combo = QComboBox()
+        for dict_type, label in SUDACHI_DICT_LABELS.items():
+            available = sudachi_dict_available(dict_type)
+            self._sudachi_dict_combo.addItem(
+                label if available else f"{label}(未インストール)", dict_type
+            )
+            item = self._sudachi_dict_combo.model().item(self._sudachi_dict_combo.count() - 1)
+            if not available:
+                item.setEnabled(False)
+                item.setToolTip("`uv sync`(または `pip install -e \".[all]\"`)で導入できます。")
+        current_dict = str(self._settings.sudachi_dict_type or "core").lower()
+        self._set_combo_value(
+            self._sudachi_dict_combo,
+            current_dict if current_dict in SUDACHI_DICT_LABELS else "core",
+        )
+        self._sudachi_dict_combo.setEnabled(is_engine_available("sudachi"))
+        row.addWidget(self._sudachi_dict_combo)
+        row.addStretch()
+        group_layout.addLayout(row)
+        hint = QLabel(
+            "大きい辞書ほど固有名詞の検出精度が上がりますが、読み込みに時間とメモリを使います。"
+            "未導入の辞書は `uv sync`(または `pip install -e \".[all]\"`)で導入します"
+            "(fullは数百MB)。導入していない辞書が設定に残っている場合は、標準(core)で検出して警告を表示します。"
+        )
+        hint.setWordWrap(True)
+        group_layout.addWidget(hint)
+        return group
 
     def _set_all_engine_checks(self, checked: bool) -> None:
         for checkbox in self._engine_checks.values():
@@ -491,6 +540,26 @@ class PiiSettingsDialog(QDialog):
         dpi_row.addStretch()
         group_layout.addLayout(dpi_row)
 
+        # モデルの種別。heavy(server)は同梱されておらず、初回のOCR実行時に
+        # RapidOCRがモデルファイルをダウンロードする(light/mobileはパッケージに同梱)。
+        tier_row = QHBoxLayout()
+        tier_row.addWidget(QLabel("OCRモデル:"))
+        self._ocr_tier_combo = QComboBox()
+        self._ocr_tier_combo.addItem("軽量(高速・同梱モデル)", "light")
+        self._ocr_tier_combo.addItem("高精度(低速・初回にモデルをダウンロード)", "heavy")
+        self._ocr_tier_combo.setToolTip(
+            "高精度モデルはパッケージに同梱されていないため、初めて使うときに"
+            "RapidOCRがモデルファイルをインターネットからダウンロードします。"
+            "軽量モデルは同梱されており、追加のダウンロードは要りません。"
+        )
+        self._set_combo_value(
+            self._ocr_tier_combo, normalize_ocr_model_tier(self._settings.ocr_model_tier)
+        )
+        self._ocr_tier_combo.setEnabled(available)
+        tier_row.addWidget(self._ocr_tier_combo)
+        tier_row.addStretch()
+        group_layout.addLayout(tier_row)
+
         layout.addWidget(group)
         layout.addStretch()
         return widget
@@ -511,5 +580,12 @@ class PiiSettingsDialog(QDialog):
         self._settings.pattern_whitespace_mode = self._whitespace_mode_combo.currentData()
         self._settings.ocr_enabled = self._ocr_enabled_check.isChecked()
         self._settings.ocr_dpi = self._ocr_dpi_spin.value()
+        self._settings.ocr_model_tier = normalize_ocr_model_tier(
+            self._ocr_tier_combo.currentData()
+        )
+        self._settings.sudachi_dict_type = str(
+            self._sudachi_dict_combo.currentData() or self._settings.sudachi_dict_type
+        )
+        self._settings.cross_page_detection = self._cross_page_check.isChecked()
         self._settings.prune_added_at()
         return self._settings

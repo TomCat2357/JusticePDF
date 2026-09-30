@@ -49,6 +49,11 @@ class Analyzer:
             )
         return self._tokenizer
 
+    @property
+    def tokenizer_fallback_message(self) -> str | None:
+        """辞書のフォールバックが起きていれば、その説明(未生成・問題なしなら None)。"""
+        return getattr(self._tokenizer, "fallback_message", None)
+
     def analyze_text(self, text: str, entities: List[str] = None) -> List[Dict]:
         """テキストの個人情報を解析（大容量ファイル対応）"""
         if entities is None:

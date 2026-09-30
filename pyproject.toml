@@ -29,6 +29,22 @@ ocr = [
     "Pillow>=10.0.0",
 ]
 
+# SudachiPyの辞書(既定のcoreはdependenciesに含まれる)。small/fullも`all`(下記)で入る。
+# 未導入のまま選択するとcoreへフォールバックする(fullは数百MB)。
+sudachi-small = ["sudachidict-small>=20240409"]
+sudachi-full = ["sudachidict-full>=20240409"]
+
+# 全部入り: OCR + Sudachi辞書(small/core/full)。pip/install2.ps1は `.[all]` を使う。
+# OCRの高精度(server)モデルは別途 `python -m src.ocr.download_models` で取得する。
+all = ["justicepdf[ocr,sudachi-small,sudachi-full]"]
+
+# uvは既定でextraを入れないため、素の `uv sync` で全部入るようグループ経由で`all`を取り込む。
+[dependency-groups]
+full = ["justicepdf[all]"]
+
+[tool.uv]
+default-groups = ["full"]
+
 [build-system]
 requires = ["setuptools==80.10.2", "wheel==0.46.3"]
 build-backend = "setuptools.build_meta"

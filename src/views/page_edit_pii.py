@@ -21,6 +21,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
 from src.pii.detection_service import PiiDetection, expand_quads_for_ocr, run_detection
@@ -297,6 +298,7 @@ class PiiDrawerMixin:
             panel.set_busy(True, "検出を開始しています...")
         worker = PiiDetectWorker(self._pdf_path, page_indices, self._pii_settings(), parent=self)
         worker.progress.connect(self._on_pii_detect_progress)
+        worker.warnings_raised.connect(self._on_pii_detect_warnings)
         worker.finished.connect(
             lambda results: self._on_pii_detect_finished(page_indices, results)
         )
@@ -308,6 +310,13 @@ class PiiDrawerMixin:
         panel = getattr(self, "_pii_panel", None)
         if panel is not None:
             panel.set_progress(done, total)
+
+    def _on_pii_detect_warnings(self, messages: list) -> None:
+        """検出中に出た注意(辞書のフォールバック等)を、検出完了後にダイアログで知らせる。"""
+        text = "\n".join(str(m) for m in messages)
+        logger.warning("個人情報検出の注意: %s", text)
+        # 結果の反映(finished)より後に表示する(モーダルで結果の反映を止めないため)。
+        QTimer.singleShot(0, lambda: QMessageBox.warning(self, "個人情報検出", text))
 
     def _on_pii_detect_error(self, error: Exception) -> None:
         self._pii_worker = None
@@ -539,6 +548,7 @@ class PiiDrawerMixin:
             lambda: create_markup_annot(self._pdf_path, template),
             lambda *a: delete_markup_annot(*a),
             select_created=False,
+            after_create=self._select_created_pii_result,
         )
 
     def _create_mask_shape(
@@ -579,6 +589,7 @@ class PiiDrawerMixin:
             lambda: create_shape_annot(self._pdf_path, template),
             lambda *a: delete_shape_annot(*a),
             select_created=False,
+            after_create=self._select_created_pii_result,
         )
 
     # ------------------------------------------------------------------
@@ -656,6 +667,18 @@ class PiiDrawerMixin:
         self._jump_zoom_to_page(annot.page_num + 1)
         current = self._find_zoom_annotation(annot.xref) or annot
         self._set_selected_zoom_annotation(current, open_drawer=False)
+
+    def _select_created_pii_result(self, created: object) -> None:
+        """手動追加した塗りつぶし対象を、結果一覧でアクティブにしてスクロールする。
+
+        ``_run_zoom_create`` の ``after_create`` から呼ばれる(一覧は作成後の
+        ``_refresh_current_zoom_page`` で再構築済み)。``select_result`` は
+        ``result_activated`` を発火しないため、ページ側への往復は起きない。
+        """
+        panel = getattr(self, "_pii_panel", None)
+        if panel is None or not panel.is_open:
+            return
+        panel.select_result(created)
 
     def _reveal_pii_result(self, annot: "TextMarkupAnnotData | ShapeAnnotData") -> None:
         """ページ上でクリックした塗りつぶし対象を、結果一覧の該当行として見せる。
@@ -889,6 +912,7 @@ class PiiDrawerMixin:
             entity_exclusions={k: list(v) for k, v in current.entity_exclusions.items()},
             enabled_engines={key: False for key in ENGINE_KEYS},
             dedupe_enabled=False,
+            cross_page_detection=current.cross_page_detection,
         )
         try:
             detections = run_detection(self._pdf_path, page_indices, pattern_settings)

@@ -293,14 +293,14 @@ function Install-ProjectDeps([string]$VenvPython)
     $oldTmp = [Environment]::GetEnvironmentVariable("TMP", "Process")
     $oldTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
 
-    Write-Info "Installing project (editable) and deps (including the ocr extra) from pyproject.toml..."
+    Write-Info "Installing project (editable) and deps (all extras: OCR + Sudachi small/core/full) from pyproject.toml..."
     Write-Info ("Temporary pip dir: " + $pipTempDir)
     try
     {
         Set-EnvVar "TMP" $pipTempDir
         Set-EnvVar "TEMP" $pipTempDir
 
-        & $VenvPython -m pip install -e ".[ocr]" | Out-Host
+        & $VenvPython -m pip install -e ".[all]" | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "Failed to install project dependencies." }
     } finally
     {
@@ -320,6 +320,18 @@ function Install-ProjectDeps([string]$VenvPython)
     }
 
     Write-Ok "Dependencies installed."
+
+    # OCR high-accuracy (server) model is downloaded on first use; fetch it now.
+    # Non-fatal: the app downloads missing models on first OCR use anyway.
+    Write-Info "Downloading OCR models (light + high-accuracy) from modelscope.cn..."
+    & $VenvPython -m src.ocr.download_models | Out-Host
+    if ($LASTEXITCODE -ne 0)
+    {
+        Write-Warn "OCR model download failed. Retry later: .venv\Scripts\python.exe -m src.ocr.download_models (missing models are also fetched on first OCR use)."
+    } else
+    {
+        Write-Ok "OCR models ready."
+    }
 }
 
 # =========================
