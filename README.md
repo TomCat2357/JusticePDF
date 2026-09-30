@@ -98,8 +98,11 @@
 # 仮想環境
 uv venv .venv --python 3.14
 
-# 依存関係インストール
+# 依存関係インストール(OCR・Sudachi辞書 small/core/full まで全部入る。fullは数百MB)
 uv sync
+
+# OCRの高精度(server)モデルを事前取得(modelscope.cn、初回のみ)
+uv run python -m src.ocr.download_models
 
 # 起動
 uv run python -m src.main
@@ -120,7 +123,8 @@ python -m venv .venv
 # source .venv/bin/activate
 
 pip install -U pip
-pip install -e .
+pip install -e ".[all]"   # OCR・Sudachi辞書(small/core/full)込み
+python -m src.ocr.download_models   # OCRの高精度モデルを事前取得
 
 python -m src.main
 ```

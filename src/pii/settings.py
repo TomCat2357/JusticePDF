@@ -66,6 +66,15 @@ DEFAULT_WHITESPACE_MODE = "optional"
 _WHITESPACE_MODE_KEYS = tuple(key for key, _ in WHITESPACE_MODES)
 
 
+OCR_MODEL_TIERS: tuple[str, ...] = ("light", "heavy")
+
+
+def normalize_ocr_model_tier(value) -> str:
+    """OCRモデルの種別を "light" / "heavy" のどちらかへ揃える(不明なら "light")。"""
+    text = str(value or "").strip().lower()
+    return text if text in OCR_MODEL_TIERS else "light"
+
+
 def normalize_whitespace_mode(value) -> str:
     """不正な空白モードは既定値(``optional``)にする。"""
     value = str(value or "")
@@ -202,9 +211,13 @@ class PiiSettings:
     # SudachiPy
     sudachi_dict_type: str = "core"  # core | full | small
     sudachi_split_mode: str = "C"  # A | B | C
+    # 連続するページにまたがる語(ページ末尾と次ページ先頭で分かれた氏名など)も検出する。
+    cross_page_detection: bool = True
     # OCR（rapidocr が導入されている場合のみ実際に使われる）
     ocr_enabled: bool = False
     ocr_dpi: int = 300
+    # OCRモデル: "light"(軽量/mobile) | "heavy"(高精度/server。初回に追加モデルをダウンロード)
+    ocr_model_tier: str = "light"
     # OCRで認識した文字を、画面(ズームビュー)に重ねて表示するか。表示だけの設定で、
     # PDFへ埋め込んだテキスト(見えない注釈)自体は変えない。色・透明度は再OCRなしで
     # いつでも変えられる(次に描画するときに反映される)。
@@ -495,8 +508,14 @@ class PiiSettings:
             sudachi_split_mode=str(
                 s.value(_key("sudachi_split_mode"), default.sudachi_split_mode, type=str)
             ),
+            cross_page_detection=bool(
+                s.value(_key("cross_page_detection"), default.cross_page_detection, type=bool)
+            ),
             ocr_enabled=bool(s.value(_key("ocr_enabled"), False, type=bool)),
             ocr_dpi=int(s.value(_key("ocr_dpi"), default.ocr_dpi, type=int)),
+            ocr_model_tier=normalize_ocr_model_tier(
+                s.value(_key("ocr_model_tier"), default.ocr_model_tier, type=str)
+            ),
             ocr_text_visible=bool(s.value(_key("ocr_text_visible"), False, type=bool)),
             ocr_text_color=_normalize_mask_color(
                 _load_json(s, "ocr_text_color", None), DEFAULT_OCR_TEXT_COLOR
@@ -549,8 +568,10 @@ class PiiSettings:
         _save_json(s, "entity_priority_order", self.entity_priority_order)
         s.setValue(_key("sudachi_dict_type"), self.sudachi_dict_type)
         s.setValue(_key("sudachi_split_mode"), self.sudachi_split_mode)
+        s.setValue(_key("cross_page_detection"), self.cross_page_detection)
         s.setValue(_key("ocr_enabled"), self.ocr_enabled)
         s.setValue(_key("ocr_dpi"), self.ocr_dpi)
+        s.setValue(_key("ocr_model_tier"), normalize_ocr_model_tier(self.ocr_model_tier))
         s.setValue(_key("ocr_text_visible"), self.ocr_text_visible)
         _save_json(
             s,

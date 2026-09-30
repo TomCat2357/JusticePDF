@@ -7,8 +7,28 @@ Ported from PresidioPDF src/analysis/backends/sudachi_tokenizer.py（無改修�
 
 from __future__ import annotations
 
+import importlib.util
+import logging
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# 選択できる辞書種別 → 日本語ラベル。pyproject の extra(sudachi-small/-full、`all` に含まれる)で導入する。
+SUDACHI_DICT_LABELS = {
+    "small": "小(small)",
+    "core": "標準(core)",
+    "full": "大(full)",
+}
+FALLBACK_DICT_TYPE = "core"
+
+
+def sudachi_dict_available(dict_type: str) -> bool:
+    """辞書パッケージ(``sudachidict_<type>``)が導入済みか(実際にはimportしない)。"""
+    try:
+        return importlib.util.find_spec(f"sudachidict_{str(dict_type).lower()}") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 @dataclass
@@ -34,11 +54,28 @@ class SudachiTokenizer:
         }.get(str(split_mode or "C").upper(), SplitMode.C)
 
         dict_name = str(dict_type or "core").lower()
+        # 辞書が未導入などで読み込めなかったとき、coreへ切り替えた旨のメッセージ。
+        self.fallback_message: Optional[str] = None
+        try:
+            self._tokenizer = self._create(Dictionary, dict_name)
+        except Exception as exc:  # noqa: BLE001 - 未導入辞書(ModuleNotFoundError等)
+            if dict_name == FALLBACK_DICT_TYPE:
+                raise
+            self.fallback_message = (
+                f"Sudachi辞書「{dict_name}」を読み込めなかったため、"
+                f"「{FALLBACK_DICT_TYPE}」辞書で検出しました"
+                f"(`uv sync`(または `pip install -e \".[all]\"`)で導入できます)。"
+            )
+            logger.warning("%s 原因: %s", self.fallback_message, exc)
+            self._tokenizer = self._create(Dictionary, FALLBACK_DICT_TYPE)
+
+    @staticmethod
+    def _create(dictionary_cls, dict_name: str):
         # sudachipy 0.6.x の新 API は `dict=`、旧 API は `dict_type=`。両対応。
         try:
-            self._tokenizer = Dictionary(dict=dict_name).create()
+            return dictionary_cls(dict=dict_name).create()
         except TypeError:
-            self._tokenizer = Dictionary(dict_type=dict_name).create()
+            return dictionary_cls(dict_type=dict_name).create()
 
     def tokenize(self, text: str) -> List[Token]:
         """テキストを形態素に分割する。"""

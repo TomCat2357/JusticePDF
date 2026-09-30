@@ -24,7 +24,7 @@ from src.ocr import OCR_INSTALL_HINT, is_ocr_available
 from src.ocr.base import OCRResult
 from src.ocr.embedder import count_ocr_annots, replace_ocr_in_file, snapshot_ocr_results
 from src.ocr.pipeline import DEFAULT_OCR_DPI
-from src.pii.settings import DEFAULT_OCR_TEXT_COLOR
+from src.pii.settings import DEFAULT_OCR_TEXT_COLOR, normalize_ocr_model_tier
 from src.utils.pdf_utils import get_page_count
 from src.views.ocr_panel import OcrPanel
 from src.workers.ocr_worker import OcrWorker
@@ -138,12 +138,17 @@ class OcrDrawerMixin:
         except (TypeError, ValueError):
             return DEFAULT_OCR_DPI
 
+    def _ocr_tier(self) -> str:
+        """設定のOCRモデル(light=軽量 / heavy=高精度)。"""
+        return normalize_ocr_model_tier(getattr(self._ocr_settings(), "ocr_model_tier", "light"))
+
     def _create_ocr_worker(self, page_indices: list[int], *, only_textless: bool) -> "OcrWorker":
         """OCRワーカーを生成する(テストから差し替えて偽のエンジンを渡せる)。"""
         return OcrWorker(
             self._pdf_path,
             page_indices,
             dpi=self._ocr_dpi(),
+            tier=self._ocr_tier(),
             only_textless=only_textless,
             parent=self,
         )

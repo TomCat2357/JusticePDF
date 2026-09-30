@@ -266,6 +266,60 @@ def test_mask_shape_tool_does_not_create_normal_shape(qtbot, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _current_result_xref(window):
+    tree = window._pii_panel._result_tree
+    item = tree.currentItem()
+    assert item is not None
+    assert tree.selectedItems() == [item]
+    return item.data(0, Qt.ItemDataRole.UserRole).annot.xref
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_manual_candidate_becomes_current_row_in_results_list(qtbot, tmp_path):
+    """手動で塗りつぶし候補を追加すると、一覧の新規行がアクティブ(選択+カレント)になる。"""
+    pdf_path = tmp_path / "mask-select-markup.pdf"
+    _make_text_pdf(pdf_path, "SECRET KEEPME")
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+    window._activate_create_mode(CreateMode.MASK_MARKUP)
+
+    activated = []
+    window._pii_panel.result_activated.connect(activated.append)
+
+    for word in ("SECRET", "KEEPME"):
+        _select_chars(window, _char_indices_for_substring(window, word))
+        window._on_zoom_text_selection_released()
+        annots = [a for a in list_pii_markup_annots(str(pdf_path), 0) if a.pii_text == word]
+        assert len(annots) == 1
+        # 直近に追加した行がアクティブ。
+        assert _current_result_xref(window) == annots[0].xref
+
+    # 一覧側の選択はページ側へ往復しない(result_activated を発火しない)。
+    assert activated == []
+
+
+@pytest.mark.usefixtures("qtbot")
+def test_manual_shape_becomes_current_row_in_results_list(qtbot, tmp_path):
+    """手動で塗り四角を追加すると、一覧の新規行がアクティブになる。"""
+    pdf_path = tmp_path / "mask-select-shape.pdf"
+    _make_text_pdf(pdf_path)
+
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+    window._activate_create_mode(CreateMode.MASK_SHAPE, ShapeType.RECTANGLE)
+
+    _drag_on_zoom_label(qtbot, window, (30, 80), (80, 115))
+    _drag_on_zoom_label(qtbot, window, (200, 80), (260, 115))
+
+    shapes = list_pii_mask_shapes(str(pdf_path), 0)
+    assert len(shapes) == 2
+    newest = max(shapes, key=lambda sh: sh.rect[0])  # 右側(後から追加)の図形
+    assert _current_result_xref(window) == newest.xref
+
+
 @pytest.mark.usefixtures("qtbot")
 def test_clicking_pii_markup_on_page_reveals_row_in_results_list(qtbot, tmp_path):
     """ページ上で塗りつぶし候補をクリックしても注釈ドロワーは開かず、
