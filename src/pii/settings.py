@@ -86,23 +86,28 @@ _DISPLAY_MODES = ("mark", "black", "hidden")
 
 DEFAULT_MASK_COLOR: tuple[float, float, float] = (0.0, 0.0, 0.0)
 DEFAULT_MASK_TRANSPARENCY = 70
+# OCRで認識した文字を画面に重ねて表示するときの既定(色は赤、透明度50%)。
+DEFAULT_OCR_TEXT_COLOR: tuple[float, float, float] = (1.0, 0.0, 0.0)
+DEFAULT_OCR_TEXT_TRANSPARENCY = 50
 
 
-def _clamp_transparency(value) -> int:
+def _clamp_transparency(value, default: int = DEFAULT_MASK_TRANSPARENCY) -> int:
     try:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError):
-        return DEFAULT_MASK_TRANSPARENCY
+        return default
 
 
-def _normalize_mask_color(value) -> tuple[float, float, float]:
+def _normalize_mask_color(
+    value, default: tuple[float, float, float] = DEFAULT_MASK_COLOR
+) -> tuple[float, float, float]:
     if isinstance(value, (list, tuple)) and len(value) == 3:
         try:
             r, g, b = (max(0.0, min(1.0, float(c))) for c in value)
             return (r, g, b)
         except (TypeError, ValueError):
             pass
-    return DEFAULT_MASK_COLOR
+    return default
 
 
 def _normalize_display_mode(value) -> str:
@@ -158,6 +163,13 @@ class PiiSettings:
     # OCR（rapidocr が導入されている場合のみ実際に使われる）
     ocr_enabled: bool = False
     ocr_dpi: int = 300
+    # OCRで認識した文字を、画面(ズームビュー)に重ねて表示するか。表示だけの設定で、
+    # PDFへ埋め込んだテキスト(見えない注釈)自体は変えない。色・透明度は再OCRなしで
+    # いつでも変えられる(次に描画するときに反映される)。
+    ocr_text_visible: bool = False
+    ocr_text_color: tuple[float, float, float] = DEFAULT_OCR_TEXT_COLOR
+    # 認識文字の透明度(0=不透明 / 100=完全に透明)。
+    ocr_text_transparency: int = DEFAULT_OCR_TEXT_TRANSPARENCY
     # 検出エンジン(認識器)ごとのON/OFF。キーは src.pii.engines.ENGINE_KEYS。
     enabled_engines: dict[str, bool] = field(default_factory=default_enabled_engines)
     # 検出ボタン押下時、既存の検出結果・手動追加分を消さずに新規検出分だけ
@@ -224,6 +236,13 @@ class PiiSettings:
     def mask_opacity(self) -> float:
         """塗りつぶしの不透明度(0.0-1.0)。透明度0 -> 1.0、透明度100 -> 0.0。"""
         return (100 - _clamp_transparency(self.mask_transparency)) / 100.0
+
+    @property
+    def ocr_text_opacity(self) -> float:
+        """認識文字の不透明度(0.0-1.0)。透明度0 -> 1.0、透明度100 -> 0.0。"""
+        return (100 - _clamp_transparency(
+            self.ocr_text_transparency, DEFAULT_OCR_TEXT_TRANSPARENCY
+        )) / 100.0
 
     def is_engine_enabled(self, engine_key: str) -> bool:
         return bool(self.enabled_engines.get(engine_key, False))
@@ -396,6 +415,18 @@ class PiiSettings:
             ),
             ocr_enabled=bool(s.value(_key("ocr_enabled"), False, type=bool)),
             ocr_dpi=int(s.value(_key("ocr_dpi"), default.ocr_dpi, type=int)),
+            ocr_text_visible=bool(s.value(_key("ocr_text_visible"), False, type=bool)),
+            ocr_text_color=_normalize_mask_color(
+                _load_json(s, "ocr_text_color", None), DEFAULT_OCR_TEXT_COLOR
+            ),
+            ocr_text_transparency=_clamp_transparency(
+                s.value(
+                    _key("ocr_text_transparency"),
+                    DEFAULT_OCR_TEXT_TRANSPARENCY,
+                    type=int,
+                ),
+                DEFAULT_OCR_TEXT_TRANSPARENCY,
+            ),
             enabled_engines=enabled_engines,
             keep_existing_on_detect=bool(
                 s.value(_key("keep_existing_on_detect"), False, type=bool)
@@ -431,6 +462,16 @@ class PiiSettings:
         s.setValue(_key("sudachi_split_mode"), self.sudachi_split_mode)
         s.setValue(_key("ocr_enabled"), self.ocr_enabled)
         s.setValue(_key("ocr_dpi"), self.ocr_dpi)
+        s.setValue(_key("ocr_text_visible"), self.ocr_text_visible)
+        _save_json(
+            s,
+            "ocr_text_color",
+            list(_normalize_mask_color(self.ocr_text_color, DEFAULT_OCR_TEXT_COLOR)),
+        )
+        s.setValue(
+            _key("ocr_text_transparency"),
+            _clamp_transparency(self.ocr_text_transparency, DEFAULT_OCR_TEXT_TRANSPARENCY),
+        )
         _save_json(s, "enabled_engines", self.enabled_engines)
         s.setValue(_key("keep_existing_on_detect"), self.keep_existing_on_detect)
         s.setValue(_key("display_mode"), self.display_mode)

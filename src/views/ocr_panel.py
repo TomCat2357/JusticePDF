@@ -8,14 +8,18 @@
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QCheckBox,
+    QColorDialog,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
+    QSlider,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -39,6 +43,9 @@ class OcrPanel(QFrame):
         「OCRテキストを削除(全ページ)」ボタン押下時。
     clear_page_requested()
         「OCRテキストを削除(このページ)」ボタン押下時。
+    text_style_changed(bool, object, int, bool)
+        認識文字の表示設定(表示するか, 色(RGB 0.0-1.0のタプル), 透明度0-100, 確定か)。
+        透明度スライダのドラッグ中は確定=False(画面へ即時反映するだけで保存しない)。
     """
 
     open_changed = pyqtSignal(bool)
@@ -46,6 +53,7 @@ class OcrPanel(QFrame):
     ocr_page_requested = pyqtSignal()
     clear_all_requested = pyqtSignal()
     clear_page_requested = pyqtSignal()
+    text_style_changed = pyqtSignal(bool, object, int, bool)
 
     DRAWER_WIDTH = 340
 
@@ -58,6 +66,7 @@ class OcrPanel(QFrame):
         self._collapsed_width = 32
         self._available = True
         self._busy = False
+        self._text_color: tuple[float, float, float] = (1.0, 0.0, 0.0)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -115,6 +124,41 @@ class OcrPanel(QFrame):
         clear_layout.addWidget(self._clear_page_btn)
         panel_layout.addWidget(clear_group)
 
+        # 認識した文字を画面に重ねて表示する(表示専用。PDFの埋め込みは変えない)。
+        # 色・透明度は、OCR済みの文字にも再OCRなしでいつでも反映される。
+        text_group = QGroupBox("認識した文字の表示")
+        text_layout = QVBoxLayout(text_group)
+        self._text_visible_check = QCheckBox("認識した文字を画面に重ねて表示")
+        self._text_visible_check.setToolTip(
+            "埋め込んだOCRテキストを、認識した行の位置に重ねて表示します。\n"
+            "表示だけの設定で、PDFの内容は変わりません。"
+        )
+        self._text_visible_check.toggled.connect(self._emit_text_style)
+        text_layout.addWidget(self._text_visible_check)
+        style_row = QHBoxLayout()
+        style_row.addWidget(QLabel("色:"))
+        self._text_color_btn = QPushButton()
+        self._text_color_btn.setFixedWidth(48)
+        self._text_color_btn.setToolTip("認識した文字の色を選びます。")
+        self._text_color_btn.clicked.connect(self._on_text_color_clicked)
+        style_row.addWidget(self._text_color_btn)
+        style_row.addWidget(QLabel("透明度:"))
+        self._text_transparency_slider = QSlider(Qt.Orientation.Horizontal)
+        self._text_transparency_slider.setRange(0, 100)
+        self._text_transparency_slider.setValue(50)
+        self._text_transparency_slider.setToolTip("0%で不透明、100%で完全に透明です。")
+        self._text_transparency_slider.valueChanged.connect(self._on_text_transparency_value)
+        self._text_transparency_slider.sliderReleased.connect(
+            lambda: self._emit_text_style(commit=True)
+        )
+        style_row.addWidget(self._text_transparency_slider, 1)
+        self._text_transparency_label = QLabel("50%")
+        self._text_transparency_label.setMinimumWidth(36)
+        style_row.addWidget(self._text_transparency_label)
+        text_layout.addLayout(style_row)
+        panel_layout.addWidget(text_group)
+        self._refresh_text_color_button()
+
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
         panel_layout.addWidget(self._progress_bar)
@@ -155,6 +199,55 @@ class OcrPanel(QFrame):
         self._toggle_btn.hide()
         if not self._is_open:
             self.setFixedWidth(0)
+
+    # 認識文字の表示設定 ---------------------------------------------------
+    def set_text_style(
+        self, visible: bool, color: "tuple[float, float, float]", transparency: int
+    ) -> None:
+        """設定値をUIへ反映する(シグナルは出さない)。"""
+        self._text_color = (float(color[0]), float(color[1]), float(color[2]))
+        widgets = (self._text_visible_check, self._text_transparency_slider)
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self._text_visible_check.setChecked(bool(visible))
+            self._text_transparency_slider.setValue(max(0, min(100, int(transparency))))
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+        self._text_transparency_label.setText(f"{self._text_transparency_slider.value()}%")
+        self._refresh_text_color_button()
+
+    def text_style(self) -> "tuple[bool, tuple[float, float, float], int]":
+        return (
+            self._text_visible_check.isChecked(),
+            self._text_color,
+            int(self._text_transparency_slider.value()),
+        )
+
+    def _refresh_text_color_button(self) -> None:
+        r, g, b = (max(0, min(255, round(c * 255))) for c in self._text_color)
+        self._text_color_btn.setStyleSheet(
+            f"background-color: rgb({r}, {g}, {b}); border: 1px solid palette(mid);"
+        )
+
+    def _emit_text_style(self, *_args, commit: bool = True) -> None:
+        visible, color, transparency = self.text_style()
+        self.text_style_changed.emit(visible, color, transparency, bool(commit))
+
+    def _on_text_color_clicked(self) -> None:
+        r, g, b = (max(0, min(255, round(c * 255))) for c in self._text_color)
+        chosen = QColorDialog.getColor(QColor(r, g, b), self, "認識した文字の色")
+        if not chosen.isValid():
+            return
+        self._text_color = (chosen.redF(), chosen.greenF(), chosen.blueF())
+        self._refresh_text_color_button()
+        self._emit_text_style()
+
+    def _on_text_transparency_value(self, value: int) -> None:
+        self._text_transparency_label.setText(f"{value}%")
+        # ドラッグ中は画面へ即時反映のみ。キーボード/クリックでの変更は即確定。
+        self._emit_text_style(commit=not self._text_transparency_slider.isSliderDown())
 
     def set_available(self, available: bool) -> None:
         """OCRの依存が導入済みか。未導入なら実行ボタンを無効にして案内を出す。"""

@@ -52,6 +52,7 @@ from src.utils.pdf_utils import (
     TextMarkupAnnotData,
     NoteAnnotData,
 )
+from src.views.ocr_overlay import paint_ocr_lines
 from src.utils.constants import (
     FREETEXT_LINE_HEIGHT,
     FREETEXT_TEXT_INSET_PT,
@@ -656,6 +657,11 @@ class ZoomPageWidget(QWidget):
         self._pii_mask_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._pii_mask_opacity: float = 0.3
         self._pii_hidden_entities: frozenset[str] = frozenset()
+        # OCRで認識した文字の重ね描き(表示専用)。行ごとの(テキスト, PDF座標の矩形)と
+        # 色(RGB 0.0-1.0)・不透明度。PDFの内容は変えない(src.views.ocr_overlay)。
+        self._ocr_lines: list[tuple[str, tuple[float, float, float, float]]] = []
+        self._ocr_text_color: tuple[float, float, float] = (1.0, 0.0, 0.0)
+        self._ocr_text_opacity: float = 0.0
         # 校正コールアウト配置モード（クリックで挿入位置を指定）。
         self._callout_create_mode = False
         # マークアップ/消しゴムの連続モード。有効時は注釈のヒットテスト・リンク操作を
@@ -2108,6 +2114,7 @@ class ZoomPageWidget(QWidget):
         if self._pixmap and not self._pixmap.isNull():
             offset = self._pixmap_offset()
             painter.drawPixmap(offset, self._pixmap)
+            self._paint_ocr_overlay(painter, offset)
 
             if self._search_hit_rects:
                 painter.setPen(Qt.PenStyle.NoPen)
@@ -2590,6 +2597,41 @@ class ZoomPageWidget(QWidget):
         self._pii_mask_color = color
         self._pii_mask_opacity = opacity
         self.update()
+
+    def set_ocr_overlay(
+        self,
+        lines: "list[tuple[str, tuple[float, float, float, float]]]",
+        color: "tuple[float, float, float]",
+        opacity: float,
+    ) -> None:
+        """認識したOCR文字の重ね描きを設定する。
+
+        ``lines`` は (テキスト, (x0, y0, x1, y1) PDF座標の行矩形)。``opacity`` が0
+        (または ``lines`` が空)なら何も描かない。色・不透明度を変えるだけならこれを
+        呼び直せばよく、再OCRやPDFの書き換えは要らない。
+        """
+        self._ocr_lines = [(str(t), tuple(float(v) for v in r)) for t, r in lines]
+        self._ocr_text_color = (float(color[0]), float(color[1]), float(color[2]))
+        self._ocr_text_opacity = max(0.0, min(1.0, float(opacity)))
+        self.update()
+
+    def _paint_ocr_overlay(self, painter: QPainter, offset: QPoint) -> None:
+        if not self._ocr_lines or self._ocr_text_opacity <= 0.0:
+            return
+        scale = self._zoom_factor
+        widget_lines = [
+            (
+                text,
+                QRectF(
+                    offset.x() + x0 * scale,
+                    offset.y() + y0 * scale,
+                    (x1 - x0) * scale,
+                    (y1 - y0) * scale,
+                ),
+            )
+            for text, (x0, y0, x1, y1) in self._ocr_lines
+        ]
+        paint_ocr_lines(painter, widget_lines, self._ocr_text_color, self._ocr_text_opacity)
 
     def _pii_hidden(self, annot) -> bool:
         """パネルでチェックが外れた種別の塗りつぶし候補/図形か(描画・ヒットテストの対象外)。"""
