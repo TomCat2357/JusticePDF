@@ -77,9 +77,9 @@ def test_original_span_returns_page_text_not_normalized_text():
     assert original_span("abc", "abcd", 0, 3, "abc") == "abc"
 
 
-def test_excluded_words_and_entity_exclusions_match_normalized_detections():
+def test_anchored_exclusion_patterns_and_entity_exclusions_match_normalized_detections():
     cm = ConfigManager(
-        {"exclusions": {"excluded_words": ["０９０－１２３４－５６７８"], "entity_exclusions": {"PERSON": ["ＡＢＣ"]}}}
+        {"exclusions": {"text_exclusions_regex": ["^０９０－１２３４－５６７８$"], "entity_exclusions": {"PERSON": ["ＡＢＣ"]}}}
     )
     assert cm.is_entity_excluded("PHONE_NUMBER", "090-1234-5678") is True  # 正規化後の検出語
     assert cm.is_entity_excluded("PERSON", "ABC") is True

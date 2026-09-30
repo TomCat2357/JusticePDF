@@ -293,14 +293,14 @@ function Install-ProjectDeps([string]$VenvPython)
     $oldTmp = [Environment]::GetEnvironmentVariable("TMP", "Process")
     $oldTemp = [Environment]::GetEnvironmentVariable("TEMP", "Process")
 
-    Write-Info "Installing project (editable) and deps from pyproject.toml..."
+    Write-Info "Installing project (editable) and deps (including the ocr extra) from pyproject.toml..."
     Write-Info ("Temporary pip dir: " + $pipTempDir)
     try
     {
         Set-EnvVar "TMP" $pipTempDir
         Set-EnvVar "TEMP" $pipTempDir
 
-        & $VenvPython -m pip install -e . | Out-Host
+        & $VenvPython -m pip install -e ".[ocr]" | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "Failed to install project dependencies." }
     } finally
     {

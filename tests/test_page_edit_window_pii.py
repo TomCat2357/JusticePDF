@@ -10,7 +10,7 @@ import fitz
 import pytest
 
 from src.models.undo_manager import UndoManager
-from src.pii.settings import PiiSettings
+from src.pii.settings import PiiSettings, exact_match_pattern, pattern_key
 from src.utils.pdf_utils import list_pii_markup_annots
 from src.views import page_edit_pii as page_edit_pii_module
 from src.views.page_edit_window import PageEditWindow
@@ -65,7 +65,7 @@ def _stub_detect_scope(window, scope: str):
 
 
 def _stub_exclude_scope(window, scope: str):
-    """「除外語に追加」の範囲選択ダイアログ(``_ask_pii_exclude_scope``)のスタブ。"""
+    """「除外パターンに追加」の範囲選択ダイアログ(``_ask_pii_exclude_scope``)のスタブ。"""
     calls: list[str] = []
 
     def fake(text):
@@ -306,7 +306,7 @@ def test_keep_existing_detect_does_not_duplicate_or_remove_prior_results(qtbot, 
 
 
 # ---------------------------------------------------------------------------
-# 結果一覧の右クリック「検出語に追加」「除外語に追加」
+# 結果一覧の右クリック「検出語に追加」「除外パターンに追加」
 # ---------------------------------------------------------------------------
 
 
@@ -415,7 +415,7 @@ def test_add_detect_word_uses_chosen_entity(qtbot, monkeypatch, tmp_path):
 
 
 def test_add_detect_word_removes_identical_exclusions_everywhere(qtbot, monkeypatch, tmp_path):
-    """同じ語句の除外(除外語・種別別・除外パターン)は検出語登録時に取り除く。他の語句は残す。"""
+    """同じ語句の除外(種別別・除外パターン)は検出語登録時に取り除く。他の語句は残す。"""
     pdf_path = tmp_path / "pii-detect-word-drop-exclusion.pdf"
     _make_job_title_pdf(pdf_path)
     window = _create_window(qtbot, pdf_path)
@@ -425,7 +425,6 @@ def test_add_detect_word_removes_identical_exclusions_everywhere(qtbot, monkeypa
 
     word = "山田(仮)"  # 正規表現の記号を含む(re.escape で変わる)語句
     settings = window._pii_settings().copy()
-    settings.excluded_words = [word, "残る除外語"]
     settings.entity_exclusions = {
         "PERSON": [word, "別語"],
         "LOCATION": [word],
@@ -439,10 +438,10 @@ def test_add_detect_word_removes_identical_exclusions_everywhere(qtbot, monkeypa
     window._on_pii_add_detect_word("PERSON", word)
 
     for current in (window._pii_settings(), PiiSettings.load()):
-        assert current.excluded_words == ["残る除外語"]
         assert current.entity_exclusions == {"PERSON": ["別語"], "OTHER": ["残る語"]}
         assert current.text_exclusions_regex == [r"\d+"]
         assert ("PERSON", re.escape(word)) in current.additional_patterns
+        assert pattern_key("PERSON", re.escape(word)) in current.additional_patterns_added_at
 
 
 def test_detect_word_scan_respects_remaining_exclusions(qtbot, monkeypatch, tmp_path):
@@ -454,7 +453,7 @@ def test_detect_word_scan_respects_remaining_exclusions(qtbot, monkeypatch, tmp_
     window._toggle_pii_drawer()
     _silence_message_boxes(monkeypatch)
     settings = window._pii_settings().copy()
-    settings.excluded_words = ["公務員"]
+    settings.add_exclusion(exact_match_pattern("公務員"))
     window._pii_settings_cache = settings
 
     window._run_pattern_only_detection("PERSON", re.escape("公務員"), [0])
@@ -479,7 +478,7 @@ def test_ask_detect_and_exclude_scope_factories_use_scope_dialog(qtbot, monkeypa
     assert window._ask_pii_exclude_scope("語") == "page"
     assert seen[0] == ("検出語に追加", "語", ("全ページで検出", "このページだけ検出", "検出しない"), window)
     assert seen[1] == (
-        "除外語に追加",
+        "除外パターンに追加",
         "語",
         ("全ページの検出済みを削除", "このページだけ削除", "削除しない"),
         window,
@@ -502,8 +501,9 @@ def test_add_exclude_word_registers_without_touching_detect_words(qtbot, monkeyp
     window._on_pii_add_exclude_word("公務員")
 
     for current in (window._pii_settings(), PiiSettings.load()):
-        assert current.excluded_words == ["公務員"]
-        # 除外語の追加では検出語(追加パターン)から外さない(除外が優先されるだけ)。
+        assert current.text_exclusions_regex == [exact_match_pattern("公務員")]
+        assert exact_match_pattern("公務員") in current.text_exclusions_added_at  # 追加日時を記録
+        # 除外パターンの追加では検出語(検出パターン)から外さない(除外が優先されるだけ)。
         assert current.additional_patterns == [("PERSON", "公務員")]
     assert calls == ["公務員"]
 
@@ -557,7 +557,7 @@ def test_add_exclude_word_deletes_detected_all_pages_except_manual_one_undo(
 
     remaining = [(a.page_num, a.pii_entity, a.pii_text) for a in list_pii_markup_annots(str(pdf_path))]
     assert sorted(remaining) == [(0, "PERSON", "KEEPME"), (1, "MANUAL", "SECRET")]
-    assert window._pii_settings().excluded_words == ["SECRET"]
+    assert window._pii_settings().text_exclusions_regex == [exact_match_pattern("SECRET")]
     assert window._undo_manager.undo_count() == undo_depth + 1  # Undoは1回分
 
     window._undo_manager.undo()
@@ -579,7 +579,7 @@ def test_add_exclude_word_deletes_only_current_page_when_page_scope(qtbot, monke
 
     remaining = [(a.page_num, a.pii_text) for a in list_pii_markup_annots(str(pdf_path))]
     assert remaining == [(1, "SECRET")]
-    assert window._pii_settings().excluded_words == ["SECRET"]
+    assert window._pii_settings().text_exclusions_regex == [exact_match_pattern("SECRET")]
 
 
 def test_add_exclude_word_none_scope_keeps_existing_results(qtbot, monkeypatch, tmp_path):
@@ -595,13 +595,13 @@ def test_add_exclude_word_none_scope_keeps_existing_results(qtbot, monkeypatch, 
     window._on_pii_add_exclude_word("SECRET")
 
     assert len(list_pii_markup_annots(str(pdf_path))) == 1
-    assert window._pii_settings().excluded_words == ["SECRET"]
+    assert window._pii_settings().text_exclusions_regex == [exact_match_pattern("SECRET")]
     # 同じ語を再度追加しても二重登録しない。
     window._on_pii_add_exclude_word("SECRET")
-    assert window._pii_settings().excluded_words == ["SECRET"]
+    assert window._pii_settings().text_exclusions_regex == [exact_match_pattern("SECRET")]
 
 
-def test_add_detect_word_after_exclude_removes_it_from_excluded_words(qtbot, monkeypatch, tmp_path):
+def test_add_detect_word_after_exclude_removes_it_from_exclusion_patterns(qtbot, monkeypatch, tmp_path):
     pdf_path = tmp_path / "pii-exclude-then-detect.pdf"
     _make_job_title_pdf(pdf_path)
     window = _create_window(qtbot, pdf_path)
@@ -612,11 +612,11 @@ def test_add_detect_word_after_exclude_removes_it_from_excluded_words(qtbot, mon
     _stub_detect_scope(window, ScopeChoiceDialog.SCOPE_PAGE)
 
     window._on_pii_add_exclude_word("公務員")
-    assert window._pii_settings().excluded_words == ["公務員"]
+    assert window._pii_settings().text_exclusions_regex == [exact_match_pattern("公務員")]
 
     window._on_pii_add_detect_word("PERSON", "公務員")
 
-    assert window._pii_settings().excluded_words == []
+    assert window._pii_settings().text_exclusions_regex == []
     assert any(a.pii_text == "公務員" for a in list_pii_markup_annots(str(pdf_path)))
 
 

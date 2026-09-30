@@ -1400,6 +1400,44 @@ class ZoomPageWidget(QWidget):
         """
         return self._quads_for_char_indices(self._selected_char_indices)
 
+    def _glyph_indices_of_selection(self) -> list[int]:
+        """選択中の文字から、各行の先頭・末尾の空白類を除いた添字を返す。
+
+        空白類は ``str.strip()`` が空白とみなす文字(半角/全角スペース U+3000、
+        タブ、改行、NBSP など)。行の途中の空白は語句の一部なので残す。
+        """
+        ordered = sorted(i for i in self._selected_char_indices if 0 <= i < len(self._chars))
+        by_line: dict = {}
+        order: list = []
+        for idx in ordered:
+            key = self._chars[idx].get("line_id")
+            if key not in by_line:
+                by_line[key] = []
+                order.append(key)
+            by_line[key].append(idx)
+        kept: list[int] = []
+        for key in order:
+            run = by_line[key]
+            start, end = 0, len(run)
+            while start < end and not self._chars[run[start]].get("c", "").strip():
+                start += 1
+            while end > start and not self._chars[run[end - 1]].get("c", "").strip():
+                end -= 1
+            kept.extend(run[start:end])
+        return kept
+
+    def selected_glyph_quads(self) -> list[tuple[float, float, float, float]]:
+        """``selected_markup_quads`` と同じだが、各行の先頭・末尾の空白類の範囲は含めない。"""
+        return self._quads_for_char_indices(self._glyph_indices_of_selection())
+
+    def selected_glyph_text(self) -> str:
+        """``selected_text`` と同じだが、各行の先頭・末尾の空白類を除く(行間の改行は残す)。"""
+        from src.pii.pdf_text_map import join_chars_reading_order
+
+        return join_chars_reading_order(
+            [self._chars[i] for i in self._glyph_indices_of_selection()]
+        )
+
     def selected_text(self) -> str:
         """Return the plain text (reading order) of the current char selection.
 

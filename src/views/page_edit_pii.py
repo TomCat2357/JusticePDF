@@ -32,7 +32,7 @@ from src.pii.entity_types import (
 )
 from src.pii.engines import ENGINE_KEYS
 from src.pii.pdf_text_map import text_under_ellipse, text_under_rect
-from src.pii.settings import PiiSettings
+from src.pii.settings import PiiSettings, exact_match_pattern
 from src.pii.text_normalize import normalize_1to1
 from src.views.page_edit_annotations import CreateMode, _AnnotRef
 from src.utils.pdf_utils import (
@@ -507,14 +507,16 @@ class PiiDrawerMixin:
         """
         if self._zoom_page_num is None or self._zoom_label is None:
             return
-        quads = self._zoom_label.selected_markup_quads()
+        # 選択範囲の行頭・行末の空白/改行(全角スペース含む)は候補に含めない。
+        # 含めると語句に改行が混ざって結果一覧の行が縦に伸び、塗りつぶしも空白部分に及ぶ。
+        quads = self._zoom_label.selected_glyph_quads()
         if not quads:
             self._flash_zoom_hint("塗りつぶし候補にするテキストを選択してください")
             return
         # OCRで埋め込んだ文字を選択した場合は、自動検出と同じくOCRの位置誤差を見込んだ
         # 余白ぶん広げる(通常のテキストの quad はそのまま)。
         quads = expand_quads_for_ocr(self._pdf_path, self._zoom_page_num, list(quads))
-        matched_text = self._zoom_label.selected_text()
+        matched_text = self._zoom_label.selected_glyph_text()
         settings = self._pii_settings()
         self._sync_pii_annot_style_registry()
         template = TextMarkupAnnotData(
@@ -721,16 +723,16 @@ class PiiDrawerMixin:
         self._push_undoable(description, do_delete, undo_delete)
 
     # ------------------------------------------------------------------
-    # 結果一覧の右クリックメニュー: 除外語に追加 / 検出語に追加
+    # 結果一覧の右クリックメニュー: 除外パターンに追加 / 検出語に追加
     # ------------------------------------------------------------------
     def _ask_pii_exclude_scope(self, text: str) -> str:
-        """「除外語に追加」の後の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
+        """「除外パターンに追加」の後の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
 
         テストからはこのメソッドを差し替えてモーダル表示を避ける。
         """
         return ScopeChoiceDialog.ask(
-            "除外語に追加",
-            "除外語に追加しました(今後の検出から除外されます)。\n"
+            "除外パターンに追加",
+            "除外パターンに追加しました(今後の検出から除外されます)。\n"
             "すでに検出済みのこの語句の結果を削除しますか?(手動で追加した分は削除しません)",
             text,
             ("全ページの検出済みを削除", "このページだけ削除", "削除しない"),
@@ -755,10 +757,10 @@ class PiiDrawerMixin:
     def _drop_exclusions_for_text(settings: PiiSettings, text: str) -> bool:
         """``text`` を検出語へ追加するとき、同じ語句の除外設定をすべて取り除く。
 
-        除外語(``excluded_words``)・種別別の除外語(``entity_exclusions``。空に
-        なったリストは項目ごと消す)・除外パターン(``text_exclusions_regex`` の
-        ``re.escape(text)`` および ``^re.escape(text)$``)から外す。除外が追加より
-        優先されるため、残っていると追加した語句が検出されなくなってしまう。
+        種別別の除外語(``entity_exclusions``。空になったリストは項目ごと消す)・
+        除外パターン(``text_exclusions_regex`` の ``re.escape(text)`` および
+        ``^re.escape(text)$``)から外す。除外パターンが検出パターンより優先される
+        ため、残っていると追加した語句が検出されなくなってしまう。
         何か取り除いたら True。
         """
         removed = False
@@ -766,12 +768,6 @@ class PiiDrawerMixin:
         # 検出は全角→半角へ1文字ずつ揃えた文字列に対して行われるため、元の表記と
         # 正規化後の表記のどちらで登録されていても同じ語句として扱う。
         variants = {text, target, normalize_1to1(text), normalize_1to1(target)}
-        kept_words = [
-            w for w in settings.excluded_words if w.strip() not in variants
-        ]
-        if len(kept_words) != len(settings.excluded_words):
-            settings.excluded_words = kept_words
-            removed = True
         for key in list(settings.entity_exclusions):
             words = settings.entity_exclusions[key]
             if any(w in variants for w in words):
@@ -792,17 +788,17 @@ class PiiDrawerMixin:
         return removed
 
     def _on_pii_add_exclude_word(self, text: str) -> None:
-        """右クリック「除外語に追加」。
+        """右クリック「除外パターンに追加」。
 
-        語句を除外語に登録し(追加パターン=検出語には触れない)、範囲を選ばせて、
+        語句を完全一致の除外パターン(``^語句$``、記号はエスケープ)に登録し
+        (検出パターン=検出語には触れない)、範囲を選ばせて、
         すでに検出済みの同じ語句の結果(手動追加分を除く)をまとめて削除する
         (Undo は1回分)。
         """
         if not text or not text.strip():
             return
         settings = self._pii_settings().copy()
-        if text.strip() not in {w.strip() for w in settings.excluded_words}:
-            settings.excluded_words.append(text.strip())
+        if settings.add_exclusion(exact_match_pattern(text)):
             settings.save()
             self._pii_settings_cache = settings
 
@@ -822,7 +818,7 @@ class PiiDrawerMixin:
             and (page_filter is None or r.page_num == page_filter)
         ]
         if targets:
-            self._remove_mask_targets(targets, f"除外語「{text.strip()}」の検出済みを削除")
+            self._remove_mask_targets(targets, f"除外パターン「{text.strip()}」の検出済みを削除")
 
     def _on_pii_add_detect_word(self, entity: str, text: str) -> None:
         """右クリック「検出語に追加」(種別はサブメニューで選択済み)。
@@ -839,9 +835,7 @@ class PiiDrawerMixin:
         pattern = re.escape(normalize_1to1(text))
         settings = self._pii_settings().copy()
         entry = (entity, pattern)
-        added = entry not in settings.additional_patterns
-        if added:
-            settings.additional_patterns.append(entry)
+        added = settings.add_additional_pattern(*entry)
         removed_exclusion = self._drop_exclusions_for_text(settings, text)
         if added or removed_exclusion:
             settings.save()
@@ -880,7 +874,6 @@ class PiiDrawerMixin:
             additional_patterns=[(entity, pattern)],
             text_exclusions_regex=list(current.text_exclusions_regex),
             entity_exclusions={k: list(v) for k, v in current.entity_exclusions.items()},
-            excluded_words=list(current.excluded_words),
             enabled_engines={key: False for key in ENGINE_KEYS},
             dedupe_enabled=False,
         )

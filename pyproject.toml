@@ -25,6 +25,8 @@ dependencies = [
 ocr = [
     "rapidocr>=3.8.1",
     "onnxruntime>=1.22.0",
+    # src/ocr/base.py が画像の白塗り(既存テキスト部分の消去)に使う。
+    "Pillow>=10.0.0",
 ]
 
 [build-system]

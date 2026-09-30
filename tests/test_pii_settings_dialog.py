@@ -26,7 +26,7 @@ def test_entities_tab_removed_and_entity_settings_preserved(qtbot):
     tabs = dialog.findChild(QTabWidget)
     titles = [tabs.tabText(i) for i in range(tabs.count())]
     assert "検出対象・色" not in titles
-    assert titles == ["検出エンジン", "除外・追加パターン", "重複除去", "OCR"]
+    assert titles == ["検出エンジン", "除外・検出パターン", "重複除去", "OCR"]
     assert not hasattr(dialog, "_entity_checks")
     assert not hasattr(dialog, "_entity_color_btns")
 
@@ -48,7 +48,7 @@ def test_add_and_remove_additional_pattern(qtbot):
     result = dialog.result_settings()
     assert (dialog._pattern_entity_combo.currentData(), r"社員番号[0-9]{4}") in result.additional_patterns
 
-    dialog._pattern_list.setCurrentRow(0)
+    dialog._pattern_table.selectRow(0)
     dialog._on_remove_pattern()
     result_after_remove = dialog.result_settings()
     assert result_after_remove.additional_patterns == []
@@ -105,28 +105,200 @@ def test_dedupe_options_round_trip(qtbot):
     assert result.dedupe_overlap == "exact"
 
 
-def test_excluded_words_editor_add_and_remove(qtbot):
+def _texts(table, col):
+    return [table.item(r, col).text() for r in range(table.rowCount())]
+
+
+def _select(table, rows):
+    from PyQt6.QtCore import QItemSelectionModel
+
+    table.clearSelection()
+    model = table.selectionModel()
+    for r in rows:
+        model.select(
+            table.model().index(r, 0),
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+        )
+
+
+def test_excluded_words_section_removed(qtbot):
+    from PyQt6.QtWidgets import QLabel
+
+    dialog = PiiSettingsDialog(PiiSettings())
+    qtbot.addWidget(dialog)
+    assert not hasattr(dialog, "_excluded_words_list")
+    labels = " ".join(lb.text() for lb in dialog.findChildren(QLabel))
+    assert "除外語" not in labels
+    assert "検出パターン" in labels and "追加検出パターン" not in labels
+
+
+def test_exclusion_table_columns_add_and_persist_timestamp(qtbot):
     settings = PiiSettings()
-    settings.excluded_words = ["既存語"]
+    settings.text_exclusions_regex = ["旧パターン"]  # 追加日時なし(旧形式)
     dialog = PiiSettingsDialog(settings)
     qtbot.addWidget(dialog)
-    assert [dialog._excluded_words_list.item(i).text() for i in range(dialog._excluded_words_list.count())] == ["既存語"]
+    table = dialog._exclusion_table
+    assert [table.horizontalHeaderItem(i).text() for i in range(2)] == ["パターン", "追加日時"]
+    assert _texts(table, 1) == [""]  # 日時なしは空欄
 
-    row = dialog._excluded_words_list.parentWidget().layout()
-    # 追加/削除行(最初の QLineEdit と、その隣の「追加」「削除」ボタン)を探す。
-    from PyQt6.QtWidgets import QLineEdit, QPushButton
-
-    edits = [w for w in dialog.findChildren(QLineEdit) if w.placeholderText() == "除外語を入力"]
-    assert len(edits) == 1
-    edits[0].setText("追加語")
-    add_btn = [b for b in dialog.findChildren(QPushButton) if b.text() == "追加"][0]
-    add_btn.click()  # 最初の「追加」ボタン=除外語の行
+    dialog._exclusion_edit.setText("新パターン")
+    dialog._on_add_exclusion()
+    assert _texts(table, 0) == ["旧パターン", "新パターン"]
+    assert len(_texts(table, 1)[1]) == len("2026-09-30 11:23")
     result = dialog.result_settings()
-    assert result.excluded_words == ["既存語", "追加語"]
-    # 元のオブジェクトは変更されない(ダイアログはコピー上で編集する)。
-    assert settings.excluded_words == ["既存語"]
+    assert result.text_exclusions_regex == ["旧パターン", "新パターン"]
+    assert "新パターン" in result.text_exclusions_added_at
+    assert "旧パターン" not in result.text_exclusions_added_at
+    # 元のオブジェクトは変更されない
+    assert settings.text_exclusions_regex == ["旧パターン"]
 
-    dialog._excluded_words_list.setCurrentRow(0)
+
+def test_pattern_table_columns_and_timestamp(qtbot):
+    from src.pii.settings import pattern_key
+
+    settings = PiiSettings()
+    settings.additional_patterns = [("PERSON", "山田")]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._pattern_table
+    assert [table.horizontalHeaderItem(i).text() for i in range(3)] == ["種類", "パターン", "追加日時"]
+    assert _texts(table, 1) == ["山田"] and _texts(table, 2) == [""]
+    dialog._pattern_regex_edit.setText("鈴木")
+    dialog._on_add_pattern()
+    assert _texts(table, 1) == ["山田", "鈴木"]
+    assert _texts(table, 2)[1] != ""
+    result = dialog.result_settings()
+    key = pattern_key(dialog._pattern_entity_combo.currentData(), "鈴木")
+    assert key in result.additional_patterns_added_at
+
+
+def test_tables_are_read_only_row_multi_select(qtbot):
+    from PyQt6.QtWidgets import QAbstractItemView
+
+    dialog = PiiSettingsDialog(PiiSettings())
+    qtbot.addWidget(dialog)
+    for table in (dialog._exclusion_table, dialog._pattern_table):
+        assert table.selectionMode() == QAbstractItemView.SelectionMode.ExtendedSelection
+        assert table.selectionBehavior() == QAbstractItemView.SelectionBehavior.SelectRows
+        assert table.editTriggers() == QAbstractItemView.EditTrigger.NoEditTriggers
+        assert table.isSortingEnabled()
+
+
+def test_exclusion_table_multi_delete_button_and_delete_key(qtbot):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QPushButton
+
+    settings = PiiSettings()
+    settings.text_exclusions_regex = ["a", "b", "c", "d", "e"]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._exclusion_table
+    _select(table, [0, 2, 4])
     remove_btn = [b for b in dialog.findChildren(QPushButton) if b.text() == "削除"][0]
     remove_btn.click()
-    assert dialog.result_settings().excluded_words == ["追加語"]
+    assert _texts(table, 0) == ["b", "d"]
+    assert dialog.result_settings().text_exclusions_regex == ["b", "d"]
+
+    _select(table, [0, 1])
+    qtbot.keyClick(table, Qt.Key.Key_Delete)
+    assert table.rowCount() == 0
+    assert dialog.result_settings().text_exclusions_regex == []
+
+
+def test_pattern_table_multi_delete_button_and_delete_key(qtbot):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QPushButton
+
+    settings = PiiSettings()
+    settings.additional_patterns = [
+        ("PERSON", "a"), ("LOCATION", "b"), ("PERSON", "c"), ("PERSON", "d"),
+    ]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._pattern_table
+    _select(table, [0, 1, 3])
+    remove_btn = [b for b in dialog.findChildren(QPushButton) if b.text() == "削除"][1]
+    remove_btn.click()
+    assert _texts(table, 1) == ["c"]
+    assert dialog.result_settings().additional_patterns == [("PERSON", "c")]
+    _select(table, [0])
+    qtbot.keyClick(table, Qt.Key.Key_Delete)
+    assert dialog.result_settings().additional_patterns == []
+
+
+def test_ctrl_a_selects_all_rows(qtbot):
+    from PyQt6.QtCore import Qt
+
+    settings = PiiSettings()
+    settings.text_exclusions_regex = ["a", "b", "c"]
+    settings.additional_patterns = [("PERSON", "x"), ("PERSON", "y")]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    for table, n in ((dialog._exclusion_table, 3), (dialog._pattern_table, 2)):
+        table.clearSelection()
+        table.setFocus()
+        qtbot.keyClick(table, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        assert len(table.selectionModel().selectedRows()) == n
+
+
+def test_sort_then_delete_removes_the_right_entry(qtbot):
+    from PyQt6.QtCore import Qt
+
+    settings = PiiSettings()
+    settings.text_exclusions_regex = ["b", "c", "a"]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._exclusion_table
+    table.sortItems(0, Qt.SortOrder.AscendingOrder)
+    assert _texts(table, 0) == ["a", "b", "c"]
+    table.sortItems(0, Qt.SortOrder.DescendingOrder)
+    assert _texts(table, 0) == ["c", "b", "a"]
+    _select(table, [0])  # 並べ替え後の先頭 = "c"
+    dialog._on_remove_exclusion()
+    assert dialog.result_settings().text_exclusions_regex == ["b", "a"]
+
+
+def test_sort_by_added_at_uses_datetime_not_display_string(qtbot):
+    from PyQt6.QtCore import Qt
+
+    settings = PiiSettings()
+    settings.text_exclusions_regex = ["late", "none", "early", "mid"]
+    settings.text_exclusions_added_at = {
+        "late": "2026-09-30T11:23:45",
+        "early": "2025-01-02T03:04:05",
+        "mid": "2026-09-30T09:00:00",
+    }
+    settings.additional_patterns = [("PERSON", "p1"), ("PERSON", "p2"), ("PERSON", "p3")]
+    settings.additional_patterns_added_at = {
+        "PERSON\tp1": "2026-02-01T00:00:00",
+        "PERSON\tp3": "2026-01-01T00:00:00",
+    }
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    table = dialog._exclusion_table
+    table.sortItems(1, Qt.SortOrder.AscendingOrder)
+    assert _texts(table, 0) == ["none", "early", "mid", "late"]  # 日時なしは最古扱い
+    table.sortItems(1, Qt.SortOrder.DescendingOrder)
+    assert _texts(table, 0) == ["late", "mid", "early", "none"]
+    ptable = dialog._pattern_table
+    ptable.sortItems(2, Qt.SortOrder.AscendingOrder)
+    assert _texts(ptable, 1) == ["p2", "p3", "p1"]
+
+
+def test_header_click_toggles_sort_order(qtbot):
+    from PyQt6.QtCore import QPoint, Qt
+
+    settings = PiiSettings()
+    settings.text_exclusions_regex = ["b", "a", "c"]
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    table = dialog._exclusion_table
+    header = table.horizontalHeader()
+    pos = QPoint(10, header.height() // 2)
+    qtbot.mouseClick(header.viewport(), Qt.MouseButton.LeftButton, pos=pos)
+    first = _texts(table, 0)
+    qtbot.mouseClick(header.viewport(), Qt.MouseButton.LeftButton, pos=pos)
+    second = _texts(table, 0)
+    assert first == ["a", "b", "c"]
+    assert second == ["c", "b", "a"]
