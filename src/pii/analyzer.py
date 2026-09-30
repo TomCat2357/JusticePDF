@@ -390,13 +390,10 @@ class Analyzer:
         """エンティティタイプに応じてテキスト境界を調整"""
         import re
 
-        if entity_type == "PERSON":
-            refined = re.sub(r"[0-9\-\s]*", "", entity_text).strip()
-            if refined:
-                return refined
-
-        elif entity_type == "LOCATION":
-            refined = re.sub(r"[0-9\-\s]*", "", entity_text).strip()
+        if entity_type in ("PERSON", "LOCATION"):
+            # 端の数字・ハイフン・空白だけを除く。内部の空白(「姓　名」)は残し、
+            # テキストとオフセット長が食い違わない(quad 計算が1対1前提)ようにする。
+            refined = re.sub(r"^[0-9\-\s]+|[0-9\-\s]+$", "", entity_text)
             if refined:
                 return refined
 
