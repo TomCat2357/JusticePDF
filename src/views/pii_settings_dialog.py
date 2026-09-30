@@ -44,7 +44,13 @@ from PyQt6.QtWidgets import (
 from src.ocr import is_ocr_available
 from src.pii.engines import ENGINES, is_engine_available
 from src.pii.entity_types import ENTITY_TYPES, get_entity_type_name_ja
-from src.pii.settings import PiiSettings, format_added_at, parse_added_at, pattern_key
+from src.pii.settings import (
+    WHITESPACE_MODES,
+    PiiSettings,
+    format_added_at,
+    parse_added_at,
+    pattern_key,
+)
 from src.views.view_helpers import build_accept_cancel_box
 
 _SORT_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -294,6 +300,22 @@ class PiiSettingsDialog(QDialog):
         pattern_row.addWidget(remove_pattern_btn)
         layout.addLayout(pattern_row)
 
+        whitespace_row = QHBoxLayout()
+        whitespace_row.addWidget(QLabel("登録時の空白の扱い:"))
+        self._whitespace_mode_combo = QComboBox()
+        for key, label in WHITESPACE_MODES:
+            self._whitespace_mode_combo.addItem(label, key)
+        self._set_combo_value(
+            self._whitespace_mode_combo, self._settings.pattern_whitespace_mode
+        )
+        self._whitespace_mode_combo.setToolTip(
+            "右クリックメニューから語句を検出パターン・除外パターンに追加するとき、\n"
+            "語句の中の空白(半角・全角・改行)をどう扱うパターンにするかを選びます。\n"
+            "この一覧から手入力で追加するパターンには影響しません。"
+        )
+        whitespace_row.addWidget(self._whitespace_mode_combo, 1)
+        layout.addLayout(whitespace_row)
+
         return widget
 
     def _on_add_exclusion(self) -> None:
@@ -486,6 +508,7 @@ class PiiSettingsDialog(QDialog):
         self._settings.dedupe_enabled = self._dedupe_enabled_check.isChecked()
         self._settings.dedupe_overlap = self._dedupe_overlap_combo.currentData()
         self._settings.dedupe_keep = self._dedupe_keep_combo.currentData()
+        self._settings.pattern_whitespace_mode = self._whitespace_mode_combo.currentData()
         self._settings.ocr_enabled = self._ocr_enabled_check.isChecked()
         self._settings.ocr_dpi = self._ocr_dpi_spin.value()
         self._settings.prune_added_at()

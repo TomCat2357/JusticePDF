@@ -54,13 +54,55 @@ def pattern_key(entity_type: str, regex: str) -> str:
     return entity_type + "\t" + regex
 
 
-def exact_match_pattern(text: str) -> str:
-    """語句そのものに完全一致する除外パターン(``^語句$``、記号はエスケープ済み)を返す。
+# 右クリックから語句を検出/除外パターンへ登録するときの空白の扱い(キー, 表示名)。
+# 既定は ``optional``。``literal_to_pattern`` が各キーを正規表現へ変換する。
+WHITESPACE_MODES: tuple[tuple[str, str], ...] = (
+    ("literal", "そのまま(完全一致)"),
+    ("optional", "空白の有無を問わない"),
+    ("flexible", "空白の種類・個数を問わない(空白必須)"),
+    ("any_gap", "すべての文字の間で空白を許す"),
+)
+DEFAULT_WHITESPACE_MODE = "optional"
+_WHITESPACE_MODE_KEYS = tuple(key for key, _ in WHITESPACE_MODES)
+
+
+def normalize_whitespace_mode(value) -> str:
+    """不正な空白モードは既定値(``optional``)にする。"""
+    value = str(value or "")
+    return value if value in _WHITESPACE_MODE_KEYS else DEFAULT_WHITESPACE_MODE
+
+
+def literal_to_pattern(text: str, mode: str = DEFAULT_WHITESPACE_MODE) -> str:
+    r"""語句を、空白の扱い(``mode``)に応じた正規表現の本体(アンカーなし)にする。
+
+    前後の空白は除き、記号はエスケープする。空白の区切りは先に分割してから
+    個別にエスケープして結合するため、``\ `` は残らない(``\s*`` / ``\s+`` になる)。
+
+    - ``literal``: そのまま(空白も文字どおり)
+    - ``optional``: 空白の連なりを ``\s*``(有無を問わない)
+    - ``flexible``: 空白の連なりを ``\s+``(種類・個数を問わないが必須)
+    - ``any_gap``: 空白を捨て、すべての文字の間に ``\s*``
+    不明な ``mode`` は既定(``optional``)として扱う。
+    """
+    stripped = text.strip()
+    mode = normalize_whitespace_mode(mode)
+    if mode == "literal":
+        return re.escape(stripped)
+    if mode == "any_gap":
+        chars = [re.escape(ch) for ch in stripped if not ch.isspace()]
+        return r"\s*".join(chars)
+    parts = [re.escape(piece) for piece in re.split(r"\s+", stripped) if piece]
+    return (r"\s*" if mode == "optional" else r"\s+").join(parts)
+
+
+def exact_match_pattern(text: str, mode: str = "literal") -> str:
+    """語句に完全一致する除外パターン(``^語句$``、記号はエスケープ済み)を返す。
 
     除外パターンは ``re.search``(部分一致)で使われるため、旧「除外語」(完全一致)の
-    移行や右クリック「除外パターンに追加」ではこの形で登録する。
+    移行や右クリック「除外パターンに追加」ではこの形で登録する。``mode`` は
+    ``literal_to_pattern`` と同じ空白の扱い(既定は空白をそのまま扱う ``literal``)。
     """
-    return "^" + re.escape(text.strip()) + "$"
+    return "^" + literal_to_pattern(text, mode) + "$"
 
 
 def _key(name: str) -> str:
@@ -186,6 +228,9 @@ class PiiSettings:
     # 「手動」種別(手動で追加した候補・図形)を一覧/ページ上で表示・出力の
     # 対象にするか。自動検出の8種別は ``enabled_entities`` が持つ。
     manual_visible: bool = True
+    # 右クリックで語句を検出/除外パターンへ登録するときの空白の扱い
+    # (``WHITESPACE_MODES`` のキー。``literal_to_pattern`` 参照)。
+    pattern_whitespace_mode: str = DEFAULT_WHITESPACE_MODE
 
     def add_exclusion(self, pattern: str, added_at: str | None = None) -> bool:
         """除外パターンを追加し追加日時を記録する。すでにあれば何もせず False。"""
@@ -472,6 +517,13 @@ class PiiSettings:
             mask_color=_normalize_mask_color(_load_json(s, "mask_color", None)),
             mask_transparency=mask_transparency,
             manual_visible=bool(s.value(_key("manual_visible"), True, type=bool)),
+            pattern_whitespace_mode=normalize_whitespace_mode(
+                s.value(
+                    _key("pattern_whitespace_mode"),
+                    default.pattern_whitespace_mode,
+                    type=str,
+                )
+            ),
         )
 
     def save(self, settings: QSettings | None = None) -> None:
@@ -515,6 +567,10 @@ class PiiSettings:
         _save_json(s, "mask_color", list(_normalize_mask_color(self.mask_color)))
         s.setValue(_key("mask_transparency"), _clamp_transparency(self.mask_transparency))
         s.setValue(_key("manual_visible"), self.manual_visible)
+        s.setValue(
+            _key("pattern_whitespace_mode"),
+            normalize_whitespace_mode(self.pattern_whitespace_mode),
+        )
 
     def copy(self) -> "PiiSettings":
         """独立編集用のディープコピーを返す(可変フィールドの参照共有を避ける)。
