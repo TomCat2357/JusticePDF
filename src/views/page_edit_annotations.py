@@ -1907,7 +1907,11 @@ class ZoomAnnotationMixin:
         self._set_shape_create_mode(None)
         self._set_note_create_mode(False)
         self._set_callout_create_mode(False)
-        if isinstance(annotation, (FreeTextAnnotData, ShapeAnnotData, TextMarkupAnnotData, NoteAnnotData)):
+        if isinstance(annotation, (ShapeAnnotData, TextMarkupAnnotData)) and annotation.pii_entity:
+            # 個人情報検出の塗りつぶし対象は、アノテーションの編集ではなく
+            # 個人情報検出ドロワーの結果一覧で扱う(該当行をアクティブにしてスクロール)。
+            self._reveal_pii_result(annotation)
+        elif isinstance(annotation, (FreeTextAnnotData, ShapeAnnotData, TextMarkupAnnotData, NoteAnnotData)):
             current = self._find_zoom_annotation(annotation.xref) or annotation
             self._set_selected_zoom_annotation(current, open_drawer=True)
         else:

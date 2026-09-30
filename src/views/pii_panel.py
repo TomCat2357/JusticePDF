@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from PyQt6.QtCore import QEvent, Qt, QSignalBlocker, pyqtSignal
 from PyQt6.QtGui import QColor, QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QDialog,
@@ -180,8 +181,6 @@ class PiiPanel(QFrame):
         「塗り丸」ツールのON/OFF。
     remove_selected_requested()
         「削除」ボタン押下時、または結果一覧でDeleteキー押下時。
-    delete_same_text_requested(str)
-        結果一覧の右クリックメニュー「同じ語句をすべて削除」。
     add_detect_word_requested(str, str)
         結果一覧の右クリックメニュー「検出語に追加」の種別サブメニュー選択時。
         (entity_type, text) を伴う。
@@ -211,7 +210,6 @@ class PiiPanel(QFrame):
     mask_rect_tool_toggled = pyqtSignal(bool)
     mask_ellipse_tool_toggled = pyqtSignal(bool)
     remove_selected_requested = pyqtSignal()
-    delete_same_text_requested = pyqtSignal(str)
     add_detect_word_requested = pyqtSignal(str, str)
     add_exclude_word_requested = pyqtSignal(str)
     settings_requested = pyqtSignal()
@@ -319,14 +317,6 @@ class PiiPanel(QFrame):
         for btn in (self._mask_markup_btn, self._mask_rect_btn, self._mask_ellipse_btn):
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         manual_layout.addLayout(tools_row)
-
-        self._manual_hint_label = QLabel(
-            "テキストを選択してから「テキスト候補」を押すとその場で追加。"
-            "先に押すと連続モード(Esc で終了)。"
-        )
-        self._manual_hint_label.setWordWrap(True)
-        self._manual_hint_label.setStyleSheet("color: palette(dark);")
-        manual_layout.addWidget(self._manual_hint_label)
         panel_layout.addWidget(manual_group)
 
         # --- 結果一覧 ---
@@ -413,18 +403,16 @@ class PiiPanel(QFrame):
 
         # --- 操作ボタン ---
         # 全件削除は結果一覧で Ctrl+A → 「削除」で行える。
+        # 削除・設定・エクスポートは1行に並べる(縦に3段積むと結果一覧が狭くなるため)。
         action_row = QHBoxLayout()
         self._remove_selected_btn = QPushButton("削除")
         self._remove_selected_btn.setToolTip("結果一覧で選択した項目を塗りつぶし対象から削除します。")
         self._remove_selected_btn.clicked.connect(self.remove_selected_requested.emit)
         action_row.addWidget(self._remove_selected_btn)
-        panel_layout.addLayout(action_row)
 
-        settings_row = QHBoxLayout()
         self._settings_btn = QPushButton("設定...")
         self._settings_btn.clicked.connect(self.settings_requested.emit)
-        settings_row.addWidget(self._settings_btn)
-        panel_layout.addLayout(settings_row)
+        action_row.addWidget(self._settings_btn)
 
         self._export_btn = QPushButton("エクスポート...")
         self._export_btn.setToolTip(
@@ -433,7 +421,8 @@ class PiiPanel(QFrame):
             "出力形式・解像度・圧縮などは、開くダイアログで選べます。"
         )
         self._export_btn.clicked.connect(self.export_requested.emit)
-        panel_layout.addWidget(self._export_btn)
+        action_row.addWidget(self._export_btn)
+        panel_layout.addLayout(action_row)
 
         panel_layout.addStretch()
         layout.addWidget(self._panel)
@@ -530,7 +519,6 @@ class PiiPanel(QFrame):
         enabled = bool(enabled)
         for btn in (self._mask_markup_btn, self._mask_rect_btn, self._mask_ellipse_btn):
             btn.setEnabled(enabled)
-        self._manual_hint_label.setEnabled(enabled)
 
     def set_mask_markup_tool_active(self, enabled: bool) -> None:
         """呼び出し側(mixin)の実際の作成モードにボタンのチェック状態を同期する。"""
@@ -551,6 +539,28 @@ class PiiPanel(QFrame):
     def selected_results(self) -> list["TextMarkupAnnotData | ShapeAnnotData"]:
         items = self._result_tree.selectedItems()
         return [item.data(0, _ANNOT_ROLE).annot for item in items if item.data(0, _ANNOT_ROLE) is not None]
+
+    def select_result(self, annot: object) -> bool:
+        """``annot`` に対応する行だけを選択(アクティブ)にして、見える位置へスクロールする。
+
+        ページ上で塗りつぶし候補をクリックしたときに、一覧の該当行へ追従させるために使う。
+        一致は (種類, ページ, xref) で判定する。行が無ければ選択は変えず False を返す。
+        ``result_activated`` は発火しない(ページ側の選択との往復を避ける)。
+        """
+        target = (type(annot), getattr(annot, "page_num", None), getattr(annot, "xref", None))
+        tree = self._result_tree
+        for i in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(i)
+            row = item.data(0, _ANNOT_ROLE)
+            if row is None:
+                continue
+            if (type(row.annot), row.annot.page_num, row.annot.xref) != target:
+                continue
+            tree.clearSelection()
+            tree.setCurrentItem(item)  # 現在行+選択の両方を更新する
+            tree.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+            return True
+        return False
 
     def copy_results_to_clipboard(self) -> None:
         """結果一覧をTSVとしてクリップボードへコピーする(Excelへそのまま貼り付け可)。
@@ -663,8 +673,6 @@ class PiiPanel(QFrame):
         menu = QMenu(self._result_tree)
         copy_action = menu.addAction("コピー")
         menu.addSeparator()
-        delete_same_action = menu.addAction("同じ語句をすべて削除")
-        delete_same_action.setEnabled(bool(row.text))
         # 検出語: 種別のサブメニューから選ぶ(手動追加分の行でも、語句があれば登録できる)。
         detect_menu = menu.addMenu("検出語に追加")
         detect_menu.setEnabled(bool(row.text))
@@ -679,8 +687,6 @@ class PiiPanel(QFrame):
             return
         if chosen is copy_action:
             self.copy_results_to_clipboard()
-        elif chosen is delete_same_action:
-            self.delete_same_text_requested.emit(row.text)
         elif chosen is exclude_action:
             self.add_exclude_word_requested.emit(row.text)
         elif chosen in detect_actions:

@@ -94,7 +94,6 @@ class PiiDrawerMixin:
         self._pii_panel.mask_rect_tool_toggled.connect(self._on_pii_mask_rect_toggled)
         self._pii_panel.mask_ellipse_tool_toggled.connect(self._on_pii_mask_ellipse_toggled)
         self._pii_panel.remove_selected_requested.connect(self._on_pii_remove_selected)
-        self._pii_panel.delete_same_text_requested.connect(self._on_pii_delete_same_text)
         self._pii_panel.add_exclude_word_requested.connect(self._on_pii_add_exclude_word)
         self._pii_panel.add_detect_word_requested.connect(self._on_pii_add_detect_word)
         self._pii_panel.settings_requested.connect(self._on_pii_settings_requested)
@@ -651,6 +650,21 @@ class PiiDrawerMixin:
         current = self._find_zoom_annotation(annot.xref) or annot
         self._set_selected_zoom_annotation(current, open_drawer=False)
 
+    def _reveal_pii_result(self, annot: "TextMarkupAnnotData | ShapeAnnotData") -> None:
+        """ページ上でクリックした塗りつぶし対象を、結果一覧の該当行として見せる。
+
+        個人情報検出ドロワーが閉じていれば開き(付箋ドロワー等は排他で閉じる)、
+        ページ上の選択を維持したまま一覧の該当行をアクティブにしてスクロールする。
+        """
+        panel = getattr(self, "_pii_panel", None)
+        if panel is None:
+            return
+        if not panel.is_open:
+            panel.set_open(True)
+        current = self._find_zoom_annotation(annot.xref) or annot
+        self._set_selected_zoom_annotation(current, open_drawer=False)
+        panel.select_result(current)
+
     # ------------------------------------------------------------------
     # 削除
     # ------------------------------------------------------------------
@@ -663,15 +677,6 @@ class PiiDrawerMixin:
         ]
         if selected:
             self._remove_mask_targets(selected, "塗りつぶし対象を削除")
-
-    def _on_pii_delete_same_text(self, text: str) -> None:
-        """結果一覧の右クリックメニュー「同じ語句をすべて削除」。"""
-        if not text:
-            return
-        rows = self._build_pii_result_rows()
-        targets = [r.annot for r in rows if r.text == text]
-        if targets:
-            self._remove_mask_targets(targets, f"「{text}」を一括削除")
 
     def _remove_mask_targets(
         self, targets: list["TextMarkupAnnotData | ShapeAnnotData"], description: str

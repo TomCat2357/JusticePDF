@@ -201,13 +201,56 @@ def test_manual_tools_disabled_helper(qtbot):
     assert panel._mask_rect_btn.isEnabled()
 
 
-def test_manual_tool_buttons_do_not_take_focus_and_hint_is_shown(qtbot):
+def test_manual_tool_buttons_do_not_take_focus_and_have_no_hint_label(qtbot):
     panel = PiiPanel()
     qtbot.addWidget(panel)
     for btn in (panel._mask_markup_btn, panel._mask_rect_btn, panel._mask_ellipse_btn):
         assert btn.focusPolicy() == Qt.FocusPolicy.NoFocus
-    assert panel._manual_hint_label.wordWrap() is True
-    assert "テキスト候補" in panel._manual_hint_label.text()
+    # 操作の説明文はボタンのツールチップに集約し、パネル上の常時表示の説明は置かない。
+    assert not hasattr(panel, "_manual_hint_label")
+    assert "連続モード" in panel._mask_markup_btn.toolTip()
+
+
+def test_delete_settings_export_buttons_share_one_row(qtbot):
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.set_open(True)
+    panel.resize(PiiPanel.DRAWER_WIDTH, 600)
+    panel.show()
+    qtbot.waitExposed(panel)
+    buttons = (panel._remove_selected_btn, panel._settings_btn, panel._export_btn)
+    tops = {btn.mapTo(panel, btn.rect().topLeft()).y() for btn in buttons}
+    assert len(tops) == 1  # 同じ行(縦位置が同じ)
+    xs = [btn.mapTo(panel, btn.rect().topLeft()).x() for btn in buttons]
+    assert xs == sorted(xs) and len(set(xs)) == 3  # 左から 削除 / 設定 / エクスポート
+
+
+def test_select_result_activates_matching_row_and_scrolls(qtbot):
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.resize(340, 300)
+    panel.set_open(True)
+    panel.show()
+    qtbot.waitExposed(panel)
+    rows = [_row(i, "PERSON", f"人物{i}") for i in range(60)]
+    panel.set_results(rows)
+    clicked = []
+    panel.result_activated.connect(clicked.append)
+
+    target = rows[45].annot
+    assert panel.select_result(target) is True
+
+    tree = panel._result_tree
+    current = tree.currentItem()
+    assert current.data(0, Qt.ItemDataRole.UserRole).annot is target
+    assert tree.selectedItems() == [current]
+    assert tree.visualItemRect(current).intersects(tree.viewport().rect())  # スクロールで見える
+    assert clicked == []  # 一覧側からのシグナルは出さない(往復防止)
+
+    # 一覧に無い注釈は選択を変えない。
+    other = _row(999, "PERSON", "無い").annot
+    assert panel.select_result(other) is False
+    assert tree.selectedItems() == [current]
 
 
 def test_mask_style_round_trip_and_signals(qtbot, monkeypatch):
@@ -264,7 +307,8 @@ def test_result_context_menu_has_copy_first(qtbot, monkeypatch):
     panel._on_result_context_menu(panel._result_tree.visualItemRect(item).center())
 
     assert seen["texts"][0] == "コピー"
-    assert seen["texts"][1:] == ["同じ語句をすべて削除", "検出語に追加", "除外語に追加"]
+    assert seen["texts"][1:] == ["検出語に追加", "除外語に追加"]
+    assert "同じ語句をすべて削除" not in seen["texts"]
     # 旧メニュー項目は撤去済み。
     assert "追加パターンに登録" not in seen["texts"]
     assert "除外語句に登録" not in seen["texts"]
@@ -424,7 +468,6 @@ def test_context_menu_word_actions_disabled_when_no_text(qtbot, monkeypatch):
 
     assert _find_action(opened["menu"], "検出語に追加").isEnabled() is False
     assert _find_action(opened["menu"], "除外語に追加").isEnabled() is False
-    assert _find_action(opened["menu"], "同じ語句をすべて削除").isEnabled() is False
 
 
 def test_scope_choice_dialog_labels_and_scopes(qtbot):
