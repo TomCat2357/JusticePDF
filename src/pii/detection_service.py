@@ -191,9 +191,10 @@ def _ocr_regions(
 ) -> tuple[list[tuple[float, float, float, float]], tuple[float, float, float, float] | None]:
     """ページ内のOCR注釈の矩形(``get_page_chars`` と同じ座標系)と、ページの範囲を返す。"""
     from src.ocr.embedder import is_ocr_annot
+    from src.utils.pdf_utils.common import _open_doc
 
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             if page_num < 0 or page_num >= len(doc):
                 return [], None
             page = doc[page_num]

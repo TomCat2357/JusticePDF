@@ -40,7 +40,13 @@ import fitz
 
 from src.ocr.base import OCRResult
 from src.utils.pdf_utils.annotations import JUSTICEPDF_OCR_SUBJECT_PREFIX
-from src.utils.pdf_utils.common import _save_document_in_place
+from src.utils.pdf_utils.common import (
+    _acquire_doc,
+    _mark_edit_failed,
+    _open_doc,
+    _release_doc,
+    _save_document_in_place,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -349,7 +355,7 @@ def read_ocr_results(
 def count_ocr_annots(pdf_path: str, page_filter: Optional[Sequence[int]] = None) -> int:
     """PDF内のOCR注釈(区間単位)の件数(読み取り専用)。"""
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             total = 0
             for page_num in _resolve_pages(len(doc), page_filter):
                 for annot in doc[page_num].annots(types=[fitz.PDF_ANNOT_FREE_TEXT]) or []:
@@ -364,7 +370,7 @@ def count_ocr_annots(pdf_path: str, page_filter: Optional[Sequence[int]] = None)
 def count_ocr_lines(pdf_path: str, page_filter: Optional[Sequence[int]] = None) -> int:
     """PDF内に埋め込まれたOCRの「行」数(読み取り専用)。"""
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             return len(read_ocr_results(doc, page_filter))
     except Exception:  # noqa: BLE001
         logger.debug("count_ocr_lines failed: %s", pdf_path, exc_info=True)
@@ -380,7 +386,7 @@ def snapshot_ocr_results(
     pdf_path: str, page_filter: Optional[Sequence[int]] = None
 ) -> List[OCRResult]:
     """指定ページの埋め込み済みOCRを読み戻す(ファイルは変更しない)。"""
-    with fitz.open(pdf_path) as doc:
+    with _open_doc(pdf_path) as doc:
         return read_ocr_results(doc, page_filter)
 
 
@@ -397,12 +403,15 @@ def replace_ocr_in_file(
     ``PdfWritePermissionError`` は呼び出し側で処理する。
     """
     results = list(results)
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         removed = remove_ocr_annots(doc, page_filter)
         inserted = embed_ocr_results(doc, results)
         if removed or inserted:
             _save_document_in_place(doc, pdf_path)
         return removed, inserted
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)

@@ -21,6 +21,7 @@ from src.views.pdf_card import PDFCard
 from src.views.folder_card import FolderCard
 from src.models.undo_manager import UndoAction
 from src.utils.pdf_utils import (
+    PdfSessionConflictError,
     PdfWritePermissionError,
     get_pdf_metadata_title,
     update_pdf_metadata_title,
@@ -799,6 +800,11 @@ class FileOpsMixin:
 
         return str(target)
     def _handle_pdf_write_permission_denied(self, error: PdfWritePermissionError) -> None:
+        if isinstance(error, PdfSessionConflictError):
+            # 手動保存モードの編集ウィンドウで、未保存の変更の保存確認をキャンセルされただけ
+            # (他のアプリが使用中なのではない)ので、警告は出さない。
+            logger.debug("PDF write cancelled: unsaved changes in edit window: %s", error.pdf_path)
+            return
         logger.warning("PDF write blocked in main window for %s", error.pdf_path)
         logger.debug("PDF write blocked in main window for %s", error.pdf_path, exc_info=True)
         pdf_name = os.path.basename(error.pdf_path)

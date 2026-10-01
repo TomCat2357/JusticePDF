@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -93,6 +94,25 @@ class SettingsDialog(QDialog):
         self._cache_entries_spin.setValue(app_settings.pixmap_cache_max_entries())
         form.addRow("ページ画像キャッシュの上限件数:", self._cache_entries_spin)
 
+        # ---------------------------------------------------------------
+        # 編集内容の保存方法
+        # ---------------------------------------------------------------
+        self._save_mode_combo = QComboBox()
+        self._save_mode_combo.addItem("操作ごとに自動保存", app_settings.EDIT_SAVE_MODE_AUTO)
+        self._save_mode_combo.addItem(
+            "保存ボタンで保存(大きいPDFで操作が速くなります)",
+            app_settings.EDIT_SAVE_MODE_MANUAL,
+        )
+        idx = self._save_mode_combo.findData(app_settings.edit_save_mode())
+        self._save_mode_combo.setCurrentIndex(max(0, idx))
+        form.addRow("編集内容の保存方法:", self._save_mode_combo)
+        save_mode_note = QLabel(
+            "次に開く編集画面から有効になります。保存ボタンで保存する場合、保存するまで\n"
+            "ファイルは変更されません(アプリの終了・異常終了時は未保存の変更が失われます)。"
+        )
+        save_mode_note.setWordWrap(True)
+        form.addRow(save_mode_note)
+
         btn_box, self._ok_btn = build_accept_cancel_box(self, "OK")
         layout.addWidget(btn_box)
 
@@ -129,5 +149,7 @@ class SettingsDialog(QDialog):
         app_settings.set_heavy_pdf_widget_chunk_size(self._widget_chunk_spin.value())
         app_settings.set_heavy_pdf_render_batch_size(self._render_batch_spin.value())
         app_settings.set_pixmap_cache_max_entries(self._cache_entries_spin.value())
+        # 編集内容の保存方法も同時に保存する(次に開く編集画面から有効)。
+        app_settings.set_edit_save_mode(self._save_mode_combo.currentData())
         # キャッシュ上限は実行中のキャッシュへ即時反映する。
         set_pixmap_cache_max_entries(app_settings.pixmap_cache_max_entries())

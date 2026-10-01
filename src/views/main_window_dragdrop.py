@@ -646,6 +646,12 @@ class DragDropMixin:
             logger.debug("No drop_pos and no dest_dir, ignoring")
             return
 
+        # 元のファイルを直接読み書きするので、(手動保存モードで)編集中の未保存の変更を先に保存する。
+        from src.views.page_edit_window import ensure_path_saved
+
+        if not ensure_path_saved(pdf_path, "ページの移動・コピー"):
+            return
+
         effective_work_dir = Path(dest_dir) if dest_dir is not None else Path(self._work_dir)
 
         if dest_dir is not None:

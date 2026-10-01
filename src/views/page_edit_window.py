@@ -117,6 +117,12 @@ from src.utils.pdf_utils import (
     is_heavy_pdf,
 )
 from src.utils import app_settings
+from src.utils.pdf_utils.common import (
+    PdfSession,
+    PdfSessionConflictError,
+    open_session,
+    release_session_for_path,
+)
 from src.utils.constants import (
     INCREMENTAL_SAVE_COMPACT_BYTES,
     INCREMENTAL_SAVE_COMPACT_RATIO,
@@ -224,6 +230,15 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # 増分保存の累積による肥大を、閉じるときに整理するか判断するための基準サイズ。
         self._initial_file_size = self._current_file_size()
         self._undo_manager = undo_manager
+        # 手動保存モード(設定「編集内容の保存方法」)。開くときに1回だけ読み、開いている間は
+        # 切り替えない。手動のときは編集をメモリ上のドキュメント(セッション)へ行い、
+        # 保存ボタンで初めてファイルへ書く。自動のときは _session が None のままで従来どおり。
+        self._undo_owner = object()  # 共有 UndoManager に積んだ未保存の操作を識別するトークン
+        self._session: PdfSession | None = None
+        self._save_action: QAction | None = None
+        self._save_btn: QPushButton | None = None
+        if app_settings.is_manual_save_mode():
+            self._open_manual_session()
         self._did_initial_grid_layout = False
         self._thumbnails: list[PageThumbnail] = []
         self._selected_thumbnails: list[PageThumbnail] = []
@@ -371,7 +386,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         QTimer.singleShot(0, self._load_pages)
 
     def _setup_ui(self) -> None:
-        self.setWindowTitle(f"JusticePDF - 編集:{os.path.basename(self._pdf_path)}")
+        self.setWindowTitle(self._page_edit_window_title())
         self.resize(800, 600)
         self.setAcceptDrops(True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -791,6 +806,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
     def _run_toc_update(self, new_entries: list[TocEntry], description: str) -> None:
         """しおり変更を PDF に保存し、Undo/Redo に登録する(TOC全体スナップショット方式)。"""
+        if not self._ensure_saved("しおりの変更"):
+            # パネルは編集後の表示になっているので、ディスク上の真値に戻す
+            self._reload_bookmarks_tree()
+            return
         old_entries = get_pdf_toc(self._pdf_path)
         state: dict[str, list[TocEntry]] = {"old": old_entries, "new": list(new_entries)}
 
@@ -814,10 +833,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._reload_bookmarks_tree()
             self._handle_pdf_write_permission_denied(error)
             return
-        self._undo_manager.add_action(UndoAction(
+        self._add_undo_action(UndoAction(
             description=description,
             undo_func=undo_update,
             redo_func=lambda: do_update(True),
+            writes_file=True,
         ))
         self._update_button_states()
 
@@ -844,6 +864,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._redo_btn = QPushButton("やり直し")
         self._redo_btn.clicked.connect(self._on_redo)
         toolbar.addWidget(self._redo_btn)
+
+        # 手動保存モードのときだけ表示する「保存」ボタン(未保存の変更があるときだけ有効)。
+        self._save_btn = QPushButton("保存")
+        self._save_btn.setToolTip("編集内容をファイルへ保存 (Ctrl+S)")
+        self._save_btn.clicked.connect(self._on_save)
+        self._save_action = toolbar.addWidget(self._save_btn)
+        self._save_action.setVisible(self._session is not None)
 
         toolbar.addSeparator()
 
@@ -892,6 +919,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             (
                 (QKeySequence.StandardKey.Undo, self._on_undo),
                 (QKeySequence.StandardKey.Redo, self._on_redo),
+                (QKeySequence.StandardKey.Save, self._on_save_shortcut),
                 (QKeySequence.StandardKey.Delete, self._on_delete),
                 (QKeySequence(Qt.Key.Key_F2), self._on_rename),
                 (QKeySequence("Shift+F2"), self._on_rename_pdf_title),
@@ -932,6 +960,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._refresh_current_zoom_page(
             open_drawer=selected_annotation is not None and self._zoom_annotation_open
         )
+        if isinstance(error, PdfSessionConflictError):
+            return  # 保存の確認をキャンセルされた(ほかのアプリが使用中なのではない)ので、案内は出さない
         pdf_name = os.path.basename(error.pdf_path or self._pdf_path)
         QMessageBox.warning(
             self,
@@ -951,12 +981,16 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         *,
         selected_annotation_on_error: FreeTextAnnotData | None = None,
         affects_pages: bool = True,
+        writes_file: bool = False,
     ) -> bool:
         """do_func を実行し、成功時のみ Undo/Redo 履歴に登録する。
 
         ``affects_pages=False`` は注釈の編集だけの操作(ページ構成は変わらない)。Undo/Redo
         後にページ一覧を作り直さず表示中のページだけ更新する。do/undo の各関数が
         ``_refresh_current_zoom_page`` 等で自分の画面更新を行うこと。
+
+        ``writes_file=True`` はファイルを直接書き換える操作(ページ構成など。手動保存モードでは
+        メモリ上で編集できない)。Undo/Redo の前に保存を求める。
 
         PdfWritePermissionError 時は警告ダイアログを表示して False を返す
         (履歴には積まない)。redo には do_func をそのまま使う。
@@ -972,13 +1006,29 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                     error, selected_annotation=selected_annotation_on_error
                 )
                 return False
-        self._undo_manager.add_action(UndoAction(
+            except Exception:
+                if self._session is None:
+                    raise
+                # 手動保存モード: 途中までの変更がメモリ上のドキュメントに残っている(pdf_utils 側で
+                # 未保存扱いにしてある)。画面を実際の内容に合わせ直し、履歴には積まない。
+                logger.exception("手動保存モードの編集に失敗しました: %s", description)
+                self._refresh_current_zoom_page()
+                self._flash_zoom_hint("操作に失敗しました。画面を再表示しました")
+                return False
+        self._add_undo_action(UndoAction(
             description=description,
             undo_func=undo_func,
             redo_func=do_func,
             affects_pages=affects_pages,
+            writes_file=writes_file,
         ))
         return True
+
+    def _add_undo_action(self, action: UndoAction) -> None:
+        """共有 UndoManager へ操作を積む。手動保存モードでは未保存分としてこのウィンドウを記録する。"""
+        if self._session is not None and not action.writes_file:
+            action.owner = self._undo_owner
+        self._undo_manager.add_action(action)
 
     # --- Annotation xref handles ------------------------------------------
     # 注釈の移動・編集は delete+recreate で xref を回す。論理的に同じ注釈を指す
@@ -1016,6 +1066,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._rotate_btn.setEnabled(can_edit_pages)
         self._undo_btn.setEnabled(not spread and self._undo_manager.can_undo())
         self._redo_btn.setEnabled(not spread and self._undo_manager.can_redo())
+        self._update_save_button()
 
     def _debug_undo_state(self, reason: str) -> None:
         log_undo_state(
@@ -1030,6 +1081,229 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def _on_undo_manager_changed(self, reason: str) -> None:
         self._update_button_states()
         self._debug_undo_state(reason)
+
+    # --- 手動保存モード(メモリ上で編集し、保存ボタンでファイルへ書く) ----------------
+    # 手動保存では pdf_utils の注釈・描画系の関数が、このウィンドウのセッションが保持する
+    # ドキュメントを使う(common.PdfSession)。ファイルを別経路で書き換える操作(ページ構成・
+    # しおり・タイトル・ファイル名・OCR/検出のワーカー・エクスポート・印刷など)は、
+    # 先に _ensure_saved() で保存してから行う。保存済みなら pdf_utils 側の書き込みが
+    # 保持ハンドルを自動で閉じる(Windows では開いたままだと置き換えできない)。
+
+    def _open_manual_session(self) -> None:
+        try:
+            session = open_session(self._pdf_path)
+        except Exception:  # noqa: BLE001 - 開けなければ自動保存で続ける
+            logger.warning(
+                "手動保存モードを開始できないため、自動保存で開きます: %s",
+                self._pdf_path,
+                exc_info=True,
+            )
+            return
+        session.add_dirty_listener(self._on_session_dirty_changed)
+        session.before_external_write = self._on_external_write_requested
+        self._session = session
+
+    def _session_dirty(self) -> bool:
+        return self._session is not None and self._session.dirty()
+
+    def _on_session_dirty_changed(self) -> None:
+        """未保存の状態が変わったとき(未保存になった・保存した)の画面更新。"""
+        if self._pending_widget_pages is None:
+            self.setWindowTitle(self._page_edit_window_title())
+        self._update_save_button()
+
+    def _save_blocked_by_worker(self) -> bool:
+        """OCR・個人情報検出のワーカー実行中は保存しない(ワーカーはファイルを読んでいるため)。"""
+        return self._ocr_busy() or getattr(self, "_pii_worker", None) is not None
+
+    def _update_save_button(self) -> None:
+        if self._save_btn is None:
+            return
+        self._save_btn.setEnabled(self._session_dirty() and not self._save_blocked_by_worker())
+
+    def _on_save_shortcut(self) -> None:
+        # 自動保存モードでは何もしない(Ctrl+S は手動保存モード専用)。
+        if self._session is not None:
+            self._on_save()
+
+    def _on_save(self) -> bool:
+        """未保存の変更をファイルへ書く。保存できた(または保存不要だった)ら True。"""
+        session = self._session
+        if session is None:
+            return True
+        # 編集中のテキスト・未確定のフォーム操作を先に確定する(メモリ上のドキュメントへ反映)。
+        self._commit_inline_annotation_editor()
+        if not session.dirty():
+            return True
+        if self._save_blocked_by_worker():
+            self._flash_zoom_hint("OCR・個人情報検出の実行中は保存できません")
+            return False
+        self._flash_zoom_hint("保存中...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        error: PdfWritePermissionError | None = None
+        try:
+            QApplication.processEvents()
+            # restyle ジョブはPDFを開いたままなので、書き込みの間だけ止める。
+            with self._pii_restyle_paused():
+                session.save()
+        except PdfWritePermissionError as exc:
+            error = exc
+        finally:
+            QApplication.restoreOverrideCursor()
+        if error is not None:
+            self._handle_pdf_write_permission_denied(error)
+            return False
+        # 保存した操作は、以後このウィンドウの「未保存分」として破棄の対象にしない。
+        self._undo_manager.release_owner(self._undo_owner)
+        self._flash_zoom_hint("保存しました")
+        self._update_button_states()
+        return True
+
+    def _ensure_saved(self, reason: str, *, silent: bool = False, release: bool = False) -> bool:
+        """ファイルを直接読み書きする操作の前に呼ぶ。未保存なら保存を確認し、保存できたら True。
+
+        *silent* は確認なしで保存する(すでにユーザーが保存を了承した流れの続き用)。
+        *release* は、続けてファイル名変更・ゴミ箱送りなど保持ハンドルがあると失敗する
+        操作をするとき、保存後にハンドルを閉じる(次に読まれたときにディスクから開き直す)。
+        自動保存モード(セッション無し)では常に True を返して何もしない。
+        """
+        session = self._session
+        if session is None:
+            return True
+        self._commit_inline_annotation_editor()
+        if session.dirty():
+            if not silent:
+                answer = QMessageBox.question(
+                    self,
+                    "保存",
+                    f"この操作({reason})の前に保存が必要です。\n保存しますか?",
+                    QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Save,
+                )
+                if answer != QMessageBox.StandardButton.Save:
+                    return False
+            if not self._on_save():
+                return False
+        if release:
+            self._release_session_handle()
+        return True
+
+    def _release_session_handle(self) -> None:
+        """保持ハンドルを閉じる。実行中の restyle ジョブは閉じたドキュメントを掴んだままになるので、先に止めて走り直す。"""
+        session = self._session
+        if session is None:
+            return
+        was_dirty = session.dirty()
+        was_active = self._abort_pii_restyle_job()
+        try:
+            # 中断した restyle が残した途中経過だけが未保存の内容なら、捨ててよい(再実行で収束する)。
+            session.release(force=not was_dirty)
+        finally:
+            if was_active:
+                self._schedule_pii_restyle()
+
+    def _on_external_write_requested(self) -> bool:
+        """未保存のままほかの経路でファイルへ書かれそうなとき(pdf_utils から)の保存確認。"""
+        return self._ensure_saved("ほかの書き込み操作")
+
+    def _on_pdf_path_changed(self, new_path: str) -> None:
+        """ファイル名変更の後に呼ぶ。パスを更新し、手動保存ではセッションを新しいパスで開き直す。"""
+        self._pdf_path = new_path
+        session = self._session
+        if session is not None:
+            # 改名できた時点で保持ハンドルは無く(あれば OS が拒否する)、変更も保存済み。
+            session.close(discard=True)
+            self._session = None
+            self._open_manual_session()
+        self.setWindowTitle(self._page_edit_window_title())
+
+    def _finish_manual_session_on_close(self) -> bool:
+        """ウィンドウを閉じる前の保存確認とセッションの後始末。閉じてよければ True(キャンセルは False)。
+
+        未保存なら 保存 / 破棄 / キャンセル。保存 → restyle を反映 → 保存 → セッションを閉じる。
+        破棄 → restyle は反映せずセッションを閉じ、共有 UndoManager から未保存分の操作を取り除く。
+        """
+        session = self._session
+        if session is None:
+            return True
+        self._commit_inline_annotation_editor()
+        # 実行中の restyle を止める(途中までの変更は未保存として残る)。予約だけのものも止まる。
+        was_dirty = session.dirty()
+        restyle_pending = self._abort_pii_restyle_job()
+        discard = False
+        if not was_dirty and restyle_pending:
+            # ユーザーの編集は無く、PII注釈の色・表示状態の反映だけが残っている: 自動保存モードと同じく
+            # 確認なしで反映して保存する(書けなければ諦めて閉じる。次に開いたとき再度反映される)。
+            self._run_pii_restyle_now()
+            try:
+                session.save()
+            except Exception:  # noqa: BLE001 - 見た目の同期失敗で閉じる操作を止めない
+                logger.warning("PII注釈の反映を保存できませんでした: %s", self._pdf_path, exc_info=True)
+                discard = True
+        elif session.dirty():
+            Button = QMessageBox.StandardButton
+            answer = QMessageBox.question(
+                self,
+                "保存",
+                "保存していない変更があります。\n保存しますか?",
+                Button.Save | Button.Discard | Button.Cancel,
+                Button.Save,
+            )
+            if answer == Button.Save:
+                if restyle_pending:
+                    self._run_pii_restyle_now()
+                if not self._on_save():
+                    return False
+            elif answer == Button.Discard:
+                discard = True
+            else:
+                if restyle_pending:
+                    self._schedule_pii_restyle()
+                return False
+        self._session = None
+        try:
+            session.close(discard=discard)
+        finally:
+            if discard:
+                self._undo_manager.purge_owner(self._undo_owner)
+            else:
+                self._undo_manager.release_owner(self._undo_owner)
+        return True
+
+    def _prepare_session_for_reload(self) -> bool:
+        """ディスクから読み直す前の準備。続けてよければ True。
+
+        保存済みなら保持ハンドルを閉じるだけ(次に読まれたときにディスクから開き直す)。
+        未保存の変更があるときは、外部で変更された場合に失われることを確認する。
+        """
+        session = self._session
+        if session is None:
+            return True
+        if session.dirty():
+            if not session.disk_changed_externally():
+                # ファイルは自分が最後に読み書きしたままなので、読み直す意味が無い(F5 や
+                # 自分の書き込みの余波)。未保存の編集を捨てる確認はせず、そのまま残す。
+                return False
+            answer = QMessageBox.question(
+                self,
+                "再読み込み",
+                "ファイルが外部で変更されました。\n再読み込みすると、保存していない変更は失われます。"
+                "\n再読み込みしますか?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            self._abort_pii_restyle_job()
+            session.close(discard=True)
+            self._session = None
+            self._undo_manager.purge_owner(self._undo_owner)
+            self._open_manual_session()
+            self._update_button_states()
+            self.setWindowTitle(self._page_edit_window_title())
+            return True
+        self._release_session_handle()
+        return True
 
     def _reset_thumbnail_render_queue(self) -> None:
         self._thumb_render_timer.stop()
@@ -1279,7 +1553,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._reload_bookmarks_tree()
 
     def _page_edit_window_title(self) -> str:
-        return f"JusticePDF - 編集:{os.path.basename(self._pdf_path)}"
+        # 手動保存モードで未保存の変更があるときは末尾に " *" を付ける。
+        mark = " *" if self._session is not None and self._session.dirty() else ""
+        return f"JusticePDF - 編集:{os.path.basename(self._pdf_path)}{mark}"
 
     def _build_thumbnail_widgets_chunk(self, generation: int) -> None:
         """重量文書向け: サムネイルウィジェットを少しずつ生成し、都度グリッドへ足す。
@@ -1336,6 +1612,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             return
 
         self._commit_inline_annotation_editor()
+        # 手動保存モード: 保存済みなら保持ハンドルを閉じて読み直す。未保存なら破棄してよいか確認する。
+        if not self._prepare_session_for_reload():
+            return
         clear_pixmap_cache_for_path(self._pdf_path)
         page_count = get_page_count(self._pdf_path)
         if page_count != len(self._thumbnails):
@@ -1961,12 +2240,15 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._commit_inline_annotation_editor()
         pending = self._undo_manager.peek_undo()
         affects_pages = pending.affects_pages if pending is not None else True
+        if pending is not None and pending.writes_file and not self._ensure_saved("元に戻す", release=True):
+            return
         with self._pii_restyle_paused():  # PDFへ書き込むので restyle ジョブを止める
             try:
                 self._undo_manager.undo()
             except PdfWritePermissionError as error:
                 self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
                 return
+        self._claim_undo_redo_action(pending)
         self._after_undo_redo(affects_pages)
 
     def _on_redo(self) -> None:
@@ -1975,13 +2257,31 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._commit_inline_annotation_editor()
         pending = self._undo_manager.peek_redo()
         affects_pages = pending.affects_pages if pending is not None else True
+        if pending is not None and pending.writes_file and not self._ensure_saved("やり直し", release=True):
+            return
         with self._pii_restyle_paused():  # PDFへ書き込むので restyle ジョブを止める
             try:
                 self._undo_manager.redo()
             except PdfWritePermissionError as error:
                 self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
                 return
+        self._claim_undo_redo_action(pending)
         self._after_undo_redo(affects_pages)
+
+    def _claim_undo_redo_action(self, action: "UndoAction | None") -> None:
+        """Undo/Redo した操作の効果がメモリ上の未保存の変更として残ったら、このウィンドウの分として記録する。
+
+        (保存点を越えて Undo すると、保存済みだった操作の取り消しが未保存になる。
+        破棄したときに、その操作を共有 UndoManager に残さないため)
+        """
+        if (
+            self._session is not None
+            and action is not None
+            and action.owner is None
+            and not action.writes_file
+            and self._session.dirty()
+        ):
+            action.owner = self._undo_owner
 
     def _after_undo_redo(self, affects_pages: bool) -> None:
         """Undo/Redo 実行後の画面更新。
@@ -2010,6 +2310,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             return
 
         if not self._selected_thumbnails:
+            return
+        if not self._ensure_saved("ページの削除"):
             return
 
         import tempfile
@@ -2041,7 +2343,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             insert_pages(pdf_path, backup_path, sorted_indices)
             self._load_pages()
 
-        self._push_undoable(f"Delete {len(indices)} page(s)", do_delete, undo_delete)
+        self._push_undoable(f"Delete {len(indices)} page(s)", do_delete, undo_delete, writes_file=True)
 
     def _on_rename(self) -> None:
         old_path = self._pdf_path
@@ -2056,6 +2358,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             new_path = os.path.join(os.path.dirname(old_path), new_name)
             if os.path.abspath(old_path) == os.path.abspath(new_path):
                 return
+            # 改名は保持中のハンドルがあると Windows で失敗するので、保存してハンドルを閉じる。
+            if not self._ensure_saved("名前変更", release=True):
+                return
 
             def _get_main_window():
                 from src.views.main_window import MainWindow
@@ -2064,32 +2369,35 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 return owner if isinstance(owner, MainWindow) else None
 
             def do_rename() -> None:
+                # 共有 UndoManager 経由(メイン画面の Redo など)でも、保持ハンドルがあると改名できない。
+                # 未保存なら保存の確認、保存済みならハンドルを閉じる。
+                release_session_for_path(old_path)
                 main_window = _get_main_window()
                 if main_window:
                     main_window._perform_rename(old_path, new_path)
                 else:
                     os.rename(old_path, new_path)
-                    self._pdf_path = new_path
-                    self.setWindowTitle(f"JusticePDF - 編集:{new_name}")
+                    self._on_pdf_path_changed(new_path)
 
             def undo_rename() -> None:
+                release_session_for_path(new_path)
                 main_window = _get_main_window()
                 if main_window:
                     main_window._perform_rename(new_path, old_path)
                 else:
                     os.rename(new_path, old_path)
-                    self._pdf_path = old_path
-                    self.setWindowTitle(f"JusticePDF - 編集:{old_name}")
+                    self._on_pdf_path_changed(old_path)
 
             try:
                 do_rename()
             except OSError as error:
                 self._handle_file_operation_error(error, old_path, "名前変更")
                 return
-            self._undo_manager.add_action(UndoAction(
+            self._add_undo_action(UndoAction(
                 description="Rename PDF",
                 undo_func=undo_rename,
-                redo_func=do_rename
+                redo_func=do_rename,
+                writes_file=True,
             ))
 
     def _on_rename_pdf_title(self) -> None:
@@ -2101,6 +2409,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         )
 
         if not ok or not new_title or new_title == old_title:
+            return
+        if not self._ensure_saved("PDF名の変更"):
             return
 
         def do_rename_pdf_title() -> None:
@@ -2119,10 +2429,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         except Exception as error:
             self._handle_file_operation_error(error, old_path, "PDFタイトル変更")
             return
-        self._undo_manager.add_action(UndoAction(
+        self._add_undo_action(UndoAction(
             description="Rename PDF Name",
             undo_func=undo_rename_pdf_title,
-            redo_func=do_rename_pdf_title
+            redo_func=do_rename_pdf_title,
+            writes_file=True,
         ))
 
     def _on_print(self) -> None:
@@ -2131,6 +2442,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         current = self._zoom_page_num if (self._zoom_view and self._zoom_view.isVisible()) else None
         dialog = PrintDialog([self._pdf_path], self, current_index=current)
         if dialog.exec() != PrintDialog.DialogCode.Accepted:
+            return
+        # 印刷はファイルを読んで行うので、未保存の編集が含まれるよう先に保存する。
+        if not self._ensure_saved("印刷"):
             return
         print_pdfs([self._pdf_path], self, settings=dialog.get_settings(), printer=dialog.build_printer())
 
@@ -2144,6 +2458,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             return
 
         if not self._selected_thumbnails:
+            return
+        if not self._ensure_saved("ページの回転"):
             return
 
         indices = [t.page_num for t in self._selected_thumbnails]
@@ -2160,7 +2476,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             for thumb in selected_thumbs:
                 self._request_thumbnail_refresh(thumb.page_num)
 
-        self._push_undoable(f"Rotate {len(indices)} page(s)", do_rotate, undo_rotate)
+        self._push_undoable(f"Rotate {len(indices)} page(s)", do_rotate, undo_rotate, writes_file=True)
 
     def _on_select_all(self) -> None:
         self._clear_selection()
@@ -2174,6 +2490,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         import tempfile
 
         if self._zoom_page_num is None:
+            return
+        if not self._ensure_saved("ページの削除"):
             return
 
         pdf_path = self._pdf_path
@@ -2221,11 +2539,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 self._zoom_page_num = deleted_page
                 self._render_zoom()
 
-        self._push_undoable("Delete page from zoom view", do_delete, undo_delete)
+        self._push_undoable("Delete page from zoom view", do_delete, undo_delete, writes_file=True)
 
     def _rotate_zoom_page(self) -> None:
         """ズームビュー表示中のページを回転"""
         if self._zoom_page_num is None:
+            return
+        if not self._ensure_saved("ページの回転"):
             return
 
         pdf_path = self._pdf_path
@@ -2249,7 +2569,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             if page_num < len(self._thumbnails):
                 self._request_thumbnail_refresh(page_num)
 
-        self._push_undoable("Rotate page from zoom view", do_rotate, undo_rotate)
+        self._push_undoable("Rotate page from zoom view", do_rotate, undo_rotate, writes_file=True)
 
     def _delete_all_pages(self, backup_path: str) -> None:
         """全ページ削除（ファイルをゴミ箱へ移動し、UNDO対応）"""
@@ -2277,6 +2597,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             # ファイルをゴミ箱へ
             try:
                 if os.path.exists(pdf_path):
+                    # 手動保存セッションが保持しているハンドルがあるとゴミ箱へ送れない(Windows)。
+                    release_session_for_path(pdf_path)
                     send2trash(pdf_path)
             except OSError:
                 if main_window:
@@ -2313,10 +2635,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             )
             return
 
-        self._undo_manager.add_action(UndoAction(
+        self._add_undo_action(UndoAction(
             description="Delete all pages (file to trash)",
             undo_func=undo_delete,
-            redo_func=do_delete
+            redo_func=do_delete,
+            writes_file=True,
         ))
 
     def _delete_all_pages_from_zoom(self, backup_path: str) -> None:
@@ -2527,6 +2850,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         new_order = remaining[:insert_index] + source_pages + remaining[insert_index:]
         if new_order == list(range(page_count)):
             return
+        if not self._ensure_saved("ページの並べ替え"):
+            return
 
         pdf_path = self._pdf_path
         moved_count = len(source_pages)
@@ -2550,7 +2875,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             reorder_pages(pdf_path, inverse)
             self._load_pages()
 
-        self._push_undoable("Reorder page", do_reorder, undo_reorder)
+        self._push_undoable("Reorder page", do_reorder, undo_reorder, writes_file=True)
 
     def _handle_page_copy(self, source_pages: list[int], drop_pos) -> None:
         """Ctrl+ドラッグで同一PDF内のページを複製挿入する。"""
@@ -2559,6 +2884,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         target_page = self._get_drop_page_index(drop_pos)
         source_pages = sorted(set(source_pages))
         if not source_pages or target_page == -1:
+            return
+        if not self._ensure_saved("ページのコピー"):
             return
 
         pdf_path = self._pdf_path
@@ -2588,7 +2915,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             remove_pages(pdf_path, list(range(insert_at, insert_at + copied_count)))
             self._load_pages()
 
-        self._push_undoable("Copy page", do_copy, undo_copy)
+        self._push_undoable("Copy page", do_copy, undo_copy, writes_file=True)
 
     def _handle_page_insert(self, source_pdf_path: str, source_pages: list[int], drop_pos) -> None:
         import tempfile
@@ -2609,6 +2936,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         modifiers = QApplication.keyboardModifiers()
         is_copy = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
         logger.debug(f"is_copy={is_copy}")
+
+        # 両方のファイルを直接読み書きするので、(手動保存モードの)未保存の編集を先に保存する。
+        if not self._ensure_saved("ページの挿入"):
+            return
+        if not ensure_path_saved(source_pdf_path, "ページの移動・コピー"):
+            return
 
         tmp_path = None
         inserted_count = len(source_pages)
@@ -2716,6 +3049,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         from src.views.main_window import MainWindow
 
         logger.debug(f"PageEditWindow closing for {self._pdf_path}")
+
+        # 手動保存モード: 未保存なら 保存/破棄/キャンセル を確認し、セッションを閉じる。
+        if not self._finish_manual_session_on_close():
+            event.ignore()
+            return
 
         self._reset_thumbnail_render_queue()
         # 未確定のフォーム編集(スライダー/スピン)があれば先に確定する。
@@ -2836,3 +3174,17 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_label.set_search_hit_rects([])
         if self._search_dialog is not None:
             self._search_dialog.clear_status()
+
+
+def ensure_path_saved(pdf_path: str, reason: str) -> bool:
+    """*pdf_path* を開いている編集ウィンドウの未保存の編集を保存する(手動保存モード)。
+
+    別のウィンドウ・メイン画面がそのファイルを直接読み書きする操作(ページのドラッグ移動など)の
+    前に呼ぶ。保存をキャンセルされたら False。該当ウィンドウが無い・自動保存なら True。
+    """
+    key = os.path.normcase(os.path.abspath(pdf_path))
+    for widget in QApplication.topLevelWidgets():
+        if isinstance(widget, PageEditWindow) and os.path.normcase(os.path.abspath(widget._pdf_path)) == key:
+            if not widget._ensure_saved(reason):
+                return False
+    return True

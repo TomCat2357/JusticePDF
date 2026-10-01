@@ -9,7 +9,7 @@ import fitz
 
 logger = logging.getLogger(__name__)
 
-from .common import _save_document_in_place
+from .common import _open_doc_for_write, _save_document_in_place, release_session_for_path
 from src.utils.path_utils import ensure_unique_path, sanitize_filename
 
 
@@ -28,7 +28,7 @@ class TocEntry:
 
 def update_pdf_metadata_title(pdf_path: str, title: str) -> None:
     """PDFメタデータのTitleプロパティを更新する。"""
-    with fitz.open(pdf_path) as doc:
+    with _open_doc_for_write(pdf_path) as doc:
         meta = doc.metadata
         meta['title'] = title
         doc.set_metadata(meta)
@@ -100,7 +100,7 @@ def update_pdf_toc(
     TOC 再構築は旧オブジェクトを残してファイルが肥大するため、既定では全保存
     （``incremental=False``）を用いる。
     """
-    with fitz.open(pdf_path) as doc:
+    with _open_doc_for_write(pdf_path) as doc:
         normalized = normalize_toc(entries, page_count=doc.page_count)
         toc_list = [[e.level, e.title, e.page] for e in normalized]
         doc.set_toc(toc_list)
@@ -189,7 +189,7 @@ def merge_pdfs_in_place(
     if not pdf_paths:
         return
 
-    dest_doc = fitz.open(dest_path)
+    dest_doc = _open_doc_for_write(dest_path)
     try:
         dest_orig_count = len(dest_doc)
         dest_orig_toc = dest_doc.get_toc(simple=True)
@@ -526,13 +526,15 @@ def remove_pages(pdf_path: str, page_indices: list[int]) -> bool:
     """
     from send2trash import send2trash
 
-    doc = fitz.open(pdf_path)
+    doc = _open_doc_for_write(pdf_path)
     total_pages = len(doc)
     pages_to_remove = [idx for idx in page_indices if 0 <= idx < total_pages]
 
     if len(pages_to_remove) >= total_pages:
         # All pages removed - delete the file
         doc.close()
+        # 手動保存セッションが保持しているハンドルがあると、Windows ではゴミ箱へ送れない。
+        release_session_for_path(pdf_path)
         send2trash(pdf_path)
         return True
 
@@ -547,7 +549,7 @@ def remove_pages(pdf_path: str, page_indices: list[int]) -> bool:
 
 def rotate_pages(pdf_path: str, page_indices: list[int], angle: int = 90) -> None:
     """Rotate specific pages in a PDF (in place)."""
-    doc = fitz.open(pdf_path)
+    doc = _open_doc_for_write(pdf_path)
     try:
         for idx in page_indices:
             if 0 <= idx < len(doc):
@@ -560,7 +562,7 @@ def rotate_pages(pdf_path: str, page_indices: list[int], angle: int = 90) -> Non
 
 def reorder_pages(pdf_path: str, new_order: list[int]) -> None:
     """Reorder pages in a PDF (in place)."""
-    doc = fitz.open(pdf_path)
+    doc = _open_doc_for_write(pdf_path)
     try:
         doc.select(new_order)
         _save_document_in_place(doc, pdf_path, incremental=True)
@@ -576,7 +578,7 @@ def insert_pages(dest_path: str, src_path: str, insert_indices: list[int]) -> No
         src_path: Source PDF path containing pages to insert
         insert_indices: List of positions where each page should be inserted
     """
-    dest_doc = fitz.open(dest_path)
+    dest_doc = _open_doc_for_write(dest_path)
     src_doc = fitz.open(src_path)
     try:
         # Insert pages in reverse order to maintain correct indices

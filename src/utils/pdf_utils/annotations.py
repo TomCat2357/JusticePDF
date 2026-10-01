@@ -21,7 +21,14 @@ from src.utils.constants import (
 
 logger = logging.getLogger(__name__)
 
-from .common import _save_document_in_place
+from .common import (
+    _acquire_doc,
+    _mark_edit_failed,
+    _open_doc,
+    _release_doc,
+    _save_document_in_place,
+    get_session,
+)
 
 
 JUSTICEPDF_FREETEXT_SUBJECT_PREFIX = "JusticePDF-FreeText:"
@@ -1104,7 +1111,7 @@ def list_ink_annot_xrefs(pdf_path: str, page_num: int | None = None) -> list[int
     """
     xrefs: list[int] = []
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             page_numbers = _page_numbers_for(doc, page_num)
             if page_numbers is None:
                 return []
@@ -1130,7 +1137,7 @@ def list_ink_annot_xrefs_by_page(pdf_path: str) -> dict[int, list[int]]:
     """
     result: dict[int, list[int]] = {}
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             for pn in range(len(doc)):
                 page = doc[pn]
                 annots = page.annots(types=[fitz.PDF_ANNOT_INK])
@@ -1148,7 +1155,7 @@ def list_ink_annot_xrefs_by_page(pdf_path: str) -> dict[int, list[int]]:
 def _list_annots(family: _AnnotFamily, pdf_path: str, page_num: int | None) -> list:
     results: list = []
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             page_numbers = _page_numbers_for(doc, page_num)
             if page_numbers is None:
                 return []
@@ -1168,7 +1175,7 @@ def _list_annots(family: _AnnotFamily, pdf_path: str, page_num: int | None) -> l
 
 
 def _create_annot(family: _AnnotFamily, pdf_path: str, data: Any) -> Any:
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         if data.page_num < 0 or data.page_num >= len(doc):
             raise IndexError(f"page out of range: {data.page_num}")
@@ -1179,12 +1186,15 @@ def _create_annot(family: _AnnotFamily, pdf_path: str, data: Any) -> Any:
         if saved is None:
             raise RuntimeError(f"Failed to extract saved {family.label} annotation")
         return saved
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 def _delete_annot(family: _AnnotFamily, pdf_path: str, page_num: int, xref: int) -> bool:
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         if page_num < 0 or page_num >= len(doc):
             return False
@@ -1195,12 +1205,15 @@ def _delete_annot(family: _AnnotFamily, pdf_path: str, page_num: int, xref: int)
         page.delete_annot(annot)
         _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         return True
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 def _replace_annot(family: _AnnotFamily, pdf_path: str, page_num: int, xref: int, data: Any) -> Any:
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         if page_num < 0 or page_num >= len(doc):
             raise IndexError(f"page out of range: {page_num}")
@@ -1214,8 +1227,11 @@ def _replace_annot(family: _AnnotFamily, pdf_path: str, page_num: int, xref: int
         if saved is None:
             raise RuntimeError(f"Failed to extract saved {family.label} annotation")
         return saved
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 
@@ -1295,7 +1311,7 @@ def create_bracket_pair(
         bracket_both_sides=True, bracket_side="right", group_id=gid,
     )
 
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         if page_num < 0 or page_num >= len(doc):
             raise IndexError(f"page out of range: {page_num}")
@@ -1311,8 +1327,11 @@ def create_bracket_pair(
         if left_saved is None or right_saved is None:
             raise RuntimeError("Failed to extract saved bracket annotations")
         return left_saved, right_saved
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 # --- Proofreading callout (single FreeTextCallout: text box + leader arrow) -
@@ -1387,7 +1406,7 @@ def delete_annot_group(pdf_path: str, page_num: int, group_id: str) -> int:
     """指定 group_id の注釈をまとめて削除し、削除数を返す。"""
     if not group_id:
         return 0
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     deleted = 0
     try:
         if page_num < 0 or page_num >= len(doc):
@@ -1402,8 +1421,11 @@ def delete_annot_group(pdf_path: str, page_num: int, group_id: str) -> int:
         if deleted:
             _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         return deleted
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 # --- Text markup annotations (highlight / underline / strikeout) ---------
@@ -1584,7 +1606,7 @@ def create_markup_annots(
     """
     if not items:
         return []
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         saved: list[TextMarkupAnnotData] = []
         for data in items:
@@ -1597,8 +1619,11 @@ def create_markup_annots(
                 saved.append(extracted)
         _save_document_in_place(doc, pdf_path, incremental=True, changed_pages={d.page_num for d in items})
         return saved
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 def edit_markup_annots(
@@ -1616,7 +1641,7 @@ def edit_markup_annots(
     """
     if not ops:
         return []
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         results: list[TextMarkupAnnotData | None] = []
         changed: set[int] = set()
@@ -1655,8 +1680,11 @@ def edit_markup_annots(
             results.append(saved)
         _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=changed)
         return results
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 def delete_markup_annots(pdf_path: str, refs: list[tuple[int, int]]) -> int:
@@ -1666,7 +1694,7 @@ def delete_markup_annots(pdf_path: str, refs: list[tuple[int, int]]) -> int:
     """
     if not refs:
         return 0
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         deleted = 0
         for page_num, xref in refs:
@@ -1681,8 +1709,11 @@ def delete_markup_annots(pdf_path: str, refs: list[tuple[int, int]]) -> int:
         if deleted:
             _save_document_in_place(doc, pdf_path, incremental=True, changed_pages={pn for pn, _ in refs})
         return deleted
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 def _pii_annot_needs_restyle(
@@ -1742,7 +1773,7 @@ def list_pii_targets_by_page(
     """
     result: dict[int, tuple[tuple[float, float], list]] = {}
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             if pages is None:
                 page_numbers: Iterable[int] = range(len(doc))
             else:
@@ -1810,7 +1841,7 @@ def iter_restyle_pii_annots(
     opacity = max(0.0, min(1.0, float(opacity)))
     hidden_set = frozenset(str(e) for e in (hidden_entities or ()))
     changed = 0
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         for page in doc:
             annots = page.annots(types=[*_MARKUP_ANNOT_TYPES, *_SHAPE_ANNOT_TYPES])
@@ -1854,8 +1885,19 @@ def iter_restyle_pii_annots(
             # xref は変わらないので増分保存で足りる(失敗時は全体保存へ自動フォールバック)。
             _save_document_in_place(doc, pdf_path, incremental=True)
         return changed
+    except GeneratorExit:
+        # 手動保存セッションでは、途中までの変更が保持中のドキュメントに残る。
+        # 未保存の印を付けて、表示・保存と食い違わないようにする(再実行で収束する)。
+        if changed:
+            session = get_session(pdf_path)
+            if session is not None and session.doc is doc:
+                session.mark_dirty()
+        raise
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 def restyle_pii_annots(
@@ -2014,7 +2056,7 @@ def _set_page_annot_xref_order(doc: fitz.Document, page_num: int, order: list[in
 
 def get_annot_xref_order(pdf_path: str, page_num: int) -> list[int]:
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             if page_num < 0 or page_num >= len(doc):
                 return []
             return _get_page_annot_xref_order(doc, page_num)
@@ -2024,7 +2066,7 @@ def get_annot_xref_order(pdf_path: str, page_num: int) -> list[int]:
 
 
 def set_annot_xref_order(pdf_path: str, page_num: int, order: list[int]) -> bool:
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         if page_num < 0 or page_num >= len(doc):
             return False
@@ -2036,14 +2078,17 @@ def set_annot_xref_order(pdf_path: str, page_num: int, order: list[int]) -> bool
         _set_page_annot_xref_order(doc, page_num, order)
         _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         return True
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 def reorder_annot_on_page(pdf_path: str, page_num: int, xref: int, mode: str) -> bool:
     if mode not in ("front", "back", "forward", "backward"):
         return False
-    doc = fitz.open(pdf_path)
+    doc = _acquire_doc(pdf_path)
     try:
         if page_num < 0 or page_num >= len(doc):
             return False
@@ -2070,8 +2115,11 @@ def reorder_annot_on_page(pdf_path: str, page_num: int, xref: int, mode: str) ->
         _set_page_annot_xref_order(doc, page_num, order)
         _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         return True
+    except BaseException:
+        _mark_edit_failed(doc)
+        raise
     finally:
-        doc.close()
+        _release_doc(doc)
 
 
 
@@ -2131,7 +2179,7 @@ def load_zoom_page_annotations(
         "ink_xrefs": [],
     }
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             result["page_count"] = len(doc)
             if page_num < 0 or page_num >= len(doc):
                 return result

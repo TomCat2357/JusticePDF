@@ -1,6 +1,7 @@
 """ページ描画・サムネイル・テキスト抽出/検索。"""
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
 
 import fitz
 from PyQt6.QtGui import QPixmap, QImage
@@ -9,7 +10,7 @@ from PyQt6.QtGui import QPixmap, QImage
 
 logger = logging.getLogger(__name__)
 
-from .common import _get_file_cache_token, _pixmap_cache
+from .common import _get_disk_file_token, _get_file_cache_token, _open_doc, _pixmap_cache
 
 
 def _pixmap_to_qpixmap(pix: "fitz.Pixmap") -> QPixmap:
@@ -29,10 +30,36 @@ def _pixmap_to_qpixmap(pix: "fitz.Pixmap") -> QPixmap:
     return QPixmap.fromImage(img)
 
 
+@contextmanager
+def _hidden_annots(page: "fitz.Page", hide_xrefs: "Collection[int] | None") -> Iterator[None]:
+    """描画の間だけ *hide_xrefs* の注釈に Hidden フラグを立て、終わったら必ず元へ戻す。
+
+    手動保存セッションでは保持中のドキュメントを描画に使うため、フラグを戻さないと
+    「非表示」がそのまま保存・永続化されてしまう。例外時も ``finally`` で復元する。
+    """
+    original: list[tuple["fitz.Annot", int]] = []
+    try:
+        if hide_xrefs:
+            hide_set = set(hide_xrefs)
+            for annot in page.annots() or []:
+                if annot.xref in hide_set:
+                    flags = annot.flags
+                    original.append((annot, flags))
+                    annot.set_flags(flags | fitz.PDF_ANNOT_IS_HIDDEN)
+        yield
+    finally:
+        for annot, flags in original:
+            try:
+                annot.set_flags(flags)
+            except Exception:
+                logger.debug("failed to restore annot flags", exc_info=True)
+
+
 def get_pdf_card_info(pdf_path: str, size: int = 128) -> tuple[QPixmap, int]:
     """Get (thumbnail, page_count) for main-grid cards with a single PDF open."""
     try:
-        cache_token = _get_file_cache_token(pdf_path)
+        # カードはディスク上の状態を表示する(手動保存セッションの未保存分は含めない)。
+        cache_token = _get_disk_file_token(pdf_path)
         with fitz.open(pdf_path) as doc:
             page_count = len(doc)
             if page_count == 0:
@@ -77,21 +104,17 @@ def _render_page_pixmap(
         cached = _pixmap_cache.get(cache_key)
         if cached is not None:
             return cached
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             if page_num >= len(doc) or page_num < 0:
                 return QPixmap()
             page = doc[page_num]
-            if hide_xrefs:
-                hide_set = set(hide_xrefs)
-                for annot in page.annots():
-                    if annot.xref in hide_set:
-                        annot.set_flags(annot.flags | fitz.PDF_ANNOT_IS_HIDDEN)
             if size is not None:
                 scale = size / max(page.rect.width, page.rect.height)
             else:
                 scale = zoom or 1.0
             mat = fitz.Matrix(scale, scale)
-            pix = page.get_pixmap(matrix=mat, annots=annots)
+            with _hidden_annots(page, hide_xrefs):
+                pix = page.get_pixmap(matrix=mat, annots=annots)
         qpix = _pixmap_to_qpixmap(pix)
         _pixmap_cache.put(cache_key, qpix)
         return qpix
@@ -110,7 +133,7 @@ def _render_page_pixmap(
 def get_page_count(pdf_path: str) -> int:
     """Get the number of pages in a PDF."""
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             return len(doc)
     except Exception:
         logger.debug("get_page_count failed: %s", pdf_path, exc_info=True)
@@ -128,7 +151,7 @@ def get_page_sizes_points(
     if not sizes:
         return sizes
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             count = len(doc)
             for index in sizes:
                 if 0 <= index < count:
@@ -142,7 +165,7 @@ def get_page_sizes_points(
 def get_page_size_points(pdf_path: str, page_index: int) -> "tuple[float, float]":
     """Return a page's (width, height) in PDF points, or (0.0, 0.0) on error."""
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             if 0 <= page_index < len(doc):
                 r = doc[page_index].rect
                 return float(r.width), float(r.height)
@@ -208,20 +231,17 @@ def render_page_thumbnails_batch(
 
     if miss_pages:
         try:
-            with fitz.open(pdf_path) as doc:
+            with _open_doc(pdf_path) as doc:
                 for pn in miss_pages:
                     if pn < 0 or pn >= len(doc):
                         result[pn] = QPixmap()
                         continue
                     page = doc[pn]
                     hide_set = hide_xrefs.get(pn) if hide_xrefs else None
-                    if hide_set:
-                        for annot in page.annots():
-                            if annot.xref in hide_set:
-                                annot.set_flags(annot.flags | fitz.PDF_ANNOT_IS_HIDDEN)
                     scale = size / max(page.rect.width, page.rect.height)
                     mat = fitz.Matrix(scale, scale)
-                    pix = page.get_pixmap(matrix=mat)
+                    with _hidden_annots(page, hide_set):
+                        pix = page.get_pixmap(matrix=mat)
                     qpix = _pixmap_to_qpixmap(pix)
                     cache_key = (pdf_path, pn, size, None, True, _hide_key(pn), cache_token)
                     _pixmap_cache.put(cache_key, qpix)
@@ -238,7 +258,7 @@ def render_page_thumbnails_batch(
 def get_page_words(pdf_path: str, page_num: int) -> list[tuple]:
     """Extract word-level text with coordinates for a page."""
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             if page_num >= len(doc):
                 return []
             page = doc[page_num]
@@ -267,7 +287,7 @@ def get_page_chars(pdf_path: str, page_num: int) -> list[dict]:
     """
     chars: list[dict] = []
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             if page_num >= len(doc):
                 return []
             page = doc[page_num]
@@ -334,7 +354,7 @@ def search_text_in_pdf(pdf_path: str, query: str) -> dict[int, list]:
         return {}
     results: dict[int, list] = {}
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             for i in range(len(doc)):
                 page = doc[i]
                 rects = page.search_for(query)
@@ -354,7 +374,7 @@ def search_text_in_pdf(pdf_path: str, query: str) -> dict[int, list]:
 def get_page_links(pdf_path: str, page_num: int) -> list[dict]:
     """Extract link annotations with rectangles for a page."""
     try:
-        with fitz.open(pdf_path) as doc:
+        with _open_doc(pdf_path) as doc:
             if page_num >= len(doc):
                 return []
             page = doc[page_num]

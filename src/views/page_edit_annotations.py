@@ -2723,7 +2723,7 @@ class ZoomAnnotationMixin:
         after = get_annot_xref_order(self._pdf_path, page_num)
         if after == before:
             return
-        self._undo_manager.add_action(UndoAction(
+        self._add_undo_action(UndoAction(
             description=f"Reorder annotation ({mode})",
             undo_func=undo_reorder,
             redo_func=do_reorder,

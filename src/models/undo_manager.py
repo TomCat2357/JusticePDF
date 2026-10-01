@@ -17,6 +17,14 @@ class UndoAction:
     # Undo/Redo 後にページ一覧全体を作り直さず、表示中のページだけ更新する。
     # 迷ったら True のままにする(従来どおり全体を再読込する安全側の既定値)。
     affects_pages: bool = True
+    # この操作を積んだ(未保存の変更を持つ)ウィンドウを識別する不透明なトークン。
+    # 手動保存モードで変更を破棄したとき、そのウィンドウの未保存分の操作だけを共有の
+    # UndoManager から取り除くために使う(``purge_owner``)。保存すると外れる(``release_owner``)。
+    # 設計書の ``owner_path`` はファイル名変更で値が古くなるため、パスではなくトークンにした。
+    owner: object | None = None
+    # Undo/Redo がファイルを直接書き換える操作(ページ構成・しおり・タイトル・ファイル名など、
+    # 手動保存モードのメモリ上では編集できないもの)なら True。実行前に未保存の編集を保存させる。
+    writes_file: bool = False
 
 
 class UndoManager:
@@ -81,6 +89,33 @@ class UndoManager:
         self._undo_stack.append(action)
         self._notify(f"redo:{action.description}")
         return action.description
+
+    def release_owner(self, owner: object) -> None:
+        """*owner* の操作を「保存済み」扱いにする(以後 ``purge_owner`` の対象にしない)。"""
+        for action in (*self._undo_stack, *self._redo_stack):
+            if action.owner is owner:
+                action.owner = None
+
+    def purge_owner(self, owner: object) -> int:
+        """*owner* が積んだ(未保存の)操作を Undo/Redo の両スタックから取り除く。除いた件数を返す。
+
+        ウィンドウが未保存の変更を破棄したあとに、その操作が残っていると、後で
+        メイン画面などから Undo したときにディスクへ意図しない書き込みをしてしまう。
+        """
+        removed = 0
+        kept_undo = [a for a in self._undo_stack if a.owner is not owner]
+        removed += len(self._undo_stack) - len(kept_undo)
+        if removed:
+            self._undo_stack.clear()
+            self._undo_stack.extend(kept_undo)
+        kept_redo = [a for a in self._redo_stack if a.owner is not owner]
+        removed_redo = len(self._redo_stack) - len(kept_redo)
+        if removed_redo:
+            self._redo_stack[:] = kept_redo
+        removed += removed_redo
+        if removed:
+            self._notify("purge")
+        return removed
 
     def clear(self) -> None:
         self._undo_stack.clear()

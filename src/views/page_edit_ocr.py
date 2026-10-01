@@ -186,6 +186,9 @@ class OcrDrawerMixin:
             if panel is not None:
                 panel.set_status(f"OCRを利用できません。{OCR_INSTALL_HINT}")
             return False
+        # OCRワーカーはファイルを読んで認識するので、手動保存モードでは未保存の編集を先に保存する。
+        if not self._ensure_saved("OCR"):
+            return False
         if panel is not None:
             panel.set_busy(True, "OCRを開始しています...(初回はモデルの読み込みに時間がかかります)")
         pii_panel = getattr(self, "_pii_panel", None)
@@ -220,6 +223,7 @@ class OcrDrawerMixin:
         panel = getattr(self, "_ocr_panel", None)
         if panel is not None:
             panel.set_busy(False)
+        self._update_save_button()  # ワーカー実行中は無効にしていた保存ボタンを戻す
 
     def _on_ocr_error(
         self, error: Exception, on_done: "Callable[[], None] | None", show_errors: bool

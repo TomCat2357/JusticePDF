@@ -596,8 +596,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         new_name = os.path.basename(new_path)
         for widget in QApplication.topLevelWidgets():
             if isinstance(widget, PageEditWindow) and widget._pdf_path == old_path:
-                widget._pdf_path = new_path
-                widget.setWindowTitle(f"JusticePDF - Edit: {new_name}")
+                # パス・タイトルの更新と、手動保存モードのセッションの開き直しは編集ウィンドウ側で行う。
+                widget._on_pdf_path_changed(new_path)
 
     def _refresh_page_edit_windows_for_paths(self, paths: list[str]) -> None:
         """指定PDFのPageEditWindowを外部更新として再描画する。"""

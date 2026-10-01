@@ -8,9 +8,20 @@
 import shutil
 
 from .common import (
+    PdfSession,
+    PdfSessionConflictError,
+    PdfSessionError,
     PdfWritePermissionError,
     _PixmapCache,
+    _acquire_doc,
+    _get_disk_file_token,
     _get_file_cache_token,
+    _open_doc,
+    _release_doc,
+    close_session,
+    get_session,
+    open_session,
+    release_session_for_path,
     _is_permission_denied_error,
     _pixmap_cache,
     _save_document_in_place,

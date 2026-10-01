@@ -160,3 +160,27 @@ def test_heavy_pdf_page_count_threshold_falls_back_on_corrupt_value():
 def test_heavy_pdf_file_size_bytes_reflects_mb_setting():
     app_settings.set_heavy_pdf_file_size_mb(7)
     assert app_settings.heavy_pdf_file_size_bytes() == 7 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# 編集内容の保存方法(自動 / 手動)
+# ---------------------------------------------------------------------------
+def test_edit_save_mode_defaults_to_auto(env):
+    assert app_settings.edit_save_mode() == "auto"
+    assert app_settings.is_manual_save_mode() is False
+
+
+def test_edit_save_mode_round_trips(env):
+    app_settings.set_edit_save_mode("manual")
+    assert app_settings.edit_save_mode() == "manual"
+    assert app_settings.is_manual_save_mode() is True
+    app_settings.set_edit_save_mode("auto")
+    assert app_settings.edit_save_mode() == "auto"
+
+
+@pytest.mark.parametrize("raw", ["bogus", "", "MANUALLY", 5])
+def test_edit_save_mode_invalid_value_falls_back_to_auto(env, raw):
+    QSettings().setValue(app_settings.EDIT_SAVE_MODE_KEY, raw)
+    assert app_settings.edit_save_mode() == "auto"
+    app_settings.set_edit_save_mode(raw if isinstance(raw, str) else "x")
+    assert app_settings.edit_save_mode() == "auto"

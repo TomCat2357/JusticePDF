@@ -38,6 +38,13 @@ HEAVY_PDF_WIDGET_CHUNK_SIZE_KEY = "heavy_pdf/widget_chunk_size"
 HEAVY_PDF_RENDER_BATCH_SIZE_KEY = "heavy_pdf/render_batch_size"
 PIXMAP_CACHE_MAX_ENTRIES_KEY = "heavy_pdf/pixmap_cache_max_entries"
 
+# ---------------------------------------------------------------------------
+# 編集内容の保存方法(自動保存 / 手動保存)
+# ---------------------------------------------------------------------------
+EDIT_SAVE_MODE_KEY = "editing/save_mode"
+EDIT_SAVE_MODE_AUTO = "auto"
+EDIT_SAVE_MODE_MANUAL = "manual"
+
 
 def _clamp(value: int, value_range: tuple[int, int]) -> int:
     lo, hi = value_range
@@ -126,6 +133,30 @@ def pixmap_cache_max_entries() -> int:
 
 def set_pixmap_cache_max_entries(value: int) -> None:
     _set_int(PIXMAP_CACHE_MAX_ENTRIES_KEY, value, PIXMAP_CACHE_MAX_ENTRIES_RANGE)
+
+
+def edit_save_mode() -> str:
+    """編集画面の保存方法。"auto"(操作ごとに自動保存・既定) か "manual"(保存ボタンで保存)。
+
+    保存値が壊れている(想定外の文字列)場合は "auto" にフォールバックする。
+    """
+    raw = QSettings().value(EDIT_SAVE_MODE_KEY, EDIT_SAVE_MODE_AUTO)
+    value = str(raw).strip().lower() if raw is not None else EDIT_SAVE_MODE_AUTO
+    if value == EDIT_SAVE_MODE_MANUAL:
+        return EDIT_SAVE_MODE_MANUAL
+    return EDIT_SAVE_MODE_AUTO
+
+
+def set_edit_save_mode(mode: str) -> None:
+    """保存方法を保存する。不正値は "auto" として保存する。"""
+    is_manual = str(mode).strip().lower() == EDIT_SAVE_MODE_MANUAL
+    QSettings().setValue(
+        EDIT_SAVE_MODE_KEY, EDIT_SAVE_MODE_MANUAL if is_manual else EDIT_SAVE_MODE_AUTO
+    )
+
+
+def is_manual_save_mode() -> bool:
+    return edit_save_mode() == EDIT_SAVE_MODE_MANUAL
 
 
 def default_library_dir() -> Path:

@@ -59,3 +59,20 @@ def test_selected_folder_normalizes_relative_path_to_absolute(qtbot):
 
     assert result.is_absolute()
     assert result.name == "relative_dir"
+
+
+def test_save_mode_combo_defaults_to_auto_and_saves_manual(qtbot):
+    from src.utils import app_settings
+
+    dialog = SettingsDialog()
+    qtbot.addWidget(dialog)
+    assert dialog._save_mode_combo.currentData() == "auto"
+
+    dialog._save_mode_combo.setCurrentIndex(dialog._save_mode_combo.findData("manual"))
+    dialog.save_heavy_pdf_settings()
+
+    assert app_settings.edit_save_mode() == "manual"
+    # 次に開くダイアログは保存済みの値を初期表示する
+    again = SettingsDialog()
+    qtbot.addWidget(again)
+    assert again._save_mode_combo.currentData() == "manual"

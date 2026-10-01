@@ -249,6 +249,10 @@ class PiiDrawerMixin:
         """予約・実行中の restyle があれば同期で最後まで反映する(ウィンドウを閉じる前など)。"""
         if not self._abort_pii_restyle_job() or not sync:
             return
+        self._run_pii_restyle_now()
+
+    def _run_pii_restyle_now(self) -> None:
+        """PII注釈のスタイル反映を、いま同期で最後まで行う(予約・実行中のジョブは止めてから)。"""
         settings = self._pii_settings()
         self._sync_pii_annot_style_registry()
         try:
@@ -437,6 +441,9 @@ class PiiDrawerMixin:
     def _run_pii_detection(self, page_indices: list[int]) -> None:
         if getattr(self, "_pii_worker", None) is not None or self._ocr_busy():
             return  # 実行中は多重起動しない
+        # 検出ワーカーはファイルを読むので、手動保存モードでは未保存の編集を先に保存する。
+        if not self._ensure_saved("個人情報検出"):
+            return
         # 設定「テキストレイヤの無いページはOCRしてから検出する」: 先にOCR(バックグラウンド)
         # → 結果をメインスレッドで埋め込み → 検出、の順に進める。
         if self._pii_settings().ocr_enabled and self._start_ocr_before_detect(
@@ -449,6 +456,12 @@ class PiiDrawerMixin:
         if getattr(self, "_pii_worker", None) is not None:
             return
         panel = getattr(self, "_pii_panel", None)
+        # 検出前のOCR結果はメモリ上のドキュメントに埋め込まれているので、確認なしで保存してから読ませる
+        # (OCRの前に保存を了承済みの流れの続き)。保存できなければ検出は始めない。
+        if not self._ensure_saved("個人情報検出", silent=True):
+            if panel is not None:
+                panel.set_busy(False)
+            return
         if panel is not None:
             panel.set_busy(True, "検出を開始しています...")
         worker = PiiDetectWorker(self._pdf_path, page_indices, self._pii_settings(), parent=self)
@@ -475,6 +488,7 @@ class PiiDrawerMixin:
 
     def _on_pii_detect_error(self, error: Exception) -> None:
         self._pii_worker = None
+        self._update_save_button()
         panel = getattr(self, "_pii_panel", None)
         if panel is not None:
             panel.set_busy(False)
@@ -485,6 +499,7 @@ class PiiDrawerMixin:
         self, page_indices: list[int], detections: list[PiiDetection]
     ) -> None:
         self._pii_worker = None
+        self._update_save_button()
         panel = getattr(self, "_pii_panel", None)
         if panel is not None:
             panel.set_busy(False)
@@ -1360,6 +1375,10 @@ class PiiDrawerMixin:
                 redact_ellipses.setdefault(shape.page_num, []).append(region)
             else:
                 redact_rects.setdefault(shape.page_num, []).append(region)
+
+        # 黒塗りはファイルを読んで行うので、手動保存モードでは未保存の編集を先に保存する。
+        if not self._ensure_saved("エクスポート"):
+            return
 
         # 黒塗り用の読み込み中に restyle ジョブがPDFを開いたままにならないよう止め、
         # 終わったら(止めていたなら)走り直す。
