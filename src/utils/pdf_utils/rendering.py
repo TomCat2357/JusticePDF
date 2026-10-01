@@ -117,6 +117,28 @@ def get_page_count(pdf_path: str) -> int:
         return 0
 
 
+def get_page_sizes_points(
+    pdf_path: str, page_indices: "Collection[int]"
+) -> "dict[int, tuple[float, float]]":
+    """複数ページの (width, height) をドキュメント1回の open で返す。
+
+    範囲外のページやエラー時は (0.0, 0.0)。大きいPDFでページごとに開き直さないため。
+    """
+    sizes: dict[int, tuple[float, float]] = {int(i): (0.0, 0.0) for i in page_indices}
+    if not sizes:
+        return sizes
+    try:
+        with fitz.open(pdf_path) as doc:
+            count = len(doc)
+            for index in sizes:
+                if 0 <= index < count:
+                    r = doc[index].rect
+                    sizes[index] = (float(r.width), float(r.height))
+    except Exception:
+        logger.debug("get_page_sizes_points failed: %s", pdf_path, exc_info=True)
+    return sizes
+
+
 def get_page_size_points(pdf_path: str, page_index: int) -> "tuple[float, float]":
     """Return a page's (width, height) in PDF points, or (0.0, 0.0) on error."""
     try:

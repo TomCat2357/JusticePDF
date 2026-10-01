@@ -19,6 +19,9 @@ import os
 import re
 import shutil
 import tempfile
+import time
+from contextlib import contextmanager
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 
 from PyQt6.QtCore import QTimer
@@ -47,6 +50,7 @@ from src.utils.pdf_utils import (
     ShapeAnnotData,
     ShapeType,
     TextMarkupAnnotData,
+    _get_file_cache_token,
     create_markup_annot,
     create_markup_annots,
     create_shape_annot,
@@ -57,6 +61,7 @@ from src.utils.pdf_utils import (
     export_pdf_compressed,
     get_page_chars,
     get_page_count,
+    iter_restyle_pii_annots,
     list_pii_mask_shapes,
     list_pii_markup_annots,
     rasterize_pdf,
@@ -81,10 +86,22 @@ PII_HIGHLIGHT_OPACITY = 0.35
 MANUAL_MASK_ENTITY = MANUAL_ENTITY_TYPE
 MASK_SHAPE_STROKE_WIDTH = 1.2
 MASK_SHAPE_OPACITY = 0.35
+# 色・透明度などの変更からPDFへの書き込み(restyle)を始めるまでのデバウンス時間。
+# ホイール/キー操作の連続commitは、最後の1回分の書き込みに集約される。
+PII_RESTYLE_DEBOUNCE_MS = 500
+# restyle ジョブ1ティックあたりのUIスレッド占有の上限(ミリ秒)。
+PII_RESTYLE_TICK_BUDGET_MS = 25
 
 
 class PiiDrawerMixin:
     """PageEditWindow に混ぜ込む個人情報検出ドロワー機能。"""
+
+    # PII注釈の色・透明度・表示状態をPDFへ反映する restyle ジョブの状態。
+    # 大きいPDFでUIを固めないよう、UIスレッド上でジェネレータを時間分割して進める。
+    _pii_restyle_job = None
+    _pii_restyle_timer = None  # デバウンス用(single-shot)
+    _pii_restyle_tick_timer = None  # ジョブを進めるタイマー(0ms)
+    _pii_restyle_old_token = None
 
     # ------------------------------------------------------------------
     # ドロワーの組み立て・開閉
@@ -144,6 +161,11 @@ class PiiDrawerMixin:
         if zoom_label is not None:
             zoom_label.set_pii_mask_style(settings.mask_color, settings.mask_opacity)
             zoom_label.set_pii_hidden_entities(settings.hidden_entities())
+        # ページ一覧のサムネイルは paint 時に重ね描きするので、画像の再レンダリングは不要
+        # (表示中のサムネイルだけが実際に再描画される)。
+        color, opacity, hidden = settings.mask_color, settings.mask_opacity, settings.hidden_entities()
+        for thumb in getattr(self, "_thumbnails", ()):
+            thumb.set_pii_mask_style(color, opacity, hidden)
 
     def _sync_pii_annot_style_registry(self) -> None:
         """PDFへ書くPII注釈の色・不透明度・非表示種別(他のPDFソフト向け)を、現在の設定に合わせる。
@@ -156,18 +178,80 @@ class PiiDrawerMixin:
             settings.mask_color, settings.mask_opacity, settings.hidden_entities()
         )
 
-    def _restyle_pii_annots_in_pdf(self) -> None:
-        """ファイル内のPII注釈を、現在の色・透明度・チェック状態に揃える(Undo対象外)。
+    # ------------------------------------------------------------------
+    # PII注釈スタイルのPDFへの書き込み(デバウンス+時間分割ジョブ)
+    # ------------------------------------------------------------------
+    # 設定は全ファイル共通、注釈はファイルごとに持つため、設定の確定時と
+    # 個人情報検出ドロワーを開いたときにファイル内のPII注釈を現在の色・透明度・
+    # チェック状態へ揃える(Undo対象外)。他のPDFソフトで開いたとき、チェック中の
+    # 種別は選んだ色・透明度の注釈として表示され、チェックを外した種別は見えなくなる。
+    # 書き込めないPDFでは何もせずヒントだけ表示する。
+    #
+    # 大きいPDFでは数秒かかるため、同期実行せず次の流れで進める:
+    #   _schedule_pii_restyle(): 500ms デバウンス(連続操作は最後の1回に集約)
+    #   -> _start_pii_restyle_job(): iter_restyle_pii_annots を開く
+    #   -> _on_pii_restyle_tick(): 1ティック約25ms の予算で next() を繰り返す
+    #   -> StopIteration で増分保存が済み、_on_pii_restyle_finished()。
+    # ジョブは実行中ずっとPDFを開いたままなので、**このウィンドウがPDFへ書き込む
+    # 操作の前では必ず _abort_pii_restyle_job() / _pii_restyle_paused() を通すこと**
+    # (Windows では開いたまま全体保存の置き換えに失敗する)。新しい書き込み経路を
+    # 追加するときも同様。中断したジョブは再スケジュールで最新設定から走り直す。
 
-        設定は全ファイル共通、注釈はファイルごとに持つため、設定の確定時と
-        個人情報検出ドロワーを開いたときに呼ぶ。他のPDFソフトで開いたとき、
-        チェック中の種別は選んだ色・透明度の注釈として表示され、チェックを外した
-        種別は見えなくなる。書き込めないPDFでは何もせずヒントだけ表示する。
-        """
+    def _ensure_pii_restyle_timers(self) -> None:
+        if self._pii_restyle_timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(PII_RESTYLE_DEBOUNCE_MS)
+            timer.timeout.connect(self._start_pii_restyle_job)
+            self._pii_restyle_timer = timer
+        if self._pii_restyle_tick_timer is None:
+            tick = QTimer(self)
+            tick.setInterval(0)
+            tick.timeout.connect(self._on_pii_restyle_tick)
+            self._pii_restyle_tick_timer = tick
+
+    def _schedule_pii_restyle(self) -> None:
+        """PII注釈のスタイル反映を予約する(実行中なら中断して、最新設定で走り直す)。"""
+        self._sync_pii_annot_style_registry()
+        self._abort_pii_restyle_job()
+        self._ensure_pii_restyle_timers()
+        self._pii_restyle_timer.start()
+
+    def _abort_pii_restyle_job(self) -> bool:
+        """予約・実行中の restyle を止める(PDFは保存しない)。何かを止めたら True。"""
+        active = False
+        for timer in (self._pii_restyle_timer, self._pii_restyle_tick_timer):
+            if timer is not None and timer.isActive():
+                timer.stop()
+                active = True
+        job = self._pii_restyle_job
+        if job is not None:
+            self._pii_restyle_job = None
+            active = True
+            try:
+                job.close()  # GeneratorExit: 保存せずPDFを閉じる
+            except Exception:  # noqa: BLE001
+                logger.debug("PII restyle ジョブの中断に失敗しました", exc_info=True)
+        return active
+
+    @contextmanager
+    def _pii_restyle_paused(self):
+        """PDFへ書き込む処理を囲む。実行中の restyle を止め、終わったら走り直しを予約する。"""
+        was_active = self._abort_pii_restyle_job()
+        try:
+            yield
+        finally:
+            if was_active:
+                self._schedule_pii_restyle()
+
+    def _flush_pii_restyle(self, sync: bool = True) -> None:
+        """予約・実行中の restyle があれば同期で最後まで反映する(ウィンドウを閉じる前など)。"""
+        if not self._abort_pii_restyle_job() or not sync:
+            return
         settings = self._pii_settings()
         self._sync_pii_annot_style_registry()
         try:
-            changed = restyle_pii_annots(
+            restyle_pii_annots(
                 self._pdf_path,
                 settings.mask_color,
                 settings.mask_opacity,
@@ -175,14 +259,81 @@ class PiiDrawerMixin:
             )
         except PdfWritePermissionError:
             logger.warning("PII注釈の色・表示状態を更新できませんでした(書き込み不可): %s", self._pdf_path)
-            self._flash_zoom_hint("PDFに書き込めないため、他のPDFソフト向けの注釈の色・表示状態は更新されません")
+        except Exception:  # noqa: BLE001 - 見た目の同期失敗で閉じる操作を止めない
+            logger.warning("PII注釈の色・表示状態の更新に失敗しました", exc_info=True)
+
+    def _start_pii_restyle_job(self) -> None:
+        self._abort_pii_restyle_job()
+        settings = self._pii_settings()
+        self._sync_pii_annot_style_registry()
+        self._ensure_pii_restyle_timers()
+        self._pii_restyle_old_token = _get_file_cache_token(self._pdf_path)
+        self._pii_restyle_job = iter_restyle_pii_annots(
+            self._pdf_path,
+            settings.mask_color,
+            settings.mask_opacity,
+            settings.hidden_entities(),
+        )
+        self._pii_restyle_tick_timer.start()
+
+    def _on_pii_restyle_tick(self) -> None:
+        job = self._pii_restyle_job
+        if job is None:
+            if self._pii_restyle_tick_timer is not None:
+                self._pii_restyle_tick_timer.stop()
             return
+        deadline = time.monotonic() + PII_RESTYLE_TICK_BUDGET_MS / 1000.0
+        changed = 0
+        try:
+            while True:
+                next(job)
+                if time.monotonic() >= deadline:
+                    return  # 次のティックで続ける(その間にUIイベントを処理する)
+        except StopIteration as stop:
+            changed = int(stop.value or 0)
+        except PdfWritePermissionError:
+            logger.warning("PII注釈の色・表示状態を更新できませんでした(書き込み不可): %s", self._pdf_path)
+            self._flash_zoom_hint("PDFに書き込めないため、他のPDFソフト向けの注釈の色・表示状態は更新されません")
         except Exception:  # noqa: BLE001 - 見た目の同期失敗で操作を止めない
             logger.warning("PII注釈の色・表示状態の更新に失敗しました", exc_info=True)
-            return
+        self._pii_restyle_job = None
+        self._pii_restyle_tick_timer.stop()
         if changed:
-            # 画面上のデータ(注釈の色・不透明度)もファイルに合わせて読み直す。
-            self._refresh_current_zoom_page()
+            self._on_pii_restyle_finished(changed)
+
+    def _on_pii_restyle_finished(self, changed: int) -> None:
+        """restyle 完了後の後処理。結果一覧の行は変わらないので再スキャンはしない。"""
+        # サムネイル用の塗りつぶし対象キャッシュは、保存でファイルのトークンだけが
+        # 変わった(中身=位置・種別は同じ)ので、開く前のトークンと一致していれば付け替える。
+        cache = getattr(self, "_pii_targets_by_page_cache", None)
+        if cache is not None and cache[0] == self._pii_restyle_old_token:
+            self._pii_targets_by_page_cache = (_get_file_cache_token(self._pdf_path), cache[1])
+        # 画面上のデータ(注釈の色・不透明度)もファイルに合わせてメモリ内で更新する。
+        settings = self._pii_settings()
+        color = tuple(float(c) for c in settings.mask_color)
+        opacity = settings.mask_opacity
+
+        def restyled(annot):
+            if isinstance(annot, TextMarkupAnnotData) and annot.pii_entity:
+                return dataclass_replace(annot, color=color, opacity=opacity)
+            if isinstance(annot, ShapeAnnotData) and annot.pii_entity:
+                return dataclass_replace(
+                    annot, stroke_color=color, fill_color=color, opacity=opacity
+                )
+            return annot
+
+        annotations = getattr(self, "_zoom_annotations", None)
+        if annotations:
+            annotations[:] = [restyled(a) for a in annotations]
+        zoom_label = getattr(self, "_zoom_label", None)
+        label_annotations = getattr(zoom_label, "_annotations", None)
+        if label_annotations and label_annotations is not annotations:
+            label_annotations[:] = [restyled(a) for a in label_annotations]
+        selected = getattr(self, "_selected_zoom_annotation", None)
+        if selected is not None:
+            self._selected_zoom_annotation = restyled(selected)
+        if zoom_label is not None:
+            zoom_label.update()
 
     def _on_pii_entity_visibility_changed(self, entity: str, checked: bool) -> None:
         """種別チェックボックスの操作。設定へ即保存し、一覧・ページ上・サムネイルを更新する。"""
@@ -196,7 +347,7 @@ class PiiDrawerMixin:
         settings.save()
         self._pii_settings_cache = settings
         self._apply_pii_visual_settings()
-        self._restyle_pii_annots_in_pdf()
+        self._schedule_pii_restyle()
         selected = self._selected_zoom_annotation
         if not checked and selected is not None and getattr(selected, "pii_entity", "") == entity:
             # 非表示にした種別の注釈が選択中のままだと、見えないのに Delete で消せてしまう。
@@ -209,7 +360,6 @@ class PiiDrawerMixin:
                 # 手動が非表示の間は追加しても見えないため、装着中のツールは解除する。
                 self._activate_create_mode(CreateMode.NONE)
         self._reload_pii_results()
-        self._invalidate_and_requeue_thumbnails()
 
     def _on_pii_mask_color_changed(self, color: object) -> None:
         settings = self._pii_settings().copy()
@@ -217,8 +367,7 @@ class PiiDrawerMixin:
         settings.save()
         self._pii_settings_cache = settings
         self._apply_pii_visual_settings()
-        self._restyle_pii_annots_in_pdf()
-        self._invalidate_and_requeue_thumbnails()
+        self._schedule_pii_restyle()
 
     def _on_pii_mask_transparency_changed(self, value: int, commit: bool) -> None:
         """透明度スライダ。ドラッグ中は画面へ即時反映するだけで、保存は確定時に行う。"""
@@ -229,8 +378,7 @@ class PiiDrawerMixin:
         self._pii_settings_cache = settings
         self._apply_pii_visual_settings()
         if commit:
-            self._restyle_pii_annots_in_pdf()
-            self._invalidate_and_requeue_thumbnails()
+            self._schedule_pii_restyle()
 
     def _toggle_pii_drawer(self) -> None:
         panel = getattr(self, "_pii_panel", None)
@@ -253,7 +401,7 @@ class PiiDrawerMixin:
                 ocr_panel.set_open(False)
             # 設定は全ファイル共通・注釈はファイルごとなので、開いたファイルの
             # PII注釈を現在の設定(色・透明度・チェック)に揃える。
-            self._restyle_pii_annots_in_pdf()
+            self._schedule_pii_restyle()
             self._reload_pii_results()
         else:
             # ドロワーを閉じたら手動ツール(テキスト候補/塗り四角/塗り丸)も解除する。
@@ -1163,26 +1311,29 @@ class PiiDrawerMixin:
             else:
                 redact_rects.setdefault(shape.page_num, []).append(region)
 
-        try:
-            # 画像名(<元名>_黒塗り_pN.png 等)が正しくなるよう、一時フォルダ内に
-            # 最終名と同じ stem で黒塗り済みPDFを作り、そこから書き出す。
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                tmp_pdf = os.path.join(tmp_dir, f"{src_path.stem}_黒塗り.pdf")
-                redact_pdf_remove_text(
-                    self._pdf_path,
-                    tmp_pdf,
-                    remove_xrefs=remove_xrefs,
-                    redact_rects=redact_rects,
-                    redact_ellipses=redact_ellipses,
-                    fill_color=(0.0, 0.0, 0.0),
+        # 黒塗り用の読み込み中に restyle ジョブがPDFを開いたままにならないよう止め、
+        # 終わったら(止めていたなら)走り直す。
+        with self._pii_restyle_paused():
+            try:
+                # 画像名(<元名>_黒塗り_pN.png 等)が正しくなるよう、一時フォルダ内に
+                # 最終名と同じ stem で黒塗り済みPDFを作り、そこから書き出す。
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_pdf = os.path.join(tmp_dir, f"{src_path.stem}_黒塗り.pdf")
+                    redact_pdf_remove_text(
+                        self._pdf_path,
+                        tmp_pdf,
+                        remove_xrefs=remove_xrefs,
+                        redact_rects=redact_rects,
+                        redact_ellipses=redact_ellipses,
+                        fill_color=(0.0, 0.0, 0.0),
+                    )
+                    created = self._write_pii_export(tmp_pdf, options, output_path, out_dir)
+            except Exception as error:  # noqa: BLE001 - ダイアログで詳細を提示する
+                logger.warning("PIIエクスポートに失敗しました: %s", error, exc_info=True)
+                QMessageBox.warning(
+                    self, "個人情報検出", f"エクスポートに失敗しました。\n\n{error}"
                 )
-                created = self._write_pii_export(tmp_pdf, options, output_path, out_dir)
-        except Exception as error:  # noqa: BLE001 - ダイアログで詳細を提示する
-            logger.warning("PIIエクスポートに失敗しました: %s", error, exc_info=True)
-            QMessageBox.warning(
-                self, "個人情報検出", f"エクスポートに失敗しました。\n\n{error}"
-            )
-            return
+                return
 
         if fmt == "pdf":
             message = (

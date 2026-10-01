@@ -83,9 +83,7 @@ from src.utils.pdf_utils import (
     AnyAnnotData,
     list_ink_annot_xrefs,
     list_ink_annot_xrefs_by_page,
-    list_pii_markup_annots,
-    list_pii_mask_shapes,
-    get_page_size_points,
+    list_pii_targets_by_page,
     _get_file_cache_token,
     list_shape_annots,
     create_shape_annot,
@@ -127,7 +125,6 @@ from src.views.page_edit_widgets import (
     NoteContentEdit,
     PageThumbnail,
     ZoomPageWidget,
-    paint_pii_mask_overlay,
     _apply_block_line_height,
     _build_freetext_document,
     _freetext_pixel_size,
@@ -944,13 +941,17 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         PdfWritePermissionError 時は警告ダイアログを表示して False を返す
         (履歴には積まない)。redo には do_func をそのまま使う。
         """
-        try:
-            do_func()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(
-                error, selected_annotation=selected_annotation_on_error
-            )
-            return False
+        # PII注釈の restyle ジョブはPDFを開いたままなので、書き込み前に止める
+        # (Windows では全体保存の置き換えに失敗する)。終わったら走り直す。
+        # PDFへ書き込む新しい経路を足すときも同じガードが必要。
+        with self._pii_restyle_paused():
+            try:
+                do_func()
+            except PdfWritePermissionError as error:
+                self._handle_pdf_write_permission_denied(
+                    error, selected_annotation=selected_annotation_on_error
+                )
+                return False
         self._undo_manager.add_action(UndoAction(
             description=description,
             undo_func=undo_func,
@@ -1106,16 +1107,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         cached = self._pii_targets_by_page_cache
         if cached is not None and cached[0] == token:
             return cached[1]
-        grouped: dict[int, list] = {}
-        for target in [
-            *list_pii_markup_annots(self._pdf_path),
-            *list_pii_mask_shapes(self._pdf_path),
-        ]:
-            grouped.setdefault(target.page_num, []).append(target)
-        by_page = {
-            pn: (get_page_size_points(self._pdf_path, pn), targets)
-            for pn, targets in grouped.items()
-        }
+        # ドキュメントを1回だけ開く(PIIのあるページ数に依存しない)。
+        by_page = list_pii_targets_by_page(self._pdf_path)
         self._pii_targets_by_page_cache = (token, by_page)
         return by_page
 
@@ -1158,27 +1151,33 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             pixmaps = render_page_thumbnails_batch(
                 self._pdf_path, batch, self._thumb_size, hide_xrefs=hide_xrefs_by_page or None
             )
+            pii_settings = self._pii_settings()
+            pii_color = pii_settings.mask_color
+            pii_opacity = pii_settings.mask_opacity
+            pii_hidden = pii_settings.hidden_entities()
             for pn in batch:
                 if pn < len(self._thumbnails):
                     pixmap = pixmaps.get(pn, QPixmap())
+                    thumb = self._thumbnails[pn]
+                    # 塗りつぶし対象はピクセルへ焼き込まず、サムネイルの paint 時に重ねる
+                    # (色・透明度・種別の変更で画像を再レンダリングしなくて済む)。
                     if pn in pii_targets_by_page:
                         page_size, targets = pii_targets_by_page[pn]
-                        pii_settings = self._pii_settings()
-                        pixmap = paint_pii_mask_overlay(
-                            pixmap,
-                            targets,
-                            page_size,
-                            pii_settings.mask_color,
-                            pii_settings.mask_opacity,
-                            pii_settings.hidden_entities(),
-                        )
-                    self._thumbnails[pn].set_pixmap_direct(pixmap)
+                        thumb.set_pii_overlay(targets, page_size)
+                    else:
+                        thumb.set_pii_overlay([], (0.0, 0.0))
+                    thumb.set_pii_mask_style(pii_color, pii_opacity, pii_hidden)
+                    thumb.set_pixmap_direct(pixmap)
         self._schedule_thumbnail_render()
 
     def _on_grid_viewport_changed(self, _value: int) -> None:
         self._scroll_debounce_timer.start()  # デバウンス（スクロール停止150ms後に優先化）
 
     def _load_pages(self) -> None:
+        # ページ構成の変更(書き込み)の直後に呼ばれるので、PDFを開いたままの
+        # PII restyle ジョブを止め、走り直しを予約する(デバウンスなので本処理の後に動く)。
+        if self._abort_pii_restyle_job():
+            self._schedule_pii_restyle()
         self._reset_thumbnail_render_queue()
         # ページ構成が変わるため、ページ別 Ink xref キャッシュも破棄する。
         self._ink_xrefs_by_page_cache = None
@@ -1922,11 +1921,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if self._zoom_page_layout_is_multi():
             return
         self._commit_inline_annotation_editor()
-        try:
-            self._undo_manager.undo()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
-            return
+        with self._pii_restyle_paused():  # PDFへ書き込むので restyle ジョブを止める
+            try:
+                self._undo_manager.undo()
+            except PdfWritePermissionError as error:
+                self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
+                return
         self._load_pages()
         self._update_button_states()
 
@@ -1934,11 +1934,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if self._zoom_page_layout_is_multi():
             return
         self._commit_inline_annotation_editor()
-        try:
-            self._undo_manager.redo()
-        except PdfWritePermissionError as error:
-            self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
-            return
+        with self._pii_restyle_paused():  # PDFへ書き込むので restyle ジョブを止める
+            try:
+                self._undo_manager.redo()
+            except PdfWritePermissionError as error:
+                self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
+                return
         self._load_pages()
         self._update_button_states()
 
@@ -2637,6 +2638,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         logger.debug(f"PageEditWindow closing for {self._pdf_path}")
 
         self._reset_thumbnail_render_queue()
+        # 予約中・実行中の PII 注釈スタイル反映は、閉じる前に同期で済ませる。
+        self._flush_pii_restyle(sync=True)
         self._undo_manager.remove_listener(self._on_undo_manager_changed)
 
         if self._search_dialog is not None:

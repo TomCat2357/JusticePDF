@@ -7,7 +7,7 @@ import re
 import uuid
 from dataclasses import dataclass, replace as dataclass_replace
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import fitz
 
@@ -1668,6 +1668,130 @@ def _pii_annot_needs_restyle(
     return is_hidden != hidden
 
 
+def list_pii_targets_by_page(
+    pdf_path: str,
+) -> "dict[int, tuple[tuple[float, float], list]]":
+    """PII塗りつぶし対象(テキスト候補+図形)をページ番号ごとにまとめて返す。
+
+    戻り値は ``{page_num: ((幅, 高さ)pt, [対象...])}``。ドキュメントを1回だけ開き、
+    ページ内はテキスト候補→図形の順で並べる。サイズは表示座標系(``page.rect``)。
+    大きいPDFでマークアップ/図形/ページサイズ用に何度も開き直さないための関数。
+    読み込みに失敗したら空の dict を返す。
+    """
+    result: dict[int, tuple[tuple[float, float], list]] = {}
+    try:
+        with fitz.open(pdf_path) as doc:
+            for pn in range(len(doc)):
+                page = doc[pn]
+                targets: list = []
+                for family in (_MARKUP_FAMILY, _SHAPE_FAMILY):
+                    annots = page.annots(types=family.types)
+                    if annots is None:
+                        continue
+                    for annot in annots:
+                        data = family.extract_fn(doc, pn, annot)
+                        if data is not None and data.pii_entity:
+                            targets.append(data)
+                if targets:
+                    rect = page.rect
+                    result[pn] = ((float(rect.width), float(rect.height)), targets)
+    except Exception:
+        logger.debug("list_pii_targets_by_page failed: %s", pdf_path, exc_info=True)
+    return result
+
+
+def _regenerate_annot_appearance(annot: fitz.Annot) -> None:
+    """色・不透明度・フラグ変更後に AP を MuPDF ネイティブで再生成する(annot.update() より約6倍速い)。
+
+    ``annot._update_appearance`` は Multiply が消えるため使わない。
+    ネイティブ関数が無い PyMuPDF では ``annot.update()`` にフォールバックする。
+    """
+    mupdf_mod = getattr(fitz, "mupdf", None)
+    if (
+        mupdf_mod is not None
+        and hasattr(mupdf_mod, "pdf_annot_request_resynthesis")
+        and hasattr(mupdf_mod, "pdf_update_annot")
+    ):
+        mupdf_mod.pdf_annot_request_resynthesis(annot.this)
+        mupdf_mod.pdf_update_annot(annot.this)
+        return
+    annot.update()
+
+
+def iter_restyle_pii_annots(
+    pdf_path: str,
+    color: tuple[float, float, float],
+    opacity: float,
+    hidden_entities=(),
+) -> "Iterator[None]":
+    """``restyle_pii_annots`` のジェネレータ版。ページごとに ``yield`` する。
+
+    呼び出し側(UIスレッド)が時間予算つきで ``next()`` を繰り返せば、大きいPDFでも
+    UIを固めずに処理できる。全ページの処理が終わったときだけ、変更があれば増分保存し
+    (``StopIteration.value`` が変更件数)、``finally`` でドキュメントを閉じる。
+    途中で ``close()`` した場合(``GeneratorExit``)は保存せず、ドキュメントだけ閉じる。
+    ``PdfWritePermissionError`` は保存時に ``next()`` から送出される。
+
+    注意: ``yield`` の間はこのジェネレータが PDF を開いたままなので、同じファイルへ
+    書き込む操作の前には必ず ``close()`` すること(Windows では開いたまま全体保存の
+    置き換えに失敗する)。
+    """
+    color = (
+        max(0.0, min(1.0, float(color[0]))),
+        max(0.0, min(1.0, float(color[1]))),
+        max(0.0, min(1.0, float(color[2]))),
+    )
+    opacity = max(0.0, min(1.0, float(opacity)))
+    hidden_set = frozenset(str(e) for e in (hidden_entities or ()))
+    changed = 0
+    doc = fitz.open(pdf_path)
+    try:
+        for page in doc:
+            annots = page.annots(types=[*_MARKUP_ANNOT_TYPES, *_SHAPE_ANNOT_TYPES])
+            if annots is not None:
+                for annot in annots:
+                    subject = annot.info.get("subject", "")
+                    metadata = _decode_markup_metadata(subject)
+                    is_markup = metadata is not None
+                    if metadata is None:
+                        metadata = _decode_shape_metadata(subject)
+                    if metadata is None or not metadata.get("pii_entity"):
+                        continue
+                    hidden = str(metadata["pii_entity"]) in hidden_set
+                    if not _pii_annot_needs_restyle(
+                        doc,
+                        annot,
+                        metadata,
+                        is_markup=is_markup,
+                        color=color,
+                        opacity=opacity,
+                        hidden=hidden,
+                    ):
+                        continue
+                    if is_markup:
+                        annot.set_colors(stroke=list(color))
+                        metadata["color"] = list(color)
+                        metadata["opacity"] = opacity
+                        prefix = JUSTICEPDF_MARKUP_SUBJECT_PREFIX
+                    else:
+                        annot.set_colors(stroke=list(color), fill=list(color))
+                        metadata["stroke_color"] = list(color)
+                        metadata["fill_color"] = list(color)
+                        prefix = JUSTICEPDF_SHAPE_SUBJECT_PREFIX
+                    annot.set_opacity(opacity)
+                    _set_hidden_flag(annot, hidden)
+                    annot.set_info(subject=_encode_prefixed_json(prefix, metadata))
+                    _regenerate_annot_appearance(annot)
+                    changed += 1
+            yield
+        if changed:
+            # xref は変わらないので増分保存で足りる(失敗時は全体保存へ自動フォールバック)。
+            _save_document_in_place(doc, pdf_path, incremental=True)
+        return changed
+    finally:
+        doc.close()
+
+
 def restyle_pii_annots(
     pdf_path: str,
     color: tuple[float, float, float],
@@ -1682,60 +1806,14 @@ def restyle_pii_annots(
     合わせるためのもの。ドキュメントを1回だけ開き、変更が必要な注釈があった場合
     だけ1回保存する。変更した注釈の件数を返す(保存が必要なかったら0)。
     ``PdfWritePermissionError`` は呼び出し側で処理する。
+    UIから呼ぶときは固まらないよう ``iter_restyle_pii_annots`` を時間分割で回すこと。
     """
-    color = (
-        max(0.0, min(1.0, float(color[0]))),
-        max(0.0, min(1.0, float(color[1]))),
-        max(0.0, min(1.0, float(color[2]))),
-    )
-    opacity = max(0.0, min(1.0, float(opacity)))
-    hidden_set = frozenset(str(e) for e in (hidden_entities or ()))
-    changed = 0
-    doc = fitz.open(pdf_path)
+    gen = iter_restyle_pii_annots(pdf_path, color, opacity, hidden_entities)
     try:
-        for page in doc:
-            annots = page.annots(types=[*_MARKUP_ANNOT_TYPES, *_SHAPE_ANNOT_TYPES])
-            if annots is None:
-                continue
-            for annot in annots:
-                subject = annot.info.get("subject", "")
-                metadata = _decode_markup_metadata(subject)
-                is_markup = metadata is not None
-                if metadata is None:
-                    metadata = _decode_shape_metadata(subject)
-                if metadata is None or not metadata.get("pii_entity"):
-                    continue
-                hidden = str(metadata["pii_entity"]) in hidden_set
-                if not _pii_annot_needs_restyle(
-                    doc,
-                    annot,
-                    metadata,
-                    is_markup=is_markup,
-                    color=color,
-                    opacity=opacity,
-                    hidden=hidden,
-                ):
-                    continue
-                if is_markup:
-                    annot.set_colors(stroke=list(color))
-                    metadata["color"] = list(color)
-                    metadata["opacity"] = opacity
-                    prefix = JUSTICEPDF_MARKUP_SUBJECT_PREFIX
-                else:
-                    annot.set_colors(stroke=list(color), fill=list(color))
-                    metadata["stroke_color"] = list(color)
-                    metadata["fill_color"] = list(color)
-                    prefix = JUSTICEPDF_SHAPE_SUBJECT_PREFIX
-                annot.set_opacity(opacity)
-                annot.update()
-                _set_hidden_flag(annot, hidden)
-                annot.set_info(subject=_encode_prefixed_json(prefix, metadata))
-                changed += 1
-        if changed:
-            _save_document_in_place(doc, pdf_path)
-        return changed
-    finally:
-        doc.close()
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return int(stop.value or 0)
 
 
 # --- Sticky note (comment) annotations -----------------------------------

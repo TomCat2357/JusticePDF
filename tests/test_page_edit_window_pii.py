@@ -974,7 +974,7 @@ def test_pii_mask_overlay_paints_markup_and_ellipse_only_inside():
     assert _rgb(corner_px) == (255, 255, 255)
 
 
-def test_page_list_thumbnail_shows_pii_mask_targets(qtbot, tmp_path):
+def test_page_list_thumbnail_shows_pii_mask_targets(qtbot, monkeypatch, tmp_path):
     """ページ一覧のサムネイルにも塗りつぶし対象が種別色で重ね描きされる。"""
     from src.utils.pdf_utils import MarkupType, TextMarkupAnnotData, create_markup_annot
 
@@ -1006,20 +1006,47 @@ def test_page_list_thumbnail_shows_pii_mask_targets(qtbot, tmp_path):
     thumb = window._thumbnails[0]
     assert thumb.thumbnail_loaded
 
-    image = thumb._image_label.pixmap().toImage()
-    px = image.pixelColor(image.width() // 2, 2)
+    # オーバーレイは paint 時に重ねるので、ラベルを grab() した見た目で確認する
+    # (ページ画像のピクセルには焼き込まれない)。
+    def label_center_px():
+        image = window._thumbnails[0]._image_label.grab().toImage()
+        return image.pixelColor(image.width() // 2, image.height() // 2)
+
+    px = label_center_px()
     # 実PDF注釈(不透明度0.35=暗い灰色)ではなく、設定の色(赤)の重ね描きになる。
     assert px.red() > 200 and px.green() < 200 and px.blue() < 200
 
-    # 種別のチェックを外すと、サムネイルにも描かれない。
-    hidden_style = style.copy()
-    hidden_style.enabled_entities["PERSON"] = False
-    window._pii_settings_cache = hidden_style
-    window._invalidate_and_requeue_thumbnails()
-    window._process_thumbnail_render_queue()
-    image = window._thumbnails[0]._image_label.pixmap().toImage()
-    px = image.pixelColor(image.width() // 2, 2)
+    # 種別のチェックを外すと、サムネイルにも描かれない(画像の再レンダリング無し)。
+    from src.views import page_edit_window as page_edit_window_module
+
+    calls = []
+    original = page_edit_window_module.render_page_thumbnails_batch
+    monkeypatch.setattr(
+        page_edit_window_module,
+        "render_page_thumbnails_batch",
+        lambda *a, **k: calls.append(1) or original(*a, **k),
+    )
+    window._on_pii_entity_visibility_changed("PERSON", False)
+    px = label_center_px()
     assert not (px.red() > 200 and px.green() < 200 and px.blue() < 200)
+    window._on_pii_entity_visibility_changed("PERSON", True)
+    px = label_center_px()
+    assert px.red() > 200 and px.green() < 200 and px.blue() < 200
+
+    # 色・透明度を変えても、サムネイル画像は再レンダリングされず色だけ変わる。
+    window._on_pii_mask_color_changed((0.0, 0.0, 1.0))
+    px = label_center_px()
+    assert px.blue() > 200 and px.red() < 200
+    window._on_pii_mask_transparency_changed(100, True)
+    px = label_center_px()
+    assert px.red() > 200 and px.green() > 200 and px.blue() > 200  # 完全に透明
+    window._on_pii_mask_transparency_changed(0, True)
+    window._thumbnails[0]._image_label.set_style((0.0, 1.0, 0.0), 1.0, frozenset())
+    px = label_center_px()
+    assert px.green() > 200 and px.red() < 200 and px.blue() < 200
+    window._flush_pii_restyle(sync=True)
+    assert calls == []
+    assert window._thumbnails[0].thumbnail_loaded
 
 
 def test_pii_mask_overlay_uses_opacity_and_skips_hidden_entities():

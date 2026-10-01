@@ -221,15 +221,45 @@ def paint_pii_mask_overlay(
     scale = pixmap.width() / page_w
     result = QPixmap(pixmap)
     painter = QPainter(result)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     try:
+        draw_pii_mask_overlay(
+            painter, targets, scale, (0.0, 0.0), color, opacity, hidden_entities
+        )
+    finally:
+        painter.end()
+    return result
+
+
+def draw_pii_mask_overlay(
+    painter: QPainter,
+    targets: "list[TextMarkupAnnotData | ShapeAnnotData]",
+    scale: float,
+    offset: tuple[float, float],
+    color: tuple[float, float, float],
+    opacity: float,
+    hidden_entities: "frozenset[str] | set[str] | tuple[str, ...]" = (),
+) -> None:
+    """塗りつぶし対象を ``painter`` へ描く(``paint_pii_mask_overlay`` と paint 時描画の共通本体)。
+
+    PDF座標(pt)を ``scale`` 倍して ``offset``(描画先ピクセル)だけずらして描く。
+    ``hidden_entities`` に含まれる種別は描かない。painter の状態は呼び出し前に戻す。
+    """
+    targets = [t for t in targets if t.pii_entity not in hidden_entities]
+    if not targets:
+        return
+    ox, oy = offset
+    painter.save()
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         fill, border = mask_fill_style(color, opacity)
         painter.setPen(Qt.PenStyle.NoPen if border is None else QPen(border, 1.0))
         painter.setBrush(QBrush(fill))
         for target in targets:
             if isinstance(target, ShapeAnnotData):
                 x0, y0, x1, y1 = target.rect
-                rect = QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+                rect = QRectF(
+                    ox + x0 * scale, oy + y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale
+                )
                 painter.save()
                 rotation = float(target.rotation or 0.0)
                 if rotation:
@@ -245,11 +275,85 @@ def paint_pii_mask_overlay(
             else:
                 for x0, y0, x1, y1 in target.quads:
                     painter.drawRect(
-                        QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+                        QRectF(
+                            ox + x0 * scale,
+                            oy + y0 * scale,
+                            (x1 - x0) * scale,
+                            (y1 - y0) * scale,
+                        )
                     )
     finally:
-        painter.end()
-    return result
+        painter.restore()
+
+
+class _PiiOverlayLabel(QLabel):
+    """サムネイル画像を描いた後、塗りつぶし対象を paint 時に重ねるラベル。
+
+    色・透明度・種別の表示状態を変えても、サムネイル画像の再レンダリングは不要
+    (``update()`` だけで見た目が変わる)。実PDF注釈はページ画像側で ``hide_xrefs`` により
+    隠してあるので二重描画にならない。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pii_targets: list = []
+        self._pii_page_size: tuple[float, float] = (0.0, 0.0)
+        self._pii_style: tuple[tuple[float, float, float], float, frozenset[str]] = (
+            (0.0, 0.0, 0.0),
+            0.3,
+            frozenset(),
+        )
+
+    def set_overlay(self, targets: list, page_size: tuple[float, float]) -> None:
+        self._pii_targets = list(targets)
+        self._pii_page_size = (float(page_size[0]), float(page_size[1]))
+        self.update()
+
+    def set_style(
+        self,
+        color: tuple[float, float, float],
+        opacity: float,
+        hidden_entities: "frozenset[str] | set[str] | tuple[str, ...]",
+    ) -> None:
+        style = (
+            (float(color[0]), float(color[1]), float(color[2])),
+            float(opacity),
+            frozenset(hidden_entities),
+        )
+        if style == self._pii_style:
+            return
+        self._pii_style = style
+        if self._pii_targets:
+            self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().paintEvent(event)
+        pix = self.pixmap()
+        page_w, page_h = self._pii_page_size
+        if (
+            not self._pii_targets
+            or pix is None
+            or pix.isNull()
+            or page_w <= 0
+            or page_h <= 0
+        ):
+            return
+        dpr = pix.devicePixelRatio() or 1.0
+        logical_w = pix.width() / dpr
+        logical_h = pix.height() / dpr
+        content = self.contentsRect()  # AlignCenter なので内容矩形の中央に描かれる
+        offset = (
+            content.x() + (content.width() - logical_w) / 2.0,
+            content.y() + (content.height() - logical_h) / 2.0,
+        )
+        color, opacity, hidden = self._pii_style
+        painter = QPainter(self)
+        try:
+            draw_pii_mask_overlay(
+                painter, self._pii_targets, logical_w / page_w, offset, color, opacity, hidden
+            )
+        finally:
+            painter.end()
 
 
 class PageThumbnail(QFrame):
@@ -287,7 +391,7 @@ class PageThumbnail(QFrame):
         self._thumbnail_container = QWidget()
         self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
 
-        self._image_label = QLabel(self._thumbnail_container)
+        self._image_label = _PiiOverlayLabel(self._thumbnail_container)
         self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._image_label.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
@@ -331,6 +435,19 @@ class PageThumbnail(QFrame):
         self._image_label.setText("")
         self._thumbnail_loaded = True
         return True
+
+    def set_pii_overlay(self, targets: list, page_size: tuple[float, float]) -> None:
+        """このページの塗りつぶし対象(PDF座標)を登録する。描画は paint 時に重ねる。"""
+        self._image_label.set_overlay(targets, page_size)
+
+    def set_pii_mask_style(
+        self,
+        color: tuple[float, float, float],
+        opacity: float,
+        hidden_entities: "frozenset[str] | set[str] | tuple[str, ...]" = (),
+    ) -> None:
+        """塗りつぶし対象の色・不透明度・非表示種別。変化したときだけ再描画する。"""
+        self._image_label.set_style(color, opacity, hidden_entities)
 
     def set_pixmap_direct(self, pixmap: QPixmap) -> None:
         """Set a pre-rendered pixmap directly (for batch rendering)."""
