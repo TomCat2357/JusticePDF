@@ -10,15 +10,18 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QModelIndex, QObject, QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
@@ -34,6 +37,62 @@ _PAGE_ROLE = Qt.ItemDataRole.UserRole
 # ノード種別: None=しおり, "note_group"=付箋グループ, "note"=付箋
 _NODE_KIND_ROLE = Qt.ItemDataRole.UserRole + 1
 _XREF_ROLE = Qt.ItemDataRole.UserRole + 2
+
+_MIN_ROW_HEIGHT = 24
+_DEFAULT_MAX_PAGE = 99999
+# グローバルQSS(QLineEdit の padding 6px 8px 等)でインライン編集欄が潰れないよう、
+# エディタ個別に上書きする。
+_EDITOR_STYLE = (
+    "{sel} {{ padding: 0 2px; margin: 0; border: 1px solid #4f46e5;"
+    " border-radius: 0; background-color: #ffffff; }}"
+)
+
+
+class _BookmarkDelegate(QStyledItemDelegate):
+    """しおりツリー用デリゲート。行高の確保と、列ごとのインライン編集欄を提供する。
+
+    列0=タイトル(QLineEdit)、列1=ページ(QSpinBox, 1..ページ数)。
+    """
+
+    def __init__(self, panel: "BookmarksPanel") -> None:
+        super().__init__(panel._tree)
+        self._panel = panel
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        size = super().sizeHint(option, index)
+        return QSize(size.width(), max(size.height(), _MIN_ROW_HEIGHT))
+
+    def createEditor(self, parent, option, index):
+        if index.column() == 1:
+            spin = QSpinBox(parent)
+            spin.setRange(1, self._panel._max_page())
+            spin.setStyleSheet(_EDITOR_STYLE.format(sel="QSpinBox"))
+            spin.setMinimumHeight(_MIN_ROW_HEIGHT)
+            return spin
+        edit = QLineEdit(parent)
+        edit.setStyleSheet(_EDITOR_STYLE.format(sel="QLineEdit"))
+        edit.setMinimumHeight(_MIN_ROW_HEIGHT)
+        return edit
+
+    def setEditorData(self, editor, index) -> None:
+        if isinstance(editor, QSpinBox):
+            try:
+                editor.setValue(int(index.data(Qt.ItemDataRole.DisplayRole)))
+            except (TypeError, ValueError):
+                editor.setValue(1)
+            editor.selectAll()
+        else:
+            super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index) -> None:
+        if isinstance(editor, QSpinBox):
+            editor.interpretText()
+            model.setData(index, str(editor.value()), Qt.ItemDataRole.EditRole)
+        else:
+            super().setModelData(editor, model, index)
+
+    def updateEditorGeometry(self, editor, option, index) -> None:
+        editor.setGeometry(option.rect)
 
 
 class BookmarksPanel(QFrame):
@@ -56,7 +115,11 @@ class BookmarksPanel(QFrame):
 
     DRAWER_WIDTH = 320
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        page_count_provider: Callable[[], int] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("bookmarksDrawer")
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -68,7 +131,10 @@ class BookmarksPanel(QFrame):
         # 閲覧専用(見開き表示)モード。True の間は編集系ボタンを全て無効化し、
         # ジャンプ/閲覧のみ可能にする。
         self._read_only = False
-        self._current_page_provider: Callable[[], int] | None = None
+        self._current_page_provider: Callable[[], int | None] | None = None
+        self._page_count_provider = page_count_provider
+        # 現在ページが存在するか(無ければ追加ボタンを無効化)。read_only が優先。
+        self._current_page_available = True
         # 付箋一覧（page 1始まり, xref, 冒頭テキスト）。set_annotation_notes で更新。
         self._notes: list[tuple[int, int, str]] = []
 
@@ -99,45 +165,49 @@ class BookmarksPanel(QFrame):
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.itemChanged.connect(self._on_item_changed)
         self._tree.itemSelectionChanged.connect(self._update_button_states)
+        self._tree.setItemDelegate(_BookmarkDelegate(self))
+        self._tree.installEventFilter(self)
         panel_layout.addWidget(self._tree, 1)
+
+        hint = QLabel("ダブルクリックまたは F2 で名前・ページを編集")
+        hint.setObjectName("bookmarksHint")
+        hint.setWordWrap(True)
+        panel_layout.addWidget(hint)
 
         # 追加/削除
         add_row = QHBoxLayout()
-        self._add_current_btn = QPushButton("現在ページに追加")
-        self._add_current_btn.setToolTip("表示中のページへのしおりを追加")
-        self._add_current_btn.clicked.connect(self._on_add_current_page)
-        add_row.addWidget(self._add_current_btn)
-        panel_layout.addLayout(add_row)
-
-        edit_row = QHBoxLayout()
-        self._add_btn = QPushButton("追加...")
-        self._add_btn.clicked.connect(self._on_add_dialog)
-        edit_row.addWidget(self._add_btn)
-        self._edit_btn = QPushButton("編集...")
-        self._edit_btn.clicked.connect(self._on_edit_dialog)
-        edit_row.addWidget(self._edit_btn)
+        self._add_btn = QPushButton("追加")
+        self._add_btn.setToolTip("現在のページにしおりを追加し、名前を入力します")
+        self._add_btn.clicked.connect(self._on_add)
+        add_row.addWidget(self._add_btn)
         self._delete_btn = QPushButton("削除")
+        self._delete_btn.setToolTip("選択中のしおりを削除します(Delete キー)")
         self._delete_btn.clicked.connect(self._on_delete)
-        edit_row.addWidget(self._delete_btn)
-        panel_layout.addLayout(edit_row)
+        add_row.addWidget(self._delete_btn)
+        panel_layout.addLayout(add_row)
+        # 旧名の互換エイリアス(「現在ページに追加」ボタンは「追加」に統合)
+        self._add_current_btn = self._add_btn
 
-        # 階層/並べ替え
+        # 階層
         move_row = QHBoxLayout()
         self._promote_btn = QPushButton("← 昇格")
-        self._promote_btn.setToolTip("階層を一つ上げる")
+        self._promote_btn.setToolTip("階層を一つ上げます")
         self._promote_btn.clicked.connect(self._on_promote)
         move_row.addWidget(self._promote_btn)
         self._demote_btn = QPushButton("降格 →")
-        self._demote_btn.setToolTip("直前の項目の子にする")
+        self._demote_btn.setToolTip("直前のしおりの子にします")
         self._demote_btn.clicked.connect(self._on_demote)
         move_row.addWidget(self._demote_btn)
         panel_layout.addLayout(move_row)
 
+        # 並べ替え
         order_row = QHBoxLayout()
         self._up_btn = QPushButton("↑ 上へ")
+        self._up_btn.setToolTip("同じ階層で一つ上へ移動します")
         self._up_btn.clicked.connect(lambda: self._move_within_siblings(-1))
         order_row.addWidget(self._up_btn)
         self._down_btn = QPushButton("↓ 下へ")
+        self._down_btn.setToolTip("同じ階層で一つ下へ移動します")
         self._down_btn.clicked.connect(lambda: self._move_within_siblings(1))
         order_row.addWidget(self._down_btn)
         panel_layout.addLayout(order_row)
@@ -150,9 +220,26 @@ class BookmarksPanel(QFrame):
     # ------------------------------------------------------------------
     # 公開 API
     # ------------------------------------------------------------------
-    def set_current_page_provider(self, provider: Callable[[], int]) -> None:
-        """現在表示中のページ(1始まり)を返す callable を登録する。"""
+    def set_current_page_provider(self, provider: Callable[[], int | None]) -> None:
+        """現在表示中のページ(1始まり)を返す callable を登録する。None なら追加は何もしない。"""
         self._current_page_provider = provider
+
+    def set_page_count_provider(self, provider: Callable[[], int] | None) -> None:
+        """総ページ数を返す callable を登録する(ページ列エディタの上限)。"""
+        self._page_count_provider = provider
+
+    def set_current_page_available(self, available: bool) -> None:
+        """現在ページが存在するか。False の間は追加ボタンを無効化する(閲覧専用が優先)。"""
+        self._current_page_available = bool(available)
+        self._update_button_states()
+
+    def _max_page(self) -> int:
+        if self._page_count_provider is not None:
+            try:
+                return max(1, int(self._page_count_provider()))
+            except (TypeError, ValueError):
+                pass
+        return _DEFAULT_MAX_PAGE
 
     def set_read_only(self, read_only: bool) -> None:
         """閲覧専用(見開き表示)時に編集系ボタンを全て無効化する。
@@ -410,28 +497,65 @@ class BookmarksPanel(QFrame):
             return
         if self._is_note_node(item):
             return
-        if column == 0:
-            self._tree.editItem(item, 0)
-        elif column == 1:
-            self._edit_page_via_dialog(item)
+        if column in (0, 1):
+            self._tree.editItem(item, column)
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
-        # インライン編集(タイトル列)の確定時に発火。プログラム的な更新は抑制する。
+        # インライン編集の確定時に発火。プログラム的な更新は抑制する。
         if self._loading or self._suppress_item_changed:
+            return
+        if self._is_note_node(item):
             return
         if column == 0:
             self._emit_changed("しおり名変更")
+        elif column == 1:
+            old = item.data(0, _PAGE_ROLE)
+            try:
+                page = max(1, min(int(item.text(1).strip()), self._max_page()))
+            except ValueError:
+                page = old
+            self._suppress_item_changed = True
+            try:
+                item.setText(1, str(page))
+                item.setData(0, _PAGE_ROLE, page)
+            finally:
+                self._suppress_item_changed = False
+            if page != old:
+                self._emit_changed("しおりページ変更")
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        # F2=タイトル編集、Delete=削除(ツリーにフォーカスがある間のみ)。
+        if obj is self._tree and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key == Qt.Key.Key_F2:
+                self._start_title_edit(self._tree.currentItem())
+                return True
+            if key == Qt.Key.Key_Delete:
+                if not self._read_only:
+                    self._on_delete()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _start_title_edit(self, item: QTreeWidgetItem | None) -> None:
+        if item is None or self._read_only or self._is_note_node(item):
+            return
+        if not (item.flags() & Qt.ItemFlag.ItemIsEditable):
+            return
+        self._tree.setCurrentItem(item)
+        self._tree.editItem(item, 0)
 
     # ------------------------------------------------------------------
     # 追加 / 削除 / 編集
     # ------------------------------------------------------------------
-    def _current_page(self) -> int:
+    def _current_page(self) -> int | None:
+        """現在ページ(1始まり)。provider が None を返したら None。未登録なら 1。"""
         if self._current_page_provider is None:
             return 1
         try:
-            return max(1, int(self._current_page_provider()))
+            value = self._current_page_provider()
+            return None if value is None else max(1, int(value))
         except (TypeError, ValueError):
-            return 1
+            return None
 
     def _insert_sibling(self, item: QTreeWidgetItem) -> None:
         """選択項目の直後・同階層に挿入。未選択ならトップレベル末尾。"""
@@ -450,67 +574,27 @@ class BookmarksPanel(QFrame):
             parent.insertChild(index + 1, item)
             parent.setExpanded(True)
 
-    def _on_add_current_page(self) -> None:
+    def _on_add(self) -> None:
+        """現在ページに「(無題)」を追加し、続けてタイトルをインライン編集する。"""
+        if self._read_only or not self._current_page_available:
+            return
         page = self._current_page()
-        item = self._make_item("(無題)", page)
+        if page is None:
+            return
+        item = self._make_item("(無題)", min(page, self._max_page()))
         self._insert_sibling(item)
         self._tree.setCurrentItem(item)
         self._emit_changed("しおり追加")
-
-    def _on_add_dialog(self) -> None:
-        default_page = self._current_page()
-        title, ok = QInputDialog.getText(self, "しおりを追加", "タイトル:")
-        if not ok:
-            return
-        title = title.strip() or "(無題)"
-        page, ok = QInputDialog.getInt(
-            self, "しおりを追加", "ページ:", default_page, 1, 1_000_000
-        )
-        if not ok:
-            return
-        item = self._make_item(title, page)
-        self._insert_sibling(item)
-        self._tree.setCurrentItem(item)
-        self._emit_changed("しおり追加")
-
-    def _on_edit_dialog(self) -> None:
-        item = self._tree.currentItem()
-        if item is None:
-            return
-        title, ok = QInputDialog.getText(
-            self, "しおりを編集", "タイトル:", text=item.text(0)
-        )
-        if not ok:
-            return
-        current_page = item.data(0, _PAGE_ROLE) or 1
-        page, ok = QInputDialog.getInt(
-            self, "しおりを編集", "ページ:", int(current_page), 1, 1_000_000
-        )
-        if not ok:
-            return
-        self._suppress_item_changed = True
+        # ウィンドウ側が失敗時にツリーを再構築すると item は破棄されるため確認する。
         try:
-            item.setText(0, title.strip() or "(無題)")
-            item.setText(1, str(page))
-            item.setData(0, _PAGE_ROLE, int(page))
-        finally:
-            self._suppress_item_changed = False
-        self._emit_changed("しおり編集")
+            alive = item.treeWidget() is self._tree
+        except RuntimeError:
+            alive = False
+        if alive:
+            self._start_title_edit(item)
 
-    def _edit_page_via_dialog(self, item: QTreeWidgetItem) -> None:
-        current_page = item.data(0, _PAGE_ROLE) or 1
-        page, ok = QInputDialog.getInt(
-            self, "ページを変更", "ページ:", int(current_page), 1, 1_000_000
-        )
-        if not ok:
-            return
-        self._suppress_item_changed = True
-        try:
-            item.setText(1, str(page))
-            item.setData(0, _PAGE_ROLE, int(page))
-        finally:
-            self._suppress_item_changed = False
-        self._emit_changed("しおりページ変更")
+    # 旧名の互換エイリアス
+    _on_add_current_page = _on_add
 
     def _on_delete(self) -> None:
         item = self._tree.currentItem()
@@ -612,27 +696,24 @@ class BookmarksPanel(QFrame):
         # 閲覧専用(見開き表示)中は、作成系も含めた全編集ボタンを無効化する。
         if self._read_only:
             for btn in (
-                self._add_current_btn, self._add_btn, self._edit_btn,
-                self._delete_btn, self._promote_btn, self._demote_btn,
-                self._up_btn, self._down_btn,
+                self._add_btn, self._delete_btn, self._promote_btn,
+                self._demote_btn, self._up_btn, self._down_btn,
             ):
                 btn.setEnabled(False)
             return
         # 通常モードでは作成ボタンは常時有効(選択非依存)。閲覧専用からの復帰を保証する。
-        self._add_current_btn.setEnabled(True)
-        self._add_btn.setEnabled(True)
+        self._add_btn.setEnabled(self._current_page_available)
         item = self._tree.currentItem()
         # 付箋ノードはしおり編集の対象外。
         if item is not None and self._is_note_node(item):
             for btn in (
-                self._edit_btn, self._delete_btn, self._promote_btn,
+                self._delete_btn, self._promote_btn,
                 self._demote_btn, self._up_btn, self._down_btn,
             ):
                 btn.setEnabled(False)
             return
         has_selection = item is not None
-        for btn in (self._edit_btn, self._delete_btn):
-            btn.setEnabled(has_selection)
+        self._delete_btn.setEnabled(has_selection)
 
         can_promote = has_selection and item.parent() is not None
         self._promote_btn.setEnabled(bool(can_promote))

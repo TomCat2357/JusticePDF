@@ -428,7 +428,7 @@ class PiiDrawerMixin:
     # 検出実行
     # ------------------------------------------------------------------
     def _on_pii_detect_current_page(self) -> None:
-        if self._zoom_page_num is None:
+        if self._zoom_page_num is None or not self._canvas_available():
             return
         self._run_pii_detection([self._zoom_page_num])
 
@@ -885,6 +885,8 @@ class PiiDrawerMixin:
         if not isinstance(annot, (TextMarkupAnnotData, ShapeAnnotData)):
             return
         self._jump_zoom_to_page(annot.page_num + 1)
+        if not self._zoom_view_shown():
+            return  # ページ一覧では該当ページのサムネイルを選ぶだけ(注釈の選択はページ画面が要る)
         current = self._find_zoom_annotation(annot.xref) or annot
         self._set_selected_zoom_annotation(current, open_drawer=False)
 
@@ -911,6 +913,8 @@ class PiiDrawerMixin:
             return
         if not panel.is_open:
             panel.set_open(True)
+        if not self._zoom_view_shown():
+            return
         current = self._find_zoom_annotation(annot.xref) or annot
         self._set_selected_zoom_annotation(current, open_drawer=False)
         panel.select_result(current)
@@ -1029,15 +1033,21 @@ class PiiDrawerMixin:
             self,
         )
 
+    def _scope_page_num(self) -> "int | None":
+        """「このページだけ」の対象ページ。拡大表示では表示中のページ、ページ一覧では選択中の先頭ページ。"""
+        if self._zoom_view_shown():
+            return self._zoom_page_num
+        selected = [t.page_num for t in self._selected_thumbnails]
+        return min(selected) if selected else None
+
     def _pii_page_indices_for_scope(self, scope: str) -> list[int] | None:
         """範囲(``ScopeChoiceDialog.SCOPE_*``)を対象ページ番号のリストにする。
 
         「しない」、対象のページが無い場合は None(何もしない)。
         """
         if scope == ScopeChoiceDialog.SCOPE_PAGE:
-            if self._zoom_page_num is None:
-                return None
-            return [self._zoom_page_num]
+            page_num = self._scope_page_num()
+            return None if page_num is None else [page_num]
         if scope == ScopeChoiceDialog.SCOPE_ALL:
             page_count = get_page_count(self._pdf_path)
             if page_count <= 0:
@@ -1057,9 +1067,9 @@ class PiiDrawerMixin:
             return
         page_filter: int | None = None
         if scope == ScopeChoiceDialog.SCOPE_PAGE:
-            if self._zoom_page_num is None:
+            page_filter = self._scope_page_num()
+            if page_filter is None:
                 return
-            page_filter = self._zoom_page_num
         # 検出は normalize_1to1 済みテキストに対して行われるため、パターン
         # (空白の扱いによっては ``\\s*`` などを含む)も同じ正規化をかけて完全一致で比べる。
         compiled = re.compile(normalize_pattern(pattern[1:-1]))

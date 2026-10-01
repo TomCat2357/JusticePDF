@@ -106,8 +106,8 @@ class OcrDrawerMixin:
         表示オフ・複数ページ表示・OCR未実行のときは空にする(何も描かない)。
         """
         zoom_label = getattr(self, "_zoom_label", None)
-        if zoom_label is None:
-            return
+        if zoom_label is None or not self._zoom_view_shown():
+            return  # ページ一覧では重ね表示しない(拡大表示を開くとき描き直す)
         settings = self._ocr_settings()
         lines: list = []
         color = getattr(settings, "ocr_text_color", DEFAULT_OCR_TEXT_COLOR)
@@ -162,7 +162,7 @@ class OcrDrawerMixin:
             self._run_ocr(list(range(page_count)))
 
     def _on_ocr_current_page(self) -> None:
-        if self._zoom_page_num is not None:
+        if self._zoom_page_num is not None and self._canvas_available():
             self._run_ocr([self._zoom_page_num])
 
     def _run_ocr(
@@ -313,7 +313,7 @@ class OcrDrawerMixin:
             self._clear_ocr(list(range(page_count)), "OCRテキストを削除(全ページ)")
 
     def _on_ocr_clear_current_page(self) -> None:
-        if self._zoom_page_num is not None and not self._ocr_busy():
+        if self._zoom_page_num is not None and self._canvas_available() and not self._ocr_busy():
             self._clear_ocr([self._zoom_page_num], "OCRテキストを削除(このページ)")
 
     # ------------------------------------------------------------------

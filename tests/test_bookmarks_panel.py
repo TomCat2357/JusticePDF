@@ -29,9 +29,8 @@ def test_read_only_disables_all_edit_buttons():
     panel = BookmarksPanel()
     panel.load_entries(_entries())
     edit_buttons = (
-        panel._add_current_btn, panel._add_btn, panel._edit_btn,
-        panel._delete_btn, panel._promote_btn, panel._demote_btn,
-        panel._up_btn, panel._down_btn,
+        panel._add_btn, panel._delete_btn, panel._promote_btn,
+        panel._demote_btn, panel._up_btn, panel._down_btn,
     )
 
     # 閲覧専用ONで作成系を含む全編集ボタンが無効化される。
@@ -49,7 +48,6 @@ def test_read_only_disables_all_edit_buttons():
     # 閲覧専用OFFで作成ボタンが復帰する。
     panel.set_read_only(False)
     assert panel._read_only is False
-    assert panel._add_current_btn.isEnabled() is True
     assert panel._add_btn.isEnabled() is True
 
 

@@ -279,6 +279,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # 初回アクセス時に文書全体を一度だけ開いて集計する。ページ構成が変わる
         # 操作(読み込み直し・削除等)の際に None へ戻して再集計させる。
         self._ink_xrefs_by_page_cache: dict[int, list[int]] | None = None
+        # 描画済みサムネイルごとの「塗りつぶし対象の xref」(描き直しの要否判定用)。
+        self._grid_pii_xrefs: dict[int, tuple[int, ...]] = {}
         # ページ一覧サムネイルに重ねる塗りつぶし対象(個人情報検出)のページ別
         # 集計。塗りつぶし対象の追加/削除はファイル保存を伴うので、ファイルの
         # キャッシュトークン(mtime/size)が変われば自動的に再集計する。
@@ -394,11 +396,26 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         central = QWidget()
         self.setCentralWidget(central)
 
-        layout = QVBoxLayout(central)
+        # 左: ページ一覧/拡大表示(どちらか一方だけ表示)、右: ドロワー列。
+        # ドロワーは両モードで共有するため、表示モードを切り替えても付け替えない。
+        root_layout = QHBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        main_area = QWidget()
+        layout = QVBoxLayout(main_area)
         layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.addWidget(main_area, 1)
 
         self._build_page_grid(layout)
         self._build_zoom_view(layout)
+
+        root_layout.addWidget(self._build_annotation_drawer())
+        root_layout.addWidget(self._build_bookmarks_panel())
+        root_layout.addWidget(self._build_pii_drawer())
+        root_layout.addWidget(self._build_ocr_drawer())
+        self._set_zoom_annotation_drawer_open(False)
+        self._set_selected_zoom_annotation(None)
 
     def _build_page_grid(self, layout: QVBoxLayout) -> None:
         """ページサムネイル一覧(グリッド)と選択・ドロップ表示部品を組み立てる。"""
@@ -430,26 +447,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self._container)
 
     def _build_zoom_view(self, layout: QVBoxLayout) -> None:
-        """拡大表示ビュー(操作バー+キャンバス+付箋/しおりドロワー)を組み立てる。"""
+        """拡大表示ビュー(操作バー+キャンバス)を組み立てる。ドロワーは _setup_ui が右列に置く。"""
         self._zoom_view = QWidget()
         zoom_layout = QVBoxLayout(self._zoom_view)
         zoom_layout.setContentsMargins(0, 0, 0, 0)
 
         zoom_layout.addWidget(self._build_zoom_controls())
-
-        zoom_content = QWidget()
-        zoom_content_layout = QHBoxLayout(zoom_content)
-        zoom_content_layout.setContentsMargins(0, 0, 0, 0)
-        zoom_content_layout.setSpacing(0)
-        zoom_content_layout.addWidget(self._build_zoom_canvas(), 1)
-        zoom_content_layout.addWidget(self._build_annotation_drawer())
-        zoom_content_layout.addWidget(self._build_bookmarks_panel())
-        zoom_content_layout.addWidget(self._build_pii_drawer())
-        zoom_content_layout.addWidget(self._build_ocr_drawer())
-
-        zoom_layout.addWidget(zoom_content, 1)
-        self._set_zoom_annotation_drawer_open(False)
-        self._set_selected_zoom_annotation(None)
+        zoom_layout.addWidget(self._build_zoom_canvas(), 1)
 
         layout.addWidget(self._zoom_view)
         self._zoom_view.hide()
@@ -505,13 +509,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._zoom_next_btn.clicked.connect(self._on_zoom_next_page)
         controls_layout.addWidget(self._zoom_next_btn)
 
-        # 右側ドロワー(アノテーション/個人情報検出/OCR)を1つのドロップダウンに
+        # 右側ドロワー(アノテーション/個人情報検出/OCR/しおり)を1つのドロップダウンに
         # まとめる。ボタン表示は開いているパネル名(無ければ「パネル」)。項目は
         # 同時に1つだけ選べ(全て外すことも可)、選択済みの項目を選ぶと閉じる。
         # ドロワー同士の排他はそれぞれの開閉ハンドラが担う。
         self._zoom_panel_btn = QPushButton(self.ZOOM_PANEL_BUTTON_DEFAULT_TEXT)
         self._zoom_panel_btn.setCheckable(True)
-        self._zoom_panel_btn.setToolTip("右側のパネル(アノテーション/個人情報検出/OCR)を選択")
+        self._zoom_panel_btn.setToolTip("右側のパネル(アノテーション/個人情報検出/OCR/しおり)を選択")
         self._zoom_panel_menu = QMenu(self._zoom_panel_btn)
         self._zoom_panel_menu.setToolTipsVisible(True)
         self._zoom_panel_group = QActionGroup(self._zoom_panel_menu)
@@ -523,12 +527,22 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._zoom_pii_btn.setToolTip("個人情報(PII)の検出・ハイライト・黒塗りエクスポート")
         self._zoom_ocr_action = self._zoom_panel_menu.addAction("OCR")
         self._zoom_ocr_action.setToolTip("文字認識(OCR)して、検索・個人情報検出で使えるテキストを埋め込む")
-        for action in (self._zoom_object_btn, self._zoom_pii_btn, self._zoom_ocr_action):
+        self._zoom_bookmark_action = self._zoom_panel_menu.addAction("しおり")
+        self._zoom_bookmark_action.setToolTip("しおり編集")
+        # 旧しおりボタンの属性名も QAction へ向ける(text/isChecked/setChecked/trigger は共通)。
+        self._zoom_bookmark_btn = self._zoom_bookmark_action
+        for action in (
+            self._zoom_object_btn,
+            self._zoom_pii_btn,
+            self._zoom_ocr_action,
+            self._zoom_bookmark_action,
+        ):
             action.setCheckable(True)
             self._zoom_panel_group.addAction(action)
         self._zoom_object_btn.triggered.connect(self._on_zoom_panel_annotation_triggered)
         self._zoom_pii_btn.triggered.connect(self._on_zoom_panel_pii_triggered)
         self._zoom_ocr_action.triggered.connect(self._on_zoom_panel_ocr_triggered)
+        self._zoom_bookmark_action.triggered.connect(self._on_zoom_panel_bookmarks_triggered)
         # ボタンのクリックでメニューを開いた後にチェック状態がずれないよう、
         # メニューが閉じたら実際のドロワーの開閉状態に合わせ直す。
         self._zoom_panel_menu.aboutToHide.connect(
@@ -536,12 +550,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         )
         self._zoom_panel_btn.setMenu(self._zoom_panel_menu)
         controls_layout.addWidget(self._zoom_panel_btn)
-
-        self._zoom_bookmark_btn = QPushButton("しおり")
-        self._zoom_bookmark_btn.setCheckable(True)
-        self._zoom_bookmark_btn.setToolTip("しおり編集")
-        self._zoom_bookmark_btn.clicked.connect(self._toggle_bookmarks_drawer)
-        controls_layout.addWidget(self._zoom_bookmark_btn)
 
         # ページ表示レイアウト。クリックで選択肢を開き、1枚を選ぶと閲覧専用を解除する。
         self._zoom_spread_btn = QPushButton("ページ表示")
@@ -614,14 +622,16 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def _build_bookmarks_panel(self) -> "BookmarksPanel":
         """しおり(アウトライン)編集ドロワーを組み立てる。"""
         self._bookmarks_panel = BookmarksPanel()
-        self._bookmarks_panel.set_current_page_provider(
-            lambda: (self._zoom_page_num or 0) + 1
-        )
+        self._bookmarks_panel.set_current_page_provider(self._bookmark_current_page)
+        if hasattr(self._bookmarks_panel, "set_page_count_provider"):
+            self._bookmarks_panel.set_page_count_provider(
+                lambda: get_page_count(self._pdf_path)
+            )
         self._bookmarks_panel.bookmarks_changed.connect(self._run_toc_update)
         self._bookmarks_panel.jump_requested.connect(self._jump_zoom_to_page)
         self._bookmarks_panel.note_jump_requested.connect(self._on_bookmark_note_jump)
         self._bookmarks_panel.open_changed.connect(self._on_bookmarks_drawer_open_changed)
-        # 開閉トグルはツールバーの「しおり」ボタンへ移設したため内蔵トグルを隠す
+        # 開閉トグルは「パネル」ドロップダウンへ移設したため内蔵トグルを隠す
         self._bookmarks_panel.use_external_toggle()
         return self._bookmarks_panel
 
@@ -644,27 +654,93 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             panel.set_open(bool(checked))
         self._sync_zoom_panel_button()
 
+    def _on_zoom_panel_bookmarks_triggered(self, checked: bool) -> None:
+        """パネルメニューの「しおり」。チェックされたら開き、外されたら閉じる。"""
+        panel = getattr(self, "_bookmarks_panel", None)
+        if panel is not None:
+            panel.set_open(bool(checked))
+        self._sync_zoom_panel_button()
+
+    def _panel_buttons(self) -> list:
+        """パネルのドロップダウンボタン(拡大表示バーとページ一覧ツールバーの両方)。"""
+        return [
+            b
+            for b in (
+                getattr(self, "_zoom_panel_btn", None),
+                getattr(self, "_grid_panel_btn", None),
+            )
+            if b is not None
+        ]
+
     def _sync_zoom_panel_button(self) -> None:
         """パネルボタンの表示(開いているパネル名/「パネル」)とチェック状態を実状態に合わせる。"""
-        button = getattr(self, "_zoom_panel_btn", None)
-        if button is None:
+        buttons = self._panel_buttons()
+        if not buttons:
             return
         pii_panel = getattr(self, "_pii_panel", None)
         ocr_panel = getattr(self, "_ocr_panel", None)
+        bookmarks_panel = getattr(self, "_bookmarks_panel", None)
         if self._zoom_annotation_open:
             name = self._zoom_object_btn.text()
         elif pii_panel is not None and pii_panel.is_open:
             name = self._zoom_pii_btn.text()
         elif ocr_panel is not None and ocr_panel.is_open:
             name = self._zoom_ocr_action.text()
+        elif bookmarks_panel is not None and bookmarks_panel.is_open:
+            name = self._zoom_bookmark_action.text()
         else:
             name = None
-        button.setText(name or self.ZOOM_PANEL_BUTTON_DEFAULT_TEXT)
-        button.setChecked(name is not None)
+        for button in buttons:
+            button.setText(name or self.ZOOM_PANEL_BUTTON_DEFAULT_TEXT)
+            button.setChecked(name is not None)
         # メニュー側のチェックも実状態へ(プログラムから開閉された場合の同期)。
         self._zoom_object_btn.setChecked(bool(self._zoom_annotation_open))
         self._zoom_pii_btn.setChecked(bool(pii_panel is not None and pii_panel.is_open))
         self._zoom_ocr_action.setChecked(bool(ocr_panel is not None and ocr_panel.is_open))
+        self._zoom_bookmark_action.setChecked(
+            bool(bookmarks_panel is not None and bookmarks_panel.is_open)
+        )
+
+    def _zoom_view_shown(self) -> bool:
+        """拡大表示(ビュー)に切り替わっているか(ウィンドウ未表示でも切替状態で判定する)。"""
+        view = getattr(self, "_zoom_view", None)
+        return view is not None and not view.isHidden()
+
+    def _canvas_available(self) -> bool:
+        """ページ画面(単ページの拡大表示)が使えるか。ページ一覧・複数ページ表示では False。"""
+        return self._zoom_view_shown() and not self._zoom_page_layout_is_multi()
+
+    def _apply_panel_context(self) -> None:
+        """表示モード(ページ一覧/拡大)に合わせて、各パネルの画面依存の操作を有効/無効にする。"""
+        canvas = self._canvas_available()
+        self._set_annotation_canvas_available(canvas)
+        # 拡大表示バーにも同じ「パネル」があるので、拡大表示中はツールバー側を隠す。
+        grid_action = getattr(self, "_grid_panel_action", None)
+        if grid_action is not None:
+            grid_action.setVisible(not self._zoom_view_shown())
+        pii_panel = getattr(self, "_pii_panel", None)
+        if pii_panel is not None:
+            pii_panel.set_canvas_available(canvas)
+        ocr_panel = getattr(self, "_ocr_panel", None)
+        if ocr_panel is not None:
+            ocr_panel.set_canvas_available(canvas)
+        if not canvas and self._create_mode is not CreateMode.NONE:
+            # ページ一覧へ戻る/複数ページ表示へ移るとき、作成ツールの装着を解除する。
+            self._activate_create_mode(CreateMode.NONE)
+        self._sync_bookmark_page_availability()
+
+    def _bookmark_current_page(self) -> "int | None":
+        """しおり追加の対象ページ(1始まり)。ページ一覧では選択中の先頭ページ、無ければ None。"""
+        if self._zoom_view_shown():
+            return (self._zoom_page_num or 0) + 1
+        selected = [t.page_num for t in self._selected_thumbnails]
+        return min(selected) + 1 if selected else None
+
+    def _sync_bookmark_page_availability(self) -> None:
+        panel = getattr(self, "_bookmarks_panel", None)
+        setter = getattr(panel, "set_current_page_available", None)
+        if setter is not None:
+            setter(self._bookmark_current_page() is not None)
 
     def _toggle_bookmarks_drawer(self) -> None:
         panel = getattr(self, "_bookmarks_panel", None)
@@ -717,6 +793,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_label.set_view_only(is_multi)
         # 複数ページ表示中はアノテーション(付箋)/個人情報検出ドロワーを無効化する。
         self._set_zoom_panel_actions_enabled(not is_multi)
+        self._apply_panel_context()
         self._sync_zoom_page_layout_controls()
         # 複数ページ表示中はしおりを閲覧/ジャンプ専用にし、回転・削除ボタンを無効化する。
         panel = getattr(self, "_bookmarks_panel", None)
@@ -729,15 +806,15 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._render_zoom()
 
     def _set_zoom_panel_actions_enabled(self, enabled: bool) -> None:
-        """パネルメニューのアノテーション/個人情報検出(とボタン本体)の有効/無効を切り替える。"""
+        """パネルメニューのアノテーション/個人情報検出/OCRの有効/無効を切り替える(しおりは対象外)。"""
         if getattr(self, "_zoom_object_btn", None) is not None:
             self._zoom_object_btn.setEnabled(enabled)
         if getattr(self, "_zoom_pii_btn", None) is not None:
             self._zoom_pii_btn.setEnabled(enabled)
         if getattr(self, "_zoom_ocr_action", None) is not None:
             self._zoom_ocr_action.setEnabled(enabled)
-        if getattr(self, "_zoom_panel_btn", None) is not None:
-            self._zoom_panel_btn.setEnabled(enabled)
+        # しおりは複数ページ表示でも閲覧/ジャンプ専用で使えるので、パネルボタンと
+        # 「しおり」項目は有効のまま(上の3項目だけをグレーアウトする)。
 
     def _toggle_zoom_spread_view(self) -> None:
         """旧来の見開き切替呼び出しを横2枚の選択へ互換接続する。"""
@@ -749,8 +826,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._set_zoom_page_layout(layout)
 
     def _on_bookmarks_drawer_open_changed(self, is_open: bool) -> None:
-        if getattr(self, "_zoom_bookmark_btn", None) is not None:
-            self._zoom_bookmark_btn.setChecked(is_open)
+        self._sync_zoom_panel_button()
         if is_open:
             # 付箋/個人情報検出ドロワーと排他にする
             if self._zoom_annotation_open:
@@ -784,20 +860,32 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         panel.set_annotation_notes(entries)
 
     def _on_bookmark_note_jump(self, page_one_based: int, xref: int) -> None:
-        """しおりパネルの付箋ノードクリックで、該当ページへ移動し付箋を選択する。"""
+        """しおりパネルの付箋ノードクリックで、該当ページへ移動し付箋を選択する。
+
+        付箋の選択はページ画面が要るので、ページ一覧からは該当ページの拡大表示へ切り替える。
+        """
+        if not self._zoom_view_shown():
+            page_count = get_page_count(self._pdf_path)
+            if page_count <= 0:
+                return
+            self._open_zoom_view(max(0, min(page_one_based - 1, page_count - 1)))
         self._jump_zoom_to_page(page_one_based)
         note = self._find_zoom_annotation(xref)
         if isinstance(note, NoteAnnotData):
             self._set_selected_zoom_annotation(note, open_drawer=False)
 
     def _jump_zoom_to_page(self, page_one_based: int) -> None:
-        """しおりクリック時に該当ページ(1始まり)へズーム移動する。"""
-        if self._zoom_page_num is None:
+        """しおりクリック時に該当ページ(1始まり)へ移動する。ページ一覧ではそのサムネイルを選択する。"""
+        zoom_shown = self._zoom_view_shown()
+        if zoom_shown and self._zoom_page_num is None:
             return
         page_count = get_page_count(self._pdf_path)
         if page_count <= 0:
             return
         target = max(0, min(page_one_based - 1, page_count - 1))
+        if not zoom_shown:
+            self._select_page_thumbnail(target)
+            return
         self._commit_inline_annotation_editor()
         self._set_zoom_annotation_create_mode(False)
         self._selected_zoom_annotation = None
@@ -911,6 +999,24 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._search_btn.clicked.connect(self._on_open_search)
         toolbar.addWidget(self._search_btn)
 
+        # 拡大表示バーの「パネル」と同じ QAction を共有する(チェック状態が連動する)。
+        # 画面(ページ)が要る機能はページ一覧ではパネル内でグレーアウトされる。
+        self._grid_panel_btn = QPushButton(self.ZOOM_PANEL_BUTTON_DEFAULT_TEXT)
+        self._grid_panel_btn.setCheckable(True)
+        self._grid_panel_btn.setToolTip(self._zoom_panel_btn.toolTip())
+        self._grid_panel_menu = QMenu(self._grid_panel_btn)
+        self._grid_panel_menu.setToolTipsVisible(True)
+        for action in self._zoom_panel_group.actions():
+            self._grid_panel_menu.addAction(action)
+        self._grid_panel_menu.aboutToHide.connect(
+            lambda: QTimer.singleShot(0, self._sync_zoom_panel_button)
+        )
+        self._grid_panel_btn.setMenu(self._grid_panel_menu)
+        # QToolBar に載せたウィジェットの表示切替は、返された QAction で行う。
+        self._grid_panel_action = toolbar.addWidget(self._grid_panel_btn)
+
+        self._apply_panel_context()
+        self._sync_zoom_panel_button()
         self._update_button_states()
 
     def _setup_shortcuts(self) -> None:
@@ -1067,6 +1173,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._undo_btn.setEnabled(not spread and self._undo_manager.can_undo())
         self._redo_btn.setEnabled(not spread and self._undo_manager.can_redo())
         self._update_save_button()
+        self._sync_bookmark_page_availability()
 
     def _debug_undo_state(self, reason: str) -> None:
         log_undo_state(
@@ -1418,6 +1525,22 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._pii_targets_by_page_cache = (token, by_page)
         return by_page
 
+    def _sync_grid_pii_thumbnails(self) -> None:
+        """塗りつぶし対象が変わったページのサムネイルを描き直す(ページ一覧へ戻ったとき・一覧での操作後)。
+
+        サムネイルは描画時に対象の注釈をページ画像から隠して重ね描きするため、
+        対象の増減は画像ごと作り直さないと二重に見える。
+        """
+        if not self._thumbnails or not self._grid_pii_xrefs:
+            return
+        targets = self._get_pii_targets_by_page()
+        for pn, thumb in enumerate(self._thumbnails):
+            if not thumb.thumbnail_loaded:
+                continue
+            current = tuple(t.xref for t in targets.get(pn, (None, ()))[1])
+            if self._grid_pii_xrefs.get(pn, ()) != current:
+                self._request_thumbnail_refresh(pn)
+
     def _invalidate_and_requeue_thumbnails(self) -> None:
         """全サムネイルを未読込状態に戻し、再描画キューへ積み直す。"""
         self._reset_thumbnail_render_queue()
@@ -1473,6 +1596,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                     else:
                         thumb.set_pii_overlay([], (0.0, 0.0))
                     thumb.set_pii_mask_style(pii_color, pii_opacity, pii_hidden)
+                    self._grid_pii_xrefs[pn] = tuple(
+                        t.xref for t in pii_targets_by_page.get(pn, (None, ()))[1]
+                    )
                     thumb.set_pixmap_direct(pixmap)
         self._schedule_thumbnail_render()
 
@@ -1483,6 +1609,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # ページ構成が変わるので、塗りつぶし対象のページ別集計は破棄して全ページ再集計させる。
         self._pii_targets_by_page_cache = None
         self._pii_result_rows_cache = None
+        self._grid_pii_xrefs.clear()
         # ページ構成の変更(書き込み)の直後に呼ばれるので、PDFを開いたままの
         # PII restyle ジョブを止め、走り直しを予約する(デバウンスなので本処理の後に動く)。
         if self._abort_pii_restyle_job():
@@ -1840,6 +1967,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_view.show()
         for action in getattr(self, "_zoom_nav_actions", ()):
             action.setEnabled(True)
+        self._apply_panel_context()
+        self._sync_ocr_overlay()  # 表示前の描画では重ね表示を省くため、開いた直後に反映する
         self._reload_bookmarks_tree()
         self._update_button_states()
 
@@ -1857,14 +1986,22 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if self._grid_scroll:
             self._grid_scroll.show()
         # 最後に表示していたページを選択状態にする
-        if last_page is not None and 0 <= last_page < len(self._thumbnails):
-            self._clear_selection()
-            thumb = self._thumbnails[last_page]
-            thumb.set_selected(True)
-            self._selected_thumbnails.append(thumb)
-            # サムネイルが見える位置にスクロール
-            if self._grid_scroll:
-                self._grid_scroll.ensureWidgetVisible(thumb)
+        if last_page is not None:
+            self._select_page_thumbnail(last_page)
+        self._apply_panel_context()
+        self._sync_grid_pii_thumbnails()
+        self._update_button_states()
+
+    def _select_page_thumbnail(self, page_num: int) -> None:
+        """ページ一覧で、そのページのサムネイルだけを選択して見える位置へスクロールする。"""
+        if not 0 <= page_num < len(self._thumbnails):
+            return
+        self._clear_selection()
+        thumb = self._thumbnails[page_num]
+        thumb.set_selected(True)
+        self._selected_thumbnails.append(thumb)
+        if self._grid_scroll:
+            self._grid_scroll.ensureWidgetVisible(thumb)
         self._update_button_states()
 
     def _set_zoom_percent(self, value: int) -> None:

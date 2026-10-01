@@ -32,7 +32,9 @@ def test_spread_toggle_sets_view_only_and_label(qtbot, tmp_path):
     assert window._zoom_object_btn.isEnabled() is False
     assert window._zoom_pii_btn.isEnabled() is False
     assert window._zoom_ocr_action.isEnabled() is False
-    assert window._zoom_panel_btn.isEnabled() is False
+    # しおりは閲覧/ジャンプ専用で使えるため、パネルボタンとしおり項目は有効のまま。
+    assert window._zoom_panel_btn.isEnabled() is True
+    assert window._zoom_bookmark_action.isEnabled() is True
     assert window._zoom_page_label.text() == "1-2 / 4"
 
     window._toggle_zoom_spread_view()

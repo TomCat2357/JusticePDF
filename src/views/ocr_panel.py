@@ -66,6 +66,7 @@ class OcrPanel(QFrame):
         self._collapsed_width = 32
         self._available = True
         self._busy = False
+        self._canvas_available = True
         self._text_color: tuple[float, float, float] = (1.0, 0.0, 0.0)
 
         layout = QHBoxLayout(self)
@@ -258,6 +259,11 @@ class OcrPanel(QFrame):
     def is_available(self) -> bool:
         return self._available
 
+    def set_canvas_available(self, available: bool) -> None:
+        """拡大表示(単ページ)の画面があるか。無い(ページ一覧)間は「このページ」系を無効にする。"""
+        self._canvas_available = bool(available)
+        self._update_button_states()
+
     def set_busy(self, busy: bool, status: str = "") -> None:
         """OCR実行中はボタンを無効化し、進捗表示を出す。"""
         self._busy = bool(busy)
@@ -282,7 +288,13 @@ class OcrPanel(QFrame):
     def _update_button_states(self) -> None:
         run_enabled = self._available and not self._busy
         self._ocr_all_btn.setEnabled(run_enabled)
-        self._ocr_page_btn.setEnabled(run_enabled)
+        self._ocr_page_btn.setEnabled(run_enabled and self._canvas_available)
         # 削除は認識エンジン無しでも行える(実行中だけ無効)。
         self._clear_all_btn.setEnabled(not self._busy)
-        self._clear_page_btn.setEnabled(not self._busy)
+        self._clear_page_btn.setEnabled(not self._busy and self._canvas_available)
+        page_tip = "" if self._canvas_available else "ページをダブルクリックして拡大表示すると使用できます"
+        for btn, base in (
+            (self._ocr_page_btn, "表示中のページだけを文字認識します。"),
+            (self._clear_page_btn, "表示中のページの、埋め込んだOCRテキストを削除します。"),
+        ):
+            btn.setToolTip(page_tip or base)

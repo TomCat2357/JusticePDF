@@ -349,15 +349,28 @@ class ZoomAnnotationMixin:
 
         self._build_ink_visibility_toggle(panel_layout)
 
-        panel_layout.addWidget(self._build_section_header("追加"))
-        self._build_addition_grid(panel_layout)
+        # ページ一覧(拡大表示でない)間は、ページ画面が要る操作を本体ごと無効にする。
+        # Acrobat手書きの表示切替だけは画面を要さないので本体の外に置く。
+        self._zoom_annotation_hint_label = QLabel("ページをダブルクリックして拡大表示すると使用できます")
+        self._zoom_annotation_hint_label.setWordWrap(True)
+        self._zoom_annotation_hint_label.setStyleSheet("color: #b45309;")
+        self._zoom_annotation_hint_label.setVisible(False)
+        panel_layout.addWidget(self._zoom_annotation_hint_label)
 
-        panel_layout.addWidget(self._build_section_header("選択中の注釈"))
-        self._build_annotation_actions(panel_layout)
-        self._build_annotation_form(panel_layout)
-        self._build_shape_option_rows(panel_layout)
-        self._build_annotation_colors(panel_layout)
-        panel_layout.addWidget(self._zoom_note_editor)
+        self._zoom_annotation_body = QWidget()
+        body_layout = QVBoxLayout(self._zoom_annotation_body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.addWidget(self._zoom_annotation_body)
+
+        body_layout.addWidget(self._build_section_header("追加"))
+        self._build_addition_grid(body_layout)
+
+        body_layout.addWidget(self._build_section_header("選択中の注釈"))
+        self._build_annotation_actions(body_layout)
+        self._build_annotation_form(body_layout)
+        self._build_shape_option_rows(body_layout)
+        self._build_annotation_colors(body_layout)
+        body_layout.addWidget(self._zoom_note_editor)
 
         # FreeText-only widgets container references for visibility toggling
         self._zoom_freetext_only_widgets: list[QWidget] = []
@@ -365,15 +378,24 @@ class ZoomAnnotationMixin:
         # 現在ページの付箋一覧（B）。クリックで該当付箋を選択。
         self._zoom_note_list_label = QLabel("このページの付箋")
         self._style_section_header(self._zoom_note_list_label)
-        panel_layout.addWidget(self._zoom_note_list_label)
+        body_layout.addWidget(self._zoom_note_list_label)
         self._zoom_note_list = QListWidget()
         self._zoom_note_list.setMaximumHeight(140)
         self._zoom_note_list.itemClicked.connect(self._on_note_list_item_clicked)
-        panel_layout.addWidget(self._zoom_note_list)
+        body_layout.addWidget(self._zoom_note_list)
 
         panel_layout.addStretch()
         drawer_layout.addWidget(self._zoom_annotation_panel)
         return self._zoom_annotation_drawer
+
+    def _set_annotation_canvas_available(self, available: bool) -> None:
+        """拡大表示(単ページ)の画面があるか。無い間はドロワーの操作系を無効にして案内を出す。"""
+        body = getattr(self, "_zoom_annotation_body", None)
+        if body is not None:
+            body.setEnabled(bool(available))
+        hint = getattr(self, "_zoom_annotation_hint_label", None)
+        if hint is not None:
+            hint.setVisible(not available)
 
     def _style_section_header(self, label: QLabel) -> None:
         """ドロワー内のセクション見出し(太字+上部に区切り線)の見た目を適用する。"""
@@ -441,7 +463,8 @@ class ZoomAnnotationMixin:
     def _on_toggle_ink_visibility(self, checked: bool) -> None:
         """Acrobat手書き(Ink)注釈の表示/非表示を切り替え、現在のビューとサムネイル一覧を再描画する。"""
         self._show_ink_annots = bool(checked)
-        self._render_zoom()
+        if self._zoom_view_shown():
+            self._render_zoom()
         self._invalidate_and_requeue_thumbnails()
 
     def _build_freetext_tool_row(self, grid: QGridLayout, row: int) -> None:
@@ -1923,6 +1946,9 @@ class ZoomAnnotationMixin:
             self._render_zoom()
             if open_drawer and self._selected_zoom_annotation is not None:
                 self._set_zoom_annotation_drawer_open(True)
+        elif not self._zoom_view_shown():
+            # ページ一覧からの操作(全ページ検出など)で塗りつぶし対象が変わったページを描き直す。
+            self._sync_grid_pii_thumbnails()
         # しおりドロワーが開いていれば付箋一覧も更新する。
         self._reload_bookmark_notes()
         # 個人情報検出ドロワーが開いていれば結果一覧も更新する。

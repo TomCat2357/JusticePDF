@@ -123,10 +123,12 @@ def test_panel_dropdown_replaces_separate_buttons_and_opens_one_panel(qtbot, tmp
         "アノテーション",
         "個人情報検出",
         "OCR",
+        "しおり",
     ]
     # OCR も実際のドロワーを持つ(依存が無くてもパネルは開き、案内が出る)。
     assert window._zoom_ocr_action.isEnabled() is True
-    # しおりは独立したボタンのまま。
+    # しおりもパネルメニューの項目(旧ボタン名は QAction への別名)。
+    assert window._zoom_bookmark_btn is window._zoom_bookmark_action
     assert window._zoom_bookmark_btn.text() == "しおり"
 
     window._zoom_pii_btn.trigger()
@@ -152,7 +154,9 @@ def test_panel_dropdown_replaces_separate_buttons_and_opens_one_panel(qtbot, tmp
     assert btn.text() == "個人情報検出" and window._zoom_pii_btn.isChecked()
     window._bookmarks_panel.set_open(True)
     assert window._pii_panel.is_open is False
-    assert btn.text() == "パネル" and not btn.isChecked()
+    # しおりもパネルの1項目なので、ボタン表示は「しおり」になる。
+    assert btn.text() == "しおり" and btn.isChecked()
+    assert window._zoom_bookmark_action.isChecked() and not window._zoom_pii_btn.isChecked()
 
     # OCR も同じドロップダウンで排他的に開閉できる。
     window._zoom_ocr_action.trigger()

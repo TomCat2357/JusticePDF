@@ -311,6 +311,9 @@ class PiiPanel(QFrame):
         self._collapsed_width = 32
         self._rows: list[PiiResultRow] = []
         self._mask_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._busy = False
+        self._canvas_available = True
+        self._manual_tools_enabled = True
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -541,8 +544,9 @@ class PiiPanel(QFrame):
 
     def set_busy(self, busy: bool, status: str = "") -> None:
         """検出実行中はボタンを無効化し、進捗表示を出す。"""
-        self._detect_current_btn.setEnabled(not busy)
+        self._busy = bool(busy)
         self._detect_all_btn.setEnabled(not busy)
+        self._apply_canvas_state()
         self._progress_bar.setVisible(busy)
         if busy:
             self._progress_bar.setRange(0, 0)  # 総ページ数が分かるまでは不定進捗
@@ -598,9 +602,33 @@ class PiiPanel(QFrame):
 
         種別「手動」のチェックが外れている間は、追加しても見えないため無効にする。
         """
-        enabled = bool(enabled)
+        self._manual_tools_enabled = bool(enabled)
+        self._apply_canvas_state()
+
+    def set_canvas_available(self, available: bool) -> None:
+        """拡大表示(単ページ)の画面があるか。無い(ページ一覧)間は、ページ画面が要る操作
+        (このページだけ検出/テキスト候補/塗り四角/塗り丸)を無効にする。"""
+        self._canvas_available = bool(available)
+        self._apply_canvas_state()
+
+    def _apply_canvas_state(self) -> None:
+        canvas = self._canvas_available
+        self._detect_current_btn.setEnabled(canvas and not self._busy)
+        tools_enabled = canvas and self._manual_tools_enabled
         for btn in (self._mask_markup_btn, self._mask_rect_btn, self._mask_ellipse_btn):
-            btn.setEnabled(enabled)
+            btn.setEnabled(tools_enabled)
+        hint = "" if canvas else "ページをダブルクリックして拡大表示すると使用できます"
+        if not canvas:
+            for btn in (self._detect_current_btn, self._mask_markup_btn,
+                        self._mask_rect_btn, self._mask_ellipse_btn):
+                if not hasattr(btn, "_base_tooltip"):
+                    btn._base_tooltip = btn.toolTip()
+                btn.setToolTip(hint)
+        else:
+            for btn in (self._detect_current_btn, self._mask_markup_btn,
+                        self._mask_rect_btn, self._mask_ellipse_btn):
+                if hasattr(btn, "_base_tooltip"):
+                    btn.setToolTip(btn._base_tooltip)
 
     def set_mask_markup_tool_active(self, enabled: bool) -> None:
         """呼び出し側(mixin)の実際の作成モードにボタンのチェック状態を同期する。"""

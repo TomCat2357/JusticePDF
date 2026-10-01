@@ -76,6 +76,15 @@ QToolBar QPushButton#danger           { color: #b91c1c; }
 QToolBar QPushButton#danger:hover     { background-color: #fdecec; }
 QToolBar QPushButton#danger:disabled  { color: #d9b3b3; }
 
+/* Disabled look for buttons / inputs outside the toolbar (side drawers etc.).
+   Toolbar buttons keep their own, more specific rules above. */
+QPushButton:disabled { color: #9ca3af; }
+QComboBox:disabled,
+QSpinBox:disabled,
+QDoubleSpinBox:disabled { background-color: #f4f4f0; color: #9ca3af; border: 1px solid #ececea; }
+QListWidget:disabled,
+QTreeWidget:disabled { background-color: #f4f4f0; color: #9ca3af; }
+
 /* Side-panel toggle buttons (e.g. 図形 shape selector) */
 QToolButton {
     background-color: transparent;
