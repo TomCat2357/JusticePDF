@@ -666,6 +666,8 @@ class ZoomPageWidget(QWidget):
     scroll_requested = pyqtSignal(int, int)
     # 右ドラッグで指定した範囲（ページ座標 QRectF）への拡大要求。
     zoom_region_requested = pyqtSignal(object)
+    # ページ上でマウス操作が始まる直前の通知(フォームの未確定の編集を先に確定させるため)。
+    interaction_started = pyqtSignal()
 
     HANDLE_SIZE = 10
     # 付箋アイコンの画面上の固定サイズ（px）。ズームに依らず一定。
@@ -865,6 +867,27 @@ class ZoomPageWidget(QWidget):
         top_left = self._page_point_to_widget_point(QPointF(note.point[0], note.point[1]))
         size = float(self.NOTE_ICON_PX)
         return QRectF(top_left.x(), top_left.y(), size, size)
+
+    def preview_annotation(self, annotation) -> None:
+        """同じ xref の注釈の表示だけをメモリ上で差し替える(PDFには書かない)。
+
+        フォームのスライダー/スピン操作中の即時プレビュー用。確定(保存)は呼び出し側が
+        後でまとめて行う。呼び出し元と共有しているリストは書き換えず、コピーして差し替える。
+        """
+        for i, existing in enumerate(self._annotations):
+            if existing.xref != annotation.xref:
+                continue
+            annotations = list(self._annotations)
+            annotations[i] = annotation
+            self._annotations = annotations
+            scale = self._zoom_factor
+            x0, y0, x1, y1 = annotation.rect
+            self._annotation_rects[i:i + 1] = [
+                QRectF(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale)
+            ]
+            self._layout_inline_editor()
+            self.update()
+            return
 
     def set_selected_annotation_xref(self, xref: int | None) -> None:
         self._selected_annotation_xref = xref
@@ -2400,6 +2423,7 @@ class ZoomPageWidget(QWidget):
             event.ignore()
 
     def mousePressEvent(self, event) -> None:
+        self.interaction_started.emit()
         try:
             if event.button() == Qt.MouseButton.MiddleButton:
                 # 中ボタンドラッグでつかんで移動（パン）。

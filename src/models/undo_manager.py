@@ -13,6 +13,10 @@ class UndoAction:
     description: str
     undo_func: Callable[[], None]
     redo_func: Callable[[], None]
+    # ページ構成(枚数・順序・回転・内容)を変える操作なら True。False(注釈の編集だけ)なら
+    # Undo/Redo 後にページ一覧全体を作り直さず、表示中のページだけ更新する。
+    # 迷ったら True のままにする(従来どおり全体を再読込する安全側の既定値)。
+    affects_pages: bool = True
 
 
 class UndoManager:
@@ -51,6 +55,14 @@ class UndoManager:
 
     def can_redo(self) -> bool:
         return len(self._redo_stack) > 0
+
+    def peek_undo(self) -> UndoAction | None:
+        """次に undo される操作を(取り出さずに)返す。"""
+        return self._undo_stack[-1] if self._undo_stack else None
+
+    def peek_redo(self) -> UndoAction | None:
+        """次に redo される操作を(取り出さずに)返す。"""
+        return self._redo_stack[-1] if self._redo_stack else None
 
     def undo(self) -> str | None:
         if not self.can_undo():

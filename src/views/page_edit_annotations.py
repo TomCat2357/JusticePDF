@@ -75,6 +75,7 @@ from src.utils.pdf_utils import (
     extract_pages,
     insert_pages,
     render_page_thumbnails_batch,
+    edit_markup_annots,
     FreeTextAnnotData,
     list_freetext_annots,
     create_freetext_annot,
@@ -617,13 +618,13 @@ class ZoomAnnotationMixin:
         form = QFormLayout()
         self._zoom_annotation_width_spin = QSpinBox()
         self._zoom_annotation_width_spin.setRange(1, 5000)
-        self._zoom_annotation_width_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
+        self._connect_form_spin(self._zoom_annotation_width_spin)
         self._zoom_annotation_width_label = QLabel("幅")
         form.addRow(self._zoom_annotation_width_label, self._zoom_annotation_width_spin)
 
         self._zoom_annotation_height_spin = QSpinBox()
         self._zoom_annotation_height_spin.setRange(1, 5000)
-        self._zoom_annotation_height_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
+        self._connect_form_spin(self._zoom_annotation_height_spin)
         self._zoom_annotation_height_label = QLabel("高さ")
         form.addRow(self._zoom_annotation_height_label, self._zoom_annotation_height_spin)
 
@@ -634,13 +635,13 @@ class ZoomAnnotationMixin:
         self._zoom_annotation_fontsize_spin.setValue(
             int(QSettings().value("freetext/fontsize", 14, type=int))
         )
-        self._zoom_annotation_fontsize_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
+        self._connect_form_spin(self._zoom_annotation_fontsize_spin)
         self._zoom_annotation_fontsize_label = QLabel("文字サイズ")
         form.addRow(self._zoom_annotation_fontsize_label, self._zoom_annotation_fontsize_spin)
 
         self._zoom_annotation_border_width_spin = QSpinBox()
         self._zoom_annotation_border_width_spin.setRange(0, 100)
-        self._zoom_annotation_border_width_spin.valueChanged.connect(self._on_zoom_annotation_form_value_changed)
+        self._connect_form_spin(self._zoom_annotation_border_width_spin)
         form.addRow("線幅", self._zoom_annotation_border_width_spin)
         panel_layout.addLayout(form)
 
@@ -652,6 +653,7 @@ class ZoomAnnotationMixin:
         self._zoom_annotation_opacity_slider.setRange(0, 100)
         self._zoom_annotation_opacity_slider.setValue(100)
         self._zoom_annotation_opacity_slider.valueChanged.connect(self._on_zoom_annotation_opacity_changed)
+        self._zoom_annotation_opacity_slider.sliderReleased.connect(self._flush_zoom_annotation_form_commit)
         opacity_layout.addWidget(self._zoom_annotation_opacity_slider, 1)
         self._zoom_annotation_opacity_label = QLabel("100%")
         opacity_layout.addWidget(self._zoom_annotation_opacity_label)
@@ -693,11 +695,12 @@ class ZoomAnnotationMixin:
         self._zoom_shape_rotation_spin.setRange(0, 359)
         self._zoom_shape_rotation_spin.setWrapping(True)
         self._zoom_shape_rotation_spin.setSuffix("°")
-        self._zoom_shape_rotation_spin.valueChanged.connect(self._on_zoom_shape_rotation_changed)
+        self._connect_form_spin(self._zoom_shape_rotation_spin, self._on_zoom_shape_rotation_changed)
         rot_layout.addWidget(self._zoom_shape_rotation_spin)
         self._zoom_shape_rotation_slider = QSlider(Qt.Orientation.Horizontal)
         self._zoom_shape_rotation_slider.setRange(0, 359)
         self._zoom_shape_rotation_slider.valueChanged.connect(self._on_zoom_shape_rotation_slider_changed)
+        self._zoom_shape_rotation_slider.sliderReleased.connect(self._flush_zoom_annotation_form_commit)
         rot_layout.addWidget(self._zoom_shape_rotation_slider, 1)
         panel_layout.addWidget(self._zoom_shape_rotation_row)
         self._zoom_shape_rotation_row.hide()
@@ -721,10 +724,10 @@ class ZoomAnnotationMixin:
 
         self._zoom_shape_line_start_x_spin = QSpinBox()
         self._zoom_shape_line_start_x_spin.setRange(0, 100000)
-        self._zoom_shape_line_start_x_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        self._connect_form_spin(self._zoom_shape_line_start_x_spin)
         self._zoom_shape_line_start_y_spin = QSpinBox()
         self._zoom_shape_line_start_y_spin.setRange(0, 100000)
-        self._zoom_shape_line_start_y_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        self._connect_form_spin(self._zoom_shape_line_start_y_spin)
         start_row = QWidget()
         start_layout = QHBoxLayout(start_row)
         start_layout.setContentsMargins(0, 0, 0, 0)
@@ -736,10 +739,10 @@ class ZoomAnnotationMixin:
 
         self._zoom_shape_line_end_x_spin = QSpinBox()
         self._zoom_shape_line_end_x_spin.setRange(0, 100000)
-        self._zoom_shape_line_end_x_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        self._connect_form_spin(self._zoom_shape_line_end_x_spin)
         self._zoom_shape_line_end_y_spin = QSpinBox()
         self._zoom_shape_line_end_y_spin.setRange(0, 100000)
-        self._zoom_shape_line_end_y_spin.valueChanged.connect(self._on_zoom_shape_option_changed)
+        self._connect_form_spin(self._zoom_shape_line_end_y_spin)
         end_row = QWidget()
         end_layout = QHBoxLayout(end_row)
         end_layout.setContentsMargins(0, 0, 0, 0)
@@ -782,11 +785,12 @@ class ZoomAnnotationMixin:
         self._zoom_shape_triangle_apex_x_spin = QSpinBox()
         self._zoom_shape_triangle_apex_x_spin.setRange(0, 100)
         self._zoom_shape_triangle_apex_x_spin.setSuffix("%")
-        self._zoom_shape_triangle_apex_x_spin.valueChanged.connect(self._on_zoom_shape_triangle_apex_x_changed)
+        self._connect_form_spin(self._zoom_shape_triangle_apex_x_spin, self._on_zoom_shape_triangle_apex_x_changed)
         apex_x_layout.addWidget(self._zoom_shape_triangle_apex_x_spin)
         self._zoom_shape_triangle_apex_x_slider = QSlider(Qt.Orientation.Horizontal)
         self._zoom_shape_triangle_apex_x_slider.setRange(0, 100)
         self._zoom_shape_triangle_apex_x_slider.valueChanged.connect(self._on_zoom_shape_triangle_apex_x_slider_changed)
+        self._zoom_shape_triangle_apex_x_slider.sliderReleased.connect(self._flush_zoom_annotation_form_commit)
         apex_x_layout.addWidget(self._zoom_shape_triangle_apex_x_slider, 1)
         # 新規三角形のデフォルト頂点位置（中央）に合わせる
         with QSignalBlocker(self._zoom_shape_triangle_apex_x_spin):
@@ -1027,6 +1031,17 @@ class ZoomAnnotationMixin:
         *,
         open_drawer: bool = False,
     ) -> None:
+        previous = self._selected_zoom_annotation
+        flushed = self._flush_zoom_annotation_form_commit()
+        if (
+            flushed
+            and annotation is not None
+            and previous is not None
+            and annotation.xref == previous.xref
+            and self._selected_zoom_annotation is not None
+        ):
+            # 確定の保存で xref が回ったので、同じ注釈の再選択は保存後のデータを使う。
+            annotation = self._selected_zoom_annotation
         self._commit_inline_annotation_editor()
         self._selected_zoom_annotation = annotation
         if self._zoom_label:
@@ -1508,36 +1523,45 @@ class ZoomAnnotationMixin:
             return
 
         def do_erase() -> None:
-            for entry in entries:
-                old = entry["old"]
-                ref = entry["ref"] or self._annot_ref_for(old.page_num, old.xref)
-                entry["ref"] = ref
+            # 複数注釈の書き換えは1回の open・1回の保存にまとめる(1件ずつだと
+            # 大きいPDFで件数×数秒かかる)。Undo も1件。
+            refs = [
+                entry["ref"] or self._annot_ref_for(entry["old"].page_num, entry["old"].xref)
+                for entry in entries
+            ]
+            ops = []
+            for entry, ref in zip(entries, refs):
                 if entry["new"] is not None:
-                    saved = replace_markup_annot(self._pdf_path, ref.page_num, ref.xref, entry["new"])
+                    ops.append(("replace", ref.page_num, ref.xref, entry["new"]))
+                else:
+                    ops.append(("delete", ref.page_num, ref.xref))
+            results = edit_markup_annots(self._pdf_path, ops)
+            for entry, ref, saved in zip(entries, refs, results):
+                entry["ref"] = ref
+                if saved is not None:
                     self._rebind_annot_ref(ref, saved.page_num, saved.xref)
                 else:
-                    delete_markup_annot(self._pdf_path, ref.page_num, ref.xref)
                     self._release_annot_ref(ref)
             self._selected_zoom_annotation = None
             label.clear_text_selection()
             self._refresh_current_zoom_page()
 
         def undo_erase() -> None:
+            ops = []
             for entry in reversed(entries):
-                old = entry["old"]
                 ref = entry["ref"]
                 if entry["new"] is not None:
-                    saved = replace_markup_annot(self._pdf_path, ref.page_num, ref.xref, old)
-                    self._rebind_annot_ref(ref, saved.page_num, saved.xref)
+                    ops.append(("replace", ref.page_num, ref.xref, entry["old"]))
                 else:
-                    recreated = create_markup_annot(
-                        self._pdf_path, dataclass_replace(old, xref=0)
-                    )
-                    self._rebind_annot_ref(ref, recreated.page_num, recreated.xref)
+                    ops.append(("create", dataclass_replace(entry["old"], xref=0)))
+            results = edit_markup_annots(self._pdf_path, ops)
+            for entry, saved in zip(reversed(entries), results):
+                if saved is not None:
+                    self._rebind_annot_ref(entry["ref"], saved.page_num, saved.xref)
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        self._push_undoable("Erase markup", do_erase, undo_erase)
+        self._push_undoable("Erase markup", do_erase, undo_erase, affects_pages=False)
     def _pick_markup_color(self) -> None:
         selected = self._selected_zoom_annotation
         is_markup = isinstance(selected, TextMarkupAnnotData)
@@ -1596,7 +1620,7 @@ class ZoomAnnotationMixin:
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        self._push_undoable(description, do_create, undo_create)
+        self._push_undoable(description, do_create, undo_create, affects_pages=False)
     def _run_zoom_replace(
         self,
         old_annotation: "AnyAnnotData",
@@ -1637,7 +1661,7 @@ class ZoomAnnotationMixin:
         kwargs = {}
         if select_old_on_error:
             kwargs["selected_annotation_on_error"] = state["old"]
-        self._push_undoable(description, do_replace, undo_replace, **kwargs)
+        self._push_undoable(description, do_replace, undo_replace, affects_pages=False, **kwargs)
     def _run_zoom_markup_replace(
         self,
         old_annotation: TextMarkupAnnotData,
@@ -1882,6 +1906,9 @@ class ZoomAnnotationMixin:
             callout_target=annotation.callout_target,
         )
     def _commit_inline_annotation_editor(self) -> None:
+        # 他の操作(選択変更・削除・Undo・ページ移動など)が割り込む前に、
+        # 未確定のフォーム編集(スライダー/スピン)を確定させる。
+        self._flush_zoom_annotation_form_commit()
         if (
             self._zoom_label
             and self._zoom_label.has_active_text_editor()
@@ -2102,12 +2129,72 @@ class ZoomAnnotationMixin:
             lambda: create_freetext_annot(self._pdf_path, dup_ft),
             lambda *a: delete_freetext_annot(*a),
         )
+    # --- フォームの編集確定(デバウンス) -------------------------------------
+    # スピン/スライダーは操作中に valueChanged が連発する。そのたびにPDFを保存すると
+    # 大きいPDFでは1回あたり秒単位で固まり、Undo履歴も操作ごとに積まれてしまうため、
+    # 操作中は画面上のプレビュー(メモリ上の注釈データ)だけ更新し、確定時に1回だけ保存する。
+    #   - スライダー: ドラッグ中は保存せず sliderReleased で確定。キー/ホイールなどドラッグ
+    #     以外の変更は短いデバウンス後にまとめて確定。
+    #   - スピンボックス: editingFinished(Enter/フォーカス離脱)で確定。矢印クリック/ホイール
+    #     連打はデバウンス後にまとめて確定。キー入力中は valueChanged を出さない。
+    # 確定は _apply_zoom_annotation_form(1確定=Undo1件)。他の操作が割り込む前に
+    # _commit_inline_annotation_editor / ページ上のマウス操作 / ウィンドウを閉じる際に確定する。
+    ZOOM_FORM_COMMIT_DEBOUNCE_MS = 450
+
+    def _connect_form_spin(self, spin: QSpinBox, on_value_changed: Callable[[int], None] | None = None) -> None:
+        """フォームのスピンボックスを「プレビュー+デバウンス確定」へ接続する。"""
+        spin.setKeyboardTracking(False)
+        spin.valueChanged.connect(on_value_changed or self._on_zoom_annotation_form_value_changed)
+        spin.editingFinished.connect(self._flush_zoom_annotation_form_commit)
+    def _zoom_form_commit_timer_get(self) -> QTimer:
+        timer = getattr(self, "_zoom_form_commit_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self.ZOOM_FORM_COMMIT_DEBOUNCE_MS)
+            timer.timeout.connect(self._flush_zoom_annotation_form_commit)
+            self._zoom_form_commit_timer = timer
+        return timer
+    def _preview_zoom_annotation_form(self) -> None:
+        """フォームの現在値で、選択中の注釈の表示だけを即時に更新する(保存しない)。"""
+        selected = self._selected_zoom_annotation
+        if self._zoom_label is None or selected is None:
+            return
+        if isinstance(selected, ShapeAnnotData):
+            preview = self._shape_data_from_form(selected)
+        elif isinstance(selected, FreeTextAnnotData):
+            preview = self._annotation_data_from_form(selected)
+        else:
+            return
+        self._zoom_label.preview_annotation(preview)
+    def _on_zoom_annotation_form_edited(self, slider: QSlider | None = None) -> None:
+        """フォーム値が変わった: プレビューを更新し、確定を予約する。"""
+        selected = self._selected_zoom_annotation
+        if (
+            self._zoom_annotation_form_sync
+            or selected is None
+            or isinstance(selected, (TextMarkupAnnotData, NoteAnnotData))
+        ):
+            return
+        self._zoom_form_commit_pending = True
+        self._preview_zoom_annotation_form()
+        timer = self._zoom_form_commit_timer_get()
+        if slider is not None and slider.isSliderDown():
+            timer.stop()  # ドラッグ中は離したとき(sliderReleased)に確定する
+            return
+        timer.start()
+    def _flush_zoom_annotation_form_commit(self) -> bool:
+        """未確定のフォーム編集があれば、いま1回だけ保存して確定する。確定したら True。"""
+        if not getattr(self, "_zoom_form_commit_pending", False):
+            return False
+        self._apply_zoom_annotation_form()  # 内部で予約状態とタイマーを解除する
+        return True
     def _on_zoom_annotation_form_value_changed(self, _value: int) -> None:
-        self._apply_zoom_annotation_form()
+        self._on_zoom_annotation_form_edited()
     def _on_zoom_annotation_opacity_changed(self, value: int) -> None:
         if self._zoom_annotation_opacity_label:
             self._zoom_annotation_opacity_label.setText(f"{int(value)}%")
-        self._apply_zoom_annotation_form()
+        self._on_zoom_annotation_form_edited(self._zoom_annotation_opacity_slider)
     def _on_shape_btn_clicked(self, shape_type: ShapeType, checked: bool) -> None:
         if not self._zoom_view or not self._zoom_view.isVisible() or self._zoom_page_num is None:
             self._set_shape_create_mode(None)
@@ -2258,7 +2345,7 @@ class ZoomAnnotationMixin:
             self._selected_zoom_annotation = None
             self._refresh_current_zoom_page()
 
-        self._push_undoable("Create bracket pair", do_create, undo_create)
+        self._push_undoable("Create bracket pair", do_create, undo_create, affects_pages=False)
     def _run_zoom_shape_replace(
         self,
         old_annotation: ShapeAnnotData,
@@ -2350,19 +2437,19 @@ class ZoomAnnotationMixin:
     def _on_zoom_shape_rotation_changed(self, value: int) -> None:
         with QSignalBlocker(self._zoom_shape_rotation_slider):
             self._zoom_shape_rotation_slider.setValue(value)
-        self._apply_zoom_annotation_form()
+        self._on_zoom_annotation_form_edited()
     def _on_zoom_shape_rotation_slider_changed(self, value: int) -> None:
         with QSignalBlocker(self._zoom_shape_rotation_spin):
             self._zoom_shape_rotation_spin.setValue(value)
-        self._apply_zoom_annotation_form()
+        self._on_zoom_annotation_form_edited(self._zoom_shape_rotation_slider)
     def _on_zoom_shape_triangle_apex_x_changed(self, value: int) -> None:
         with QSignalBlocker(self._zoom_shape_triangle_apex_x_slider):
             self._zoom_shape_triangle_apex_x_slider.setValue(value)
-        self._apply_zoom_annotation_form()
+        self._on_zoom_annotation_form_edited()
     def _on_zoom_shape_triangle_apex_x_slider_changed(self, value: int) -> None:
         with QSignalBlocker(self._zoom_shape_triangle_apex_x_spin):
             self._zoom_shape_triangle_apex_x_spin.setValue(value)
-        self._apply_zoom_annotation_form()
+        self._on_zoom_annotation_form_edited(self._zoom_shape_triangle_apex_x_slider)
     def _on_zoom_shape_option_changed(self, _value=None) -> None:
         self._apply_zoom_annotation_form()
     def _on_zoom_annotation_new_clicked(self, checked: bool) -> None:
@@ -2435,6 +2522,11 @@ class ZoomAnnotationMixin:
             select_old_on_error=True,
         )
     def _apply_zoom_annotation_form(self) -> None:
+        # 予約済みの確定はここで消化する(重複して2回保存しない)。
+        self._zoom_form_commit_pending = False
+        timer = getattr(self, "_zoom_form_commit_timer", None)
+        if timer is not None:
+            timer.stop()
         if self._zoom_annotation_form_sync or self._selected_zoom_annotation is None:
             return
         old_annotation = self._selected_zoom_annotation
@@ -2526,7 +2618,9 @@ class ZoomAnnotationMixin:
                 self._selected_zoom_annotation = restored
                 self._refresh_current_zoom_page(open_drawer=True)
 
-            self._push_undoable("Delete callout", do_delete_group, undo_delete_group)
+            self._push_undoable(
+                "Delete callout", do_delete_group, undo_delete_group, affects_pages=False
+            )
             return
 
         # 型別の削除/復元操作テーブル(遅延バインドlambdaでモジュールグローバルを
@@ -2599,7 +2693,7 @@ class ZoomAnnotationMixin:
         kwargs = {}
         if select_old_on_error:
             kwargs["selected_annotation_on_error"] = state["old"]
-        self._push_undoable(description, do_delete, undo_delete, **kwargs)
+        self._push_undoable(description, do_delete, undo_delete, affects_pages=False, **kwargs)
     def _reorder_selected_zoom_annotation(self, mode: str) -> None:
         if self._selected_zoom_annotation is None or self._zoom_page_num is None:
             return
@@ -2633,6 +2727,7 @@ class ZoomAnnotationMixin:
             description=f"Reorder annotation ({mode})",
             undo_func=undo_reorder,
             redo_func=do_reorder,
+            affects_pages=False,
         ))
     def _on_zoom_annotation_geometry_changed(self, annotation: object, rect: object, mode: str) -> None:
         if not isinstance(rect, tuple) or len(rect) != 4:

@@ -28,6 +28,11 @@ HEAVY_PDF_RENDER_BATCH_SIZE = 1
 # サムネイル/ページ画像キャッシュ(_PixmapCache)の既定の最大保持件数。
 PIXMAP_CACHE_MAX_ENTRIES = 256
 
+# 注釈編集は増分保存(追記のみ)で速く保存する。ウィンドウを閉じるとき、開いた時点から
+# ファイルが「この比率」または「このバイト数」を超えて膨らんでいたら1回だけ全体保存で整理する。
+INCREMENTAL_SAVE_COMPACT_RATIO = 0.10
+INCREMENTAL_SAVE_COMPACT_BYTES = 20 * 1024 * 1024
+
 # 設定ダイアログでの入力値をクランプする許容範囲(単一情報源)。
 # (下限, 上限) のタプル。
 HEAVY_PDF_PAGE_COUNT_THRESHOLD_RANGE = (10, 100_000)

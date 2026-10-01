@@ -51,6 +51,7 @@ from src.utils.pdf_utils import (
     ShapeType,
     TextMarkupAnnotData,
     _get_file_cache_token,
+    pages_changed_since,
     create_markup_annot,
     create_markup_annots,
     create_shape_annot,
@@ -308,6 +309,9 @@ class PiiDrawerMixin:
         cache = getattr(self, "_pii_targets_by_page_cache", None)
         if cache is not None and cache[0] == self._pii_restyle_old_token:
             self._pii_targets_by_page_cache = (_get_file_cache_token(self._pdf_path), cache[1])
+        rows_cache = getattr(self, "_pii_result_rows_cache", None)
+        if rows_cache is not None and rows_cache[0] == self._pii_restyle_old_token:
+            self._pii_result_rows_cache = (_get_file_cache_token(self._pdf_path), rows_cache[1])
         # 画面上のデータ(注釈の色・不透明度)もファイルに合わせてメモリ内で更新する。
         settings = self._pii_settings()
         color = tuple(float(c) for c in settings.mask_color)
@@ -746,15 +750,63 @@ class PiiDrawerMixin:
     # ------------------------------------------------------------------
     # 結果一覧
     # ------------------------------------------------------------------
+    # ページ数がこれを超える差分更新は、ページごとに開き直すより全体走査の方が速い。
+    _PII_ROWS_PARTIAL_SCAN_MAX_PAGES = 4
+
     def _build_pii_result_rows(self) -> list[PiiResultRow]:
         """検出結果一覧に表示する行(塗りつぶし候補+塗りつぶし用図形)を組み立てる。
 
+        ページ別の行をファイルトークン付きでキャッシュし、自分の注釈書き込みで変わった
+        ページだけ組み直す(全ページ走査は大きいPDFで0.7秒以上かかるため)。ページ構成の
+        変更・外部変更で追跡できないときは全体を走査し直す。表示種別の絞り込みは
+        キャッシュ後に行うので、設定変更ではキャッシュを捨てなくてよい。
+        """
+        settings = self._pii_settings()
+        token = _get_file_cache_token(self._pdf_path)
+        cache = getattr(self, "_pii_result_rows_cache", None)
+        by_page: dict[int, list[PiiResultRow]] | None = None
+        if cache is not None:
+            if cache[0] == token:
+                by_page = cache[1]
+            else:
+                changed = pages_changed_since(self._pdf_path, cache[0])
+                if changed is not None and len(changed) <= self._PII_ROWS_PARTIAL_SCAN_MAX_PAGES:
+                    by_page = dict(cache[1])
+                    for pn in changed:
+                        by_page.pop(pn, None)
+                    by_page.update(self._scan_pii_rows_by_page(changed))
+        if by_page is None:
+            by_page = self._scan_pii_rows_by_page(None)
+        self._pii_result_rows_cache = (token, by_page)
+        rows = [
+            row
+            for page_rows in by_page.values()
+            for row in page_rows
+            if settings.is_entity_visible(row.entity)  # パネルでチェックが外れた種別は一覧に出さない
+        ]
+        rows.sort(key=lambda r: (r.page_num, r.kind, r.text))
+        return rows
+
+    def _scan_pii_rows_by_page(
+        self, pages: "frozenset[int] | set[int] | None"
+    ) -> dict[int, list[PiiResultRow]]:
+        """行(塗りつぶし候補+塗りつぶし用図形)をページ番号ごとに組み立てる(表示種別の絞り込み前)。
+
+        ``pages`` が None なら文書全体、指定があればそのページだけを走査する。
         ``pii_text`` が空(旧バージョンが作成したハイライト、または座標だけ持つ
         塗りつぶし用図形)の場合は、その場でページ文字から抽出してフォールバックする。
         """
         rows: list[PiiResultRow] = []
         chars_cache: dict[int, list[dict]] = {}
-        settings = self._pii_settings()
+        markups: list[TextMarkupAnnotData] = []
+        shapes: list[ShapeAnnotData] = []
+        if pages is None:
+            markups = list_pii_markup_annots(self._pdf_path)
+            shapes = list_pii_mask_shapes(self._pdf_path)
+        else:
+            for pn in sorted(pages):
+                markups += list_pii_markup_annots(self._pdf_path, pn)
+                shapes += list_pii_mask_shapes(self._pdf_path, pn)
 
         def chars_for(page_num: int) -> list[dict]:
             cached = chars_cache.get(page_num)
@@ -763,9 +815,7 @@ class PiiDrawerMixin:
                 chars_cache[page_num] = cached
             return cached
 
-        for annot in list_pii_markup_annots(self._pdf_path):
-            if not settings.is_entity_visible(annot.pii_entity):
-                continue  # パネルでチェックが外れた種別は一覧に出さない
+        for annot in markups:
             text = annot.pii_text
             if not text:
                 text = text_under_rect(chars_for(annot.page_num), annot.rect)
@@ -782,9 +832,7 @@ class PiiDrawerMixin:
                 )
             )
 
-        for shape in list_pii_mask_shapes(self._pdf_path):
-            if not settings.is_entity_visible(shape.pii_entity):
-                continue
+        for shape in shapes:
             # 図形は移動/リサイズ(dataclasses.replaceでrectだけ変わる)できるため、
             # 作成時にキャッシュした shape.pii_text は移動後は古くなり得る。
             # 図形は文字数も少なく再抽出が軽いため、常にその場で計算し直す
@@ -807,8 +855,10 @@ class PiiDrawerMixin:
                 )
             )
 
-        rows.sort(key=lambda r: (r.page_num, r.kind, r.text))
-        return rows
+        by_page: dict[int, list[PiiResultRow]] = {}
+        for row in rows:
+            by_page.setdefault(row.page_num, []).append(row)
+        return by_page
 
     def _reload_pii_results(self) -> None:
         panel = getattr(self, "_pii_panel", None)

@@ -7,7 +7,7 @@ import re
 import uuid
 from dataclasses import dataclass, replace as dataclass_replace
 from enum import Enum
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import fitz
 
@@ -1175,7 +1175,7 @@ def _create_annot(family: _AnnotFamily, pdf_path: str, data: Any) -> Any:
         page = doc[data.page_num]
         annot = family.add_fn(page, data)
         saved = family.extract_fn(doc, data.page_num, annot)
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(data.page_num,))
         if saved is None:
             raise RuntimeError(f"Failed to extract saved {family.label} annotation")
         return saved
@@ -1193,7 +1193,7 @@ def _delete_annot(family: _AnnotFamily, pdf_path: str, page_num: int, xref: int)
         if annot is None or annot.type[0] not in family.types:
             return False
         page.delete_annot(annot)
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         return True
     finally:
         doc.close()
@@ -1210,7 +1210,7 @@ def _replace_annot(family: _AnnotFamily, pdf_path: str, page_num: int, xref: int
             page.delete_annot(annot)
         replacement = family.add_fn(page, data)
         saved = family.extract_fn(doc, page_num, replacement)
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         if saved is None:
             raise RuntimeError(f"Failed to extract saved {family.label} annotation")
         return saved
@@ -1307,7 +1307,7 @@ def create_bracket_pair(
         right_annot = _add_shape_annot_to_page(page, right_data)
         right_saved = _extract_shape_data(doc, page_num, right_annot)
 
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         if left_saved is None or right_saved is None:
             raise RuntimeError("Failed to extract saved bracket annotations")
         return left_saved, right_saved
@@ -1400,7 +1400,7 @@ def delete_annot_group(pdf_path: str, page_num: int, group_id: str) -> int:
                 page.delete_annot(annot)
                 deleted += 1
         if deleted:
-            _save_document_in_place(doc, pdf_path)
+            _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         return deleted
     finally:
         doc.close()
@@ -1595,8 +1595,66 @@ def create_markup_annots(
             extracted = _extract_markup_data(doc, data.page_num, annot)
             if extracted is not None:
                 saved.append(extracted)
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True, changed_pages={d.page_num for d in items})
         return saved
+    finally:
+        doc.close()
+
+
+def edit_markup_annots(
+    pdf_path: str,
+    ops: "list[tuple]",
+) -> "list[TextMarkupAnnotData | None]":
+    """複数のマークアップ注釈の置換・削除・作成を、1回の open・1回の保存でまとめて行う。
+
+    ``ops`` の各要素(結果は同じ順序のリストで返す):
+      - ``("replace", page_num, xref, data)``: 置換し、保存後のデータを返す
+      - ``("delete", page_num, xref)``: 削除し、結果は None
+      - ``("create", data)``: 新規作成し、保存後のデータを返す
+    消しゴムのように複数注釈を一度に書き換える操作が、1件ごとに全体を開いて保存する
+    (大きいPDFで1件あたり秒単位)のを避けるためのもの。
+    """
+    if not ops:
+        return []
+    doc = fitz.open(pdf_path)
+    try:
+        results: list[TextMarkupAnnotData | None] = []
+        changed: set[int] = set()
+        for op in ops:
+            kind = op[0]
+            if kind == "delete":
+                _, page_num, xref = op
+                if page_num < 0 or page_num >= len(doc):
+                    raise IndexError(f"page out of range: {page_num}")
+                page = doc[page_num]
+                annot = page.load_annot(xref)
+                if annot is not None and annot.type[0] in _MARKUP_ANNOT_TYPES:
+                    page.delete_annot(annot)
+                changed.add(page_num)
+                results.append(None)
+                continue
+            if kind == "replace":
+                _, page_num, xref, data = op
+            elif kind == "create":
+                _, data = op
+                page_num, xref = data.page_num, 0
+            else:
+                raise ValueError(f"unknown op: {kind}")
+            if page_num < 0 or page_num >= len(doc):
+                raise IndexError(f"page out of range: {page_num}")
+            page = doc[page_num]
+            if kind == "replace":
+                annot = page.load_annot(xref)
+                if annot is not None:
+                    page.delete_annot(annot)
+            created = _add_markup_annot_to_page(page, data)
+            saved = _extract_markup_data(doc, page_num, created)
+            if saved is None:
+                raise RuntimeError("Failed to extract saved markup annotation")
+            changed.add(page_num)
+            results.append(saved)
+        _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=changed)
+        return results
     finally:
         doc.close()
 
@@ -1621,7 +1679,7 @@ def delete_markup_annots(pdf_path: str, refs: list[tuple[int, int]]) -> int:
             page.delete_annot(annot)
             deleted += 1
         if deleted:
-            _save_document_in_place(doc, pdf_path)
+            _save_document_in_place(doc, pdf_path, incremental=True, changed_pages={pn for pn, _ in refs})
         return deleted
     finally:
         doc.close()
@@ -1670,6 +1728,7 @@ def _pii_annot_needs_restyle(
 
 def list_pii_targets_by_page(
     pdf_path: str,
+    pages: "Iterable[int] | None" = None,
 ) -> "dict[int, tuple[tuple[float, float], list]]":
     """PII塗りつぶし対象(テキスト候補+図形)をページ番号ごとにまとめて返す。
 
@@ -1677,11 +1736,18 @@ def list_pii_targets_by_page(
     ページ内はテキスト候補→図形の順で並べる。サイズは表示座標系(``page.rect``)。
     大きいPDFでマークアップ/図形/ページサイズ用に何度も開き直さないための関数。
     読み込みに失敗したら空の dict を返す。
+
+    ``pages`` を渡すと、そのページだけを走査する(自分の書き込みで変わったページの
+    再集計用。範囲外の番号は無視し、対象が無いページは結果に含まれない)。
     """
     result: dict[int, tuple[tuple[float, float], list]] = {}
     try:
         with fitz.open(pdf_path) as doc:
-            for pn in range(len(doc)):
+            if pages is None:
+                page_numbers: Iterable[int] = range(len(doc))
+            else:
+                page_numbers = sorted({int(p) for p in pages if 0 <= int(p) < len(doc)})
+            for pn in page_numbers:
                 page = doc[pn]
                 targets: list = []
                 for family in (_MARKUP_FAMILY, _SHAPE_FAMILY):
@@ -1968,7 +2034,7 @@ def set_annot_xref_order(pdf_path: str, page_num: int, order: list[int]) -> bool
         if current == order:
             return True
         _set_page_annot_xref_order(doc, page_num, order)
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         return True
     finally:
         doc.close()
@@ -2002,7 +2068,7 @@ def reorder_annot_on_page(pdf_path: str, page_num: int, xref: int, mode: str) ->
                 return False
             order[idx], order[idx - 1] = order[idx - 1], order[idx]
         _set_page_annot_xref_order(doc, page_num, order)
-        _save_document_in_place(doc, pdf_path)
+        _save_document_in_place(doc, pdf_path, incremental=True, changed_pages=(page_num,))
         return True
     finally:
         doc.close()
@@ -2041,3 +2107,53 @@ def replace_freetext_annot(
     """Replace an existing FreeText annotation and return the saved replacement."""
     return _replace_annot(_FREETEXT_FAMILY, pdf_path, page_num, xref, data)
 
+
+
+def load_zoom_page_annotations(
+    pdf_path: str, page_num: int, *, include_ink: bool = False
+) -> dict:
+    """ズーム表示用に、1ページ分の注釈情報を1回の open でまとめて取得する。
+
+    ページごとに ``list_*_annots`` ×4・``get_annot_xref_order``・Ink xref 取得で
+    7回 open していた(大きいPDFで各20〜25ms)のを1回に減らす。
+
+    戻り値: ``page_count`` / ``freetext`` / ``shape`` / ``markup`` / ``note`` /
+    ``xref_order`` / ``ink_xrefs``。``page_num`` が範囲外なら注釈は空(page_count は返す)。
+    読み込みに失敗したら全て空で返す。
+    """
+    result: dict = {
+        "page_count": 0,
+        "freetext": [],
+        "shape": [],
+        "markup": [],
+        "note": [],
+        "xref_order": [],
+        "ink_xrefs": [],
+    }
+    try:
+        with fitz.open(pdf_path) as doc:
+            result["page_count"] = len(doc)
+            if page_num < 0 or page_num >= len(doc):
+                return result
+            page = doc[page_num]
+            for key, family in (
+                ("freetext", _FREETEXT_FAMILY),
+                ("shape", _SHAPE_FAMILY),
+                ("markup", _MARKUP_FAMILY),
+                ("note", _NOTE_FAMILY),
+            ):
+                annots = page.annots(types=family.types)
+                if annots is None:
+                    continue
+                for annot in annots:
+                    data = family.extract_fn(doc, page_num, annot)
+                    if data is not None:
+                        result[key].append(data)
+            result["xref_order"] = _get_page_annot_xref_order(doc, page_num)
+            if include_ink:
+                annots = page.annots(types=[fitz.PDF_ANNOT_INK])
+                if annots is not None:
+                    result["ink_xrefs"] = [annot.xref for annot in annots]
+    except Exception:
+        logger.debug("load_zoom_page_annotations failed: %s", pdf_path, exc_info=True)
+    return result

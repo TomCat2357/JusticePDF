@@ -84,7 +84,10 @@ from src.utils.pdf_utils import (
     list_ink_annot_xrefs,
     list_ink_annot_xrefs_by_page,
     list_pii_targets_by_page,
+    load_zoom_page_annotations,
     _get_file_cache_token,
+    compact_pdf_in_place,
+    pages_changed_since,
     list_shape_annots,
     create_shape_annot,
     replace_shape_annot,
@@ -115,6 +118,8 @@ from src.utils.pdf_utils import (
 )
 from src.utils import app_settings
 from src.utils.constants import (
+    INCREMENTAL_SAVE_COMPACT_BYTES,
+    INCREMENTAL_SAVE_COMPACT_RATIO,
     PAGETHUMBNAIL_MIME_TYPE,
     PDFCARD_MIME_TYPE,
 )
@@ -216,6 +221,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def __init__(self, pdf_path: str, undo_manager: UndoManager, parent=None):
         super().__init__(parent)
         self._pdf_path = pdf_path
+        # 増分保存の累積による肥大を、閉じるときに整理するか判断するための基準サイズ。
+        self._initial_file_size = self._current_file_size()
         self._undo_manager = undo_manager
         self._did_initial_grid_layout = False
         self._thumbnails: list[PageThumbnail] = []
@@ -263,7 +270,14 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._pii_targets_by_page_cache: (
             "tuple[tuple[int, int, int], dict[int, tuple[tuple[float, float], list]]] | None"
         ) = None
+        # 個人情報検出の結果一覧用の行キャッシュ(ページ別・ファイルトークン付き)。
+        # 注釈書き込みで変わったページ分だけ組み直す(_build_pii_result_rows 参照)。
+        self._pii_result_rows_cache: (
+            "tuple[tuple[int, int, int], dict[int, list]] | None"
+        ) = None
         self._zoom_annotation_form_sync = False
+        # フォームのスライダー/スピン操作の未確定(保存待ち)フラグ。確定は page_edit_annotations 参照。
+        self._zoom_form_commit_pending = False
         self._zoom_annotation_text_commit_in_progress = False
         self._zoom_annotation_new_btn = None
         self._zoom_annotation_delete_btn = None
@@ -552,6 +566,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._zoom_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._zoom_label = ZoomPageWidget()
         self._zoom_label.wheel_zoom.connect(self._on_zoom_wheel)
+        self._zoom_label.interaction_started.connect(self._flush_zoom_annotation_form_commit)
         self._zoom_label.link_clicked.connect(self._on_zoom_link_clicked)
         self._zoom_label.annotation_selected.connect(self._on_zoom_annotation_selected)
         self._zoom_label.annotation_geometry_changed.connect(self._on_zoom_annotation_geometry_changed)
@@ -935,8 +950,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         undo_func: Callable[[], None],
         *,
         selected_annotation_on_error: FreeTextAnnotData | None = None,
+        affects_pages: bool = True,
     ) -> bool:
         """do_func を実行し、成功時のみ Undo/Redo 履歴に登録する。
+
+        ``affects_pages=False`` は注釈の編集だけの操作(ページ構成は変わらない)。Undo/Redo
+        後にページ一覧を作り直さず表示中のページだけ更新する。do/undo の各関数が
+        ``_refresh_current_zoom_page`` 等で自分の画面更新を行うこと。
 
         PdfWritePermissionError 時は警告ダイアログを表示して False を返す
         (履歴には積まない)。redo には do_func をそのまま使う。
@@ -956,6 +976,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             description=description,
             undo_func=undo_func,
             redo_func=do_func,
+            affects_pages=affects_pages,
         ))
         return True
 
@@ -1107,6 +1128,17 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         cached = self._pii_targets_by_page_cache
         if cached is not None and cached[0] == token:
             return cached[1]
+        if cached is not None:
+            # 自分の注釈書き込みだけでトークンが変わったなら、変更したページだけ再スキャンする。
+            # 外部変更・ページ構成変更が挟まって追跡できない(None)ときは全ページ再スキャン。
+            changed = pages_changed_since(self._pdf_path, cached[0])
+            if changed is not None:
+                by_page = dict(cached[1])
+                for pn in changed:
+                    by_page.pop(pn, None)
+                by_page.update(list_pii_targets_by_page(self._pdf_path, changed))
+                self._pii_targets_by_page_cache = (token, by_page)
+                return by_page
         # ドキュメントを1回だけ開く(PIIのあるページ数に依存しない)。
         by_page = list_pii_targets_by_page(self._pdf_path)
         self._pii_targets_by_page_cache = (token, by_page)
@@ -1174,6 +1206,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._scroll_debounce_timer.start()  # デバウンス（スクロール停止150ms後に優先化）
 
     def _load_pages(self) -> None:
+        # ページ構成が変わるので、塗りつぶし対象のページ別集計は破棄して全ページ再集計させる。
+        self._pii_targets_by_page_cache = None
+        self._pii_result_rows_cache = None
         # ページ構成の変更(書き込み)の直後に呼ばれるので、PDFを開いたままの
         # PII restyle ジョブを止め、走り直しを予約する(デバウンスなので本処理の後に動く)。
         if self._abort_pii_restyle_job():
@@ -1719,7 +1754,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._commit_inline_annotation_editor()
         if self._zoom_page_num is None or not self._zoom_label:
             return
-        page_count = get_page_count(self._pdf_path)
+        # ページ数・注釈4種・描画順・Ink xref を1回の open でまとめて取得する
+        # (以前は7回 open していた。大きいPDFで各20〜25ms)。
+        page_data = load_zoom_page_annotations(
+            self._pdf_path, self._zoom_page_num, include_ink=not self._show_ink_annots
+        )
+        page_count = page_data["page_count"]
         self._update_zoom_nav_buttons(page_count)
         if self._zoom_page_label:
             self._zoom_page_label.setText(f"{self._zoom_page_num + 1} / {page_count}")
@@ -1727,18 +1767,16 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._exit_zoom_view()
             return
         dpr = self._zoom_label.devicePixelRatioF()
-        freetext_annots = list_freetext_annots(self._pdf_path, self._zoom_page_num)
-        shape_annots = list_shape_annots(self._pdf_path, self._zoom_page_num)
-        markup_annots = list_markup_annots(self._pdf_path, self._zoom_page_num)
-        note_annots = list_note_annots(self._pdf_path, self._zoom_page_num)
-        merged = freetext_annots + shape_annots + markup_annots + note_annots
+        merged = (
+            page_data["freetext"] + page_data["shape"] + page_data["markup"] + page_data["note"]
+        )
         # オーバーレイで描く注釈(フリーテキスト・図形・マークアップ・ノート)は
         # 二重描画を避けるためページ画像側では隠す。それ以外(Ink など本アプリが
         # 編集対象としない注釈)はページ画像にそのまま焼き込んで表示する。
         hide_xrefs = {a.xref for a in merged}
         if not self._show_ink_annots:
             # 手書き(Ink)注釈を非表示にする設定の場合、この xref もページ画像側で隠す。
-            hide_xrefs |= set(list_ink_annot_xrefs(self._pdf_path, self._zoom_page_num))
+            hide_xrefs |= set(page_data["ink_xrefs"])
         pixmap = get_page_pixmap(
             self._pdf_path,
             self._zoom_page_num,
@@ -1757,7 +1795,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             links = get_page_links(self._pdf_path, self._zoom_page_num)
             chars = get_page_chars(self._pdf_path, self._zoom_page_num)
             self._zoom_text_cache[self._zoom_page_num] = (words, links, chars)
-        xref_order = get_annot_xref_order(self._pdf_path, self._zoom_page_num)
+        xref_order = page_data["xref_order"]
         order_index = {x: i for i, x in enumerate(xref_order)}
         # PDF の /Annots 配列順（描画順）に並べ替え。未登録 xref は末尾に置く。
         merged.sort(key=lambda a: order_index.get(a.xref, len(order_index)))
@@ -1921,26 +1959,42 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if self._zoom_page_layout_is_multi():
             return
         self._commit_inline_annotation_editor()
+        pending = self._undo_manager.peek_undo()
+        affects_pages = pending.affects_pages if pending is not None else True
         with self._pii_restyle_paused():  # PDFへ書き込むので restyle ジョブを止める
             try:
                 self._undo_manager.undo()
             except PdfWritePermissionError as error:
                 self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
                 return
-        self._load_pages()
-        self._update_button_states()
+        self._after_undo_redo(affects_pages)
 
     def _on_redo(self) -> None:
         if self._zoom_page_layout_is_multi():
             return
         self._commit_inline_annotation_editor()
+        pending = self._undo_manager.peek_redo()
+        affects_pages = pending.affects_pages if pending is not None else True
         with self._pii_restyle_paused():  # PDFへ書き込むので restyle ジョブを止める
             try:
                 self._undo_manager.redo()
             except PdfWritePermissionError as error:
                 self._handle_pdf_write_permission_denied(error, selected_annotation=self._selected_zoom_annotation)
                 return
-        self._load_pages()
+        self._after_undo_redo(affects_pages)
+
+    def _after_undo_redo(self, affects_pages: bool) -> None:
+        """Undo/Redo 実行後の画面更新。
+
+        ページ構成を変える操作は従来どおり全体を読み込み直す。注釈だけの操作は、
+        do/undo の各関数が表示中ページ(ズーム画面・サムネイル・一覧)を更新済みなので、
+        ここでは Ink xref キャッシュを捨てるだけにして、317枚規模のサムネイル再構築や
+        PII結果・しおりの再構築を避ける。
+        """
+        if affects_pages:
+            self._load_pages()
+        else:
+            self._ink_xrefs_by_page_cache = None
         self._update_button_states()
 
     def _on_delete(self) -> None:
@@ -2631,6 +2685,32 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             return len(self._thumbnails)
         return 0
 
+    def _current_file_size(self) -> int:
+        try:
+            return os.path.getsize(self._pdf_path)
+        except OSError:
+            return 0
+
+    def _pdf_bloated_since_open(self) -> bool:
+        """ウィンドウを開いた時点から、増分保存でファイルが閾値を超えて膨らんだか。"""
+        initial = self._initial_file_size
+        if initial <= 0:
+            return False
+        growth = self._current_file_size() - initial
+        return growth > INCREMENTAL_SAVE_COMPACT_BYTES or growth > initial * INCREMENTAL_SAVE_COMPACT_RATIO
+
+    def _compact_pdf_if_bloated(self) -> None:
+        """増分保存の累積で肥大していたら、閉じるときに1回だけ全体保存で整理する。
+
+        閾値未満なら何もしない(閉じる操作を遅くしない)。失敗しても閉じる操作は止めない。
+        """
+        if not self._pdf_bloated_since_open():
+            return
+        try:
+            compact_pdf_in_place(self._pdf_path)
+        except Exception:  # noqa: BLE001 - 整理の失敗でウィンドウを閉じられなくしない
+            logger.warning("PDFの整理(全体保存)に失敗しました: %s", self._pdf_path, exc_info=True)
+
     def closeEvent(self, event) -> None:
         """Handle window close - unlock the card in main window."""
         from src.views.main_window import MainWindow
@@ -2638,8 +2718,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         logger.debug(f"PageEditWindow closing for {self._pdf_path}")
 
         self._reset_thumbnail_render_queue()
+        # 未確定のフォーム編集(スライダー/スピン)があれば先に確定する。
+        self._flush_zoom_annotation_form_commit()
         # 予約中・実行中の PII 注釈スタイル反映は、閉じる前に同期で済ませる。
         self._flush_pii_restyle(sync=True)
+        # restyle の保存が済んだ後で、増分保存で肥大していたら1回だけ整理する。
+        self._compact_pdf_if_bloated()
         self._undo_manager.remove_listener(self._on_undo_manager_changed)
 
         if self._search_dialog is not None:

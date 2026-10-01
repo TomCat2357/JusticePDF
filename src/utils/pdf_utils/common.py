@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 from collections import OrderedDict
+from collections.abc import Iterable
 
 import fitz
 from PyQt6.QtGui import QPixmap
@@ -119,8 +120,66 @@ def _is_permission_denied_error(error: BaseException) -> bool:
     return False
 
 
+# 注釈の書き込み履歴: パス -> [(保存前トークン, 保存後トークン, 変更ページ集合)]。
+# 画面側のキャッシュ(PII対象のページ別集計など)が「自分の書き込みで変わったページだけ」
+# 再計算できるようにするためのもの。トークンが連鎖しない(=外部変更やページ構成の変更が
+# 挟まった)場合は利用側が全ページ再計算にフォールバックする。
+_WRITE_JOURNAL_MAX = 64
+_write_journal: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int], frozenset[int]]]] = {}
+
+
+def _journal_key(pdf_path: str) -> str:
+    return os.path.normcase(os.path.abspath(pdf_path))
+
+
+def pages_changed_since(
+    pdf_path: str, token: tuple[int, int, int]
+) -> "frozenset[int] | None":
+    """*token* の時点から現在までの変更が、すべて記録済みの注釈書き込みなら変更ページ集合を返す。
+
+    現在のファイルと同じトークンなら空集合。履歴が途切れていて追跡できない場合は None
+    (呼び出し側は全ページ再計算する)。
+    """
+    current = _get_file_cache_token(pdf_path)
+    if token == current:
+        return frozenset()
+    entries = _write_journal.get(_journal_key(pdf_path))
+    if not entries:
+        return None
+    pages: set[int] = set()
+    cursor = token
+    progressed = True
+    while cursor != current and progressed:
+        progressed = False
+        for before, after, changed in entries:
+            if before == cursor and after != cursor:
+                pages |= changed
+                cursor = after
+                progressed = True
+                break
+    if cursor != current:
+        return None
+    return frozenset(pages)
+
+
+def _record_write(
+    pdf_path: str,
+    before: tuple[int, int, int],
+    changed_pages: "Iterable[int]",
+) -> None:
+    after = _get_file_cache_token(pdf_path)
+    entries = _write_journal.setdefault(_journal_key(pdf_path), [])
+    entries.append((before, after, frozenset(int(p) for p in changed_pages)))
+    if len(entries) > _WRITE_JOURNAL_MAX:
+        del entries[: len(entries) - _WRITE_JOURNAL_MAX]
+
+
 def _save_document_in_place(
-    doc: fitz.Document, pdf_path: str, *, incremental: bool = False
+    doc: fitz.Document,
+    pdf_path: str,
+    *,
+    incremental: bool = False,
+    changed_pages: "Iterable[int] | None" = None,
 ) -> None:
     """Persist a modified document.
 
@@ -128,7 +187,19 @@ def _save_document_in_place(
     (append-only, no rewrite).  Falls back to full save on failure.
     When False (default), uses full save with garbage collection to
     prevent file growth from repeated annotation edits.
+
+    *changed_pages* (注釈だけを書き換えた操作が渡す) を指定すると、保存前後のファイル
+    トークンとともに書き込み履歴へ記録する(``pages_changed_since`` 参照)。
     """
+    token_before = _get_file_cache_token(pdf_path) if changed_pages is not None else None
+    _save_document_in_place_impl(doc, pdf_path, incremental=incremental)
+    if changed_pages is not None and token_before is not None:
+        _record_write(pdf_path, token_before, changed_pages)
+
+
+def _save_document_in_place_impl(
+    doc: fitz.Document, pdf_path: str, *, incremental: bool = False
+) -> None:
     if incremental:
         try:
             doc.saveIncr()
@@ -174,3 +245,13 @@ def _get_file_cache_token(pdf_path: str) -> tuple[int, int, int]:
         int(getattr(stat_result, "st_ctime_ns", 0)),
     )
 
+
+
+def compact_pdf_in_place(pdf_path: str) -> None:
+    """増分保存で積み上がった不要オブジェクトを、全体保存(garbage=1)で整理する。
+
+    注釈編集は増分保存(追記のみ)で速く保存するが、繰り返すとファイルが肥大する。
+    ウィンドウを閉じるときなどに1回だけ呼んで整理する。
+    """
+    with fitz.open(pdf_path) as doc:
+        _save_document_in_place(doc, pdf_path)
