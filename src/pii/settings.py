@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace as dataclass_replace
 
 from PyQt6.QtCore import QSettings
 
+from src.utils.opacity_utils import transparency_percent_to_opacity
 from src.pii.engines import default_enabled_engines
 from src.pii.entity_types import (
     ENTITY_TYPES,
@@ -348,14 +349,14 @@ class PiiSettings:
     @property
     def mask_opacity(self) -> float:
         """塗りつぶしの不透明度(0.0-1.0)。透明度0 -> 1.0、透明度100 -> 0.0。"""
-        return (100 - _clamp_transparency(self.mask_transparency)) / 100.0
+        return transparency_percent_to_opacity(_clamp_transparency(self.mask_transparency))
 
     @property
     def ocr_text_opacity(self) -> float:
         """認識文字の不透明度(0.0-1.0)。透明度0 -> 1.0、透明度100 -> 0.0。"""
-        return (100 - _clamp_transparency(
+        return transparency_percent_to_opacity(_clamp_transparency(
             self.ocr_text_transparency, DEFAULT_OCR_TEXT_TRANSPARENCY
-        )) / 100.0
+        ))
 
     def is_engine_enabled(self, engine_key: str) -> bool:
         return bool(self.enabled_engines.get(engine_key, False))

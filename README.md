@@ -28,6 +28,12 @@
 
 > このパスは `src/views/main_window.py` の `self._work_dir` で定義されています。
 
+## 設定の保存場所
+
+アプリ設定は、アプリのルート（JusticePDF フォルダ）直下の `settings\JusticePDF.ini` に保存されます（起動時に自動作成。Git 管理対象外）。
+フォルダを作成・書き込みできない場合は警告ログを出し、従来のレジストリ（`HKCU\Software\JusticePDF\JusticePDF`）に保存して起動を続けます。
+INI が無い初回起動時のみ、旧レジストリの設定を INI へ一度だけコピーします（レジストリ側は削除しません）。
+
 ---
 
 ## 基本操作

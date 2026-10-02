@@ -16,6 +16,8 @@ dependencies = [
     "sudachipy>=0.6.11",
     "sudachidict-core>=20240409",
     "phonenumbers>=8.13.0",
+    "lxml>=6.1.3",
+    "python-pptx",
 ]
 
 [project.optional-dependencies]

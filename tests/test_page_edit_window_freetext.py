@@ -139,7 +139,7 @@ def test_zoom_selects_existing_freetext_and_applies_direct_edit_and_form_changes
     window._zoom_annotation_width_spin.setValue(200)
     window._zoom_annotation_height_spin.setValue(110)
     window._zoom_annotation_fontsize_spin.setValue(22)
-    window._zoom_annotation_opacity_slider.setValue(65)
+    window._zoom_annotation_opacity_slider.setValue(35)  # 透明度35% = 不透明度0.65
     window._zoom_annotation_border_width_spin.setValue(4)
     window._zoom_annotation_text_color = (1.0, 0.0, 0.0)
     window._zoom_annotation_fill_color = (0.8, 1.0, 0.8)
@@ -156,7 +156,7 @@ def test_zoom_selects_existing_freetext_and_applies_direct_edit_and_form_changes
     assert changed.fontsize == 22.0
     assert abs(changed.opacity - 0.65) < 0.02
     assert changed.border_width == 4.0
-    assert window._zoom_annotation_opacity_label.text() == "65%"
+    assert window._zoom_annotation_opacity_label.text() == "35%"
 
 
 @pytest.mark.usefixtures("qtbot")

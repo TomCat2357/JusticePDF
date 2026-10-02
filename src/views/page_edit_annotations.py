@@ -116,6 +116,10 @@ from src.utils.pdf_utils import (
     get_pdf_toc,
     update_pdf_toc,
 )
+from src.utils.opacity_utils import (
+    opacity_to_transparency_percent,
+    transparency_percent_to_opacity,
+)
 from src.utils.constants import (
     PAGETHUMBNAIL_MIME_TYPE,
     PDFCARD_MIME_TYPE,
@@ -719,11 +723,14 @@ class ZoomAnnotationMixin:
         opacity_layout.addWidget(QLabel("透明度"))
         self._zoom_annotation_opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self._zoom_annotation_opacity_slider.setRange(0, 100)
-        self._zoom_annotation_opacity_slider.setValue(100)
+        self._zoom_annotation_opacity_slider.setValue(0)
+        self._zoom_annotation_opacity_slider.setToolTip(
+            "0%: 不透明 / 100%: 完全に透明"
+        )
         self._zoom_annotation_opacity_slider.valueChanged.connect(self._on_zoom_annotation_opacity_changed)
         self._zoom_annotation_opacity_slider.sliderReleased.connect(self._flush_zoom_annotation_form_commit)
         opacity_layout.addWidget(self._zoom_annotation_opacity_slider, 1)
-        self._zoom_annotation_opacity_label = QLabel("100%")
+        self._zoom_annotation_opacity_label = QLabel("0%")
         opacity_layout.addWidget(self._zoom_annotation_opacity_label)
         panel_layout.addWidget(opacity_row)
     def _build_annotation_colors(self, panel_layout: QVBoxLayout) -> None:
@@ -1227,9 +1234,9 @@ class ZoomAnnotationMixin:
                     self._zoom_annotation_height_spin.setRange(size_min, 5000)
                     self._zoom_annotation_height_spin.setValue(max(size_min, round(y1 - y0)))
                 if self._zoom_annotation_opacity_slider:
-                    self._zoom_annotation_opacity_slider.setValue(round(annotation.opacity * 100))
+                    self._zoom_annotation_opacity_slider.setValue(opacity_to_transparency_percent(annotation.opacity))
                 if self._zoom_annotation_opacity_label:
-                    self._zoom_annotation_opacity_label.setText(f"{round(annotation.opacity * 100)}%")
+                    self._zoom_annotation_opacity_label.setText(f"{opacity_to_transparency_percent(annotation.opacity)}%")
                 if self._zoom_annotation_border_width_spin:
                     self._zoom_annotation_border_width_spin.setValue(round(annotation.stroke_width))
                 self._zoom_annotation_fill_color = annotation.fill_color
@@ -1287,9 +1294,9 @@ class ZoomAnnotationMixin:
                 if self._zoom_annotation_fontsize_spin:
                     self._zoom_annotation_fontsize_spin.setValue(max(6, round(annotation.fontsize)))
                 if self._zoom_annotation_opacity_slider:
-                    self._zoom_annotation_opacity_slider.setValue(round(annotation.opacity * 100))
+                    self._zoom_annotation_opacity_slider.setValue(opacity_to_transparency_percent(annotation.opacity))
                 if self._zoom_annotation_opacity_label:
-                    self._zoom_annotation_opacity_label.setText(f"{round(annotation.opacity * 100)}%")
+                    self._zoom_annotation_opacity_label.setText(f"{opacity_to_transparency_percent(annotation.opacity)}%")
                 if self._zoom_annotation_border_width_spin:
                     self._zoom_annotation_border_width_spin.setValue(round(annotation.border_width))
                 self._zoom_annotation_text_color = annotation.text_color
@@ -1974,7 +1981,7 @@ class ZoomAnnotationMixin:
             fill_color=self._zoom_annotation_fill_color,
             border_color=border_color,
             border_width=border_width,
-            opacity=(float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else base.opacity,
+            opacity=transparency_percent_to_opacity(self._zoom_annotation_opacity_slider.value()) if self._zoom_annotation_opacity_slider else base.opacity,
             fontname=base.fontname,
             annotation_id=base.annotation_id,
             subject="",
@@ -2404,7 +2411,7 @@ class ZoomAnnotationMixin:
             stroke_color=self._zoom_annotation_border_color or (0.0, 0.0, 0.0),
             fill_color=self._zoom_annotation_fill_color if shape_type not in (ShapeType.LINE, ShapeType.BRACKET) else None,
             stroke_width=max(1.0, float(self._zoom_annotation_border_width_spin.value())) if self._zoom_annotation_border_width_spin else 1.0,
-            opacity=(float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else 1.0,
+            opacity=transparency_percent_to_opacity(self._zoom_annotation_opacity_slider.value()) if self._zoom_annotation_opacity_slider else 1.0,
             rotation=0.0,
             arrow_start=arrow_start,
             arrow_end=arrow_end,
@@ -2430,7 +2437,7 @@ class ZoomAnnotationMixin:
         bracket_size = _BRACKET_SIZES[self._zoom_shape_bracket_size_combo.currentIndex()]
         stroke_color = self._zoom_annotation_border_color or (0.0, 0.0, 0.0)
         stroke_width = max(1.0, float(self._zoom_annotation_border_width_spin.value())) if self._zoom_annotation_border_width_spin else 1.0
-        opacity = (float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else 1.0
+        opacity = transparency_percent_to_opacity(self._zoom_annotation_opacity_slider.value()) if self._zoom_annotation_opacity_slider else 1.0
 
         ref0: _AnnotRef | None = None
         ref1: _AnnotRef | None = None
@@ -2538,7 +2545,7 @@ class ZoomAnnotationMixin:
             stroke_color=stroke_color,
             fill_color=self._zoom_annotation_fill_color,
             stroke_width=stroke_width,
-            opacity=(float(self._zoom_annotation_opacity_slider.value()) / 100.0) if self._zoom_annotation_opacity_slider else base.opacity,
+            opacity=transparency_percent_to_opacity(self._zoom_annotation_opacity_slider.value()) if self._zoom_annotation_opacity_slider else base.opacity,
             rotation=rotation,
             arrow_start=self._zoom_shape_arrow_start_cb.isChecked(),
             arrow_end=self._zoom_shape_arrow_end_cb.isChecked(),
@@ -2604,7 +2611,7 @@ class ZoomAnnotationMixin:
             else 1.0
         )
         opacity = (
-            float(self._zoom_annotation_opacity_slider.value()) / 100.0
+            transparency_percent_to_opacity(self._zoom_annotation_opacity_slider.value())
             if self._zoom_annotation_opacity_slider
             else 1.0
         )

@@ -345,7 +345,7 @@ def test_slider_drag_saves_once_on_release(qtbot, tmp_path, monkeypatch):
     slider = window._zoom_annotation_opacity_slider
 
     slider.setSliderDown(True)
-    for value in (90, 70, 50, 30, 20):
+    for value in (10, 30, 50, 70, 80):  # 透明度%(右ほど透明)
         slider.setValue(value)
     qtbot.wait(window.ZOOM_FORM_COMMIT_DEBOUNCE_MS + 200)
     assert calls == []  # ドラッグ中は(デバウンス時間が過ぎても)保存しない
@@ -365,7 +365,7 @@ def test_non_drag_changes_are_debounced_into_one_save_and_one_undo(qtbot, tmp_pa
     calls = _count_replace(monkeypatch)
     undo_before = window._undo_manager.undo_count()
 
-    for value in (95, 90, 85, 80, 75):  # キー/ホイール相当の連続変更
+    for value in (5, 10, 15, 20, 25):  # キー/ホイール相当の連続変更
         window._zoom_annotation_opacity_slider.setValue(value)
     for value in (3, 4, 5):  # スピン矢印クリック/ホイール連打相当
         window._zoom_annotation_border_width_spin.setValue(value)
@@ -398,7 +398,7 @@ def test_spin_editing_finished_commits_immediately(qtbot, tmp_path, monkeypatch)
 def test_pending_form_edit_is_committed_before_undo_and_close(qtbot, tmp_path, monkeypatch):
     pdf, window = _open_with_selected_shape(qtbot, tmp_path)
     calls = _count_replace(monkeypatch)
-    window._zoom_annotation_opacity_slider.setValue(40)
+    window._zoom_annotation_opacity_slider.setValue(60)  # 透明度60% = 不透明度0.4
     assert calls == []
     window.closeEvent(QCloseEvent())  # 閉じる前に未確定の編集を確定する
     assert len(calls) == 1

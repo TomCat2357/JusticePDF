@@ -15,7 +15,7 @@ except ImportError:
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QApplication
-from src.utils import app_settings, order_store
+from src.utils import app_settings, order_store, settings_store
 from src.utils.pdf_utils import set_pixmap_cache_max_entries
 from src.views.main_window import MainWindow
 
@@ -46,9 +46,10 @@ def main():
     )
 
     app = QApplication(sys.argv)
-    app.setOrganizationName("JusticePDF")
-    app.setApplicationName("JusticePDF")
     app.setApplicationDisplayName("JusticePDF")
+    # 設定はアプリルート直下 settings\JusticePDF.ini に保存する(組織名/アプリ名も
+    # ここで設定。使えない場合はレジストリ既定へフォールバックする)。
+    settings_store.configure()
 
     # 設定で保存されたサムネイル/ページ画像キャッシュの上限件数を反映する
     # (QSettings は上の組織名/アプリ名設定に依存するため、ここで初めて呼べる)。

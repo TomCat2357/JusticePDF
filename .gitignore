@@ -54,3 +54,6 @@ dev/calibration_out/
 
 # Claude
 .claude/
+
+# 利用者固有の設定(INI)
+settings/
