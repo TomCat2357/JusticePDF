@@ -321,7 +321,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._markup_sticky_type: MarkupType | None = None
         self._eraser_btn: QToolButton | None = None
         # 「連続」トグル(既定OFF)。ONの間だけマーカー/U/S/消しゴムのクリックが
-        # sticky ツール切り替えとして扱われる。OFF中は各ボタンは常に単発動作。
+        # sticky ツール切り替えとして扱われ、図形・ノートも作成後に解除されない
+        # (校正・テキストボックスは対象外)。OFF中は各ボタンは常に単発動作。
         self._markup_continuous_mode: bool = False
         self._markup_continuous_btn: QToolButton | None = None
         self._zoom_note_color: tuple[float, float, float] = (1.0, 0.92, 0.23)
@@ -607,6 +608,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._zoom_label.text_select_only_escape_requested.connect(
             lambda: self._activate_create_mode(CreateMode.NONE)
         )
+        self._zoom_label.create_tool_escape_requested.connect(self._on_create_tool_escape_requested)
         self._zoom_label.scroll_requested.connect(self._on_zoom_scroll_requested)
         self._zoom_label.zoom_region_requested.connect(self._on_zoom_region_requested)
         self._zoom_scroll.setWidget(self._zoom_label)
@@ -893,7 +895,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._select_page_thumbnail(target)
             return
         self._commit_inline_annotation_editor()
-        self._set_zoom_annotation_create_mode(False)
+        self._release_create_mode_for_page_move()
         self._selected_zoom_annotation = None
         self._zoom_page_num = target
         self._render_zoom()
@@ -2077,7 +2079,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._update_zoom_nav_buttons()
             return
         self._commit_inline_annotation_editor()
-        self._set_zoom_annotation_create_mode(False)
+        self._release_create_mode_for_page_move()
         self._selected_zoom_annotation = None
         if self._zoom_page_layout_is_multi():
             # 複数ページ表示はレイアウトの収容枚数単位で戻る。
@@ -2100,7 +2102,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 self._update_zoom_nav_buttons(page_count)
                 return
             self._commit_inline_annotation_editor()
-            self._set_zoom_annotation_create_mode(False)
+            self._release_create_mode_for_page_move()
             self._selected_zoom_annotation = None
             capacity = self._zoom_page_capacity()
             new = self._zoom_page_num + capacity
@@ -2112,7 +2114,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._update_zoom_nav_buttons(page_count)
             return
         self._commit_inline_annotation_editor()
-        self._set_zoom_annotation_create_mode(False)
+        self._release_create_mode_for_page_move()
         self._selected_zoom_annotation = None
         self._zoom_page_num += 1
         self._render_zoom()
@@ -2123,7 +2125,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if self._zoom_page_num == 0:
             return
         self._commit_inline_annotation_editor()
-        self._set_zoom_annotation_create_mode(False)
+        self._release_create_mode_for_page_move()
         self._selected_zoom_annotation = None
         self._zoom_page_num = 0
         self._render_zoom()
@@ -2144,7 +2146,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if self._zoom_page_num == target:
             return
         self._commit_inline_annotation_editor()
-        self._set_zoom_annotation_create_mode(False)
+        self._release_create_mode_for_page_move()
         self._selected_zoom_annotation = None
         self._zoom_page_num = target
         self._render_zoom()
@@ -3289,7 +3291,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if zoom_visible:
             # ズーム表示中は対応ページに切り替えてヒット矩形を表示
             self._commit_inline_annotation_editor()
-            self._set_zoom_annotation_create_mode(False)
+            self._release_create_mode_for_page_move()
             self._selected_zoom_annotation = None
             self._zoom_page_num = page_num
             self._render_zoom()

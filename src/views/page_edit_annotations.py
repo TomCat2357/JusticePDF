@@ -321,8 +321,8 @@ class CreateMode(Enum):
 
     NONE = auto()
     FREETEXT = auto()  # テキストボックス(付箋)の配置待ち
-    SHAPE = auto()  # 図形の配置待ち(種別は _zoom_create_mode が保持)
-    NOTE = auto()  # コメント付箋の配置待ち
+    SHAPE = auto()  # 図形の配置待ち(種別は _zoom_create_mode が保持。「連続」ONの間は作成後も維持)
+    NOTE = auto()  # コメント付箋の配置待ち(「連続」ONの間は作成後も維持)
     CALLOUT = auto()  # 校正コールアウトの配置待ち
     MARKUP = auto()  # 文字装飾(ハイライト/下線/取り消し線)の連続モード(種類は _markup_sticky_type が保持)
     ERASER = auto()  # 文字装飾の消しゴム連続モード
@@ -386,7 +386,7 @@ class ZoomAnnotationMixin:
         body_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.addWidget(self._zoom_annotation_body)
 
-        body_layout.addWidget(self._build_section_header("追加"))
+        self._build_addition_header(body_layout)
         self._build_addition_grid(body_layout)
 
         body_layout.addWidget(self._build_section_header("選択中の注釈"))
@@ -440,6 +440,36 @@ class ZoomAnnotationMixin:
         label.setStyleSheet("color: palette(dark);")
         label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         return label
+
+    def _build_addition_header(self, panel_layout: QVBoxLayout) -> None:
+        """「追加」見出し行を組み立てる。右端に全ツール共通の「連続」トグルを置く。
+
+        見出し(太字+上部に区切り線)の見た目は他の見出しと揃えるため、区切り線は
+        見出しラベルではなく行全体(QFrame)に付け、右端のボタンの上も線が通るようにする。
+        上の余白(padding-top)は、ボタンの高さ分で見出し文字が縦中央に来るため取らない。
+        """
+        row = QFrame()
+        row.setObjectName("additionHeaderRow")
+        row.setStyleSheet(
+            "QFrame#additionHeaderRow { margin-top: 8px; border-top: 1px solid palette(mid); }"
+        )
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("追加")
+        title.setStyleSheet("font-weight: bold;")
+        row_layout.addWidget(title)
+        row_layout.addStretch()
+        self._markup_continuous_btn = QToolButton()
+        self._markup_continuous_btn.setText("連続")
+        self._markup_continuous_btn.setToolTip(
+            "ONにするとツールボタンを押した状態のまま、作成するたびに適用\n"
+            "(文字装飾・消しゴム・図形・ノート。校正・テキストボックスは対象外)\n"
+            "Escでツールを解除"
+        )
+        self._markup_continuous_btn.setCheckable(True)
+        self._markup_continuous_btn.toggled.connect(self._on_markup_continuous_toggled)
+        row_layout.addWidget(self._markup_continuous_btn)
+        panel_layout.addWidget(row)
 
     def _build_addition_grid(self, panel_layout: QVBoxLayout) -> None:
         """「追加」セクションの新規作成ツール(テキスト/付箋/図形/文字装飾)を、
@@ -604,15 +634,6 @@ class ZoomAnnotationMixin:
         self._eraser_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._eraser_btn.clicked.connect(self._on_eraser_btn_clicked)
         markup_grid.addWidget(self._eraser_btn, 1, 0)
-        self._markup_continuous_btn = QToolButton()
-        self._markup_continuous_btn.setText("連続")
-        self._markup_continuous_btn.setToolTip(
-            "ONにするとツールボタンを押した状態のまま、ドラッグするたびに適用"
-        )
-        self._markup_continuous_btn.setCheckable(True)
-        self._markup_continuous_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._markup_continuous_btn.toggled.connect(self._on_markup_continuous_toggled)
-        markup_grid.addWidget(self._markup_continuous_btn, 1, 1)
         self._zoom_markup_color_btn = _ColorSwatchButton()
         self._init_color_button(
             self._zoom_markup_color_btn,
@@ -620,7 +641,7 @@ class ZoomAnnotationMixin:
             tooltip_label="マーカー・下線・取り消し線の色",
         )
         self._zoom_markup_color_btn.clicked.connect(self._pick_markup_color)
-        markup_grid.addWidget(self._zoom_markup_color_btn, 1, 2)
+        markup_grid.addWidget(self._zoom_markup_color_btn, 1, 1, 1, 2)
         for col in range(3):
             markup_grid.setColumnStretch(col, 1)
         grid.addLayout(markup_grid, row, 1)
@@ -1058,6 +1079,25 @@ class ZoomAnnotationMixin:
                 self._zoom_annotation_new_btn.setChecked(enabled)
             self._zoom_annotation_new_btn.setText("配置待ち" if enabled else "テキストボックス")
         self._set_zoom_create_mode("freetext" if enabled else None)
+    def _release_create_mode_for_page_move(self, *, keep_continuous: bool = True) -> None:
+        """ページ移動・貼り付けの前に、テキストボックス/図形の配置待ちを整理する。
+
+        従来は ``_set_zoom_annotation_create_mode(False)`` だけを呼んでいたため、図形ツール
+        装着中は widget 側と作成パネルの状態だけが解除され、window の ``_create_mode`` と
+        ボタンの押下表示が残って食い違っていた。図形は ``_set_shape_create_mode(None)`` で
+        一括して解除する。ただし「連続」ONの間は(``keep_continuous=True`` のとき)移動先の
+        ページでも続けて作れるよう、図形ツールを解除せず維持する。ノート・校正・文字装飾は
+        widget 側のモードを触らないので、従来どおりページ移動後も維持される。
+        個人情報検出の塗りつぶし図形(MASK_SHAPE)は元々連続して描くツールなので、同じく
+        触らず維持する(従来は widget 側だけが解除され、ボタンが点灯したまま描けなかった)。
+        """
+        if self._create_mode is CreateMode.SHAPE:
+            if not (keep_continuous and self._markup_continuous_mode):
+                self._set_shape_create_mode(None)
+            return
+        if self._create_mode is CreateMode.MASK_SHAPE:
+            return
+        self._set_zoom_annotation_create_mode(False)
     def _set_zoom_create_mode(self, mode: ShapeType | str | None) -> None:
         """作成モードを更新し、変化した場合のみ右パネルへ反映する。
 
@@ -1361,12 +1401,24 @@ class ZoomAnnotationMixin:
 
         ON にした瞬間、既存のテキスト選択が残っていても後続のツール選択で
         誤って即適用されないよう、ここで選択を解除しておく。
+        連続で維持されている図形・ノートの配置待ちも、OFF にしたら解除する。
         """
         self._markup_continuous_mode = bool(checked)
         if self._markup_continuous_mode:
             if self._zoom_label is not None:
                 self._zoom_label.clear_text_selection()
-        elif self._create_mode in (CreateMode.MARKUP, CreateMode.ERASER):
+        elif self._create_mode in (
+            CreateMode.MARKUP, CreateMode.ERASER, CreateMode.SHAPE, CreateMode.NOTE
+        ):
+            self._activate_create_mode(CreateMode.NONE)
+    def _on_create_tool_escape_requested(self) -> None:
+        """図形・ノートの作成ツール装着中に Esc が押された。
+
+        「連続」ONで維持されているツールだけ解除する(「連続」トグル自体は ON のまま。
+        文字装飾の連続モードの Esc と同じ)。連続OFFの単発の配置待ち・テキストボックス・
+        校正・個人情報検出の塗りつぶし図形は、従来どおり Esc では解除しない。
+        """
+        if self._markup_continuous_mode and self._create_mode in (CreateMode.SHAPE, CreateMode.NOTE):
             self._activate_create_mode(CreateMode.NONE)
     def _on_markup_btn_clicked(self, markup_type: MarkupType) -> None:
         if self._markup_continuous_mode:
@@ -1752,13 +1804,19 @@ class ZoomAnnotationMixin:
             if self._zoom_note_editor is not None:
                 self._zoom_note_editor.setFocus()
 
-        # 連続配置はせず、配置したら作成モードを抜ける。
-        self._set_note_create_mode(False)
+        # 「連続」OFF: 連続配置はせず、配置したら作成モードを抜けて本文入力へ移る。
+        # 「連続」ON: 作成モードを維持するため、作成物を選択せず本文欄へのフォーカスも
+        # 移さない(選択すると次のクリックで作成モードが解除され、本文欄にフォーカスが
+        # 移ると Esc が widget に届かない)。
+        continuous = self._markup_continuous_mode
+        if not continuous:
+            self._set_note_create_mode(False)
         self._run_zoom_create(
             "Create note",
             lambda: create_note_annot(self._pdf_path, template),
             lambda *a: delete_note_annot(*a),
-            after_create=focus_note_editor,
+            after_create=None if continuous else focus_note_editor,
+            select_created=not continuous,
         )
     def _pick_note_color(self) -> None:
         selected = self._selected_zoom_annotation
@@ -2061,7 +2119,8 @@ class ZoomAnnotationMixin:
     def _on_zoom_annotation_paste_requested(self) -> None:
         if self._copied_zoom_annotation is None or self._zoom_label is None or self._zoom_page_num is None:
             return
-        self._set_zoom_annotation_create_mode(False)
+        # 貼り付けた注釈が選択されるので、「連続」ONの図形ツールも維持せず解除する。
+        self._release_create_mode_for_page_move(keep_continuous=False)
         page_point = self._zoom_label.page_point_from_global_pos(QCursor.pos())
         if page_point is None:
             return
@@ -2313,11 +2372,15 @@ class ZoomAnnotationMixin:
                 create_mask_shape(shape_type, rect_tuple)
             return
 
-        self._set_shape_create_mode(None)
+        # 「連続」ON: 配置待ちを維持するため、作成物を選択しない(選択すると次の押下で
+        # annotation_selected(None) が発火して作成モードが全解除される)。
+        continuous = self._markup_continuous_mode
+        if not continuous:
+            self._set_shape_create_mode(None)
 
         # For bracket with "both sides" checked, create a pair
         if shape_type == ShapeType.BRACKET and self._zoom_shape_bracket_both_cb.isChecked():
-            self._create_bracket_pair(rect_tuple)
+            self._create_bracket_pair(rect_tuple, select_created=not continuous)
             return
 
         bracket_style = _BRACKET_STYLES[self._zoom_shape_bracket_style_combo.currentIndex()]
@@ -2355,8 +2418,14 @@ class ZoomAnnotationMixin:
             f"Create {shape_type.value}",
             lambda: create_shape_annot(self._pdf_path, template),
             lambda *a: delete_shape_annot(*a),
+            select_created=not continuous,
         )
-    def _create_bracket_pair(self, rect_tuple: tuple[float, float, float, float]) -> None:
+    def _create_bracket_pair(
+        self,
+        rect_tuple: tuple[float, float, float, float],
+        *,
+        select_created: bool = True,
+    ) -> None:
         bracket_style = _BRACKET_STYLES[self._zoom_shape_bracket_style_combo.currentIndex()]
         bracket_size = _BRACKET_SIZES[self._zoom_shape_bracket_size_combo.currentIndex()]
         stroke_color = self._zoom_annotation_border_color or (0.0, 0.0, 0.0)
@@ -2384,8 +2453,11 @@ class ZoomAnnotationMixin:
             else:
                 self._rebind_annot_ref(ref0, pair[0].page_num, pair[0].xref)
                 self._rebind_annot_ref(ref1, pair[1].page_num, pair[1].xref)
-            self._selected_zoom_annotation = pair[0]
-            self._refresh_current_zoom_page(open_drawer=True)
+            if select_created:
+                self._selected_zoom_annotation = pair[0]
+                self._refresh_current_zoom_page(open_drawer=True)
+            else:
+                self._refresh_current_zoom_page()
 
         def undo_create() -> None:
             for ref in (ref0, ref1):

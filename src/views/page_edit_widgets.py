@@ -662,6 +662,9 @@ class ZoomPageWidget(QWidget):
     text_selection_released = pyqtSignal()
     # 連続モード（テキスト選択専用モード）中の Esc 押下通知。
     text_select_only_escape_requested = pyqtSignal()
+    # 図形・ノートの作成ツール装着中の Esc 押下通知(解除するかどうかは window 側が
+    # 「連続」ON かどうかを見て決める)。
+    create_tool_escape_requested = pyqtSignal()
     # ビューのスクロール要求 (dx, dy: ピクセル)。中ボタンドラッグ / Ctrl+矢印で発火。
     scroll_requested = pyqtSignal(int, int)
     # 右ドラッグで指定した範囲（ページ座標 QRectF）への拡大要求。
@@ -3087,6 +3090,12 @@ class ZoomPageWidget(QWidget):
             return
         if event.key() == Qt.Key.Key_Escape and self._text_select_only_mode:
             self.text_select_only_escape_requested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and (
+            self._note_create_mode or self._annotation_create_shape_type is not None
+        ):
+            self.create_tool_escape_requested.emit()
             event.accept()
             return
         if event.key() == Qt.Key.Key_Escape and self.has_annotation_paste_mode():
