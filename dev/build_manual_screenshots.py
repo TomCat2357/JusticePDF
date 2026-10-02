@@ -320,8 +320,15 @@ def scene_settings_dialog() -> None:
     print("[scene] 08_settings_dialog")
     dlg = SettingsDialog()
     dlg._folder_edit.setText(r"C:\Users\ユーザー名\Documents\PDFs")
+    dlg._folder_edit.setCursorPosition(0)  # 先頭から見えるようにする
     dlg.resize(420, 100)
     dlg.show()
+    QApplication.processEvents()
+    # 項目が増えても下端が切れないよう、現在の幅で内容が収まる高さに合わせる
+    # (折り返しラベルは幅から高さが決まるので heightForWidth を使う)。
+    layout = dlg.layout()
+    needed_h = layout.heightForWidth(dlg.width()) if layout.hasHeightForWidth() else 0
+    dlg.resize(dlg.width(), max(dlg.sizeHint().height(), needed_h))
     QApplication.processEvents()
     _save(dlg, "08_settings_dialog.png")
     dlg.close()
