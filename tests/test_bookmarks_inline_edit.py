@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QLineEdit, QSpinBox, QStyle, QStyleOptionFrame
+from PyQt6.QtWidgets import QApplication, QLineEdit, QSpinBox, QStyle, QStyleOptionFrame
 
 from src.utils.pdf_utils import TocEntry
 from src.views.bookmarks_panel import BookmarksPanel
@@ -85,9 +85,13 @@ def test_add_starts_inline_edit(qtbot):
     captured = []
     panel.bookmarks_changed.connect(lambda e, d: captured.append(d))
     panel._add_btn.click()
-    assert captured == ["しおり追加"]
-    assert panel._tree.findChild(QLineEdit) is not None
+    assert captured == []  # 確定するまで発火しない
+    editor = panel._tree.findChild(QLineEdit)
+    assert editor is not None
     assert panel._tree.currentItem().text(0) == "(無題)"
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    QApplication.processEvents()  # デリゲートの確定は queued
+    assert captured == ["しおり追加"]
 
 
 def test_add_noop_when_provider_returns_none_or_unavailable(qtbot):
@@ -132,3 +136,105 @@ def test_delete_key_deletes_current(qtbot):
     QTest.keyClick(tree, Qt.Key.Key_Delete)
     assert captured == ["しおり削除"]
     assert tree.topLevelItemCount() == 1
+
+
+def test_add_enter_emits_once_with_typed_title(qtbot):
+    panel = _shown_panel(qtbot)
+    panel.set_current_page_provider(lambda: 3)
+    captured = []
+    panel.bookmarks_changed.connect(lambda e, d: captured.append((e, d)))
+    panel._on_add()
+    editor = panel._tree.findChild(QLineEdit)
+    editor.setText("新しい章")
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    QApplication.processEvents()  # デリゲートの確定は queued
+    assert len(captured) == 1
+    entries, desc = captured[0]
+    assert desc == "しおり追加"
+    assert [(e.title, e.page) for e in entries][-1] == ("新しい章", 3)
+
+
+def test_add_enter_with_empty_title_uses_untitled(qtbot):
+    panel = _shown_panel(qtbot)
+    panel.set_current_page_provider(lambda: 3)
+    captured = []
+    panel.bookmarks_changed.connect(lambda e, d: captured.append((e, d)))
+    panel._on_add()
+    editor = panel._tree.findChild(QLineEdit)
+    editor.setText("")
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    QApplication.processEvents()  # デリゲートの確定は queued
+    assert len(captured) == 1
+    assert captured[0][0][-1].title == "(無題)"
+
+
+def test_add_escape_removes_pending_and_emits_nothing(qtbot):
+    panel = _shown_panel(qtbot)
+    panel.set_current_page_provider(lambda: 3)
+    captured = []
+    panel.bookmarks_changed.connect(lambda e, d: captured.append(d))
+    panel._tree.setCurrentItem(panel._tree.topLevelItem(0))
+    panel._on_add()
+    assert panel._tree.topLevelItemCount() == 3
+    QTest.keyClick(panel._tree.findChild(QLineEdit), Qt.Key.Key_Escape)
+    QApplication.processEvents()  # デリゲートの確定は queued
+    assert captured == []
+    assert panel._tree.topLevelItemCount() == 2
+    assert panel._tree.currentItem() is panel._tree.topLevelItem(0)
+    assert panel._pending_item is None
+
+
+def test_reload_and_read_only_cancel_pending(qtbot):
+    panel = _shown_panel(qtbot)
+    panel.set_current_page_provider(lambda: 3)
+    captured = []
+    panel.bookmarks_changed.connect(lambda e, d: captured.append(d))
+    panel._on_add()
+    panel.load_entries(_entries())
+    assert panel._pending_item is None
+    assert panel._tree.topLevelItemCount() == 2
+    panel._on_add()
+    panel.set_read_only(True)
+    assert panel._pending_item is None
+    assert panel._tree.topLevelItemCount() == 2
+    assert captured == []
+
+
+def test_delete_button_commits_pending_first(qtbot):
+    panel = _shown_panel(qtbot)
+    panel.set_current_page_provider(lambda: 3)
+    captured = []
+    panel.bookmarks_changed.connect(lambda e, d: captured.append(d))
+    panel._on_add()
+    panel._tree.findChild(QLineEdit).setText("X")
+    panel._move_within_siblings(-1)
+    assert captured[0] == "しおり追加"
+    assert captured.count("しおり追加") == 1
+
+
+def test_f2_rename_emits_rename_once(qtbot):
+    panel = _shown_panel(qtbot)
+    tree = panel._tree
+    captured = []
+    panel.bookmarks_changed.connect(lambda e, d: captured.append(d))
+    tree.setFocus()
+    tree.setCurrentItem(tree.topLevelItem(1))
+    QTest.keyClick(tree, Qt.Key.Key_F2)
+    editor = tree.findChild(QLineEdit)
+    editor.setText("改名")
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    QApplication.processEvents()  # デリゲートの確定は queued
+    assert captured == ["しおり名変更"]
+
+
+def test_page_spinbox_edit_still_emits(qtbot):
+    panel = _shown_panel(qtbot)
+    tree = panel._tree
+    captured = []
+    panel.bookmarks_changed.connect(lambda e, d: captured.append(d))
+    tree.editItem(tree.topLevelItem(0), 1)
+    spin = tree.findChild(QSpinBox)
+    spin.setValue(4)
+    QTest.keyClick(spin, Qt.Key.Key_Return)
+    QApplication.processEvents()  # デリゲートの確定は queued
+    assert captured == ["しおりページ変更"]

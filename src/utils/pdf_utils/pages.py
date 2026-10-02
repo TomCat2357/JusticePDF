@@ -92,6 +92,34 @@ def normalize_toc(
     return result
 
 
+def filter_toc_for_removed_pages(
+    entries: list[TocEntry], removed_indices: "list[int] | set[int]"
+) -> list[TocEntry]:
+    """ページ削除後のしおりを作る(削除前の ``entries`` と 0 始まりの削除ページ番号から)。
+
+    - 削除ページを指すしおりは取り除く(隣のページへ付け替えない)。
+    - 取り除いたしおりの子孫は 1 段ずつ繰り上げる(親が連続して消えればその分だけ)。
+    - 残るしおりの page は、それより前の削除ページ数だけ詰める。
+    - 最後に ``normalize_toc`` で ``set_toc`` が受理できる level 列にする。
+    """
+    removed = {int(i) + 1 for i in removed_indices}  # 1 始まりへ
+    sorted_removed = sorted(removed)
+    result: list[TocEntry] = []
+    stack: list[tuple[int, bool]] = []  # (元の level, 削除されたか)
+    for entry in entries:
+        while stack and stack[-1][0] >= entry.level:
+            stack.pop()
+        is_removed = entry.page in removed
+        shift = sum(1 for _, gone in stack if gone)
+        stack.append((entry.level, is_removed))
+        if is_removed:
+            continue
+        page = entry.page
+        page -= sum(1 for r in sorted_removed if r < page)
+        result.append(TocEntry(level=entry.level - shift, title=entry.title, page=page))
+    return normalize_toc(result)
+
+
 def update_pdf_toc(
     pdf_path: str, entries: list[TocEntry], *, incremental: bool = False
 ) -> None:
@@ -538,9 +566,18 @@ def remove_pages(pdf_path: str, page_indices: list[int]) -> bool:
         send2trash(pdf_path)
         return True
 
+    # delete_page は削除ページを指すしおりを page=-1 のまま残すので、先に TOC を控えておく。
+    old_toc = doc.get_toc(simple=True)
     for idx in sorted(pages_to_remove, reverse=True):
         doc.delete_page(idx)
     try:
+        if old_toc:
+            filtered = filter_toc_for_removed_pages(
+                [TocEntry(int(lv), str(t), int(pg)) for lv, t, pg in old_toc],
+                pages_to_remove,
+            )
+            if len(filtered) != len(old_toc):
+                doc.set_toc([[e.level, e.title, e.page] for e in filtered])
         _save_document_in_place(doc, pdf_path, incremental=True)
         return False
     finally:

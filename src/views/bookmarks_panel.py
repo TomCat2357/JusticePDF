@@ -12,6 +12,7 @@ from typing import Callable
 
 from PyQt6.QtCore import QEvent, QModelIndex, QObject, QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QAbstractItemDelegate,
     QAbstractItemView,
     QFrame,
     QHBoxLayout,
@@ -112,6 +113,8 @@ class BookmarksPanel(QFrame):
     jump_requested = pyqtSignal(int)
     note_jump_requested = pyqtSignal(int, int)  # (page 1始まり, 付箋 xref)
     open_changed = pyqtSignal(bool)
+    # タイトル編集(追加/改名)が閉じたとき発火。編集中に見送った再読込のきっかけに使う。
+    editing_finished = pyqtSignal()
 
     DRAWER_WIDTH = 320
 
@@ -137,6 +140,11 @@ class BookmarksPanel(QFrame):
         self._current_page_available = True
         # 付箋一覧（page 1始まり, xref, 冒頭テキスト）。set_annotation_notes で更新。
         self._notes: list[tuple[int, int, str]] = []
+        # 「追加」直後でタイトル編集中の未確定項目。確定(Enter/フォーカス喪失)で
+        # 1回だけ「しおり追加」を発火し、Esc なら取り除いて何も発火しない。
+        self._pending_item: QTreeWidgetItem | None = None
+        # 追加前に選択されていた項目(Esc で取り消すときに選択を戻す)。
+        self._pending_prev: QTreeWidgetItem | None = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -165,7 +173,10 @@ class BookmarksPanel(QFrame):
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.itemChanged.connect(self._on_item_changed)
         self._tree.itemSelectionChanged.connect(self._update_button_states)
-        self._tree.setItemDelegate(_BookmarkDelegate(self))
+        self._delegate = _BookmarkDelegate(self)
+        self._tree.setItemDelegate(self._delegate)
+        # setModelData(→itemChanged)は closeEditor より先に走る。確定/取消の判定はここで行う。
+        self._delegate.closeEditor.connect(self._on_close_editor)
         self._tree.installEventFilter(self)
         panel_layout.addWidget(self._tree, 1)
 
@@ -247,7 +258,21 @@ class BookmarksPanel(QFrame):
         ツリーのクリックによるジャンプ/閲覧は引き続き可能。
         """
         self._read_only = bool(read_only)
+        if self._read_only:
+            self._cancel_pending()
         self._update_button_states()
+
+    def is_editing(self) -> bool:
+        """タイトル/ページのインライン編集中か(追加直後の未確定項目を含む)。
+
+        編集中に load_entries すると編集欄と入力中の内容が失われるため、呼び出し側は
+        True の間は再読込を見送り、``editing_finished`` で読み直すこと。
+        """
+        return self._tree.state() == QAbstractItemView.State.EditingState
+
+    def commit_pending(self) -> None:
+        """編集中の追加(未確定項目)があれば確定する。"""
+        self._commit_pending_editor()
 
     def load_entries(self, entries: list[TocEntry]) -> None:
         """しおり一覧でツリーを再構築する(オンディスクの真値で同期)。"""
@@ -304,6 +329,8 @@ class BookmarksPanel(QFrame):
     # ツリー <-> list[TocEntry] 変換
     # ------------------------------------------------------------------
     def _build_tree(self, entries: list[TocEntry]) -> None:
+        # 再構築で未確定項目が宙に浮かないよう、先に取り消す(何も発火しない)。
+        self._cancel_pending(restore_selection=False)
         self._tree.clear()
         stack: list[tuple[int, QTreeWidgetItem]] = []  # (level, item)
         for entry in entries:
@@ -506,6 +533,8 @@ class BookmarksPanel(QFrame):
             return
         if self._is_note_node(item):
             return
+        if item is self._pending_item:
+            return  # 追加中の名前入力は closeEditor 側で「しおり追加」として1回だけ発火する
         if column == 0:
             self._emit_changed("しおり名変更")
         elif column == 1:
@@ -574,29 +603,112 @@ class BookmarksPanel(QFrame):
             parent.insertChild(index + 1, item)
             parent.setExpanded(True)
 
+    def _alive(self, item: QTreeWidgetItem | None) -> bool:
+        if item is None:
+            return False
+        try:
+            return item.treeWidget() is self._tree
+        except RuntimeError:
+            return False
+
+    def _commit_pending_editor(self) -> None:
+        """追加中のタイトル編集があれば先に確定する。
+
+        削除/移動/昇格/降格/再追加など、ツリー構造を変える操作の冒頭で呼ぶ。
+        未確定項目を放置したままツリーを組み替えると項目が宙に浮くため、
+        「無視」ではなく「先に確定してから続行」に統一している。
+        """
+        if self._pending_item is None:
+            return
+        editor = self._tree.findChild(QLineEdit)
+        if editor is not None:
+            self._delegate.commitData.emit(editor)
+            self._delegate.closeEditor.emit(editor, QAbstractItemDelegate.EndEditHint.NoHint)
+        if self._pending_item is not None:  # エディタが無かった場合の保険
+            self._finish_pending(commit=True)
+
+    def _on_close_editor(self, _editor, hint) -> None:
+        if self._pending_item is None:
+            # 改名/ページ編集の終了(追加中でない)。
+            self.editing_finished.emit()
+            return
+        revert = hint == QAbstractItemDelegate.EndEditHint.RevertModelCache
+        self._finish_pending(commit=not revert)
+        self.editing_finished.emit()
+
+    def _finish_pending(self, commit: bool) -> None:
+        """未確定項目を確定(commit=True: 1回だけ発火)または取り消し(発火なし)する。"""
+        item = self._pending_item
+        if item is None:
+            return  # 二重発火防止
+        self._pending_item = None
+        if not self._alive(item):
+            self._pending_prev = None
+            return
+        if commit:
+            self._pending_prev = None
+            if not item.text(0).strip():
+                self._suppress_item_changed = True
+                try:
+                    item.setText(0, "(無題)")
+                finally:
+                    self._suppress_item_changed = False
+            self._emit_changed("しおり追加")
+            return
+        self._remove_pending_item(item, restore_selection=True)
+
+    def _remove_pending_item(self, item: QTreeWidgetItem, restore_selection: bool) -> None:
+        prev, self._pending_prev = self._pending_prev, None
+        self._suppress_item_changed = True
+        try:
+            self._take_item(item)
+        finally:
+            self._suppress_item_changed = False
+        if restore_selection:
+            if self._alive(prev):
+                self._tree.setCurrentItem(prev)
+            else:
+                self._tree.setCurrentItem(None)
+        self._update_button_states()
+
+    def _cancel_pending(self, restore_selection: bool = True) -> None:
+        """未確定項目を何も発火せず取り除く(再構築・閲覧専用化の直前に使う)。"""
+        item = self._pending_item
+        if item is None:
+            return
+        self._pending_item = None
+        if self._alive(item):
+            self._remove_pending_item(item, restore_selection)
+        else:
+            self._pending_prev = None
+
     def _on_add(self) -> None:
-        """現在ページに「(無題)」を追加し、続けてタイトルをインライン編集する。"""
+        """現在ページに「(無題)」を挿入してタイトルをインライン編集する。
+
+        挿入時点では発火しない。編集確定で「しおり追加」を1回だけ発火(Undo 1件)、
+        Esc で取り消せば項目ごと消えて何も発火しない。
+        """
         if self._read_only or not self._current_page_available:
             return
+        self._commit_pending_editor()
         page = self._current_page()
         if page is None:
             return
+        prev = self._tree.currentItem()
         item = self._make_item("(無題)", min(page, self._max_page()))
         self._insert_sibling(item)
-        self._tree.setCurrentItem(item)
-        self._emit_changed("しおり追加")
-        # ウィンドウ側が失敗時にツリーを再構築すると item は破棄されるため確認する。
-        try:
-            alive = item.treeWidget() is self._tree
-        except RuntimeError:
-            alive = False
-        if alive:
-            self._start_title_edit(item)
+        self._pending_item = item
+        self._pending_prev = prev
+        self._start_title_edit(item)
+        if self._pending_item is item and self._tree.state() != QAbstractItemView.State.EditingState:
+            # エディタが開けなかった場合は即確定して項目を宙に浮かせない。
+            self._finish_pending(commit=True)
 
     # 旧名の互換エイリアス
     _on_add_current_page = _on_add
 
     def _on_delete(self) -> None:
+        self._commit_pending_editor()
         item = self._tree.currentItem()
         if item is None:
             return
@@ -627,6 +739,7 @@ class BookmarksPanel(QFrame):
 
     def _on_demote(self) -> None:
         """選択項目を直前の兄弟の子にする。"""
+        self._commit_pending_editor()
         item = self._tree.currentItem()
         if item is None:
             return
@@ -647,6 +760,7 @@ class BookmarksPanel(QFrame):
 
     def _on_promote(self) -> None:
         """選択項目を親の次の兄弟に引き上げる。"""
+        self._commit_pending_editor()
         item = self._tree.currentItem()
         if item is None:
             return
@@ -665,6 +779,7 @@ class BookmarksPanel(QFrame):
         self._emit_changed("しおり昇格")
 
     def _move_within_siblings(self, delta: int) -> None:
+        self._commit_pending_editor()
         item = self._tree.currentItem()
         if item is None:
             return

@@ -146,6 +146,8 @@ def test_add_bookmark_from_grid_uses_selected_page(qtbot, tmp_path):
     window._on_thumbnail_clicked(window._thumbnails[2])
 
     window._bookmarks_panel._on_add_current_page()
+    # 編集を確定して初めて TOC に書かれる(Enter 確定と同じ経路)。
+    window._bookmarks_panel._commit_pending_editor()
 
     assert [e.page for e in get_pdf_toc(str(window._pdf_path))] == [3]
     assert window._zoom_view.isHidden()

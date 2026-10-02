@@ -372,7 +372,9 @@ QSlider::handle:horizontal {
     border-radius: 7px;
 }
 QSlider::handle:horizontal:hover  { background: #eef2ff; }
-QSlider::handle:horizontal:disabled { border-color: #d9d9d4; }
+QSlider::groove:horizontal:disabled { background: #f4f4f0; }
+QSlider::sub-page:horizontal:disabled { background: #d1d5db; }
+QSlider::handle:horizontal:disabled { background: #f4f4f0; border-color: #d9d9d4; }
 
 /* ---------- Dialog buttons (QDialogButtonBox / QPushButton) ------------- */
 

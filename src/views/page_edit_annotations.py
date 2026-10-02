@@ -160,6 +160,21 @@ _SWATCH_CHECKER_LIGHT = QColor(235, 235, 235)
 _SWATCH_CHECKER_DARK = QColor(202, 202, 202)
 
 
+_SWATCH_DISABLED_BASE = QColor(244, 244, 240)
+_SWATCH_DISABLED_BORDER = QColor(236, 236, 234)
+_SWATCH_DISABLED_TEXT = QColor(156, 163, 175)
+
+
+def _blend_toward(color: QColor, target: QColor, ratio: float) -> QColor:
+    """color を target へ ratio(0〜1)の割合で近づけた色を返す。"""
+    mix = lambda a, b: round(a * (1 - ratio) + b * ratio)  # noqa: E731
+    return QColor(
+        mix(color.red(), target.red()),
+        mix(color.green(), target.green()),
+        mix(color.blue(), target.blue()),
+    )
+
+
 def _contrasting_text_qcolor(color: QColor) -> QColor:
     """背景色の輝度から、視認しやすい文字色(黒系/白系)を選ぶ。"""
     luminance = (0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()) / 255.0
@@ -200,19 +215,28 @@ class _ColorSwatchButton(QPushButton):
     def paintEvent(self, event) -> None:  # noqa: N802 (Qt override)
         painter = QPainter(self)
         rect = self.rect().adjusted(0, 0, -1, -1)
-        if not self.isEnabled():
-            painter.setOpacity(0.45)
+        enabled = self.isEnabled()
         if self._swatch_color is None:
             self._paint_checkerboard(painter, rect)
             painter.setPen(QColor(200, 40, 40))
             painter.drawLine(rect.topLeft(), rect.bottomRight())
             text_color = QColor(20, 20, 20)
         else:
-            painter.fillRect(rect, self._swatch_color)
+            fill = self._swatch_color
+            if not enabled:
+                fill = _blend_toward(fill, _SWATCH_DISABLED_BASE, 0.7)
+            painter.fillRect(rect, fill)
             text_color = _contrasting_text_qcolor(self._swatch_color)
-        painter.setPen(QColor(136, 136, 136))
-        painter.drawRect(rect)
-        painter.setPen(text_color)
+        if not enabled:
+            # 無効時は全体を地の色へ溶け込ませ、枠線・文字も淡いグレーにする。
+            painter.fillRect(rect, QColor(244, 244, 240, 178))
+            painter.setPen(_SWATCH_DISABLED_BORDER)
+            painter.drawRect(rect)
+            painter.setPen(_SWATCH_DISABLED_TEXT)
+        else:
+            painter.setPen(QColor(136, 136, 136))
+            painter.drawRect(rect)
+            painter.setPen(text_color)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
         painter.end()
 

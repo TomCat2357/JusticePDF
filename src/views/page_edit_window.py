@@ -568,12 +568,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._zoom_spread_btn.setMenu(self._zoom_layout_menu)
         controls_layout.addWidget(self._zoom_spread_btn)
 
-        # PDF 内テキスト検索 (Ctrl+F と同じ)
-        self._zoom_search_btn = QPushButton("検索")
-        self._zoom_search_btn.setToolTip("PDF 内のテキストを検索 (Ctrl+F)")
-        self._zoom_search_btn.clicked.connect(self._on_open_search)
-        controls_layout.addWidget(self._zoom_search_btn)
-
         controls_layout.addStretch()
 
         self._zoom_page_label = QLabel("")
@@ -628,6 +622,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 lambda: get_page_count(self._pdf_path)
             )
         self._bookmarks_panel.bookmarks_changed.connect(self._run_toc_update)
+        # しおり編集中に見送った再読込(下の _reload_bookmarks_tree 参照)を編集終了後に1回だけ行う。
+        self._bookmarks_reload_deferred = False
+        self._bookmarks_panel.editing_finished.connect(self._on_bookmarks_editing_finished)
         self._bookmarks_panel.jump_requested.connect(self._jump_zoom_to_page)
         self._bookmarks_panel.note_jump_requested.connect(self._on_bookmark_note_jump)
         self._bookmarks_panel.open_changed.connect(self._on_bookmarks_drawer_open_changed)
@@ -844,8 +841,17 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         panel = getattr(self, "_bookmarks_panel", None)
         if panel is None or not panel.is_open:
             return
+        if panel.is_editing():
+            # 編集中に再構築すると入力欄と追加中の項目が失われる。編集が閉じてから1回だけ読み直す。
+            self._bookmarks_reload_deferred = True
+            return
+        self._bookmarks_reload_deferred = False
         panel.load_entries(get_pdf_toc(self._pdf_path))
         self._reload_bookmark_notes()
+
+    def _on_bookmarks_editing_finished(self) -> None:
+        if getattr(self, "_bookmarks_reload_deferred", False):
+            self._reload_bookmarks_tree()
 
     def _reload_bookmark_notes(self) -> None:
         """しおりパネルに文書全体の付箋一覧を反映する。"""
@@ -2472,12 +2478,17 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         sorted_indices = sorted(indices)
         extract_pages(pdf_path, backup_path, sorted_indices)
 
+        # 削除したページを指すしおりは remove_pages が取り除くので、Undo 用に元の TOC を控える。
+        old_toc = get_pdf_toc(pdf_path)
+
         def do_delete():
             remove_pages(pdf_path, indices)
             self._load_pages()
 
         def undo_delete():
             insert_pages(pdf_path, backup_path, sorted_indices)
+            if old_toc:
+                update_pdf_toc(pdf_path, old_toc)
             self._load_pages()
 
         self._push_undoable(f"Delete {len(indices)} page(s)", do_delete, undo_delete, writes_file=True)
@@ -2657,10 +2668,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         extract_pages(pdf_path, backup_path, [current_page])
 
         deleted_page = current_page
+        old_toc = get_pdf_toc(pdf_path)
 
         def do_delete():
             remove_pages(pdf_path, [deleted_page])
             self._remove_page_thumbnails([deleted_page])
+            self._reload_bookmarks_tree()
             self._zoom_text_cache.clear()
             if self._zoom_view and self._zoom_view.isVisible():
                 new_page_count = get_page_count(pdf_path)
@@ -2670,6 +2683,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
         def undo_delete():
             insert_pages(pdf_path, backup_path, [deleted_page])
+            if old_toc:
+                update_pdf_toc(pdf_path, old_toc)
             self._load_pages()
             self._zoom_text_cache.clear()
             if self._zoom_view and self._zoom_view.isVisible():

@@ -179,6 +179,7 @@ from .pages import (
     insert_pages,
     merge_paths_to_pdf,
     merge_pdfs_in_place,
+    filter_toc_for_removed_pages,
     normalize_toc,
     plan_split,
     remove_pages,

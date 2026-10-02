@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QLineEdit
 
 from src.utils.pdf_utils import TocEntry
 from src.views.bookmarks_panel import BookmarksPanel
@@ -130,7 +133,13 @@ def test_add_current_page_uses_provider():
     captured = []
     panel.bookmarks_changed.connect(lambda e, d: captured.append((e, d)))
     panel._on_add_current_page()
+    editor = panel._tree.findChild(QLineEdit)
+    assert editor is not None
+    assert captured == []  # 編集確定までは発火しない
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    QApplication.processEvents()  # デリゲートの確定は queued
 
+    assert len(captured) == 1
     entries, desc = captured[-1]
     assert desc == "しおり追加"
     assert entries[0].page == 7
