@@ -1003,17 +1003,19 @@ def test_page_list_thumbnail_shows_pii_mask_targets(qtbot, monkeypatch, tmp_path
     style.mask_transparency = 0
     window._pii_settings_cache = style
     window._reset_thumbnail_render_queue()
-    window._thumbnails[0].invalidate_thumbnail()
+    window._rendered.pop(0, None)
+    window.widget_for_page(0).invalidate_thumbnail()
     window._thumb_render_queue.append(0)
     window._thumb_render_queue_set.add(0)
     window._process_thumbnail_render_queue()
-    thumb = window._thumbnails[0]
+    thumb = window.widget_for_page(0)
     assert thumb.thumbnail_loaded
+    assert window.is_page_rendered(0)
 
     # オーバーレイは paint 時に重ねるので、ラベルを grab() した見た目で確認する
     # (ページ画像のピクセルには焼き込まれない)。
     def label_center_px():
-        image = window._thumbnails[0]._image_label.grab().toImage()
+        image = window.widget_for_page(0)._image_label.grab().toImage()
         return image.pixelColor(image.width() // 2, image.height() // 2)
 
     px = label_center_px()
@@ -1045,12 +1047,12 @@ def test_page_list_thumbnail_shows_pii_mask_targets(qtbot, monkeypatch, tmp_path
     px = label_center_px()
     assert px.red() > 200 and px.green() > 200 and px.blue() > 200  # 完全に透明
     window._on_pii_mask_transparency_changed(0, True)
-    window._thumbnails[0]._image_label.set_style((0.0, 1.0, 0.0), 1.0, frozenset())
+    window.widget_for_page(0)._image_label.set_style((0.0, 1.0, 0.0), 1.0, frozenset())
     px = label_center_px()
     assert px.green() > 200 and px.red() < 200 and px.blue() < 200
     window._flush_pii_restyle(sync=True)
     assert calls == []
-    assert window._thumbnails[0].thumbnail_loaded
+    assert window.widget_for_page(0).thumbnail_loaded
 
 
 def test_pii_mask_overlay_uses_opacity_and_skips_hidden_entities():

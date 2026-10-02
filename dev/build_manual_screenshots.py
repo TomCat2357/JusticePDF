@@ -264,7 +264,7 @@ def scene_page_edit_grid(pdf_path: Path) -> None:
     print("[scene] 05_page_edit_grid")
     pew = _make_page_edit_window(pdf_path)
     # Select first page so it has a highlight
-    if pew._thumbnails:
+    if pew._page_count:
         pew._select_pages([0])
     QApplication.processEvents()
     _save(pew, "05_page_edit_grid.png")
@@ -274,7 +274,7 @@ def scene_page_edit_grid(pdf_path: Path) -> None:
 def scene_zoom_view(pdf_path: Path) -> None:
     print("[scene] 06_zoom_view")
     pew = _make_page_edit_window(pdf_path)
-    if not pew._thumbnails:
+    if not pew._page_count:
         print("  ! no thumbnails; skipping")
         pew.close()
         return
@@ -289,7 +289,7 @@ def scene_zoom_view(pdf_path: Path) -> None:
 def scene_zoom_annotation_panel(pdf_path: Path) -> None:
     print("[scene] 07_annotation_panel")
     pew = _make_page_edit_window(pdf_path)
-    if not pew._thumbnails:
+    if not pew._page_count:
         pew.close()
         return
     pew._open_zoom_view(0)
@@ -413,7 +413,7 @@ def scene_print_dialog(pdf_path: Path) -> None:
 def scene_spread_view(pdf_path: Path) -> None:
     print("[scene] 25_spread_view")
     pew = _make_page_edit_window(pdf_path)
-    if not pew._thumbnails:
+    if not pew._page_count:
         pew.close()
         return
     pew._open_zoom_view(0)
@@ -428,7 +428,7 @@ def scene_spread_view(pdf_path: Path) -> None:
 def scene_bookmarks_panel(pdf_path: Path) -> None:
     print("[scene] 26_bookmarks_panel")
     pew = _make_page_edit_window(pdf_path)
-    if not pew._thumbnails:
+    if not pew._page_count:
         pew.close()
         return
     pew._open_zoom_view(0)
@@ -443,7 +443,7 @@ def scene_bookmarks_panel(pdf_path: Path) -> None:
 
 def _open_annotated_zoom(pdf_path: Path):
     pew = _make_page_edit_window(pdf_path)
-    if not pew._thumbnails:
+    if not pew._page_count:
         pew.close()
         return None
     pew._open_zoom_view(0)

@@ -127,26 +127,36 @@ def test_ink_visibility_toggle_hides_and_restores_thumbnail(qtbot, tmp_path):
     window = create_page_edit_window(qtbot, pdf_path)
     open_zoom(window, qtbot)
 
-    # コンストラクタが積む初回の遅延読み込みが完了するまで待つ(それまでは
-    # window._thumbnails が入れ替わる可能性があるため、都度参照し直す)。
-    qtbot.waitUntil(lambda: window._thumbnails and window._thumbnails[0].thumbnail_loaded)
-
     def thumb_image():
-        thumb = window._thumbnails[0]
+        thumb = window.widget_for_page(0)
         return thumb._image_label.pixmap().toImage(), thumb._thumb_size / max(320, 420)
 
+    def back_to_grid_and_wait_rendered():
+        # ページ一覧が隠れている間(拡大表示中)は再描画しない。一覧へ戻ると表示範囲を描き直す。
+        window._exit_zoom_view()
+        qtbot.waitUntil(
+            lambda: window.widget_for_page(0) is not None
+            and window.widget_for_page(0).thumbnail_loaded
+        )
+
+    # コンストラクタが積む初回の遅延読み込みは拡大表示中に走るため、一覧へ戻って描画させる。
+    back_to_grid_and_wait_rendered()
     image, thumb_zoom = thumb_image()
     assert _count_reddish_pixels(image, INK_RECT, thumb_zoom) > 0
 
     # 非表示に切り替えるとサムネイルも再描画され、Ink が隠れる。
+    window._open_zoom_view(0)
     window._zoom_ink_visibility_btn.setChecked(False)
-    qtbot.waitUntil(lambda: window._thumbnails[0].thumbnail_loaded)
+    assert not window.is_page_rendered(0)
+    back_to_grid_and_wait_rendered()
     image, thumb_zoom = thumb_image()
     assert _count_reddish_pixels(image, INK_RECT, thumb_zoom) == 0
 
     # 表示に戻すとサムネイルにも Ink が戻る。
+    window._open_zoom_view(0)
     window._zoom_ink_visibility_btn.setChecked(True)
-    qtbot.waitUntil(lambda: window._thumbnails[0].thumbnail_loaded)
+    assert not window.is_page_rendered(0)
+    back_to_grid_and_wait_rendered()
     image, thumb_zoom = thumb_image()
     assert _count_reddish_pixels(image, INK_RECT, thumb_zoom) > 0
 

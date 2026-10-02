@@ -222,18 +222,18 @@ def test_shift_click_range_anchor_semantics(qtbot, tmp_path, monkeypatch):
     # 起点より前へのシフトクリックは添字順(昇順)で追加される。
     _click_with(window, monkeypatch, 0, shift)
     assert list(window._selected_pages) == [2, 3, 4, 5, 6, 7, 0, 1]
-    assert [window._thumbnails[i].is_selected for i in range(10)] == [
+    assert [window.widget_for_page(i).is_selected for i in range(10)] == [
         True, True, True, True, True, True, True, True, False, False,
     ]
 
     # Ctrl は切り替え。
     _click_with(window, monkeypatch, 3, ctrl)
     assert 3 not in window._selected_pages
-    assert not window._thumbnails[3].is_selected
+    assert not window.widget_for_page(3).is_selected
 
     # 選択済みページの通常クリックは選択を保つ。未選択ページなら選び直す。
     _click_with(window, monkeypatch, 4)
     assert 4 in window._selected_pages and len(window._selected_pages) == 7
     _click_with(window, monkeypatch, 9)
     assert list(window._selected_pages) == [9]
-    assert not window._thumbnails[4].is_selected
+    assert not window.widget_for_page(4).is_selected

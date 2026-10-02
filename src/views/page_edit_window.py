@@ -1,14 +1,12 @@
 """Page edit window for editing PDF pages."""
 import bisect
-import itertools
 import os
 import shutil
 import logging
-from collections import deque
-from collections.abc import Callable, Iterator
-from dataclasses import replace as dataclass_replace
+from collections import OrderedDict, deque
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace as dataclass_replace
 from enum import Enum, auto
-from PyQt6 import sip
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -17,12 +15,9 @@ from PyQt6.QtWidgets import (
     QToolBar,
     QPushButton,
     QScrollArea,
-    QGridLayout,
     QInputDialog,
     QLabel,
-    QFrame,
     QApplication,
-    QRubberBand,
     QMessageBox,
     QToolButton,
     QFormLayout,
@@ -140,11 +135,25 @@ from src.views.page_edit_widgets import (
     NoteContentEdit,
     PageThumbnail,
     ZoomPageWidget,
+    page_drag_pages,
     _apply_block_line_height,
     _build_freetext_document,
     _freetext_pixel_size,
     _pixel_size_to_pointf,
 )
+from src.views.page_grid_view import GRID_MARGIN, GRID_SPACING, VirtualPageGrid
+
+
+@dataclass
+class _RenderedThumb:
+    """描画済みのページサムネイル1枚分(ウィンドウ側で保持し、ウィジェットへは割り当て時に反映する)。"""
+
+    pixmap: QPixmap
+    # このページの塗りつぶし対象(個人情報検出)と、その座標系のページサイズ。paint 時に重ねる。
+    pii_targets: list = field(default_factory=list)
+    pii_page_size: tuple[float, float] = (0.0, 0.0)
+    # 描画時点の塗りつぶし対象の xref(描き直しの要否判定用)。
+    pii_xrefs: tuple[int, ...] = ()
 
 
 def _line_endpoints_from_shape(
@@ -243,12 +252,22 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if app_settings.is_manual_save_mode():
             self._open_manual_session()
         self._did_initial_grid_layout = False
-        self._thumbnails: list[PageThumbnail] = []
         # 選択中ページ(インデックスキーの順序付き集合)。最後のキーがシフト範囲選択の起点。
         # list() の順序がドラッグ MIME の順序になる。
         self._selected_pages: dict[int, None] = {}
         self._page_count: int = 0
+        # 描画済みサムネイル(ページ番号キーの LRU)。ページ一覧は仮想化されていて
+        # ウィジェットはスクロールで使い回されるため、画像はウィンドウ側で持つ。
+        self._rendered: "OrderedDict[int, _RenderedThumb]" = OrderedDict()
+        # ページ一覧のサムネイルへ重ねる塗りつぶし対象の見た目(色, 不透明度, 非表示種別)。
+        # 割り当て時にウィジェットへ流し込む。None の間は設定から初回に読む。
+        self._pii_mask_style: (
+            "tuple[tuple[float, float, float], float, frozenset[str]] | None"
+        ) = None
+        # ドロップ位置の左右(0〜2ページ)。ハイライトの状態の持ち主はウィンドウ。
+        self._drop_target_pages: tuple[int, ...] = ()
         self._grid_scroll = None
+        self._grid: VirtualPageGrid | None = None
         self._zoom_view = None
         self._zoom_scroll = None
         self._zoom_label = None
@@ -288,8 +307,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # 重量文書では表示対象ページ分だけを集計するため、走査済みページを覚える
         # (None=全ページ走査済み。キャッシュが None のときは参照されず作り直される)。
         self._ink_xrefs_scanned_pages: set[int] | None = None
-        # 描画済みサムネイルごとの「塗りつぶし対象の xref」(描き直しの要否判定用)。
-        self._grid_pii_xrefs: dict[int, tuple[int, ...]] = {}
         # ページ一覧サムネイルに重ねる塗りつぶし対象(個人情報検出)のページ別
         # 集計。塗りつぶし対象の追加/削除はファイル保存を伴うので、ファイルの
         # キャッシュトークン(mtime/size)が変われば自動的に再集計する。
@@ -356,23 +373,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._thumb_render_queue: deque[int] = deque()
         self._thumb_render_queue_set: set[int] = set()
         # ページ数/ファイルサイズが閾値を超える「重量文書」かどうか
-        # (_load_pages() で判定して更新)。真の間は、サムネイルウィジェット
-        # 生成をチャンク分割し、描画も表示範囲のみを逐次処理する。
+        # (_load_pages() で判定して更新)。真の間は、描画を1ページずつに絞り、
+        # 描画バッチ間で文書を保持し、PII/Ink の走査も描画対象のページだけにする。
         self._is_heavy_document: bool = False
-        # 重量文書でのウィジェット生成をチャンクへ分割するための残りページ
-        # イテレータ(通常文書では None のまま)。
-        self._pending_widget_pages: "Iterator[int] | None" = None
-        # 現在グリッドへ並べ終えている列数(None=未確定/不整合)。リサイズで列数が
-        # 変わらないときの並べ直しスキップと、読み込み中に抑止したリサイズの判定に使う。
-        self._grid_laid_out_cols: int | None = None
-        # 重量文書の読み込み中に届いたリサイズ(読み込み完了時に1回だけ反映する)。
-        self._grid_resize_deferred = False
-        # 進捗表示用(_pending_widget_pages が None でない間だけ意味を持つ)。
-        self._pending_widget_total: int = 0
-        # _load_pages() 呼び出しごとに増える世代番号。チャンク処理中に再度
-        # _load_pages() が呼ばれた場合、古い世代のタイマーコールバックが
-        # クリア済みの self._thumbnails へ追記してしまうのを防ぐ。
-        self._widget_build_generation: int = 0
         self._thumb_render_timer = QTimer(self)
         self._thumb_render_timer.setSingleShot(True)
         self._thumb_render_timer.timeout.connect(self._process_thumbnail_render_queue)
@@ -392,18 +395,18 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._grid_resize_timer.setSingleShot(True)
         self._grid_resize_timer.timeout.connect(self._on_grid_resize_settled)
 
-        # Drop indicator
-        self._drop_indicator = None
+        # Drop indicator(縦線の実体はグリッドの子)。
         self._drop_indicator_index = -1
+        self._drop_indicator_row_end = False
 
-        # Rubber band selection
-        self._rubber_band = None
+        # Rubber band selection(実体はグリッドの子)
         self._rubber_band_origin = None
 
         # Text search (Ctrl+F)
         self._search_dialog = None
         self._search_hits: dict[int, list] = {}
         self._search_hit_pages: list[int] = []
+        self._search_hit_set: set[int] = set()
         self._search_cursor: int = -1
 
         self._setup_ui()
@@ -443,7 +446,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._set_selected_zoom_annotation(None)
 
     def _build_page_grid(self, layout: QVBoxLayout) -> None:
-        """ページサムネイル一覧(グリッド)と選択・ドロップ表示部品を組み立てる。"""
+        """ページサムネイル一覧(仮想化したグリッド)を組み立てる。
+
+        スクロール領域の中身は ``VirtualPageGrid`` 1枚で、見えているページにだけ
+        ``PageThumbnail`` を割り当てる(ページ番号ごとの状態はこのウィンドウが持つ)。
+        """
         self._grid_scroll = QScrollArea()
         self._grid_scroll.setWidgetResizable(True)
         self._grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -452,24 +459,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._grid_scroll.horizontalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
         layout.addWidget(self._grid_scroll)
 
-        self._container = QWidget()
-        self._container.setAcceptDrops(True)
-        self._grid_scroll.setWidget(self._container)
-
-        self._grid_layout = QGridLayout(self._container)
-        self._grid_layout.setSpacing(10)
-        self._grid_layout.setContentsMargins(10, 10, 10, 10)
-        self._grid_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-
-        # Drop indicator line
-        self._drop_indicator = QFrame(self._container)
-        self._drop_indicator.setFrameShape(QFrame.Shape.VLine)
-        self._drop_indicator.setStyleSheet("background-color: #4f46e5;")
-        self._drop_indicator.setFixedWidth(3)
-        self._drop_indicator.hide()
-
-        # Rubber band for selection
-        self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self._container)
+        self._grid = VirtualPageGrid(
+            self._grid_scroll,
+            pdf_path_provider=lambda: self._pdf_path,
+            state_provider=self._grid_page_state,
+            bind_hook=self._bind_page_widget,
+            drag_pages_provider=lambda page: page_drag_pages(page, self._selected_pages),
+            thumb_size=self._thumb_size,
+        )
+        # 従来の名前も残す(座標変換 mapFrom などで使われる)。
+        self._container = self._grid
+        self._grid_scroll.setWidget(self._grid)
+        self._grid.page_clicked.connect(self._on_page_clicked)
+        self._grid.page_double_clicked.connect(self._open_zoom_view)
 
     def _build_zoom_view(self, layout: QVBoxLayout) -> None:
         """拡大表示ビュー(操作バー+キャンバス)を組み立てる。ドロワーは _setup_ui が右列に置く。"""
@@ -1247,8 +1249,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
     def _on_session_dirty_changed(self) -> None:
         """未保存の状態が変わったとき(未保存になった・保存した)の画面更新。"""
-        if self._pending_widget_pages is None:
-            self.setWindowTitle(self._page_edit_window_title())
+        self.setWindowTitle(self._page_edit_window_title())
         self._update_save_button()
 
     def _save_blocked_by_worker(self) -> bool:
@@ -1457,8 +1458,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def _enqueue_thumbnail_render(self, page_num: int, *, priority: bool = False) -> None:
         if page_num < 0 or page_num >= self._page_count:
             return
-        thumb = self._thumbnails[page_num]
-        if thumb._explicitly_hidden or thumb.thumbnail_loaded:
+        if page_num in self._rendered:
             return
         if page_num in self._thumb_render_queue_set:
             return
@@ -1468,66 +1468,97 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._thumb_render_queue.append(page_num)
         self._thumb_render_queue_set.add(page_num)
 
-    def _visible_rect_in_container(self) -> QRect:
-        if not self._grid_scroll:
-            return QRect()
-        viewport = self._grid_scroll.viewport()
-        top_left = self._container.mapFrom(viewport, QPoint(0, 0))
-        bottom_right = self._container.mapFrom(
-            viewport,
-            QPoint(max(0, viewport.width() - 1), max(0, viewport.height() - 1)),
-        )
-        return QRect(top_left, bottom_right).normalized()
-
     def _enqueue_visible_thumbnail_renders(self) -> None:
-        if not self._thumbnails or not self._grid_scroll:
+        """表示範囲(と上下1画面ぶんの先読み)で未描画のページだけを描画キューへ積み直す。
+
+        ページ数に依らず O(表示ページ数)。表示中のページを先頭、先読み分をその後ろ
+        (表示範囲に近い順)に並べる。表示範囲から外れた古い予約は破棄する
+        (スクロールで戻ってきたときに改めて積まれる)。ページ一覧が隠れている間
+        (拡大表示中)は何もしない。
+        """
+        if self._page_count <= 0 or self._grid_scroll is None or self._grid_scroll.isHidden():
             return
-        visible_rect = self._visible_rect_in_container()
-        visible_pages = []
-        for page_num, thumb in enumerate(self._thumbnails):
-            if thumb._explicitly_hidden or not thumb.isVisible():
-                continue
-            if thumb.geometry().intersects(visible_rect):
-                if not thumb.thumbnail_loaded:
-                    visible_pages.append(page_num)
-        if not visible_pages:
-            self._schedule_thumbnail_render()
-            return
-        visible_set = set(visible_pages)
-        # キュー再構築: 表示中ページを先頭、残りをその後ろ
-        remaining = deque()
-        for pn in self._thumb_render_queue:
-            if pn not in visible_set:
-                remaining.append(pn)
-        new_queue = deque(visible_pages)
-        new_queue.extend(remaining)
+        v0, v1 = self._grid.visible_page_range(0)
+        p0, p1 = self._grid.prefetch_page_range()
+        visible = [p for p in range(v0, v1) if p not in self._rendered]
+        prefetch = [
+            p for p in range(p0, p1) if not (v0 <= p < v1) and p not in self._rendered
+        ]
+        prefetch.sort(key=lambda p: min(abs(p - v0), abs(p - (v1 - 1))))
+        new_queue = deque(visible)
+        new_queue.extend(prefetch)
         self._thumb_render_queue = new_queue
         self._thumb_render_queue_set = set(new_queue)
         self._schedule_thumbnail_render()
 
-    def _enqueue_all_thumbnail_renders(self) -> None:
-        if self._is_heavy_document:
-            # 重量文書は全ページを一括でキューへ積まない。表示範囲のページだけ
-            # 描画し、残りはスクロールに応じて逐次描画する(オンデマンド方式)。
-            # そうしないと数千ページ分の描画ジョブが一度に走り、CPU を長時間
-            # 占有した上、256 件しかない固定サイズキャッシュを次々追い出して
-            # 表示中のサムネイルまで再描画させてしまう。
-            self._enqueue_visible_thumbnail_renders()
-            return
-        for page_num, thumb in enumerate(self._thumbnails):
-            if thumb._explicitly_hidden:
-                continue
-            self._enqueue_thumbnail_render(page_num)
-        # 表示ページの優先化後にスケジュール開始（次のイベントループで）
-        QTimer.singleShot(0, self._enqueue_visible_thumbnail_renders)
-
     def _request_thumbnail_refresh(self, page_num: int) -> None:
         if page_num < 0 or page_num >= self._page_count:
             return
-        thumb = self._thumbnails[page_num]
-        thumb.invalidate_thumbnail()
+        self._rendered.pop(page_num, None)
+        widget = self._grid.widget_for_page(page_num)
+        if widget is None:
+            # 画面外のページは、スクロールして見えたときに描かれる。
+            return
+        widget.invalidate_thumbnail()
         self._enqueue_thumbnail_render(page_num, priority=True)
         self._schedule_thumbnail_render()
+
+    # ------------------------------------------------------------------
+    # 仮想化したグリッドとの接続(状態の取得・割り当て時の反映)
+    # ------------------------------------------------------------------
+    def widget_for_page(self, page: int) -> "PageThumbnail | None":
+        """そのページに現在割り当てられているサムネイルウィジェット(画面外なら None)。"""
+        return self._grid.widget_for_page(page)
+
+    def is_page_rendered(self, page: int) -> bool:
+        """そのページのサムネイル画像が描画済み(保持中)か。"""
+        return page in self._rendered
+
+    def scroll_to_page(self, page: int) -> None:
+        """ページ一覧をスクロールして、そのページを見える位置へ持ってくる。"""
+        self._grid.scroll_to_page(page)
+
+    def _grid_page_state(self, page: int) -> tuple[bool, bool, bool]:
+        """(選択中か, ドロップ先か, 検索ヒットか)。グリッドがウィジェットへ反映するときに呼ぶ。"""
+        return (
+            page in self._selected_pages,
+            page in self._drop_target_pages,
+            page in self._search_hit_set,
+        )
+
+    def _read_pii_mask_style(self) -> "tuple[tuple[float, float, float], float, frozenset[str]]":
+        settings = self._pii_settings()
+        return (
+            tuple(settings.mask_color),
+            float(settings.mask_opacity),
+            frozenset(settings.hidden_entities()),
+        )
+
+    def _current_pii_mask_style(self) -> "tuple[tuple[float, float, float], float, frozenset[str]]":
+        if self._pii_mask_style is None:
+            self._pii_mask_style = self._read_pii_mask_style()
+        return self._pii_mask_style
+
+    def _bind_page_widget(self, widget: PageThumbnail, page: int) -> None:
+        """ウィジェットをページへ割り当てた直後に、画像・塗りつぶし重ね描き・見た目を流し込む。"""
+        widget.set_pii_mask_style(*self._current_pii_mask_style())
+        entry = self._rendered.get(page)
+        if entry is None:
+            if widget.thumbnail_loaded:
+                widget.invalidate_thumbnail()
+            return
+        self._rendered.move_to_end(page)
+        widget.set_pii_overlay(entry.pii_targets, entry.pii_page_size)
+        widget.set_pixmap_direct(entry.pixmap)
+
+    def _rendered_cap(self) -> int:
+        """保持する描画済みサムネイルの上限(表示セル数の3倍と、設定のキャッシュ上限の大きい方)。"""
+        return max(app_settings.pixmap_cache_max_entries(), 3 * max(1, self._grid.pool_size))
+
+    def _evict_rendered(self) -> None:
+        cap = self._rendered_cap()
+        while len(self._rendered) > cap:
+            self._rendered.popitem(last=False)
 
     def _get_ink_xrefs_by_page(
         self, pages: "list[int] | None" = None
@@ -1613,26 +1644,26 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         """塗りつぶし対象が変わったページのサムネイルを描き直す(ページ一覧へ戻ったとき・一覧での操作後)。
 
         サムネイルは描画時に対象の注釈をページ画像から隠して重ね描きするため、
-        対象の増減は画像ごと作り直さないと二重に見える。
+        対象の増減は画像ごと作り直さないと二重に見える。保持している描画済みサムネイル
+        (表示範囲とその周辺)だけを見る。
         """
-        if not self._thumbnails or not self._grid_pii_xrefs:
+        if not self._rendered:
             return
         # 重量文書は描画済み(=集計済み)のページ分だけ見る(全ページ走査を避ける)。
-        loaded = [pn for pn, t in enumerate(self._thumbnails) if t.thumbnail_loaded]
+        loaded = list(self._rendered)
         targets = self._get_pii_targets_by_page(loaded if self._is_heavy_document else None)
-        for pn, thumb in enumerate(self._thumbnails):
-            if not thumb.thumbnail_loaded:
-                continue
+        for pn, entry in list(self._rendered.items()):
             current = tuple(t.xref for t in targets.get(pn, (None, ()))[1])
-            if self._grid_pii_xrefs.get(pn, ()) != current:
+            if entry.pii_xrefs != current:
                 self._request_thumbnail_refresh(pn)
 
     def _invalidate_and_requeue_thumbnails(self) -> None:
-        """全サムネイルを未読込状態に戻し、再描画キューへ積み直す。"""
+        """描画済みサムネイルを全て捨て、表示範囲を描画キューへ積み直す。"""
         self._reset_thumbnail_render_queue()
-        for thumb in self._thumbnails:
-            thumb.invalidate_thumbnail()
-        self._enqueue_all_thumbnail_renders()
+        self._rendered.clear()
+        for widget in self._grid.bound_widgets():
+            widget.invalidate_thumbnail()
+        self._enqueue_visible_thumbnail_renders()
 
     def _process_thumbnail_render_queue(self) -> None:
         batch: list[int] = []
@@ -1644,8 +1675,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._thumb_render_queue_set.discard(page_num)
             if page_num < 0 or page_num >= self._page_count:
                 continue
-            thumb = self._thumbnails[page_num]
-            if thumb._explicitly_hidden or thumb.thumbnail_loaded:
+            if page_num in self._rendered:
                 continue
             batch.append(page_num)
         if batch:
@@ -1674,26 +1704,38 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 pixmaps = render_page_thumbnails_batch(
                     self._pdf_path, batch, self._thumb_size, hide_xrefs=hide_xrefs_by_page or None
                 )
-            pii_settings = self._pii_settings()
-            pii_color = pii_settings.mask_color
-            pii_opacity = pii_settings.mask_opacity
-            pii_hidden = pii_settings.hidden_entities()
+            # 設定の変更が経由せず反映されていない場合に備え、塗りつぶしの見た目を読み直して流し込む。
+            style = self._read_pii_mask_style()
+            if style != self._pii_mask_style:
+                self._pii_mask_style = style
+                for widget in self._grid.bound_widgets():
+                    widget.set_pii_mask_style(*style)
             for pn in batch:
-                if pn < self._page_count:
-                    pixmap = pixmaps.get(pn, QPixmap())
-                    thumb = self._thumbnails[pn]
-                    # 塗りつぶし対象はピクセルへ焼き込まず、サムネイルの paint 時に重ねる
-                    # (色・透明度・種別の変更で画像を再レンダリングしなくて済む)。
-                    if pn in pii_targets_by_page:
-                        page_size, targets = pii_targets_by_page[pn]
-                        thumb.set_pii_overlay(targets, page_size)
-                    else:
-                        thumb.set_pii_overlay([], (0.0, 0.0))
-                    thumb.set_pii_mask_style(pii_color, pii_opacity, pii_hidden)
-                    self._grid_pii_xrefs[pn] = tuple(
-                        t.xref for t in pii_targets_by_page.get(pn, (None, ()))[1]
-                    )
-                    thumb.set_pixmap_direct(pixmap)
+                if pn >= self._page_count:
+                    continue
+                pixmap = pixmaps.get(pn, QPixmap())
+                if pixmap.isNull():
+                    widget = self._grid.widget_for_page(pn)
+                    if widget is not None:
+                        widget.set_pixmap_direct(pixmap)
+                    continue
+                # 塗りつぶし対象はピクセルへ焼き込まず、サムネイルの paint 時に重ねる
+                # (色・透明度・種別の変更で画像を再レンダリングしなくて済む)。
+                if pn in pii_targets_by_page:
+                    page_size, targets = pii_targets_by_page[pn]
+                else:
+                    page_size, targets = (0.0, 0.0), []
+                self._rendered[pn] = _RenderedThumb(
+                    pixmap=pixmap,
+                    pii_targets=list(targets),
+                    pii_page_size=page_size,
+                    pii_xrefs=tuple(t.xref for t in targets),
+                )
+                self._rendered.move_to_end(pn)
+                self._evict_rendered()
+                widget = self._grid.widget_for_page(pn)
+                if widget is not None and pn in self._rendered:
+                    self._bind_page_widget(widget, pn)
             if self._is_heavy_document:
                 self._held_doc_idle_timer.start()
         self._schedule_thumbnail_render()
@@ -1704,14 +1746,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         release_held_docs(self._pdf_path)
 
     def _on_grid_viewport_changed(self, _value: int) -> None:
-        self._scroll_debounce_timer.start()  # デバウンス（スクロール停止150ms後に優先化）
+        self._scroll_debounce_timer.start()  # デバウンス（スクロール停止後に優先化）
 
     def _load_pages(self) -> None:
         self._release_held_doc()
         # ページ構成が変わるので、塗りつぶし対象のページ別集計は破棄して全ページ再集計させる。
         self._pii_targets_by_page_cache = None
         self._pii_result_rows_cache = None
-        self._grid_pii_xrefs.clear()
         # ページ構成の変更(書き込み)の直後に呼ばれるので、PDFを開いたままの
         # PII restyle ジョブを止め、走り直しを予約する(デバウンスなので本処理の後に動く)。
         if self._abort_pii_restyle_job():
@@ -1721,25 +1762,26 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._ink_xrefs_by_page_cache = None
         # ページ構成が変わったので検索結果は破棄する
         self._invalidate_search_results()
-        # 既存のサムネイルをグリッドから先に取り除く
-        while self._grid_layout.count():
-            item = self._grid_layout.takeAt(0)
-            # setParent(None)は呼ばない（deleteLater()で処理される）
-
-        for thumb in self._thumbnails:
-            thumb.deleteLater()
-        self._thumbnails.clear()
+        # 縦スクロール位置は読み込み直しの前後で保つ(範囲を超えたら新しい範囲へクランプされる)。
+        vbar = self._grid_scroll.verticalScrollBar()
+        saved_scroll = vbar.value()
+        # 描画済み・割り当て済みのサムネイルとページ状態を全て破棄する
+        self._rendered.clear()
+        self._grid.unbind_all()
         self._page_count = 0
         self._selected_pages.clear()
+        self._drop_target_pages = ()
         self._zoom_text_cache.clear()
         self._zoom_annotations = []
 
         # ファイル存在チェック
         if not os.path.exists(self._pdf_path):
+            self._grid.set_page_count(0)
             return
 
         page_count = get_page_count(self._pdf_path)
         if page_count == 0:
+            self._grid.set_page_count(0)
             return
 
         self._refresh_page_bound_views()
@@ -1748,33 +1790,17 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if self._zoom_page_num is not None and self._zoom_page_num >= page_count:
             self._zoom_page_num = max(0, page_count - 1)
 
-        self._widget_build_generation += 1
-        self._grid_laid_out_cols = None
-        self._grid_resize_deferred = False
         self._is_heavy_document = is_heavy_pdf(self._pdf_path, page_count)
+        self._page_count = page_count
 
-        if self._is_heavy_document:
-            # 重量文書: サムネイルウィジェットを一度に生成すると数千個の QWidget
-            # 生成が UI スレッドを長時間ブロックしフリーズしたように見えるため、
-            # チャンクに分けてイベントループへ制御を返しながら生成する。
-            # グリッドへの反映(_refresh_grid())は全ウィジェット生成後に1回だけ
-            # 行う。チャンクごとに呼ぶと、その時点までの全ウィジェットを毎回
-            # 並べ直すことになり O(ページ数^2) になってしまい、後半のチャンクほど
-            # 処理が重くなって結局フリーズしたように見えてしまうため。
-            self._pending_widget_pages = iter(range(page_count))
-            self._pending_widget_total = page_count
-            self._build_thumbnail_widgets_chunk(self._widget_build_generation)
-        else:
-            for i in range(page_count):
-                thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
-                thumb.clicked.connect(self._on_page_clicked)
-                self._thumbnails.append(thumb)
-            self._page_count = len(self._thumbnails)
-
-            self._refresh_grid()
-            self._enqueue_all_thumbnail_renders()
-            if self._zoom_view and self._zoom_view.isVisible():
-                self._render_zoom()
+        # ウィジェットは見えている範囲にだけ割り当てるので、ページ数に依らず一瞬で済む。
+        self._apply_grid_metrics()
+        self._grid.set_page_count(page_count)
+        if saved_scroll:
+            vbar.setValue(saved_scroll)
+        self._enqueue_visible_thumbnail_renders()
+        if self._zoom_view and self._zoom_view.isVisible():
+            self._render_zoom()
 
     def _refresh_page_bound_views(self) -> None:
         """ページ構成が変わった(並べ替え・削除・挿入・Undo/Redo)後に、ページ番号を持つ表示を追従させる。
@@ -1789,83 +1815,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # 手動保存モードで未保存の変更があるときは末尾に " *" を付ける。
         mark = " *" if self._session is not None and self._session.dirty() else ""
         return f"JusticePDF - 編集:{os.path.basename(self._pdf_path)}{mark}"
-
-    def _build_chunk_if_alive(self, generation: int) -> None:
-        """ウィンドウ破棄後に singleShot が発火しても例外にならないようにする。"""
-        if sip.isdeleted(self):
-            return
-        self._build_thumbnail_widgets_chunk(generation)
-
-    def _build_thumbnail_widgets_chunk(self, generation: int) -> None:
-        """重量文書向け: サムネイルウィジェットを少しずつ生成し、都度グリッドへ足す。
-
-        1 チャンク生成するたびに次のイベントループへ ``QTimer.singleShot(0, ...)``
-        で処理を譲り、UI スレッドを長く占有しないようにする。新規ウィジェットは
-        その場でグリッドへ ``addWidget()`` する(位置は現在の列数から算出)。
-        ``_refresh_grid()`` のように「一旦全部外してから全件を並べ直す」方式だと
-        件数が増えるほど1回あたりのコストが線形に伸び、チャンクを重ねると
-        全体では件数の2乗のコストになってしまうため、ここでは増分追加のみ行う
-        (列数が変わるリサイズ等は次に呼ばれる ``_refresh_grid()`` で解消される)。
-        表示範囲のサムネイル描画予約(``_enqueue_visible_thumbnail_renders()``)は
-        最初と最後のチャンクでのみ行う(これも全件走査のため、毎チャンク呼ぶと
-        同様に重くなる)。読み込み中はタイトルバーに進捗を表示し、フリーズと
-        誤認されないようにする。
-        """
-        if generation != self._widget_build_generation or self._pending_widget_pages is None:
-            return  # 途中で _load_pages() がやり直された(古い世代は破棄)
-
-        cols = max(1, self._apply_grid_metrics())
-        chunk_size = max(1, app_settings.heavy_pdf_widget_chunk_size())
-        is_first_chunk = not self._thumbnails
-        if is_first_chunk:
-            self._grid_laid_out_cols = cols
-        elif cols != self._grid_laid_out_cols:
-            # 読み込み中に列数が変わった: 既配置分と食い違うので完了時に並べ直す。
-            self._grid_laid_out_cols = None
-        chunk = list(itertools.islice(self._pending_widget_pages, chunk_size))
-        # 表示中のコンテナへ1件ずつ追加すると setVisible のたびに再レイアウト/再描画が
-        # 走り件数に応じて遅くなるため、チャンク中は更新を止める。
-        # 表示中のコンテナへ子を show するたびに親レイアウトが即時に activate され
-        # (全件の再計算で O(件数))、1件数ミリ秒まで遅くなる。チャンク中はレイアウトを
-        # 無効化し更新も止め、終わってから1回だけ反映する。
-        # 注意: ``self._container.setUpdatesEnabled(True)`` は全子孫ウィジェットへ再帰して
-        # update() を発行するため、数千件で約1秒かかる(計測値)。ここでは使わない。
-        self._grid_layout.setEnabled(False)
-        try:
-            for i in chunk:
-                thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
-                thumb.clicked.connect(self._on_page_clicked)
-                self._thumbnails.append(thumb)
-                self._page_count = len(self._thumbnails)
-                row, col = divmod(self._page_count - 1, cols)
-                self._grid_layout.addWidget(thumb, row, col)
-                thumb.setVisible(True)
-        finally:
-            self._grid_layout.setEnabled(True)
-
-        if len(chunk) == chunk_size:
-            if is_first_chunk:
-                # 最初の可視範囲だけは早く描画し、起動直後にフリーズと誤認
-                # されないようにする。
-                self._enqueue_visible_thumbnail_renders()
-            # まだ続きがある: 進捗をタイトルに表示しつつ次のイベントループへ
-            self.setWindowTitle(
-                f"{self._page_edit_window_title()} - 読み込み中 "
-                f"({self._page_count}/{self._pending_widget_total})"
-            )
-            QTimer.singleShot(0, lambda: self._build_chunk_if_alive(generation))
-        else:
-            # 全ページ分のウィジェット生成が完了。
-            self._pending_widget_pages = None
-            self.setWindowTitle(self._page_edit_window_title())
-            if self._grid_resize_deferred or self._grid_laid_out_cols != cols:
-                # 読み込み中に抑止したリサイズ(列数変更など)をここで1回だけ反映する。
-                self._grid_resize_deferred = False
-                self._refresh_grid()
-            else:
-                self._enqueue_visible_thumbnail_renders()
-            if self._zoom_view and self._zoom_view.isVisible():
-                self._render_zoom()
 
     def refresh_from_disk(self) -> None:
         """Reload the current PDF from disk without closing the edit window."""
@@ -1905,130 +1854,74 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         )
 
     def _apply_grid_metrics(self) -> int:
-        """列数を計算し、コンテナ幅・サムネイルサイズへ反映して列数を返す。
+        """列数を計算し、グリッドの寸法(列数・サムネイルサイズ・最小幅/高さ)へ反映して列数を返す。
 
-        ウィジェットを実際にグリッドへ追加(addWidget)するのは呼び出し側の
-        責務(``_refresh_grid()`` は全件を一括で、重量文書の読み込み中は
-        ``_build_thumbnail_widgets_chunk()`` がチャンクごとに増分で行う)。
+        サムネイルサイズが変わるときは、描画済みのサムネイルとキューを捨てる(画像の大きさが
+        合わなくなるため)。ウィジェットの割り当て直しは呼び出し側が ``grid.relayout()`` で行う。
         """
         available_width = self._grid_available_width()
-        spacing = self._grid_layout.horizontalSpacing()
-        if spacing < 0:
-            spacing = self._grid_layout.spacing()
-        spacing = int(spacing)
-        m = self._grid_layout.contentsMargins()
         preferred_item_width = self._preferred_thumb_size + PageThumbnail.CARD_PADDING
         cols, item_width = responsive_grid_metrics(
             available_width,
             preferred_item_width,
-            spacing,
-            m.left() + m.right(),
+            GRID_SPACING,
+            2 * GRID_MARGIN,
         )
-
-        content_width = (
-            m.left()
-            + m.right()
-            + cols * item_width
-            + max(0, cols - 1) * spacing
-        )
-        self._container.setMinimumWidth(max(1, int(available_width), content_width))
         thumb_size = max(1, item_width - PageThumbnail.CARD_PADDING)
         if thumb_size != self._thumb_size:
             self._reset_thumbnail_render_queue()
+            self._rendered.clear()
             self._thumb_size = thumb_size
-            for thumb in self._thumbnails:
-                thumb.set_thumbnail_size(self._thumb_size)
+        self._grid.set_metrics(cols, thumb_size, int(available_width))
         return cols
 
-    def _on_grid_resize_settled(self) -> None:
-        """ビューポートのリサイズ後の再配置。
-
-        重量文書の読み込み中は抑止し(チャンク生成と並べ直しが交互に走って
-        O(ページ数^2) になるため)、完了時に1回だけ反映する。列数もサムネイルサイズも
-        変わらないなら(パネル開閉など)並べ直しを省く。
-        """
-        if self._pending_widget_pages is not None:
-            self._grid_resize_deferred = True
-            return
-        previous_size = self._thumb_size
-        cols = self._apply_grid_metrics()
-        if cols == self._grid_laid_out_cols and self._thumb_size == previous_size:
-            return
-        self._refresh_grid()
-
-    def _detach_all_from_grid_layout(self) -> None:
-        """レイアウトからウィジェットを全て外す(親は変えない)。
-
-        以前は外すたびに ``setParent(None)`` していたが、これは1件ごとにフォーカスチェーン等を
-        辿るため件数の2乗で遅くなる(計測: 8000件で約12秒、14592件で数十秒)。
-        親はコンテナのままにし、再配置しないもの(非表示ページ)は呼び出し側で隠す。
-        """
-        while self._grid_layout.count():
-            widget = self._grid_layout.takeAt(0).widget()
-            if widget is not None:
-                # WA_LaidOut が残っていると、再度 addWidget するとき Qt が「元のレイアウトから
-                # 外す」ために既配置の全項目を走査する(件数の2乗: 14000件で約4秒)。
-                # 既に外してあるので落としてよい。
-                widget.setAttribute(Qt.WidgetAttribute.WA_LaidOut, False)
-
-    def _refresh_grid(self) -> None:
-        self._detach_all_from_grid_layout()
-
-        cols = self._apply_grid_metrics()
-        self._grid_laid_out_cols = cols
-
-        # コンテナの setUpdatesEnabled(True) は全子孫へ再帰して update() を発行し、
-        # 数千件で約1秒かかる(計測値)ため使わず、レイアウトの無効化だけで抑える。
-        self._grid_layout.setEnabled(False)
-        try:
-            row_col = 0
-            for thumb in self._thumbnails:
-                if thumb._explicitly_hidden:
-                    thumb.setVisible(False)
-                    continue
-                row, col = divmod(row_col, cols)
-                row_col += 1
-                self._grid_layout.addWidget(thumb, row, col)
-                if thumb.isHidden():
-                    thumb.setVisible(True)
-        finally:
-            self._grid_layout.setEnabled(True)
+    def _relayout_grid(self) -> None:
+        """寸法を再計算してウィジェットを割り当て直し、表示範囲の描画を予約する。"""
+        self._apply_grid_metrics()
+        self._grid.relayout()
         self._enqueue_visible_thumbnail_renders()
 
+    def _on_grid_resize_settled(self) -> None:
+        """ビューポートのリサイズ後の再配置(デバウンス済み)。
+
+        列数・サムネイルサイズが変わらなくても、表示できる行数が変わるので割り当て直す
+        (割り当て済みで位置も変わらないセルには何もしないので軽い)。
+        """
+        if self._grid_scroll is None or self._grid_scroll.isHidden():
+            return
+        self._relayout_grid()
+
     def _remove_page_thumbnails(self, page_indices: list[int]) -> None:
-        """指定されたページのサムネイルを削除（差分更新）"""
+        """指定されたページを一覧から取り除く(差分更新)。
+
+        描画済みサムネイルと選択は、削除されたページ分だけ詰めたページ番号へ付け替えて
+        残りのページの画像を再利用する(全ページを描き直さない)。
+        """
         self._reset_thumbnail_render_queue()
         # ページ番号がずれるため、ページ別 Ink xref キャッシュも破棄する。
         self._ink_xrefs_by_page_cache = None
-        # グリッドから全サムネイルを一旦取り除く
-        self._detach_all_from_grid_layout()
-
         removed_sorted = sorted({i for i in page_indices if 0 <= i < self._page_count})
         removed_set = set(removed_sorted)
 
-        # 指定されたインデックスのサムネイルを削除（逆順で処理）
-        for idx in sorted(page_indices, reverse=True):
-            if 0 <= idx < self._page_count:
-                thumb = self._thumbnails.pop(idx)
-                thumb.hide()  # 親から外さないので、削除されるまで残像が出ないよう隠す
-                thumb.deleteLater()
+        # ページ番号がずれるので検索ヒットは無効にする
+        self._invalidate_search_results()
+        self._drop_target_pages = ()
 
-        self._page_count = len(self._thumbnails)
-        # 選択ページのインデックスを削除分だけ詰める(削除されたページは選択から外す)
-        if self._selected_pages:
+        if removed_sorted:
+            remapped_rendered: "OrderedDict[int, _RenderedThumb]" = OrderedDict()
+            for k, v in self._rendered.items():
+                if k in removed_set:
+                    continue
+                remapped_rendered[k - bisect.bisect_left(removed_sorted, k)] = v
+            self._rendered = remapped_rendered
+            # 選択ページのインデックスを削除分だけ詰める(削除されたページは選択から外す)
             remapped: dict[int, None] = {}
             for k in self._selected_pages:
                 if k in removed_set:
                     continue
                 remapped[k - bisect.bisect_left(removed_sorted, k)] = None
             self._selected_pages = remapped
-
-        # ページ番号を再割り当て
-        for i, thumb in enumerate(self._thumbnails):
-            thumb._page_num = i
-            thumb._display_num = i
-            thumb._number_label.setText(str(i + 1))
-            thumb._reposition_number_badge()
+            self._page_count -= len(removed_sorted)
 
         # ズームビューのページ番号を調整
         if self._zoom_page_num is not None:
@@ -2046,13 +1939,14 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._zoom_text_cache.clear()
         self._zoom_annotations = []
 
-        self._refresh_grid()
-        self._enqueue_all_thumbnail_renders()
+        # ページ一覧が隠れている間(拡大表示中)でも、高さとスクロール範囲は更新される。
+        self._grid.set_page_count(self._page_count)
+        self._enqueue_visible_thumbnail_renders()
 
     def _sync_page_selected(self, page: int, selected: bool) -> None:
-        """選択状態をウィジェットへ反映する唯一の入口(後でグリッド側の更新に差し替える)。"""
-        if 0 <= page < self._page_count:
-            self._thumbnails[page].set_selected(selected)
+        """選択状態をウィジェットへ反映する唯一の入口(割り当て済みのウィジェットだけ更新する)。"""
+        if self._grid is not None:
+            self._grid.update_page(page)
 
     def _clear_selection(self) -> None:
         pages = list(self._selected_pages)
@@ -2079,13 +1973,21 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._selected_pages[page] = None
             self._sync_page_selected(page, True)
 
+    def _set_drop_target_pages(self, pages: tuple[int, ...]) -> None:
+        """ドロップ位置の左右のページ(ハイライト対象)を設定し、変化したページだけ更新する。"""
+        old = self._drop_target_pages
+        if old == pages:
+            return
+        self._drop_target_pages = pages
+        for p in set(old) | set(pages):
+            self._grid.update_page(p)
+
     def _set_thumbnail_size(self, size: int) -> None:
         size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
         if size == self._preferred_thumb_size:
             return
         self._preferred_thumb_size = size
-        self._refresh_grid()
-        self._enqueue_all_thumbnail_renders()
+        self._relayout_grid()
 
     def eventFilter(self, obj, event) -> bool:
         grid_scroll = getattr(self, "_grid_scroll", None)
@@ -2171,6 +2073,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_view.hide()
         if self._grid_scroll:
             self._grid_scroll.show()
+            # 隠れている間のリサイズはレイアウトへ反映されていないので、ここで確定させてから
+            # 割り当て直す(割り当て → 選択・スクロールの順。逆だと見えるはずのページにウィジェットが無い)。
+            parent_layout = self._grid_scroll.parentWidget().layout()
+            if parent_layout is not None:
+                parent_layout.activate()
+            self._relayout_grid()
         # 最後に表示していたページを選択状態にする
         if last_page is not None:
             self._select_page_thumbnail(last_page)
@@ -2183,8 +2091,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if not 0 <= page_num < self._page_count:
             return
         self._select_pages([page_num])
-        if self._grid_scroll:
-            self._grid_scroll.ensureWidgetVisible(self._thumbnails[page_num])
+        if self._grid is not None:
+            self._grid.scroll_to_page(page_num)
         self._update_button_states()
 
     def _set_zoom_percent(self, value: int) -> None:
@@ -2974,7 +2882,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         # 並べ直しは直接呼ばず、デバウンスして _on_grid_resize_settled に任せる
-        # (読み込み中は抑止され、列数・サムネイルサイズが変わらなければ省かれる)。
+        # (列数・サムネイルサイズが変わらなければ、割り当て済みのセルは何もしない)。
         self._grid_resize_timer.start()
 
     def showEvent(self, event) -> None:
@@ -2982,7 +2890,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # Run one post-show reflow so initial column count uses stable viewport width.
         if not self._did_initial_grid_layout:
             self._did_initial_grid_layout = True
-            QTimer.singleShot(0, self._refresh_grid)
+            QTimer.singleShot(0, self._relayout_grid)
 
     def mousePressEvent(self, event) -> None:
         """Handle mouse press - start rubber band selection on empty area."""
@@ -2994,32 +2902,38 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                     return
                 child = child.parent()
             # Start rubber band selection on empty area
-            container_pos = self._container.mapFrom(self, event.pos())
+            container_pos = self._grid.mapFrom(self, event.pos())
             self._rubber_band_origin = container_pos
-            self._rubber_band.setGeometry(container_pos.x(), container_pos.y(), 0, 0)
-            self._rubber_band.show()
+            self._grid.rubber_band.setGeometry(container_pos.x(), container_pos.y(), 0, 0)
+            self._grid.rubber_band.show()
             self._clear_selection()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         """Handle mouse move for rubber band selection."""
         if self._rubber_band_origin is not None:
-            container_pos = self._container.mapFrom(self, event.pos())
-            from PyQt6.QtCore import QRect
+            container_pos = self._grid.mapFrom(self, event.pos())
             rect = QRect(self._rubber_band_origin, container_pos).normalized()
-            self._rubber_band.setGeometry(rect)
-            # Select thumbnails intersecting with rubber band
-            self._select_pages(
-                thumb.page_num
-                for thumb in self._thumbnails
-                if thumb.isVisible() and rect.intersects(thumb.geometry())
-            )
+            self._grid.rubber_band.setGeometry(rect)
+            # ラバーバンドと交差するページを選択する(セル位置の算術で求める)
+            self._set_rubber_band_selection(self._grid.metrics.pages_in_rect(rect))
         super().mouseMoveEvent(event)
+
+    def _set_rubber_band_selection(self, pages: list[int]) -> None:
+        """選択をラバーバンド内のページ(昇順)に置き換える。変化したページだけ表示を更新する。"""
+        if list(self._selected_pages) == pages:
+            return
+        previous = set(self._selected_pages)
+        current = set(pages)
+        self._selected_pages = dict.fromkeys(pages)
+        for p in previous ^ current:
+            self._sync_page_selected(p, p in current)
+        self._update_button_states()
 
     def mouseReleaseEvent(self, event) -> None:
         """Handle mouse release to end rubber band selection."""
         if event.button() == Qt.MouseButton.LeftButton and self._rubber_band_origin is not None:
-            self._rubber_band.hide()
+            self._grid.rubber_band.hide()
             self._rubber_band_origin = None
         super().mouseReleaseEvent(event)
 
@@ -3044,13 +2958,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             else:
                 event.setDropAction(Qt.DropAction.MoveAction)
             event.acceptProposedAction()
-            drop_pos = self._container.mapFrom(self, event.position().toPoint())
+            drop_pos = self._grid.mapFrom(self, event.position().toPoint())
             self._show_drop_indicator(drop_pos)
         elif event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
             source_path = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')
             if source_path != self._pdf_path:
                 event.acceptProposedAction()
-                drop_pos = self._container.mapFrom(self, event.position().toPoint())
+                drop_pos = self._grid.mapFrom(self, event.position().toPoint())
                 self._show_drop_indicator(drop_pos)
 
     def dragLeaveEvent(self, event) -> None:
@@ -3060,66 +2974,30 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
     def _show_drop_indicator(self, pos) -> None:
         """Show drop indicator at the appropriate position."""
-        idx = self._get_drop_page_index(pos)
-        if idx == self._drop_indicator_index:
+        idx, row_end = self._grid.metrics.drop_target(pos)
+        if idx == self._drop_indicator_index and row_end == self._drop_indicator_row_end:
             return
 
         self._drop_indicator_index = idx
+        self._drop_indicator_row_end = row_end
 
-        if not self._thumbnails:
-            self._drop_indicator.hide()
+        if self._page_count <= 0:
+            self._grid.hide_drop_indicator()
+            self._set_drop_target_pages(())
             return
 
-        # Calculate indicator position
-        visible_thumbs = [t for t in self._thumbnails if t.isVisible()]
-        if not visible_thumbs:
-            self._drop_indicator.hide()
-            return
-
-        if idx == 0:
-            ref_thumb = visible_thumbs[0]
-            x = ref_thumb.geometry().left() - 5
-        elif idx >= len(visible_thumbs):
-            ref_thumb = visible_thumbs[-1]
-            x = ref_thumb.geometry().right() + 2
-        else:
-            ref_thumb = visible_thumbs[min(idx, len(visible_thumbs) - 1)]
-            x = ref_thumb.geometry().left() - 5
-
-        thumb_rect = visible_thumbs[0].geometry() if visible_thumbs else None
-        if thumb_rect:
-            self._drop_indicator.setFixedHeight(thumb_rect.height())
-            self._drop_indicator.move(x, ref_thumb.geometry().top())
-            self._drop_indicator.raise_()
-            self._drop_indicator.show()
-
-        targets = []
-        if 0 <= idx - 1 < self._page_count:
-            left = self._thumbnails[idx - 1]
-            if left.isVisible():
-                targets.append(left)
-        if 0 <= idx < self._page_count:
-            right = self._thumbnails[idx]
-            if right.isVisible():
-                targets.append(right)
-        self._clear_all_drop_targets(except_thumbs=targets)
-        for t in targets:
-            t.set_drop_target(True)
-
-    def _clear_all_drop_targets(self, except_thumbs=()) -> None:
-        """Turn off droptarget highlight on every thumbnail (optionally skipping some)."""
-        skip = set(except_thumbs)
-        for thumb in self._thumbnails:
-            if thumb in skip:
-                continue
-            if thumb.is_drop_target:
-                thumb.set_drop_target(False)
+        self._grid.show_drop_indicator(self._grid.metrics.indicator_rect(idx, row_end=row_end))
+        # ドロップ位置の左右のページをハイライトする
+        self._set_drop_target_pages(
+            tuple(p for p in (idx - 1, idx) if 0 <= p < self._page_count)
+        )
 
     def _hide_drop_indicator(self) -> None:
         """Hide the drop indicator."""
-        self._drop_indicator.hide()
+        self._grid.hide_drop_indicator()
         self._drop_indicator_index = -1
-        self._clear_all_drop_targets()
+        self._drop_indicator_row_end = False
+        self._set_drop_target_pages(())
 
     def dropEvent(self, event) -> None:
         """Handle drop event."""
@@ -3130,7 +3008,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             data = event.mimeData().data(PAGETHUMBNAIL_MIME_TYPE).data().decode('utf-8')
             pdf_path, page_nums_str = data.split('|')
             page_nums = [int(n) for n in page_nums_str.split(',') if n]
-            drop_pos = self._container.mapFrom(self, event.position().toPoint())
+            drop_pos = self._grid.mapFrom(self, event.position().toPoint())
             logger.debug(f"PAGETHUMBNAIL drop: pdf_path={pdf_path}, page_nums={page_nums}, drop_pos={drop_pos}")
 
             if pdf_path == self._pdf_path:
@@ -3149,7 +3027,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             source_path = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')
             logger.debug(f"PDFCARD drop: source_path={source_path}")
             if source_path != self._pdf_path:
-                drop_pos = self._container.mapFrom(self, event.position().toPoint())
+                drop_pos = self._grid.mapFrom(self, event.position().toPoint())
                 page_count = get_page_count(source_path)
                 logger.debug(f"Inserting all {page_count} pages from {source_path}")
                 if page_count > 0:
@@ -3313,16 +3191,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         logger.debug("_handle_page_insert completed")
 
     def _get_drop_page_index(self, pos) -> int:
-        pad = max(0, self._grid_layout.spacing() // 2)
-        for i, thumb in enumerate(self._thumbnails):
-            thumb_rect = thumb.geometry()
-            expanded_rect = thumb_rect.adjusted(-pad, -pad, pad, pad)
-            if expanded_rect.contains(pos):
-                center_x = thumb_rect.center().x()
-                if pos.x() < center_x:
-                    return i
-                return i + 1
-        return self._page_count
+        """ドロップ位置(グリッド座標)の挿入先インデックス。行末ならその行の末尾、最終行より下なら文書末尾。"""
+        return self._grid.metrics.drop_index(pos)
 
     def _current_file_size(self) -> int:
         try:
@@ -3451,18 +3321,24 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         else:
             # サムネイルグリッド表示中は選択 + スクロール
             self._select_pages([page_num])
-            if self._grid_scroll:
-                self._grid_scroll.ensureWidgetVisible(self._thumbnails[page_num])
+            self._grid.scroll_to_page(page_num)
             self._update_button_states()
 
     def _apply_search_highlights(self) -> None:
-        hit_set = set(self._search_hit_pages)
-        for thumb in self._thumbnails:
-            thumb.set_search_hit(thumb.page_num in hit_set)
+        self._search_hit_set = set(self._search_hit_pages)
+        for page in self._search_hit_set:
+            self._grid.update_page(page)
+
+    def _reset_search_hit_pages(self) -> None:
+        """検索ヒットの強調を解除する(以前ヒットしていたページの表示だけ更新する)。"""
+        previous = self._search_hit_set
+        self._search_hit_set = set()
+        for page in previous:
+            if self._grid is not None:
+                self._grid.update_page(page)
 
     def _clear_search_highlights(self) -> None:
-        for thumb in self._thumbnails:
-            thumb.set_search_hit(False)
+        self._reset_search_hit_pages()
         self._search_hits = {}
         self._search_hit_pages = []
         self._search_cursor = -1
@@ -3471,6 +3347,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
     def _invalidate_search_results(self) -> None:
         """ページ構成が変わったときに呼び、検索状態とダイアログ表示を初期化する。"""
+        self._reset_search_hit_pages()
         self._search_hits = {}
         self._search_hit_pages = []
         self._search_cursor = -1

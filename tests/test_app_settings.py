@@ -11,7 +11,6 @@ from src.utils.constants import (
     HEAVY_PDF_FILE_SIZE_MB_RANGE,
     HEAVY_PDF_PAGE_COUNT_THRESHOLD_RANGE,
     HEAVY_PDF_RENDER_BATCH_SIZE_RANGE,
-    HEAVY_PDF_WIDGET_CHUNK_SIZE_RANGE,
     PIXMAP_CACHE_MAX_ENTRIES_RANGE,
 )
 from src.views import main_window, pdf_card
@@ -92,7 +91,6 @@ def test_heavy_pdf_settings_default_to_constants():
     assert app_settings.heavy_pdf_page_count_threshold() == 300
     assert app_settings.heavy_pdf_file_size_mb() == 150
     assert app_settings.heavy_pdf_file_size_bytes() == 150 * 1024 * 1024
-    assert app_settings.heavy_pdf_widget_chunk_size() == 60
     assert app_settings.heavy_pdf_render_batch_size() == 1
     assert app_settings.pixmap_cache_max_entries() == 256
 
@@ -102,7 +100,6 @@ def test_heavy_pdf_settings_default_to_constants():
     [
         (app_settings.heavy_pdf_page_count_threshold, app_settings.set_heavy_pdf_page_count_threshold),
         (app_settings.heavy_pdf_file_size_mb, app_settings.set_heavy_pdf_file_size_mb),
-        (app_settings.heavy_pdf_widget_chunk_size, app_settings.set_heavy_pdf_widget_chunk_size),
         (app_settings.heavy_pdf_render_batch_size, app_settings.set_heavy_pdf_render_batch_size),
         (app_settings.pixmap_cache_max_entries, app_settings.set_pixmap_cache_max_entries),
     ],
@@ -126,11 +123,6 @@ def test_heavy_pdf_settings_round_trip(getter, setter):
             app_settings.set_heavy_pdf_file_size_mb,
             app_settings.heavy_pdf_file_size_mb,
             HEAVY_PDF_FILE_SIZE_MB_RANGE,
-        ),
-        (
-            app_settings.set_heavy_pdf_widget_chunk_size,
-            app_settings.heavy_pdf_widget_chunk_size,
-            HEAVY_PDF_WIDGET_CHUNK_SIZE_RANGE,
         ),
         (
             app_settings.set_heavy_pdf_render_batch_size,

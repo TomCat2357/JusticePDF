@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.utils.constants import (
-    HEAVY_PDF_PAGE_COUNT_THRESHOLD,
-    HEAVY_PDF_WIDGET_CHUNK_SIZE,
-)
+from src.utils.constants import HEAVY_PDF_PAGE_COUNT_THRESHOLD
 from src.utils.pdf_utils import is_heavy_pdf
 from tests.helpers import create_page_edit_window, make_pdf
 
@@ -52,24 +49,22 @@ def test_small_document_loads_synchronously_in_normal_mode(qtbot, tmp_path):
     window = create_page_edit_window(qtbot, pdf_path)
 
     assert window._is_heavy_document is False
-    # 通常文書は _load_pages() 呼び出し内で全ウィジェットが同期的に揃う
-    # (チャンク分割やタイマー待ちが不要=既存の挙動を維持)。
+    # 全文書で _load_pages() 呼び出し内にページ数が確定する(タイマー待ちが不要)。
     assert window._page_count == 5
 
 
-def test_heavy_document_builds_widgets_incrementally(qtbot, tmp_path):
+def test_heavy_document_sets_page_count_immediately_without_loading_title(qtbot, tmp_path):
     page_count = HEAVY_PDF_PAGE_COUNT_THRESHOLD + 5
     pdf_path = tmp_path / "heavy-pages.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
 
     assert window._is_heavy_document is True
-    # _load_pages() から戻った直後は最初のチャンク分しか生成されていない
-    # (全ページ分を同期生成する場合、ここで既に page_count と一致してしまう)。
-    assert 0 < window._page_count <= HEAVY_PDF_WIDGET_CHUNK_SIZE
-
-    qtbot.waitUntil(lambda: window._page_count == page_count, timeout=10000)
+    # ウィジェットを分割生成しないので、_load_pages() から戻った時点で全ページ分のページ数が揃い、
+    # タイトルバーに「読み込み中」の進捗も出ない。
     assert window._page_count == page_count
+    assert "読み込み中" not in window.windowTitle()
+    assert window.windowTitle() == window._page_edit_window_title()
 
 
 def test_heavy_document_does_not_prequeue_every_page(qtbot, tmp_path):
@@ -77,27 +72,51 @@ def test_heavy_document_does_not_prequeue_every_page(qtbot, tmp_path):
     pdf_path = tmp_path / "heavy-queue.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    qtbot.waitUntil(lambda: window._page_count == page_count, timeout=10000)
 
-    window._enqueue_all_thumbnail_renders()
+    window._rendered.clear()
+    window._enqueue_visible_thumbnail_renders()
 
-    # 通常文書は全ページをキューへ積むが、重量文書は表示範囲のページだけを
-    # 逐次(オンデマンドで)積む。
-    assert len(window._thumb_render_queue) < page_count
+    # 全ページを一括でキューへ積まず、表示範囲(と先読み)のページだけを積む。
+    assert 0 < len(window._thumb_render_queue) < page_count
+    # 表示中のページが先頭、先読み分がその後ろ。
+    first_visible, _stop = window._grid.visible_page_range(0)
+    assert window._thumb_render_queue[0] == first_visible
 
 
-def test_normal_document_prequeues_every_page(qtbot, tmp_path):
+def test_normal_document_enqueues_visible_pages(qtbot, tmp_path):
     page_count = 8
     pdf_path = tmp_path / "normal-queue.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
 
     window._reset_thumbnail_render_queue()
-    for thumb in window._thumbnails:
-        thumb.invalidate_thumbnail()
-    window._enqueue_all_thumbnail_renders()
+    window._rendered.clear()
+    window._enqueue_visible_thumbnail_renders()
 
-    assert len(window._thumb_render_queue) == page_count
+    # 8ページは全部が画面内なので、全て積まれる。
+    assert sorted(window._thumb_render_queue) == list(range(page_count))
+
+
+def test_enqueue_skips_rendered_pages_and_pages_far_from_view(qtbot, tmp_path):
+    page_count = 400
+    pdf_path = tmp_path / "far-queue.pdf"
+    make_pdf(pdf_path, pages=page_count, width=80, height=80)
+    window = create_page_edit_window(qtbot, pdf_path)
+
+    window._reset_thumbnail_render_queue()
+    window._rendered.clear()
+    window._enqueue_visible_thumbnail_renders()
+    queued = set(window._thumb_render_queue)
+    assert 0 in queued
+    assert page_count - 1 not in queued
+    assert len(queued) < 80
+
+    # 描画済みのページは積み直さない。
+    window._process_thumbnail_render_queue()
+    done = [p for p in queued if window.is_page_rendered(p)]
+    assert done
+    window._enqueue_visible_thumbnail_renders()
+    assert not (set(window._thumb_render_queue) & set(done))
 
 
 def test_heavy_document_render_batch_is_single_page(qtbot, tmp_path):
@@ -105,19 +124,19 @@ def test_heavy_document_render_batch_is_single_page(qtbot, tmp_path):
     pdf_path = tmp_path / "heavy-batch.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    qtbot.waitUntil(lambda: window._page_count == page_count, timeout=10000)
 
     # ウィンドウ下端付近(通常は表示範囲外)のページを手動でキューに積み、
     # 1回のタイマー発火でどこまで描画されるかを検証する。
     target_pages = list(range(page_count - 10, page_count))
     window._reset_thumbnail_render_queue()
+    window._rendered.clear()
     for pn in target_pages:
         window._thumb_render_queue.append(pn)
         window._thumb_render_queue_set.add(pn)
 
     window._process_thumbnail_render_queue()
 
-    loaded = sum(1 for pn in target_pages if window._thumbnails[pn].thumbnail_loaded)
+    loaded = sum(1 for pn in target_pages if window.is_page_rendered(pn))
     assert loaded == 1
     assert len(window._thumb_render_queue) == len(target_pages) - 1
 
@@ -129,54 +148,58 @@ def test_normal_document_render_batch_up_to_five(qtbot, tmp_path):
     window = create_page_edit_window(qtbot, pdf_path)
 
     window._reset_thumbnail_render_queue()
+    window._rendered.clear()
     for pn in range(page_count):
-        window._thumbnails[pn].invalidate_thumbnail()
         window._thumb_render_queue.append(pn)
         window._thumb_render_queue_set.add(pn)
 
     window._process_thumbnail_render_queue()
 
-    loaded = sum(1 for t in window._thumbnails if t.thumbnail_loaded)
+    loaded = sum(1 for pn in range(page_count) if window.is_page_rendered(pn))
     assert loaded == 5
 
 
 # ---------------------------------------------------------------------------
-# 読み込み中のリサイズ抑止 / PII・Ink の走査範囲限定
+# リサイズ / PII・Ink の走査範囲限定
 # ---------------------------------------------------------------------------
 
-def test_heavy_document_defers_resize_refresh_until_load_done(qtbot, tmp_path, monkeypatch):
-    page_count = HEAVY_PDF_PAGE_COUNT_THRESHOLD + 5
-    pdf_path = tmp_path / "heavy-resize.pdf"
-    make_pdf(pdf_path, pages=page_count, width=80, height=80)
-    window = create_page_edit_window(qtbot, pdf_path)
-    assert window._pending_widget_pages is not None
-
-    calls: list[int] = []
-    original = window._refresh_grid
-    monkeypatch.setattr(window, "_refresh_grid", lambda: (calls.append(1), original())[1])
-
-    # 読み込み中のリサイズ通知では並べ直さず、完了時に1回だけ反映する。
-    window._on_grid_resize_settled()
-    assert calls == []
-    qtbot.waitUntil(lambda: window._pending_widget_pages is None, timeout=10000)
-    assert calls == [1]
-
-
-def test_resize_with_same_columns_skips_relayout(qtbot, tmp_path, monkeypatch):
+def test_resize_with_same_columns_keeps_rendered_thumbnails_and_positions(qtbot, tmp_path):
     pdf_path = tmp_path / "normal-resize.pdf"
     make_pdf(pdf_path, pages=4, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    window._refresh_grid()
+    window._process_thumbnail_render_queue()
+    qtbot.waitUntil(lambda: all(window.is_page_rendered(p) for p in range(4)))
+    positions = {p: window.widget_for_page(p).pos() for p in range(4)}
+    pixmaps = {p: window._rendered[p].pixmap for p in range(4)}
+    bound = {p: window.widget_for_page(p) for p in range(4)}
 
-    calls: list[int] = []
-    monkeypatch.setattr(window, "_refresh_grid", lambda: calls.append(1))
     window._on_grid_resize_settled()
-    assert calls == []
 
-    # 列数が変わるなら並べ直す。
-    window._grid_laid_out_cols = (window._grid_laid_out_cols or 1) + 1
+    # 列数・サムネイルサイズが同じなら、割り当ても位置も描画済み画像も変わらない。
+    for p in range(4):
+        assert window.widget_for_page(p) is bound[p]
+        assert window.widget_for_page(p).pos() == positions[p]
+        assert window._rendered[p].pixmap is pixmaps[p]
+
+
+def test_resize_changing_columns_repositions_cells(qtbot, tmp_path):
+    pdf_path = tmp_path / "cols-resize.pdf"
+    make_pdf(pdf_path, pages=12, width=80, height=80)
+    window = create_page_edit_window(qtbot, pdf_path)
+    window.resize(1100, 700)
+    qtbot.wait(30)
     window._on_grid_resize_settled()
-    assert calls == [1]
+    cols_wide = window._grid.metrics.cols
+
+    window.resize(400, 700)
+    qtbot.wait(30)
+    window._on_grid_resize_settled()
+    cols_narrow = window._grid.metrics.cols
+
+    assert cols_narrow < cols_wide
+    m = window._grid.metrics
+    for p in window._grid.bound_pages():
+        assert window.widget_for_page(p).pos() == m.cell_rect(p).topLeft()
 
 
 def test_heavy_document_scans_pii_and_ink_only_for_batch_pages(qtbot, tmp_path, monkeypatch):
@@ -184,7 +207,6 @@ def test_heavy_document_scans_pii_and_ink_only_for_batch_pages(qtbot, tmp_path, 
     pdf_path = tmp_path / "heavy-scan.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    qtbot.waitUntil(lambda: window._pending_widget_pages is None, timeout=10000)
 
     pii_scans: list = []
     ink_scans: list = []
@@ -220,7 +242,7 @@ def test_heavy_document_scans_pii_and_ink_only_for_batch_pages(qtbot, tmp_path, 
     assert len(pii_scans) == 3
 
 
-def test_resize_event_does_not_call_refresh_grid_directly(qtbot, tmp_path, monkeypatch):
+def test_resize_event_does_not_relayout_directly(qtbot, tmp_path, monkeypatch):
     from PyQt6.QtGui import QResizeEvent
     from PyQt6.QtCore import QSize
 
@@ -228,19 +250,18 @@ def test_resize_event_does_not_call_refresh_grid_directly(qtbot, tmp_path, monke
     pdf_path = tmp_path / "heavy-resize-event.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    assert window._pending_widget_pages is not None
 
     calls: list[int] = []
-    monkeypatch.setattr(window, "_refresh_grid", lambda: calls.append(1))
+    monkeypatch.setattr(window, "_relayout_grid", lambda: calls.append(1))
+    window._grid_resize_timer.stop()
     window.resizeEvent(QResizeEvent(QSize(700, 500), QSize(600, 400)))
+    # リサイズ通知は並べ直しを直接呼ばず、デバウンス用のタイマーを起動するだけ。
     assert calls == []
     assert window._grid_resize_timer.isActive()
 
-    # 読み込み中にタイマーが満了しても並べ直さず、完了待ちの印だけ付ける。
     window._grid_resize_timer.stop()
     window._on_grid_resize_settled()
-    assert calls == []
-    assert window._grid_resize_deferred is True
+    assert calls == [1]
 
 
 def test_render_batch_reuses_single_document_open(qtbot, tmp_path, monkeypatch):
@@ -250,10 +271,8 @@ def test_render_batch_reuses_single_document_open(qtbot, tmp_path, monkeypatch):
     pdf_path = tmp_path / "heavy-reuse.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    qtbot.waitUntil(lambda: window._pending_widget_pages is None, timeout=10000)
     window._reset_thumbnail_render_queue()
-    for thumb in window._thumbnails:
-        thumb.invalidate_thumbnail()
+    window._rendered.clear()
     window._pii_targets_by_page_cache = None
     window._ink_xrefs_by_page_cache = None
     window._show_ink_annots = False
@@ -269,7 +288,7 @@ def test_render_batch_reuses_single_document_open(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(fitz, "open", counting_open)
     window._process_thumbnail_render_queue()
     assert len([p for p in opens if p == str(window._pdf_path)]) <= 1
-    assert window._thumbnails[3].thumbnail_loaded
+    assert window.is_page_rendered(3)
 
 
 def test_hold_doc_closes_document_on_exit(tmp_path):
@@ -378,7 +397,6 @@ def test_heavy_render_batches_share_held_doc_and_idle_timer_releases(qtbot, tmp_
     pdf_path = tmp_path / "heavy-linger.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    qtbot.waitUntil(lambda: window._pending_widget_pages is None, timeout=10000)
     window._reset_thumbnail_render_queue()
     window._enqueue_thumbnail_render(3)
     window._process_thumbnail_render_queue()
@@ -400,7 +418,6 @@ def test_heavy_window_close_releases_held_doc(qtbot, tmp_path):
     pdf_path = tmp_path / "heavy-close.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    qtbot.waitUntil(lambda: window._pending_widget_pages is None, timeout=10000)
     window._enqueue_thumbnail_render(2)
     window._process_thumbnail_render_queue()
     assert _held_docs
@@ -409,18 +426,3 @@ def test_heavy_window_close_releases_held_doc(qtbot, tmp_path):
     window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
     window.close()
     assert not _held_docs
-
-
-def test_heavy_chunk_does_not_toggle_container_updates(qtbot, tmp_path, monkeypatch):
-    """container.setUpdatesEnabled(True) は全子孫へ再帰し数千件で約1秒かかるため、チャンクでは呼ばない。"""
-    page_count = HEAVY_PDF_PAGE_COUNT_THRESHOLD + 5
-    pdf_path = tmp_path / "heavy-upd.pdf"
-    make_pdf(pdf_path, pages=page_count, width=80, height=80)
-    window = create_page_edit_window(qtbot, pdf_path)
-    calls: list[bool] = []
-    real = window._container.setUpdatesEnabled
-    monkeypatch.setattr(
-        window._container, "setUpdatesEnabled", lambda v: (calls.append(v), real(v))[1]
-    )
-    qtbot.waitUntil(lambda: window._pending_widget_pages is None, timeout=10000)
-    assert calls == []

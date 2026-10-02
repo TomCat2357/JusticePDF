@@ -19,8 +19,6 @@ from src.utils.constants import (
     HEAVY_PDF_PAGE_COUNT_THRESHOLD_RANGE,
     HEAVY_PDF_RENDER_BATCH_SIZE,
     HEAVY_PDF_RENDER_BATCH_SIZE_RANGE,
-    HEAVY_PDF_WIDGET_CHUNK_SIZE,
-    HEAVY_PDF_WIDGET_CHUNK_SIZE_RANGE,
     PIXMAP_CACHE_MAX_ENTRIES,
     PIXMAP_CACHE_MAX_ENTRIES_RANGE,
 )
@@ -34,7 +32,6 @@ DEFAULT_FOLDER_KEY = "general/default_folder"
 # ---------------------------------------------------------------------------
 HEAVY_PDF_PAGE_COUNT_THRESHOLD_KEY = "heavy_pdf/page_count_threshold"
 HEAVY_PDF_FILE_SIZE_MB_KEY = "heavy_pdf/file_size_mb"
-HEAVY_PDF_WIDGET_CHUNK_SIZE_KEY = "heavy_pdf/widget_chunk_size"
 HEAVY_PDF_RENDER_BATCH_SIZE_KEY = "heavy_pdf/render_batch_size"
 PIXMAP_CACHE_MAX_ENTRIES_KEY = "heavy_pdf/pixmap_cache_max_entries"
 
@@ -96,19 +93,6 @@ def set_heavy_pdf_file_size_mb(value: int) -> None:
 def heavy_pdf_file_size_bytes() -> int:
     """heavy_pdf_file_size_mb() をバイト単位に換算した値。"""
     return heavy_pdf_file_size_mb() * 1024 * 1024
-
-
-def heavy_pdf_widget_chunk_size() -> int:
-    """重量文書のサムネイルウィジェットを1回のイベントループで生成する件数。"""
-    return _get_int(
-        HEAVY_PDF_WIDGET_CHUNK_SIZE_KEY,
-        HEAVY_PDF_WIDGET_CHUNK_SIZE,
-        HEAVY_PDF_WIDGET_CHUNK_SIZE_RANGE,
-    )
-
-
-def set_heavy_pdf_widget_chunk_size(value: int) -> None:
-    _set_int(HEAVY_PDF_WIDGET_CHUNK_SIZE_KEY, value, HEAVY_PDF_WIDGET_CHUNK_SIZE_RANGE)
 
 
 def heavy_pdf_render_batch_size() -> int:

@@ -162,11 +162,14 @@ class PiiDrawerMixin:
         if zoom_label is not None:
             zoom_label.set_pii_mask_style(settings.mask_color, settings.mask_opacity)
             zoom_label.set_pii_hidden_entities(settings.hidden_entities())
-        # ページ一覧のサムネイルは paint 時に重ね描きするので、画像の再レンダリングは不要
-        # (表示中のサムネイルだけが実際に再描画される)。
-        color, opacity, hidden = settings.mask_color, settings.mask_opacity, settings.hidden_entities()
-        for thumb in getattr(self, "_thumbnails", ()):
-            thumb.set_pii_mask_style(color, opacity, hidden)
+        # ページ一覧のサムネイルは paint 時に重ね描きするので、画像の再レンダリングは不要。
+        # 見た目はウィンドウに保持し(割り当て時にウィジェットへ流し込む)、今割り当て済みの
+        # (=表示範囲の)ウィジェットだけ更新する。
+        self._pii_mask_style = self._read_pii_mask_style()
+        grid = getattr(self, "_grid", None)
+        if grid is not None:
+            for thumb in grid.bound_widgets():
+                thumb.set_pii_mask_style(*self._pii_mask_style)
 
     def _sync_pii_annot_style_registry(self) -> None:
         """PDFへ書くPII注釈の色・不透明度・非表示種別(他のPDFソフト向け)を、現在の設定に合わせる。

@@ -26,7 +26,6 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QFont,
     QKeySequence,
-    QDrag,
     QPainter,
     QColor,
     QPen,
@@ -61,8 +60,6 @@ from src.utils.constants import (
 )
 from src.pii.entity_types import get_entity_type_name_ja
 
-
-from src.views.view_helpers import apply_drag_pixmap
 
 logger = logging.getLogger(__name__)
 
@@ -356,14 +353,37 @@ class _PiiOverlayLabel(QLabel):
             painter.end()
 
 
+def page_drag_pages(page: int, selected_pages) -> list[int]:
+    """ドラッグするページ番号。押したページが複数選択に含まれるなら選択全体(選択順)、でなければそのページだけ。"""
+    selected = list(selected_pages)
+    if page in selected and len(selected) > 1:
+        return selected
+    return [page]
+
+
+def build_page_drag_mime(pdf_path: str, pages) -> QMimeData:
+    """ページドラッグ用の MIME データ(``<pdf_path>|<n>,<n>,...``)を作る。"""
+    page_nums_str = ",".join(str(n) for n in pages)
+    mime_data = QMimeData()
+    mime_data.setData(PAGETHUMBNAIL_MIME_TYPE, f"{pdf_path}|{page_nums_str}".encode("utf-8"))
+    return mime_data
+
+
 class PageThumbnail(QFrame):
-    """Widget representing a single PDF page."""
+    """ページ一覧の1セル分のウィジェット。
+
+    ページ一覧は仮想化されており、このウィジェットは固定のページに結び付かない
+    (``bind()`` でページを割り当て、``unbind()`` で解放して使い回す)。選択・ドロップ先・
+    検索ヒットの状態は持ち主(ウィンドウ)側が保持し、``set_state()`` で反映される。
+    """
 
     clicked = pyqtSignal(int)
+    double_clicked = pyqtSignal(int)
+    drag_requested = pyqtSignal(int)
     THUMBNAIL_SIZE = 120
     CARD_PADDING = 30  # total horizontal/vertical padding around the thumbnail
 
-    def __init__(self, pdf_path: str, page_num: int, display_num: int = None, parent=None, *, thumb_size: int | None = None):
+    def __init__(self, pdf_path: str, page_num: int = -1, display_num: int = None, parent=None, *, thumb_size: int | None = None):
         super().__init__(parent)
         self._pdf_path = pdf_path
         self._page_num = page_num
@@ -371,7 +391,6 @@ class PageThumbnail(QFrame):
         self._is_selected = False
         self._is_drop_target = False
         self._is_search_hit = False
-        self._explicitly_hidden = False
         self._drag_start_pos = None
         self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
         self._thumbnail_loaded = False
@@ -414,6 +433,41 @@ class PageThumbnail(QFrame):
     def _reposition_number_badge(self) -> None:
         self._number_label.adjustSize()
         self._number_label.move(self._thumb_size - self._number_label.width() - 3, 3)
+
+    # --- ページへの割り当て(プール内で使い回す) -----------------------
+    def bind(self, page_num: int, display_num: int | None = None, pdf_path: str | None = None) -> None:
+        """このウィジェットをページ ``page_num`` に割り当てる(画像・状態は呼び出し側が続けて設定する)。"""
+        self._drag_start_pos = None
+        if pdf_path is not None:
+            self._pdf_path = pdf_path
+        display = page_num if display_num is None else display_num
+        self._page_num = page_num
+        if display != self._display_num:
+            self._display_num = display
+            self._number_label.setText(str(display + 1))
+            self._reposition_number_badge()
+
+    def unbind(self) -> None:
+        """ページへの割り当てを解く。画像・塗りつぶし重ね描き・状態を空に戻す(隠すのは呼び出し側)。"""
+        self._drag_start_pos = None
+        self._page_num = -1
+        self.set_state(False, False, False)
+        self.invalidate_thumbnail()
+        self._image_label.set_overlay([], (0.0, 0.0))
+
+    def set_state(self, selected: bool, drop_target: bool, search_hit: bool) -> None:
+        """選択・ドロップ先・検索ヒットの表示状態をまとめて設定する(変化が無ければ何もしない)。"""
+        selected, drop_target, search_hit = bool(selected), bool(drop_target), bool(search_hit)
+        if (
+            selected == self._is_selected
+            and drop_target == self._is_drop_target
+            and search_hit == self._is_search_hit
+        ):
+            return
+        self._is_selected = selected
+        self._is_drop_target = drop_target
+        self._is_search_hit = search_hit
+        self._update_style()
 
     @property
     def thumbnail_loaded(self) -> bool:
@@ -479,22 +533,14 @@ class PageThumbnail(QFrame):
         return self._is_search_hit
 
     def set_search_hit(self, on: bool) -> None:
-        on = bool(on)
-        if self._is_search_hit == on:
-            return
-        self._is_search_hit = on
-        self._update_style()
+        self.set_state(self._is_selected, self._is_drop_target, on)
 
     @property
     def is_drop_target(self) -> bool:
         return self._is_drop_target
 
     def set_drop_target(self, on: bool) -> None:
-        on = bool(on)
-        if self._is_drop_target == on:
-            return
-        self._is_drop_target = on
-        self._update_style()
+        self.set_state(self._is_selected, on, self._is_search_hit)
 
     @property
     def page_num(self) -> int:
@@ -505,11 +551,7 @@ class PageThumbnail(QFrame):
         return self._is_selected
 
     def set_selected(self, selected: bool) -> None:
-        selected = bool(selected)
-        if self._is_selected == selected:
-            return
-        self._is_selected = selected
-        self._update_style()
+        self.set_state(selected, self._is_drop_target, self._is_search_hit)
 
     def refresh(self) -> None:
         self.invalidate_thumbnail()
@@ -528,46 +570,26 @@ class PageThumbnail(QFrame):
         self.updateGeometry()
 
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton and self._page_num >= 0:
             self._drag_start_pos = event.pos()
             self.clicked.emit(self._page_num)
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            parent_window = self.window()
-            if hasattr(parent_window, "_open_zoom_view"):
-                parent_window._open_zoom_view(self._page_num)
+        if event.button() == Qt.MouseButton.LeftButton and self._page_num >= 0:
+            self.double_clicked.emit(self._page_num)
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         if not (event.buttons() & Qt.MouseButton.LeftButton):
             return
-        if self._drag_start_pos is None:
+        if self._drag_start_pos is None or self._page_num < 0:
             return
         if (event.pos() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
             return
-
-        parent_window = self.window()
-        page_nums_list = [self._page_num]
-        selected_pages = list(getattr(parent_window, '_selected_pages', ()))
-        if self._page_num in selected_pages and len(selected_pages) > 1:
-            page_nums_list = selected_pages
-        page_nums_str = ','.join(str(n) for n in page_nums_list)
-
-        logger.debug(f"Starting drag: pdf_path={self._pdf_path}, page_nums={page_nums_list}")
-
-        drag = QDrag(self)
-        mime_data = QMimeData()
-        data = f"{self._pdf_path}|{page_nums_str}".encode('utf-8')
-        mime_data.setData(PAGETHUMBNAIL_MIME_TYPE, data)
-        drag.setMimeData(mime_data)
-
-        apply_drag_pixmap(drag, self, max_size=80, count=len(page_nums_list),
-                          badge_size=20, badge_font_size=9)
-
-        result = drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
-        logger.debug(f"Drag completed with result: {result}")
+        self._drag_start_pos = None
+        # ドラッグの開始(MIME・ドラッグ画像・exec)はグリッド側が行う。
+        self.drag_requested.emit(self._page_num)
 
 
 class AnnotationTextEdit(QPlainTextEdit):

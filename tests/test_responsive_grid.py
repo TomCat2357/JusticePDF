@@ -63,9 +63,11 @@ def test_page_grid_reflows_without_horizontal_overflow(qtbot, tmp_path) -> None:
             == Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         assert not window._grid_scroll.horizontalScrollBar().isVisible()
-        assert {thumb.width() for thumb in window._thumbnails} == {150}
+        bound = window._grid.bound_widgets()
+        assert bound
+        assert {thumb.width() for thumb in bound} == {150}
         _assert_items_fit_horizontally(
             window._grid_scroll,
             window._container,
-            window._thumbnails,
+            bound,
         )
