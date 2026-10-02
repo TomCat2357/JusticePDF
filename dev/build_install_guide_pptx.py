@@ -197,14 +197,15 @@ def add_picture(slide, name, x, y, width=None, height=None, crop=None, alt=""):
     return pic, scale, l, t
 
 
-def highlight(slide, pic_x, pic_y, scale, l, t, px_box, pad_px=6, color=RED):
+def highlight(slide, pic_x, pic_y, scale, l, t, px_box, pad_px=6, color=RED,
+              line_w=3.0):
     """画像上の px 矩形 (x0, y0, x1, y1) を赤枠で囲む。"""
     x0, y0, x1, y1 = px_box
     return add_shape(
         slide, MSO_SHAPE.ROUNDED_RECTANGLE,
         pic_x + (x0 - pad_px - l) * scale, pic_y + (y0 - pad_px - t) * scale,
         (x1 - x0 + 2 * pad_px) * scale, (y1 - y0 + 2 * pad_px) * scale,
-        fill=None, line=color, line_w=3.0, radius=0.2)
+        fill=None, line=color, line_w=line_w, radius=0.2)
 
 
 # ---------- Slide scaffolding ----------
@@ -320,11 +321,11 @@ def slide_flow(prs):
     s = new_slide(prs, "全体の流れ　〜 4 つのステップだけ", 2)
     cards = [
         ("1", "ダウンロード", ["Google Drive", "から保存"]),
-        ("2", "展開", ["zip を", "C:\\ に展開"]),
+        ("2", "展開", ["zip を", "ユーザー", "フォルダに展開"]),
         ("3", "ショートカット", ["デスクトップに", "アイコンを作る"]),
         ("4", "起動", ["アイコンを", "ダブルクリック"]),
     ]
-    cw, gap, x0, y0, ch = 1.95, 0.4, 0.5, 1.55, 2.55
+    cw, gap, x0, y0, ch = 1.95, 0.4, 0.5, 1.55, 2.7
     for i, (n, head, body) in enumerate(cards):
         x = x0 + i * (cw + gap)
         rrect(s, x, y0, cw, ch, fill=WHITE, line=LINE, line_w=1.5, radius=0.06)
@@ -332,7 +333,7 @@ def slide_flow(prs):
         add_text(s, x, y0 + 0.95, cw, 0.5, [head], size=18, bold=True,
                  color=NAVY, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE,
                  margins=(0.02, 0.02))
-        add_text(s, x, y0 + 1.5, cw, 0.95, body, size=18, align=PP_ALIGN.CENTER,
+        add_text(s, x, y0 + 1.5, cw, 1.15, body, size=18, align=PP_ALIGN.CENTER,
                  margins=(0.02, 0.02))
         if i < 3:
             arrow_right(s, x + cw + 0.05, y0 + ch / 2 - 0.2, 0.3, 0.4)
@@ -356,18 +357,19 @@ def slide_flow(prs):
 
 def slide_step1(prs):
     s = new_slide(prs, "ダウンロードする", 3, step=1)
-    px, py = 0.5, 1.5
+    px, py = 0.5, 1.45
     pic, sc, l, t = add_picture(
-        s, "16_install_zip.png", px, py, width=5.4,
-        alt="Google Drive の画面。zip ファイルが選択されている")
-    highlight(s, px, py, sc, l, t, (30, 178, 822, 212), pad_px=4)
-    add_shape(s, MSO_SHAPE.LEFT_ARROW, 6.05, 2.45, 0.4, 0.4, fill=RED)
-    rrect(s, 6.5, 2.15, 3.0, 1.0, fill=LIGHT_RED, line=RED, line_w=1.5,
-          paras=["この zip ファイルを", "右クリック"], size=18, bold=True,
-          color=RED, radius=0.12)
-    add_text(s, 0.5, 3.25, 9.0, 0.35,
-             ["※ 画面は例です。ファイル名は配布の時期で異なることがあります。"],
-             size=14, color=GRAY, anchor=MSO_ANCHOR.MIDDLE)
+        s, "16_install_zip.png", px, py, width=9.0,
+        alt="Google ドライブのファイル一覧。JusticePDFの使い方.docx と "
+            "JusticePDF-PRO.zip の 2 行が並んでいる。zip の行を赤枠で囲んでいる")
+    # JusticePDF-PRO.zip の行（画像下側。行の下端は画像の下端で切れている）
+    highlight(s, px, py, sc, l, t, (32, 131, 1232, 164), pad_px=2)
+    # 行の下から指す吹き出し
+    add_shape(s, MSO_SHAPE.UP_ARROW, px + 170 * sc - 0.2, py + 168 * sc + 0.05,
+              0.4, 0.4, fill=RED)
+    rrect(s, 2.0, py + 168 * sc + 0.12, 5.2, 0.8, fill=LIGHT_RED, line=RED,
+          line_w=1.5, paras=["この zip ファイルを右クリックして", "「ダウンロード」を選ぶ"],
+          size=18, bold=True, color=RED, radius=0.12)
 
     y = 3.8
     step_row(s, 0.5, y, 9.0, 0.95, 1, [
@@ -387,13 +389,14 @@ def slide_step1(prs):
 
 def slide_step2a(prs):
     s = new_slide(prs, "展開する ①　すべて展開を選ぶ", 4, step=2)
-    px, py = 0.6, 1.5
-    crop = (256, 0, 584, 490)
+    px, py = 0.6, 1.45
+    # 画像全体を使う（右クリックしたメニューと、下端の選択中の zip が両方写っている）
     pic, sc, l, t = add_picture(
-        s, "17_install_extract_menu.png", px, py, height=4.8, crop=crop,
+        s, "17_install_extract_menu.png", px, py, height=5.0,
         alt="zip ファイルを右クリックしたメニュー。「すべて展開」の項目を赤枠で囲んでいる")
-    highlight(s, px, py, sc, l, t, (262, 170, 578, 198), pad_px=2)
-    add_text(s, px - 0.1, py + 4.9, 3.6, 0.35,
+    highlight(s, px, py, sc, l, t, (110, 209, 346, 233), pad_px=1)
+    pic_w = 363 * sc
+    add_text(s, px + pic_w / 2 - 1.8, py + 5.05, 3.6, 0.35,
              ["（Windows 11 の画面の例）"], size=14, color=GRAY,
              align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
 
@@ -407,69 +410,93 @@ def slide_step2a(prs):
         ["ダウンロードした zip を", B("右クリック", BLUE), "する"]])
     step_row(s, x, 3.9, w, 1.0, 3, [
         ["メニューの", B("「すべて展開」", RED), "を選ぶ"]])
-    note_box(s, x, 5.2, w, 1.1, [
-        ["次の画面で、"],
-        ["展開先を", B("「C:\\」", NAVY), "に書き換えます"]],
+    note_box(s, x, 5.15, w, 1.6, [
+        ["次の画面で、展開先の末尾を消し、"],
+        [B("ユーザーフォルダ", NAVY), "だけにします"],
+        {"runs": ["（仮想環境でも消えずに残る場所です）"], "size": 16,
+         "color": GRAY}],
         kind="warn", size=20)
 
 
 def slide_step2b(prs):
-    s = new_slide(prs, "展開する ②　展開先を「C:\\」にする", 5, step=2)
+    s = new_slide(prs, "展開する ②　展開先の末尾を消す", 5, step=2)
     px, py = 0.5, 1.45
     pic, sc, l, t = add_picture(
-        s, "19_install_extract_button.png", px, py, width=4.7,
-        alt="「圧縮 (ZIP 形式) フォルダーの展開」画面。展開先の欄を赤枠で囲んでいる")
-    highlight(s, px, py, sc, l, t, (58, 224, 684, 261), pad_px=7)
-    # 展開先の欄を指す吹き出し（空白部分に重ねる）
-    add_shape(s, MSO_SHAPE.UP_ARROW, px + 440 * sc - 0.2, py + 272 * sc, 0.4,
-              0.5, fill=RED)
-    rrect(s, px + 140 * sc, py + 385 * sc, 600 * sc, 0.9, fill=RED, line=None,
-          paras=["ここを「C:\\」に", "書き換える"], size=18, bold=True,
-          color=WHITE, radius=0.12)
+        s, "19_install_extract_button.png", px, py, width=4.4,
+        alt="「圧縮 (ZIP 形式) フォルダーの展開」画面。展開先の欄の末尾"
+            "「\\Downloads\\JusticePDF-PRO」を赤枠で囲んでいる")
+    # 消す部分「\Downloads\JusticePDF-PRO」（選択された文字列の後ろ 25 文字）を囲む
+    # 直前の数字「sa11882」の末尾にかからないよう、枠は ¥ の直前から細めに引く
+    highlight(s, px, py, sc, l, t, (208, 226, 447, 252), pad_px=0, line_w=2.25)
+    # 囲んだ部分を指す吹き出し（ダイアログの空白部分に重ねる）
+    # 矢印はチェックボックスの文字（x ≲ 390px）にかからない右端寄りに置く
+    add_shape(s, MSO_SHAPE.UP_ARROW, px + 436 * sc - 0.2, py + 262 * sc, 0.4,
+              0.4, fill=RED)
+    rrect(s, px + 20 * sc, py + 350 * sc + 0.05, 843 * sc, 0.9, fill=RED,
+          line=None,
+          paras=[{"runs": ["「\\Downloads\\JusticePDF-PRO」"], "size": 16},
+                 {"runs": ["を消す"], "size": 20}],
+          size=18, bold=True, color=WHITE, radius=0.12)
 
-    x, w = 5.4, 4.1
-    step_row(s, x, 1.45, w, 1.2, 1, [
-        ["展開先の欄を"],
-        [B("「C:\\」", BLUE), "に書き換える"]])
-    step_row(s, x, 2.75, w, 1.2, 2, [
+    x, w = 5.1, 4.4
+    step_row(s, x, 1.45, w, 1.45, 1, [
+        ["展開先の欄の末尾の"],
+        [C("\\Downloads\\JusticePDF-PRO", RED, 16)],
+        ["を消す"]])
+    step_row(s, x, 2.95, w, 1.0, 2, [
         [B("「展開」", BLUE), "を押す"],
         {"runs": ["（数分かかることがあります）"], "size": 18, "color": GRAY},
     ])
-    step_row(s, x, 4.05, w, 1.2, 3, [
-        [C("C:\\JusticePDF-PRO", size=18)],
-        ["ができたら完了"]])
+    step_row(s, x, 4.0, w, 1.15, 3, [
+        [C("JusticePDF-PRO", NAVY, 18), " フォルダが"],
+        ["できたら完了"]])
 
-    y = 5.45
-    add_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 0.5, y, 0.7, 0.42, fill=GREEN,
+    y = 5.3
+    add_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 0.5, y, 0.7, 0.4, fill=GREEN,
               paras=["OK"], size=18, bold=True, color=WHITE, radius=0.3,
               margins=(0, 0))
-    add_text(s, 1.35, y - 0.03, 8.15, 0.48,
-             [[C("C:\\JusticePDF-PRO", TEXT, 18), "（この形になれば正解）"]],
+    add_text(s, 1.35, y - 0.03, 8.15, 0.46,
+             [[C("C:\\Users\\（s付き職員番号）\\JusticePDF-PRO", TEXT, 18),
+               "（この形が正解）"]],
              size=18, anchor=MSO_ANCHOR.MIDDLE)
-    y += 0.52
-    add_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 0.5, y, 0.7, 0.42, fill=RED,
+    y += 0.46
+    add_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 0.5, y, 0.7, 0.4, fill=RED,
               paras=["NG"], size=18, bold=True, color=WHITE, radius=0.3,
               margins=(0, 0))
-    add_text(s, 1.35, y - 0.03, 8.15, 0.48,
+    add_text(s, 1.35, y - 0.03, 8.15, 0.46,
              [[C("JusticePDF-PRO\\JusticePDF-PRO", TEXT, 18),
-               "（二重フォルダ）→ 展開し直す"]],
+               "（二重）→ 展開し直す"]],
              size=18, anchor=MSO_ANCHOR.MIDDLE)
-    y += 0.52
-    add_text(s, 0.5, y - 0.02, 9.0, 0.48,
-             ["デスクトップ・ドキュメントや、深いフォルダには置きません。"],
+    y += 0.46
+    add_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 0.5, y, 0.7, 0.4, fill=RED,
+              paras=["NG"], size=18, bold=True, color=WHITE, radius=0.3,
+              margins=(0, 0))
+    add_text(s, 1.35, y - 0.03, 8.15, 0.46,
+             ["Downloads・デスクトップ・ドキュメントの中"],
              size=18, color=RED, bold=True, anchor=MSO_ANCHOR.MIDDLE)
+    y += 0.5
+    add_text(s, 0.5, y, 9.0, 0.35,
+             ["（s付き職員番号）は自分の職員番号です（例: s12345）。"
+              "入力欄に入っているので残します"],
+             size=14, color=GRAY, anchor=MSO_ANCHOR.MIDDLE)
 
 
 def slide_step3(prs):
     s = new_slide(prs, "ショートカットを作る", 6, step=3)
-    step_row(s, 0.5, 1.5, 9.0, 0.8, 1, [
-        [C("C:\\JusticePDF-PRO", NAVY, 20), " フォルダを開く"]])
+    step_row(s, 0.5, 1.4, 9.0, 1.5, 1, [
+        [C("JusticePDF-PRO", NAVY, 20), " フォルダを開く"],
+        {"runs": ["展開が終わると自動で開きます。"], "size": 16, "color": GRAY},
+        {"runs": ["開き直すときは、エクスプローラーのアドレスバーに"],
+         "size": 16, "color": GRAY},
+        {"runs": [C("%USERPROFILE%\\JusticePDF-PRO", BLUE, 18),
+                  " と入力して Enter"], "size": 16, "color": GRAY},
+    ])
 
-    step_row(s, 0.5, 2.4, 9.0, 1.0, 2, [
+    step_row(s, 0.5, 3.0, 9.0, 1.0, 2, [
         [C("create_desktop_shortcuts.ps1", NAVY, 18), " のファイルを"],
         ["右クリックして、", B("「PowerShell で実行」", BLUE), "を選ぶ"]])
     # メニュー選択の流れ（実際のメニューではなく、項目名を囲んだ図）
-    y, h = 3.6, 0.6
+    y, h = 4.15, 0.6
     rrect(s, 1.3, y, 1.5, h, fill=WHITE, line=GRAY, line_w=1.5,
           paras=["右クリック"], size=18, bold=True, color=TEXT, radius=0.3)
     arrow_right(s, 2.85, y + 0.1, 0.3, 0.4)
@@ -482,12 +509,12 @@ def slide_step3(prs):
           paras=["PowerShell で実行"], size=18, bold=True, color=WHITE,
           radius=0.3)
 
-    step_row(s, 0.5, 4.8, 9.0, 1.2, 3, [
+    step_row(s, 0.5, 5.15, 9.0, 1.0, 3, [
         ["青（または黒）い画面が一瞬出て、すぐ消えます。"],
         ["デスクトップに", B("「JusticePDF」", BLUE),
          "のアイコンができれば完成です。"],
     ])
-    note_box(s, 0.5, 6.25, 9.0, 0.7, [
+    note_box(s, 0.5, 6.3, 9.0, 0.65, [
         ["うまくいかないときは、次のページ以降の「困ったとき」を見てください"]],
         kind="warn", size=18)
 
@@ -544,9 +571,10 @@ def slide_update(prs):
     s = new_slide(prs, "新しい版が配られたら（更新）", 8)
     rows = [
         ["JusticePDF を", B("閉じる", BLUE), "（黒い画面も一緒に消えます）"],
-        [C("C:\\JusticePDF-PRO", NAVY, 20), " フォルダを", B("削除", BLUE), "する"],
-        ["新しい zip を、", B("STEP 1 〜 2", BLUE), " と同じ手順で ",
-         C("C:\\", NAVY, 20), " に展開する"],
+        ["ユーザーフォルダの ", C("JusticePDF-PRO", NAVY, 20), " フォルダを",
+         B("削除", BLUE), "する"],
+        ["新しい zip を、", B("STEP 1 〜 2", BLUE), " と同じ手順で、",
+         "ユーザーフォルダに展開する"],
         [B("STEP 3", BLUE), " と同じ手順で、ショートカットを作り直す"],
     ]
     y = 1.5
@@ -564,7 +592,8 @@ def slide_trouble_shortcut(prs):
     s = new_slide(prs, "困ったとき ①　ショートカットが作れない", 9)
     # 1
     step_row(s, 0.5, 1.45, 9.0, 1.0, 1, [
-        [C("C:\\JusticePDF-PRO", NAVY, 18), " を開く"],
+        [C("JusticePDF-PRO", NAVY, 18), " フォルダを開く",
+         ("（開き方は STEP 3 と同じ）", {"size": 16, "color": GRAY})],
         ["上のアドレスバーに ", C("powershell", BLUE, 20),
          " と入力して Enter を押す"]])
     # アドレスバーの図
@@ -607,7 +636,7 @@ def slide_trouble_other(prs):
         ("起動しない", 1.75,
          [[C("run_justice_gui.cmd", NAVY, 18), " を直接"],
           [B("ダブルクリック", BLUE), "して試す"],
-          {"runs": ["（C:\\JusticePDF-PRO の中にあります）"], "size": 18,
+          {"runs": ["（JusticePDF-PRO フォルダの中にあります）"], "size": 18,
            "color": GRAY},
           ["それでもだめなら、管理者へ連絡してください"]]),
     ]

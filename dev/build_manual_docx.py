@@ -142,6 +142,8 @@ def _notebox(doc, label: str, text: str, fill_hex: str = "FFF6D6") -> None:
     """色付きの囲み（ヒント・注意など）を 1 つ追加する。"""
     table = doc.add_table(rows=1, cols=1)
     table.style = "Table Grid"
+    # 囲みがページをまたいで途中で切れないようにする
+    table.rows[0]._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
     cell = table.cell(0, 0)
     _set_cell_shading(cell, fill_hex)
     p = cell.paragraphs[0]
@@ -281,9 +283,13 @@ def build_doc() -> Document:
 
     _h2(doc, "STEP 1　ダウンロード")
     _step(doc, 1, "Google ドライブで、配布された ZIP ファイル（JusticePDF-PRO.zip）を選びます。")
-    _step(doc, 2, "上のバーにあるダウンロードのボタン（下向きの矢印）をクリックします。")
-    _img(doc, "16_install_zip.png")
-    _caption(doc, "▲ Google ドライブで ZIP ファイルを選んだところ（図は一例です）")
+    _img(doc, "16_install_zip.png", width_cm=16.0)
+    _caption(doc, "▲ Google ドライブのファイル一覧。「JusticePDF-PRO.zip」が配布された ZIP ファイルです")
+    _step(
+        doc, 2,
+        "上のバーにあるダウンロードのボタン（下向きの矢印）をクリックします。"
+        "ZIP ファイルを右クリックして「ダウンロード」を選んでも同じです。",
+    )
     _step(
         doc, 3,
         "大きいファイルのため、「ウイルス スキャンを実行できません」という確認の画面が出ます。"
@@ -295,29 +301,50 @@ def build_doc() -> Document:
     _h2(doc, "STEP 2　ZIP ファイルの展開（中身を取り出す）")
     _step(doc, 1, "保存した ZIP ファイル（JusticePDF-PRO.zip）を右クリックします。")
     _step(doc, 2, "出てきたメニューから「すべて展開」を選びます。")
-    _img(doc, "17_install_extract_menu.png")
-    _caption(doc, "▲ ZIP ファイルを右クリックして「すべて展開」を選びます（図は一例です）")
+    _img(doc, "17_install_extract_menu.png", width_cm=7.5)
+    _caption(doc, "▲ エクスプローラーで ZIP ファイルを右クリックし、メニューの「すべて展開」を選びます")
 
     _step(
         doc, 3,
-        "「ファイルを下のフォルダーに展開する」の入力欄に、最初から入っている場所は"
-        "消して、「C:\\」と入力し直します（展開すると C:\\JusticePDF-PRO ができます）。",
+        "「ファイルを下のフォルダーに展開する」の入力欄には、最初から"
+        "「C:\\Users\\（s付き職員番号）\\Downloads\\JusticePDF-PRO」のような場所が入っています。"
+        "この末尾の「\\Downloads\\JusticePDF-PRO」を消して、ユーザーフォルダ"
+        "「C:\\Users\\（s付き職員番号）」だけにします。"
+        "「（s付き職員番号）」の部分には、s から始まる自分の職員番号（例: s12345）が入っています。"
+        "この部分はそのまま残します。"
+        "展開すると C:\\Users\\（s付き職員番号）\\JusticePDF-PRO ができます。",
     )
     _step(doc, 4, "「展開」ボタンをクリックします。")
     _img(doc, "19_install_extract_button.png")
-    _caption(doc, "▲ 展開先の入力欄を書き換えてから「展開」を押します")
+    _caption(
+        doc,
+        "▲ 展開先の末尾（\\Downloads\\JusticePDF-PRO）を消してから「展開」を押します",
+    )
+    _tip(
+        doc,
+        "ユーザーフォルダ（C:\\Users\\（s付き職員番号））は、仮想環境（VDI）でも内容が"
+        "消えずに残る場所です。デスクトップやドキュメントの中ではなく、この場所に置きます。",
+    )
+    _para(doc, "展開先の例です。")
+    _bullet(doc, "OK：C:\\Users\\（s付き職員番号）\\JusticePDF-PRO")
+    _bullet(
+        doc,
+        "NG：C:\\Users\\（s付き職員番号）\\JusticePDF-PRO\\JusticePDF-PRO"
+        "（フォルダが二重になっています。展開し直してください）",
+    )
+    _bullet(doc, "NG：Downloads・デスクトップ・ドキュメントの中")
     _note(
         doc,
-        "入力欄の最初の場所のまま「展開」を押すと、「JusticePDF-PRO」フォルダの中に"
-        "もう 1 つ「JusticePDF-PRO」フォルダができて二重になりやすいため、"
-        "必ず「C:\\」に書き換えてください。"
+        "入力欄の最初の場所のまま「展開」を押すと、Downloads フォルダの中に展開され、"
+        "「JusticePDF-PRO」フォルダが二重になりやすいため、必ず末尾を消してください。"
         "また、OneDrive で同期されているフォルダ（デスクトップやドキュメントは同期されている場合が"
         "多いです）や、フォルダの階層が深い場所への展開は避けてください。",
     )
     _note(
         doc,
         "展開には数分かかることがあります。終わるまで待ってください。"
-        "終わると、中身が入ったフォルダが開きます。",
+        "「完了時に展開されたファイルを表示する」にチェックが入っていれば"
+        "（最初から入っています）、終わると JusticePDF-PRO フォルダが自動で開きます。",
     )
 
     _h2(doc, "STEP 3　デスクトップにショートカットを作る")
@@ -326,7 +353,13 @@ def build_doc() -> Document:
         "デスクトップにアイコン（ショートカット）を作っておくと、そこから JusticePDF を"
         "起動できるようになります。",
     )
-    _step(doc, 1, "展開してできたフォルダ（C:\\JusticePDF-PRO）を開きます。")
+    _step(
+        doc, 1,
+        "展開してできたフォルダ（C:\\Users\\（s付き職員番号）\\JusticePDF-PRO）を開きます。"
+        "展開後に自動で開いているときは、そのフォルダを使います。"
+        "開き直すときは、エクスプローラーの上のバー（アドレスバー）に"
+        "「%USERPROFILE%\\JusticePDF-PRO」と入力して Enter キーを押します。",
+    )
     _step(
         doc, 2,
         "フォルダの中の「create_desktop_shortcuts.ps1」を右クリックし、"
@@ -342,7 +375,8 @@ def build_doc() -> Document:
     _tip(
         doc,
         "「PowerShell で実行」が出ない・うまく動かないときは、次の方法を試してください。"
-        "エクスプローラーで JusticePDF-PRO フォルダを開き、上のアドレスバーに「powershell」と"
+        "エクスプローラーで JusticePDF-PRO フォルダ（C:\\Users\\（s付き職員番号）\\JusticePDF-PRO）を開き、"
+        "上のアドレスバーに「powershell」と"
         "入力して Enter キーを押します。表示された画面に、次の 1 行を入力して Enter キーを押します。",
     )
 
@@ -371,7 +405,7 @@ def build_doc() -> Document:
     _bullet(
         doc,
         "新しい版に更新するときは、(1) JusticePDF を閉じる → (2) 古い JusticePDF-PRO "
-        "フォルダを削除 → (3) 新しい ZIP ファイルを同じ場所（C:\\）に展開 → "
+        "フォルダを削除 → (3) 新しい ZIP ファイルを同じ場所（ユーザーフォルダ C:\\Users\\（s付き職員番号））に展開 → "
         "(4) 必要ならショートカットを作り直す、の順に行います。"
         "設定や、作業フォルダ（ドキュメント／PDFs）の中の PDF はそのまま残ります。",
     )
@@ -394,7 +428,8 @@ def build_doc() -> Document:
     _step(doc, 3, "しばらくすると JusticePDF の画面が開きます。")
     _tip(
         doc,
-        "デスクトップにショートカットが無いときは、JusticePDF-PRO フォルダの中の"
+        "デスクトップにショートカットが無いときは、JusticePDF-PRO フォルダ"
+        "（C:\\Users\\（s付き職員番号）\\JusticePDF-PRO）の中の"
         "「run_justice_gui.cmd」を直接ダブルクリックしても起動できます"
         "（「実行しますか？」のような確認画面が出たら、「実行」をクリックします）。",
     )
