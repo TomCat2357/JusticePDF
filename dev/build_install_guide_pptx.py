@@ -401,9 +401,10 @@ def slide_step2a(prs):
              align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
 
     x, w = 4.4, 5.1
-    step_row(s, x, 1.5, w, 1.0, 1, [
-        ["「ダウンロード」フォルダを開く", ],
-        {"runs": ["（フォルダ画面の左側の一覧にあります）"], "size": 18,
+    step_row(s, x, 1.4, w, 1.2, 1, [
+        ["ダウンロードした"],
+        ["zip がある場所を開く"],
+        {"runs": ["（ふつうは「ダウンロード」フォルダ）"], "size": 16,
          "color": GRAY},
     ])
     step_row(s, x, 2.7, w, 1.0, 2, [
