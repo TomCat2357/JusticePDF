@@ -64,10 +64,10 @@ def test_remove_pages_drops_dangling_bookmarks_on_disk(tmp_path):
 
 
 def _select_and_delete(window, qtbot, index):
-    window._on_thumbnail_clicked(window._thumbnails[index])
-    count = len(window._thumbnails)
+    window._on_page_clicked(index)
+    count = window._page_count
     window._on_delete()
-    qtbot.waitUntil(lambda: len(window._thumbnails) == count - 1)
+    qtbot.waitUntil(lambda: window._page_count == count - 1)
 
 
 @pytest.mark.usefixtures("qapp")
@@ -86,11 +86,11 @@ def test_delete_page_in_window_updates_toc_tree_and_undo_redo(qtbot, tmp_path):
     assert tree == expected
 
     window._on_undo()
-    qtbot.waitUntil(lambda: len(window._thumbnails) == 4)
+    qtbot.waitUntil(lambda: window._page_count == 4)
     assert [[e.level, e.title, e.page] for e in get_pdf_toc(str(pdf))] == original
     tree = [[e.level, e.title, e.page] for e in window._bookmarks_panel._tree_to_entries()]
     assert tree == original
 
     window._on_redo()
-    qtbot.waitUntil(lambda: len(window._thumbnails) == 3)
+    qtbot.waitUntil(lambda: window._page_count == 3)
     assert _rows(get_pdf_toc(str(pdf))) == expected

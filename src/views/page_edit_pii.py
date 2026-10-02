@@ -1037,7 +1037,7 @@ class PiiDrawerMixin:
         """「このページだけ」の対象ページ。拡大表示では表示中のページ、ページ一覧では選択中の先頭ページ。"""
         if self._zoom_view_shown():
             return self._zoom_page_num
-        selected = [t.page_num for t in self._selected_thumbnails]
+        selected = list(self._selected_pages)
         return min(selected) if selected else None
 
     def _pii_page_indices_for_scope(self, scope: str) -> list[int] | None:

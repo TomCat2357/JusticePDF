@@ -265,8 +265,7 @@ def scene_page_edit_grid(pdf_path: Path) -> None:
     pew = _make_page_edit_window(pdf_path)
     # Select first page so it has a highlight
     if pew._thumbnails:
-        pew._thumbnails[0].set_selected(True)
-        pew._selected_thumbnails.append(pew._thumbnails[0])
+        pew._select_pages([0])
     QApplication.processEvents()
     _save(pew, "05_page_edit_grid.png")
     pew.close()

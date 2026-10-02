@@ -1,4 +1,5 @@
 """Page edit window for editing PDF pages."""
+import bisect
 import itertools
 import os
 import shutil
@@ -171,7 +172,6 @@ def _line_endpoints_from_shape(
 from src.models.undo_manager import UndoManager, UndoAction
 from src.views.bookmarks_panel import BookmarksPanel
 from src.views.view_helpers import (
-    clear_selection,
     log_undo_state,
     register_shortcuts,
     responsive_grid_metrics,
@@ -244,7 +244,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._open_manual_session()
         self._did_initial_grid_layout = False
         self._thumbnails: list[PageThumbnail] = []
-        self._selected_thumbnails: list[PageThumbnail] = []
+        # 選択中ページ(インデックスキーの順序付き集合)。最後のキーがシフト範囲選択の起点。
+        # list() の順序がドラッグ MIME の順序になる。
+        self._selected_pages: dict[int, None] = {}
+        self._page_count: int = 0
         self._grid_scroll = None
         self._zoom_view = None
         self._zoom_scroll = None
@@ -753,7 +756,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         """しおり追加の対象ページ(1始まり)。ページ一覧では選択中の先頭ページ、無ければ None。"""
         if self._zoom_view_shown():
             return (self._zoom_page_num or 0) + 1
-        selected = [t.page_num for t in self._selected_thumbnails]
+        selected = list(self._selected_pages)
         return min(selected) + 1 if selected else None
 
     def _sync_bookmark_page_availability(self) -> None:
@@ -1187,7 +1190,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
 
     def _update_button_states(self) -> None:
-        has_selection = len(self._selected_thumbnails) > 0
+        has_selection = len(self._selected_pages) > 0
         zoom_active = bool(
             self._zoom_view
             and self._zoom_view.isVisible()
@@ -1452,7 +1455,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._thumb_render_timer.start(0)
 
     def _enqueue_thumbnail_render(self, page_num: int, *, priority: bool = False) -> None:
-        if page_num < 0 or page_num >= len(self._thumbnails):
+        if page_num < 0 or page_num >= self._page_count:
             return
         thumb = self._thumbnails[page_num]
         if thumb._explicitly_hidden or thumb.thumbnail_loaded:
@@ -1519,7 +1522,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         QTimer.singleShot(0, self._enqueue_visible_thumbnail_renders)
 
     def _request_thumbnail_refresh(self, page_num: int) -> None:
-        if page_num < 0 or page_num >= len(self._thumbnails):
+        if page_num < 0 or page_num >= self._page_count:
             return
         thumb = self._thumbnails[page_num]
         thumb.invalidate_thumbnail()
@@ -1639,7 +1642,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         while self._thumb_render_queue and len(batch) < batch_limit:
             page_num = self._thumb_render_queue.popleft()
             self._thumb_render_queue_set.discard(page_num)
-            if page_num < 0 or page_num >= len(self._thumbnails):
+            if page_num < 0 or page_num >= self._page_count:
                 continue
             thumb = self._thumbnails[page_num]
             if thumb._explicitly_hidden or thumb.thumbnail_loaded:
@@ -1676,7 +1679,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             pii_opacity = pii_settings.mask_opacity
             pii_hidden = pii_settings.hidden_entities()
             for pn in batch:
-                if pn < len(self._thumbnails):
+                if pn < self._page_count:
                     pixmap = pixmaps.get(pn, QPixmap())
                     thumb = self._thumbnails[pn]
                     # 塗りつぶし対象はピクセルへ焼き込まず、サムネイルの paint 時に重ねる
@@ -1726,7 +1729,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         for thumb in self._thumbnails:
             thumb.deleteLater()
         self._thumbnails.clear()
-        self._selected_thumbnails.clear()
+        self._page_count = 0
+        self._selected_pages.clear()
         self._zoom_text_cache.clear()
         self._zoom_annotations = []
 
@@ -1763,8 +1767,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         else:
             for i in range(page_count):
                 thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
-                thumb.clicked.connect(self._on_thumbnail_clicked)
+                thumb.clicked.connect(self._on_page_clicked)
                 self._thumbnails.append(thumb)
+            self._page_count = len(self._thumbnails)
 
             self._refresh_grid()
             self._enqueue_all_thumbnail_renders()
@@ -1829,9 +1834,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         try:
             for i in chunk:
                 thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
-                thumb.clicked.connect(self._on_thumbnail_clicked)
+                thumb.clicked.connect(self._on_page_clicked)
                 self._thumbnails.append(thumb)
-                row, col = divmod(len(self._thumbnails) - 1, cols)
+                self._page_count = len(self._thumbnails)
+                row, col = divmod(self._page_count - 1, cols)
                 self._grid_layout.addWidget(thumb, row, col)
                 thumb.setVisible(True)
         finally:
@@ -1845,7 +1851,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             # まだ続きがある: 進捗をタイトルに表示しつつ次のイベントループへ
             self.setWindowTitle(
                 f"{self._page_edit_window_title()} - 読み込み中 "
-                f"({len(self._thumbnails)}/{self._pending_widget_total})"
+                f"({self._page_count}/{self._pending_widget_total})"
             )
             QTimer.singleShot(0, lambda: self._build_chunk_if_alive(generation))
         else:
@@ -1873,7 +1879,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             return
         clear_pixmap_cache_for_path(self._pdf_path)
         page_count = get_page_count(self._pdf_path)
-        if page_count != len(self._thumbnails):
+        if page_count != self._page_count:
             self._load_pages()
             return
 
@@ -1997,14 +2003,25 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # グリッドから全サムネイルを一旦取り除く
         self._detach_all_from_grid_layout()
 
+        removed_sorted = sorted({i for i in page_indices if 0 <= i < self._page_count})
+        removed_set = set(removed_sorted)
+
         # 指定されたインデックスのサムネイルを削除（逆順で処理）
         for idx in sorted(page_indices, reverse=True):
-            if 0 <= idx < len(self._thumbnails):
+            if 0 <= idx < self._page_count:
                 thumb = self._thumbnails.pop(idx)
-                if thumb in self._selected_thumbnails:
-                    self._selected_thumbnails.remove(thumb)
                 thumb.hide()  # 親から外さないので、削除されるまで残像が出ないよう隠す
                 thumb.deleteLater()
+
+        self._page_count = len(self._thumbnails)
+        # 選択ページのインデックスを削除分だけ詰める(削除されたページは選択から外す)
+        if self._selected_pages:
+            remapped: dict[int, None] = {}
+            for k in self._selected_pages:
+                if k in removed_set:
+                    continue
+                remapped[k - bisect.bisect_left(removed_sorted, k)] = None
+            self._selected_pages = remapped
 
         # ページ番号を再割り当て
         for i, thumb in enumerate(self._thumbnails):
@@ -2015,7 +2032,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
         # ズームビューのページ番号を調整
         if self._zoom_page_num is not None:
-            page_count = len(self._thumbnails)
+            page_count = self._page_count
             if page_count == 0:
                 self._zoom_page_num = None
                 if self._zoom_view and self._zoom_view.isVisible():
@@ -2032,9 +2049,35 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._refresh_grid()
         self._enqueue_all_thumbnail_renders()
 
+    def _sync_page_selected(self, page: int, selected: bool) -> None:
+        """選択状態をウィジェットへ反映する唯一の入口(後でグリッド側の更新に差し替える)。"""
+        if 0 <= page < self._page_count:
+            self._thumbnails[page].set_selected(selected)
+
     def _clear_selection(self) -> None:
-        clear_selection(self._selected_thumbnails)
+        pages = list(self._selected_pages)
+        self._selected_pages.clear()
+        for p in pages:
+            self._sync_page_selected(p, False)
         self._update_button_states()
+
+    def _select_pages(self, pages, *, clear: bool = True) -> None:
+        """指定ページを(順に)選択へ追加する。範囲外は無視。clear=True なら先に選択を解除する。"""
+        if clear:
+            self._clear_selection()
+        for p in pages:
+            if 0 <= p < self._page_count and p not in self._selected_pages:
+                self._selected_pages[p] = None
+                self._sync_page_selected(p, True)
+        self._update_button_states()
+
+    def _toggle_page(self, page: int) -> None:
+        if page in self._selected_pages:
+            del self._selected_pages[page]
+            self._sync_page_selected(page, False)
+        elif 0 <= page < self._page_count:
+            self._selected_pages[page] = None
+            self._sync_page_selected(page, True)
 
     def _set_thumbnail_size(self, size: int) -> None:
         size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
@@ -2065,43 +2108,23 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 return True
         return super().eventFilter(obj, event)
 
-    def hide_page(self, page_num: int) -> None:
-        for thumb in self._thumbnails:
-            if thumb.page_num == page_num:
-                thumb._explicitly_hidden = True
-                thumb.setVisible(False)
-                if thumb in self._selected_thumbnails:
-                    self._selected_thumbnails.remove(thumb)
-                break
-
-    def _on_thumbnail_clicked(self, thumb: PageThumbnail) -> None:
+    def _on_page_clicked(self, page: int) -> None:
         modifiers = QApplication.keyboardModifiers()
 
         if modifiers & Qt.KeyboardModifier.ControlModifier:
-            if thumb in self._selected_thumbnails:
-                thumb.set_selected(False)
-                self._selected_thumbnails.remove(thumb)
-            else:
-                thumb.set_selected(True)
-                self._selected_thumbnails.append(thumb)
+            self._toggle_page(page)
         elif modifiers & Qt.KeyboardModifier.ShiftModifier:
-            if self._selected_thumbnails:
-                start_idx = self._thumbnails.index(self._selected_thumbnails[-1])
-                end_idx = self._thumbnails.index(thumb)
-                if start_idx > end_idx:
-                    start_idx, end_idx = end_idx, start_idx
-                for i in range(start_idx, end_idx + 1):
-                    if self._thumbnails[i] not in self._selected_thumbnails:
-                        self._thumbnails[i].set_selected(True)
-                        self._selected_thumbnails.append(self._thumbnails[i])
+            if self._selected_pages:
+                # 起点は最後に選択したページ。範囲は添字順に(未選択のものだけ)追加するので、
+                # 起点は範囲の端へ移る。
+                anchor = next(reversed(self._selected_pages))
+                lo, hi = (anchor, page) if anchor <= page else (page, anchor)
+                self._select_pages(range(lo, hi + 1), clear=False)
             else:
-                thumb.set_selected(True)
-                self._selected_thumbnails.append(thumb)
+                self._select_pages([page], clear=False)
         else:
-            if thumb not in self._selected_thumbnails:
-                self._clear_selection()
-                thumb.set_selected(True)
-                self._selected_thumbnails.append(thumb)
+            if page not in self._selected_pages:
+                self._select_pages([page])
 
         self._update_button_states()
 
@@ -2157,14 +2180,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
     def _select_page_thumbnail(self, page_num: int) -> None:
         """ページ一覧で、そのページのサムネイルだけを選択して見える位置へスクロールする。"""
-        if not 0 <= page_num < len(self._thumbnails):
+        if not 0 <= page_num < self._page_count:
             return
-        self._clear_selection()
-        thumb = self._thumbnails[page_num]
-        thumb.set_selected(True)
-        self._selected_thumbnails.append(thumb)
+        self._select_pages([page_num])
         if self._grid_scroll:
-            self._grid_scroll.ensureWidgetVisible(thumb)
+            self._grid_scroll.ensureWidgetVisible(self._thumbnails[page_num])
         self._update_button_states()
 
     def _set_zoom_percent(self, value: int) -> None:
@@ -2609,14 +2629,14 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._delete_zoom_page()
             return
 
-        if not self._selected_thumbnails:
+        if not self._selected_pages:
             return
         if not self._ensure_saved("ページの削除"):
             return
 
         import tempfile
 
-        indices = sorted([t.page_num for t in self._selected_thumbnails], reverse=True)
+        indices = sorted(self._selected_pages, reverse=True)
         pdf_path = self._pdf_path
 
         # 全ページ削除かチェック
@@ -2762,33 +2782,29 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._rotate_zoom_page()
             return
 
-        if not self._selected_thumbnails:
+        if not self._selected_pages:
             return
         if not self._ensure_saved("ページの回転"):
             return
 
-        indices = [t.page_num for t in self._selected_thumbnails]
+        indices = list(self._selected_pages)
         pdf_path = self._pdf_path
-        selected_thumbs = list(self._selected_thumbnails)
+        selected_pages = list(indices)
 
         def do_rotate():
             rotate_pages(pdf_path, indices, 90)
-            for thumb in selected_thumbs:
-                self._request_thumbnail_refresh(thumb.page_num)
+            for page in selected_pages:
+                self._request_thumbnail_refresh(page)
 
         def undo_rotate():
             rotate_pages(pdf_path, indices, 270)
-            for thumb in selected_thumbs:
-                self._request_thumbnail_refresh(thumb.page_num)
+            for page in selected_pages:
+                self._request_thumbnail_refresh(page)
 
         self._push_undoable(f"Rotate {len(indices)} page(s)", do_rotate, undo_rotate, writes_file=True)
 
     def _on_select_all(self) -> None:
-        self._clear_selection()
-        for thumb in self._thumbnails:
-            thumb.set_selected(True)
-            self._selected_thumbnails.append(thumb)
-        self._update_button_states()
+        self._select_pages(range(self._page_count))
 
     def _delete_zoom_page(self) -> None:
         """ズームビュー表示中のページを削除"""
@@ -2867,7 +2883,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             if self._zoom_view and self._zoom_view.isVisible():
                 self._render_zoom()
             # サムネイルも更新
-            if page_num < len(self._thumbnails):
+            if page_num < self._page_count:
                 self._request_thumbnail_refresh(page_num)
 
         def undo_rotate():
@@ -2875,7 +2891,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_text_cache.pop(page_num, None)
             if self._zoom_view and self._zoom_view.isVisible():
                 self._render_zoom()
-            if page_num < len(self._thumbnails):
+            if page_num < self._page_count:
                 self._request_thumbnail_refresh(page_num)
 
         self._push_undoable("Rotate page from zoom view", do_rotate, undo_rotate, writes_file=True)
@@ -2993,12 +3009,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             rect = QRect(self._rubber_band_origin, container_pos).normalized()
             self._rubber_band.setGeometry(rect)
             # Select thumbnails intersecting with rubber band
-            self._clear_selection()
-            for thumb in self._thumbnails:
-                if thumb.isVisible() and rect.intersects(thumb.geometry()):
-                    thumb.set_selected(True)
-                    self._selected_thumbnails.append(thumb)
-            self._update_button_states()
+            self._select_pages(
+                thumb.page_num
+                for thumb in self._thumbnails
+                if thumb.isVisible() and rect.intersects(thumb.geometry())
+            )
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
@@ -3079,11 +3094,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._drop_indicator.show()
 
         targets = []
-        if 0 <= idx - 1 < len(self._thumbnails):
+        if 0 <= idx - 1 < self._page_count:
             left = self._thumbnails[idx - 1]
             if left.isVisible():
                 targets.append(left)
-        if 0 <= idx < len(self._thumbnails):
+        if 0 <= idx < self._page_count:
             right = self._thumbnails[idx]
             if right.isVisible():
                 targets.append(right)
@@ -3169,12 +3184,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             reorder_pages(pdf_path, new_order)
             self._load_pages()
             # Select moved pages
-            self._clear_selection()
-            for i in range(final_insert_index, final_insert_index + moved_count):
-                if i < len(self._thumbnails):
-                    self._thumbnails[i].set_selected(True)
-                    self._selected_thumbnails.append(self._thumbnails[i])
-            self._update_button_states()
+            self._select_pages(range(final_insert_index, final_insert_index + moved_count))
 
         def undo_reorder():
             inverse = [0] * len(new_order)
@@ -3212,12 +3222,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
             self._load_pages()
-            self._clear_selection()
-            for i in range(insert_at, insert_at + copied_count):
-                if i < len(self._thumbnails):
-                    self._thumbnails[i].set_selected(True)
-                    self._selected_thumbnails.append(self._thumbnails[i])
-            self._update_button_states()
+            self._select_pages(range(insert_at, insert_at + copied_count))
 
         def undo_copy():
             remove_pages(pdf_path, list(range(insert_at, insert_at + copied_count)))
@@ -3277,12 +3282,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._load_pages()
 
         # Select inserted pages
-        self._clear_selection()
-        for i in range(insert_at, insert_at + inserted_count):
-            if i < len(self._thumbnails):
-                self._thumbnails[i].set_selected(True)
-                self._selected_thumbnails.append(self._thumbnails[i])
-        self._update_button_states()
+        self._select_pages(range(insert_at, insert_at + inserted_count))
 
         try:
             if not is_copy:
@@ -3322,9 +3322,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 if pos.x() < center_x:
                     return i
                 return i + 1
-        if self._thumbnails:
-            return len(self._thumbnails)
-        return 0
+        return self._page_count
 
     def _current_file_size(self) -> int:
         try:
@@ -3440,7 +3438,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
 
     def _jump_to_search_page(self, page_num: int) -> None:
-        if page_num < 0 or page_num >= len(self._thumbnails):
+        if page_num < 0 or page_num >= self._page_count:
             return
         zoom_visible = bool(self._zoom_view and self._zoom_view.isVisible())
         if zoom_visible:
@@ -3452,12 +3450,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._render_zoom()
         else:
             # サムネイルグリッド表示中は選択 + スクロール
-            self._clear_selection()
-            thumb = self._thumbnails[page_num]
-            thumb.set_selected(True)
-            self._selected_thumbnails.append(thumb)
+            self._select_pages([page_num])
             if self._grid_scroll:
-                self._grid_scroll.ensureWidgetVisible(thumb)
+                self._grid_scroll.ensureWidgetVisible(self._thumbnails[page_num])
             self._update_button_states()
 
     def _apply_search_highlights(self) -> None:

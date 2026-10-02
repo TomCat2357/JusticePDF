@@ -359,7 +359,7 @@ class _PiiOverlayLabel(QLabel):
 class PageThumbnail(QFrame):
     """Widget representing a single PDF page."""
 
-    clicked = pyqtSignal(object)
+    clicked = pyqtSignal(int)
     THUMBNAIL_SIZE = 120
     CARD_PADDING = 30  # total horizontal/vertical padding around the thumbnail
 
@@ -505,6 +505,9 @@ class PageThumbnail(QFrame):
         return self._is_selected
 
     def set_selected(self, selected: bool) -> None:
+        selected = bool(selected)
+        if self._is_selected == selected:
+            return
         self._is_selected = selected
         self._update_style()
 
@@ -527,7 +530,7 @@ class PageThumbnail(QFrame):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start_pos = event.pos()
-            self.clicked.emit(self)
+            self.clicked.emit(self._page_num)
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
@@ -547,15 +550,10 @@ class PageThumbnail(QFrame):
 
         parent_window = self.window()
         page_nums_list = [self._page_num]
-        if hasattr(parent_window, '_selected_thumbnails'):
-            selected_thumbs = parent_window._selected_thumbnails
-            if self in selected_thumbs and len(selected_thumbs) > 1:
-                page_nums_list = [thumb.page_num for thumb in selected_thumbs]
-                page_nums_str = ','.join(str(n) for n in page_nums_list)
-            else:
-                page_nums_str = str(self._page_num)
-        else:
-            page_nums_str = str(self._page_num)
+        selected_pages = list(getattr(parent_window, '_selected_pages', ()))
+        if self._page_num in selected_pages and len(selected_pages) > 1:
+            page_nums_list = selected_pages
+        page_nums_str = ','.join(str(n) for n in page_nums_list)
 
         logger.debug(f"Starting drag: pdf_path={self._pdf_path}, page_nums={page_nums_list}")
 

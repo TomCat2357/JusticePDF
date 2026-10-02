@@ -2029,7 +2029,7 @@ class ZoomAnnotationMixin:
             self._zoom_label.commit_annotation_text_edit()
     def _refresh_current_zoom_page(self, *, open_drawer: bool = False) -> None:
         self._commit_inline_annotation_editor()
-        if self._zoom_page_num is not None and self._zoom_page_num < len(self._thumbnails):
+        if self._zoom_page_num is not None and self._zoom_page_num < self._page_count:
             self._request_thumbnail_refresh(self._zoom_page_num)
         if self._zoom_view and self._zoom_view.isVisible():
             self._render_zoom()

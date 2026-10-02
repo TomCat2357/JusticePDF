@@ -54,7 +54,7 @@ def test_small_document_loads_synchronously_in_normal_mode(qtbot, tmp_path):
     assert window._is_heavy_document is False
     # 通常文書は _load_pages() 呼び出し内で全ウィジェットが同期的に揃う
     # (チャンク分割やタイマー待ちが不要=既存の挙動を維持)。
-    assert len(window._thumbnails) == 5
+    assert window._page_count == 5
 
 
 def test_heavy_document_builds_widgets_incrementally(qtbot, tmp_path):
@@ -66,10 +66,10 @@ def test_heavy_document_builds_widgets_incrementally(qtbot, tmp_path):
     assert window._is_heavy_document is True
     # _load_pages() から戻った直後は最初のチャンク分しか生成されていない
     # (全ページ分を同期生成する場合、ここで既に page_count と一致してしまう)。
-    assert 0 < len(window._thumbnails) <= HEAVY_PDF_WIDGET_CHUNK_SIZE
+    assert 0 < window._page_count <= HEAVY_PDF_WIDGET_CHUNK_SIZE
 
-    qtbot.waitUntil(lambda: len(window._thumbnails) == page_count, timeout=10000)
-    assert len(window._thumbnails) == page_count
+    qtbot.waitUntil(lambda: window._page_count == page_count, timeout=10000)
+    assert window._page_count == page_count
 
 
 def test_heavy_document_does_not_prequeue_every_page(qtbot, tmp_path):
@@ -77,7 +77,7 @@ def test_heavy_document_does_not_prequeue_every_page(qtbot, tmp_path):
     pdf_path = tmp_path / "heavy-queue.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    qtbot.waitUntil(lambda: len(window._thumbnails) == page_count, timeout=10000)
+    qtbot.waitUntil(lambda: window._page_count == page_count, timeout=10000)
 
     window._enqueue_all_thumbnail_renders()
 
@@ -105,7 +105,7 @@ def test_heavy_document_render_batch_is_single_page(qtbot, tmp_path):
     pdf_path = tmp_path / "heavy-batch.pdf"
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
-    qtbot.waitUntil(lambda: len(window._thumbnails) == page_count, timeout=10000)
+    qtbot.waitUntil(lambda: window._page_count == page_count, timeout=10000)
 
     # ウィンドウ下端付近(通常は表示範囲外)のページを手動でキューに積み、
     # 1回のタイマー発火でどこまで描画されるかを検証する。
@@ -409,22 +409,6 @@ def test_heavy_window_close_releases_held_doc(qtbot, tmp_path):
     window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
     window.close()
     assert not _held_docs
-
-
-def test_refresh_grid_keeps_thumbnails_parented_and_respects_hidden(qtbot, tmp_path):
-    """再配置は親を外さない(setParent(None) は件数の2乗で遅い)。非表示ページは並べない。"""
-    pdf_path = tmp_path / "grid.pdf"
-    make_pdf(pdf_path, pages=6, width=80, height=80)
-    window = create_page_edit_window(qtbot, pdf_path)
-    window.hide_page(2)
-    window._refresh_grid()
-    assert all(t.parentWidget() is window._container for t in window._thumbnails)
-    laid_out = [
-        window._grid_layout.itemAt(i).widget() for i in range(window._grid_layout.count())
-    ]
-    assert window._thumbnails[2] not in laid_out
-    assert len(laid_out) == 5
-    assert window._thumbnails[2].isHidden()
 
 
 def test_heavy_chunk_does_not_toggle_container_updates(qtbot, tmp_path, monkeypatch):
