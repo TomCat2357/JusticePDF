@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import replace as dataclass_replace
 from enum import Enum, auto
+from PyQt6 import sip
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -120,7 +121,9 @@ from src.utils import app_settings
 from src.utils.pdf_utils.common import (
     PdfSession,
     PdfSessionConflictError,
+    hold_doc,
     open_session,
+    release_held_docs,
     release_session_for_path,
 )
 from src.utils.constants import (
@@ -279,6 +282,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # 初回アクセス時に文書全体を一度だけ開いて集計する。ページ構成が変わる
         # 操作(読み込み直し・削除等)の際に None へ戻して再集計させる。
         self._ink_xrefs_by_page_cache: dict[int, list[int]] | None = None
+        # 重量文書では表示対象ページ分だけを集計するため、走査済みページを覚える
+        # (None=全ページ走査済み。キャッシュが None のときは参照されず作り直される)。
+        self._ink_xrefs_scanned_pages: set[int] | None = None
         # 描画済みサムネイルごとの「塗りつぶし対象の xref」(描き直しの要否判定用)。
         self._grid_pii_xrefs: dict[int, tuple[int, ...]] = {}
         # ページ一覧サムネイルに重ねる塗りつぶし対象(個人情報検出)のページ別
@@ -287,6 +293,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._pii_targets_by_page_cache: (
             "tuple[tuple[int, int, int], dict[int, tuple[tuple[float, float], list]]] | None"
         ) = None
+        # 上記の走査済みページ(重量文書の部分集計用。None=全ページ走査済み)。
+        self._pii_targets_scanned_pages: set[int] | None = None
         # 個人情報検出の結果一覧用の行キャッシュ(ページ別・ファイルトークン付き)。
         # 注釈書き込みで変わったページ分だけ組み直す(_build_pii_result_rows 参照)。
         self._pii_result_rows_cache: (
@@ -351,6 +359,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # 重量文書でのウィジェット生成をチャンクへ分割するための残りページ
         # イテレータ(通常文書では None のまま)。
         self._pending_widget_pages: "Iterator[int] | None" = None
+        # 現在グリッドへ並べ終えている列数(None=未確定/不整合)。リサイズで列数が
+        # 変わらないときの並べ直しスキップと、読み込み中に抑止したリサイズの判定に使う。
+        self._grid_laid_out_cols: int | None = None
+        # 重量文書の読み込み中に届いたリサイズ(読み込み完了時に1回だけ反映する)。
+        self._grid_resize_deferred = False
         # 進捗表示用(_pending_widget_pages が None でない間だけ意味を持つ)。
         self._pending_widget_total: int = 0
         # _load_pages() 呼び出しごとに増える世代番号。チャンク処理中に再度
@@ -360,13 +373,21 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._thumb_render_timer = QTimer(self)
         self._thumb_render_timer.setSingleShot(True)
         self._thumb_render_timer.timeout.connect(self._process_thumbnail_render_queue)
+        # 重量文書の描画バッチ間で保持している文書(hold_doc(linger=True))を、一定時間
+        # 描画が無ければ閉じる。保持するのはファイルのメモリ上の写しでハンドルは掴まない。
+        self._held_doc_idle_timer = QTimer(self)
+        self._held_doc_idle_timer.setSingleShot(True)
+        self._held_doc_idle_timer.setInterval(3000)
+        self._held_doc_idle_timer.timeout.connect(self._release_held_doc)
+        _held_path = self._pdf_path
+        self.destroyed.connect(lambda *_a, _p=_held_path: release_held_docs(_p))
         self._scroll_debounce_timer = QTimer(self)
         self._scroll_debounce_timer.setSingleShot(True)
         self._scroll_debounce_timer.setInterval(60)
         self._scroll_debounce_timer.timeout.connect(self._enqueue_visible_thumbnail_renders)
         self._grid_resize_timer = QTimer(self)
         self._grid_resize_timer.setSingleShot(True)
-        self._grid_resize_timer.timeout.connect(self._refresh_grid)
+        self._grid_resize_timer.timeout.connect(self._on_grid_resize_settled)
 
         # Drop indicator
         self._drop_indicator = None
@@ -1505,19 +1526,51 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._enqueue_thumbnail_render(page_num, priority=True)
         self._schedule_thumbnail_render()
 
-    def _get_ink_xrefs_by_page(self) -> dict[int, list[int]]:
-        """文書全体の Ink 注釈 xref をページ番号ごとに取得する(結果はキャッシュ)。"""
+    def _get_ink_xrefs_by_page(
+        self, pages: "list[int] | None" = None
+    ) -> dict[int, list[int]]:
+        """Ink 注釈 xref をページ番号ごとに取得する(結果はキャッシュ)。
+
+        通常文書は文書全体を一度だけ集計する。重量文書で ``pages`` を渡したときは、
+        まだ走査していないページ分だけ集計して足す(全ページ走査でフリーズするのを避ける)。
+        ``pages`` 以外のページ分はキャッシュに無いことがあるので、呼び出し側は渡した
+        ページだけを参照すること。
+        """
         if self._ink_xrefs_by_page_cache is None:
+            self._ink_xrefs_scanned_pages = set()
+        if self._is_heavy_document and pages is not None:
+            if self._ink_xrefs_by_page_cache is None:
+                self._ink_xrefs_by_page_cache = {}
+            scanned = self._ink_xrefs_scanned_pages
+            if scanned is not None:
+                missing = [pn for pn in pages if pn not in scanned]
+                if missing:
+                    self._ink_xrefs_by_page_cache.update(
+                        list_ink_annot_xrefs_by_page(self._pdf_path, missing)
+                    )
+                    scanned.update(missing)
+            return self._ink_xrefs_by_page_cache
+        if self._ink_xrefs_by_page_cache is None or self._ink_xrefs_scanned_pages is not None:
             self._ink_xrefs_by_page_cache = list_ink_annot_xrefs_by_page(self._pdf_path)
+            self._ink_xrefs_scanned_pages = None  # 全ページ走査済み
         return self._ink_xrefs_by_page_cache
 
-    def _get_pii_targets_by_page(self) -> "dict[int, tuple[tuple[float, float], list]]":
-        """ページ番号 -> (表示座標系のページサイズ, 塗りつぶし対象の一覧)。"""
+    def _get_pii_targets_by_page(
+        self, pages: "list[int] | None" = None
+    ) -> "dict[int, tuple[tuple[float, float], list]]":
+        """ページ番号 -> (表示座標系のページサイズ, 塗りつぶし対象の一覧)。
+
+        重量文書で ``pages`` を渡したときは、そのページのうち未走査の分だけ集計する
+        (全ページ走査でフリーズするのを避ける)。その場合 ``pages`` 以外のページ分は
+        含まれないことがあるので、呼び出し側は渡したページだけを参照すること。
+        """
+        partial = self._is_heavy_document and pages is not None
         token = _get_file_cache_token(self._pdf_path)
         cached = self._pii_targets_by_page_cache
-        if cached is not None and cached[0] == token:
-            return cached[1]
-        if cached is not None:
+        if cached is None:
+            self._pii_targets_scanned_pages = set()
+        scanned = self._pii_targets_scanned_pages  # None = 全ページ走査済み
+        if cached is not None and cached[0] != token:
             # 自分の注釈書き込みだけでトークンが変わったなら、変更したページだけ再スキャンする。
             # 外部変更・ページ構成変更が挟まって追跡できない(None)ときは全ページ再スキャン。
             changed = pages_changed_since(self._pdf_path, cached[0])
@@ -1525,12 +1578,32 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 by_page = dict(cached[1])
                 for pn in changed:
                     by_page.pop(pn, None)
-                by_page.update(list_pii_targets_by_page(self._pdf_path, changed))
-                self._pii_targets_by_page_cache = (token, by_page)
-                return by_page
+                if scanned is None:
+                    by_page.update(list_pii_targets_by_page(self._pdf_path, changed))
+                else:
+                    # 部分キャッシュ: 変えたページは未走査に戻し、必要になったとき再集計する。
+                    scanned.difference_update(changed)
+                cached = (token, by_page)
+                self._pii_targets_by_page_cache = cached
+            else:
+                cached = None
+                self._pii_targets_scanned_pages = scanned = set()
+        if partial:
+            if cached is None:
+                cached = (token, {})
+                self._pii_targets_by_page_cache = cached
+            if scanned is not None:
+                missing = [pn for pn in pages if pn not in scanned]
+                if missing:
+                    cached[1].update(list_pii_targets_by_page(self._pdf_path, missing))
+                    scanned.update(missing)
+            return cached[1]
+        if cached is not None and scanned is None:
+            return cached[1]
         # ドキュメントを1回だけ開く(PIIのあるページ数に依存しない)。
         by_page = list_pii_targets_by_page(self._pdf_path)
         self._pii_targets_by_page_cache = (token, by_page)
+        self._pii_targets_scanned_pages = None  # 全ページ走査済み
         return by_page
 
     def _sync_grid_pii_thumbnails(self) -> None:
@@ -1541,7 +1614,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         """
         if not self._thumbnails or not self._grid_pii_xrefs:
             return
-        targets = self._get_pii_targets_by_page()
+        # 重量文書は描画済み(=集計済み)のページ分だけ見る(全ページ走査を避ける)。
+        loaded = [pn for pn, t in enumerate(self._thumbnails) if t.thumbnail_loaded]
+        targets = self._get_pii_targets_by_page(loaded if self._is_heavy_document else None)
         for pn, thumb in enumerate(self._thumbnails):
             if not thumb.thumbnail_loaded:
                 continue
@@ -1574,20 +1649,28 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             # 手書き(Ink)注釈を非表示にする設定なら、対象ページ分だけ xref を隠す。
             # 塗りつぶし対象(個人情報検出)も実PDF注釈の暗く薄い見た目では縮小時に
             # 判別できないため、ページ画像からは隠して後から見やすく重ね描きする。
-            pii_targets_by_page = self._get_pii_targets_by_page()
+            # 重量文書は描画バッチのページ分だけ集計する(全ページ走査でフリーズするため)。
+            scan_pages = batch if self._is_heavy_document else None
             hide_xrefs_by_page: dict[int, set[int]] = {}
-            ink_xrefs_by_page = None if self._show_ink_annots else self._get_ink_xrefs_by_page()
-            for pn in batch:
-                xrefs: set[int] = set()
-                if ink_xrefs_by_page:
-                    xrefs.update(ink_xrefs_by_page.get(pn, ()))
-                if pn in pii_targets_by_page:
-                    xrefs.update(t.xref for t in pii_targets_by_page[pn][1])
-                if xrefs:
-                    hide_xrefs_by_page[pn] = xrefs
-            pixmaps = render_page_thumbnails_batch(
-                self._pdf_path, batch, self._thumb_size, hide_xrefs=hide_xrefs_by_page or None
-            )
+            # 走査と描画で同じドキュメントを使い回す(重量文書は開き直すたびに
+            # 最初の load_page でページツリー解析が走り、バッチごとに約1秒ブロックするため)。
+            # 重量文書はバッチをまたいで保持する(アイドル・閉じる・ファイル更新時に閉じる)。
+            with hold_doc(self._pdf_path, linger=self._is_heavy_document):
+                pii_targets_by_page = self._get_pii_targets_by_page(scan_pages)
+                ink_xrefs_by_page = (
+                    None if self._show_ink_annots else self._get_ink_xrefs_by_page(scan_pages)
+                )
+                for pn in batch:
+                    xrefs: set[int] = set()
+                    if ink_xrefs_by_page:
+                        xrefs.update(ink_xrefs_by_page.get(pn, ()))
+                    if pn in pii_targets_by_page:
+                        xrefs.update(t.xref for t in pii_targets_by_page[pn][1])
+                    if xrefs:
+                        hide_xrefs_by_page[pn] = xrefs
+                pixmaps = render_page_thumbnails_batch(
+                    self._pdf_path, batch, self._thumb_size, hide_xrefs=hide_xrefs_by_page or None
+                )
             pii_settings = self._pii_settings()
             pii_color = pii_settings.mask_color
             pii_opacity = pii_settings.mask_opacity
@@ -1608,12 +1691,20 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                         t.xref for t in pii_targets_by_page.get(pn, (None, ()))[1]
                     )
                     thumb.set_pixmap_direct(pixmap)
+            if self._is_heavy_document:
+                self._held_doc_idle_timer.start()
         self._schedule_thumbnail_render()
+
+    def _release_held_doc(self) -> None:
+        """バッチ間で保持している文書を閉じる(アイドル・閉じる・再読込・ファイル更新の前)。"""
+        self._held_doc_idle_timer.stop()
+        release_held_docs(self._pdf_path)
 
     def _on_grid_viewport_changed(self, _value: int) -> None:
         self._scroll_debounce_timer.start()  # デバウンス（スクロール停止150ms後に優先化）
 
     def _load_pages(self) -> None:
+        self._release_held_doc()
         # ページ構成が変わるので、塗りつぶし対象のページ別集計は破棄して全ページ再集計させる。
         self._pii_targets_by_page_cache = None
         self._pii_result_rows_cache = None
@@ -1654,6 +1745,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_page_num = max(0, page_count - 1)
 
         self._widget_build_generation += 1
+        self._grid_laid_out_cols = None
+        self._grid_resize_deferred = False
         self._is_heavy_document = is_heavy_pdf(self._pdf_path, page_count)
 
         if self._is_heavy_document:
@@ -1692,6 +1785,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         mark = " *" if self._session is not None and self._session.dirty() else ""
         return f"JusticePDF - 編集:{os.path.basename(self._pdf_path)}{mark}"
 
+    def _build_chunk_if_alive(self, generation: int) -> None:
+        """ウィンドウ破棄後に singleShot が発火しても例外にならないようにする。"""
+        if sip.isdeleted(self):
+            return
+        self._build_thumbnail_widgets_chunk(generation)
+
     def _build_thumbnail_widgets_chunk(self, generation: int) -> None:
         """重量文書向け: サムネイルウィジェットを少しずつ生成し、都度グリッドへ足す。
 
@@ -1713,14 +1812,30 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         cols = max(1, self._apply_grid_metrics())
         chunk_size = max(1, app_settings.heavy_pdf_widget_chunk_size())
         is_first_chunk = not self._thumbnails
+        if is_first_chunk:
+            self._grid_laid_out_cols = cols
+        elif cols != self._grid_laid_out_cols:
+            # 読み込み中に列数が変わった: 既配置分と食い違うので完了時に並べ直す。
+            self._grid_laid_out_cols = None
         chunk = list(itertools.islice(self._pending_widget_pages, chunk_size))
-        for i in chunk:
-            thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
-            thumb.clicked.connect(self._on_thumbnail_clicked)
-            self._thumbnails.append(thumb)
-            row, col = divmod(len(self._thumbnails) - 1, cols)
-            self._grid_layout.addWidget(thumb, row, col)
-            thumb.setVisible(True)
+        # 表示中のコンテナへ1件ずつ追加すると setVisible のたびに再レイアウト/再描画が
+        # 走り件数に応じて遅くなるため、チャンク中は更新を止める。
+        # 表示中のコンテナへ子を show するたびに親レイアウトが即時に activate され
+        # (全件の再計算で O(件数))、1件数ミリ秒まで遅くなる。チャンク中はレイアウトを
+        # 無効化し更新も止め、終わってから1回だけ反映する。
+        # 注意: ``self._container.setUpdatesEnabled(True)`` は全子孫ウィジェットへ再帰して
+        # update() を発行するため、数千件で約1秒かかる(計測値)。ここでは使わない。
+        self._grid_layout.setEnabled(False)
+        try:
+            for i in chunk:
+                thumb = PageThumbnail(self._pdf_path, i, thumb_size=self._thumb_size)
+                thumb.clicked.connect(self._on_thumbnail_clicked)
+                self._thumbnails.append(thumb)
+                row, col = divmod(len(self._thumbnails) - 1, cols)
+                self._grid_layout.addWidget(thumb, row, col)
+                thumb.setVisible(True)
+        finally:
+            self._grid_layout.setEnabled(True)
 
         if len(chunk) == chunk_size:
             if is_first_chunk:
@@ -1732,12 +1847,17 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 f"{self._page_edit_window_title()} - 読み込み中 "
                 f"({len(self._thumbnails)}/{self._pending_widget_total})"
             )
-            QTimer.singleShot(0, lambda: self._build_thumbnail_widgets_chunk(generation))
+            QTimer.singleShot(0, lambda: self._build_chunk_if_alive(generation))
         else:
             # 全ページ分のウィジェット生成が完了。
             self._pending_widget_pages = None
             self.setWindowTitle(self._page_edit_window_title())
-            self._enqueue_visible_thumbnail_renders()
+            if self._grid_resize_deferred or self._grid_laid_out_cols != cols:
+                # 読み込み中に抑止したリサイズ(列数変更など)をここで1回だけ反映する。
+                self._grid_resize_deferred = False
+                self._refresh_grid()
+            else:
+                self._enqueue_visible_thumbnail_renders()
             if self._zoom_view and self._zoom_view.isVisible():
                 self._render_zoom()
 
@@ -1747,6 +1867,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             return
 
         self._commit_inline_annotation_editor()
+        self._release_held_doc()
         # 手動保存モード: 保存済みなら保持ハンドルを閉じて読み直す。未保存なら破棄してよいか確認する。
         if not self._prepare_session_for_reload():
             return
@@ -1813,22 +1934,59 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 thumb.set_thumbnail_size(self._thumb_size)
         return cols
 
-    def _refresh_grid(self) -> None:
+    def _on_grid_resize_settled(self) -> None:
+        """ビューポートのリサイズ後の再配置。
+
+        重量文書の読み込み中は抑止し(チャンク生成と並べ直しが交互に走って
+        O(ページ数^2) になるため)、完了時に1回だけ反映する。列数もサムネイルサイズも
+        変わらないなら(パネル開閉など)並べ直しを省く。
+        """
+        if self._pending_widget_pages is not None:
+            self._grid_resize_deferred = True
+            return
+        previous_size = self._thumb_size
+        cols = self._apply_grid_metrics()
+        if cols == self._grid_laid_out_cols and self._thumb_size == previous_size:
+            return
+        self._refresh_grid()
+
+    def _detach_all_from_grid_layout(self) -> None:
+        """レイアウトからウィジェットを全て外す(親は変えない)。
+
+        以前は外すたびに ``setParent(None)`` していたが、これは1件ごとにフォーカスチェーン等を
+        辿るため件数の2乗で遅くなる(計測: 8000件で約12秒、14592件で数十秒)。
+        親はコンテナのままにし、再配置しないもの(非表示ページ)は呼び出し側で隠す。
+        """
         while self._grid_layout.count():
-            item = self._grid_layout.takeAt(0)
-            # 削除予定のウィジェットには触らない
-            widget = item.widget()
-            if widget and widget in self._thumbnails:
-                widget.setParent(None)
+            widget = self._grid_layout.takeAt(0).widget()
+            if widget is not None:
+                # WA_LaidOut が残っていると、再度 addWidget するとき Qt が「元のレイアウトから
+                # 外す」ために既配置の全項目を走査する(件数の2乗: 14000件で約4秒)。
+                # 既に外してあるので落としてよい。
+                widget.setAttribute(Qt.WidgetAttribute.WA_LaidOut, False)
+
+    def _refresh_grid(self) -> None:
+        self._detach_all_from_grid_layout()
 
         cols = self._apply_grid_metrics()
+        self._grid_laid_out_cols = cols
 
-        visible_thumbs = [t for t in self._thumbnails if not t._explicitly_hidden]
-        for i, thumb in enumerate(visible_thumbs):
-            row = i // cols
-            col = i % cols
-            self._grid_layout.addWidget(thumb, row, col)
-            thumb.setVisible(True)
+        # コンテナの setUpdatesEnabled(True) は全子孫へ再帰して update() を発行し、
+        # 数千件で約1秒かかる(計測値)ため使わず、レイアウトの無効化だけで抑える。
+        self._grid_layout.setEnabled(False)
+        try:
+            row_col = 0
+            for thumb in self._thumbnails:
+                if thumb._explicitly_hidden:
+                    thumb.setVisible(False)
+                    continue
+                row, col = divmod(row_col, cols)
+                row_col += 1
+                self._grid_layout.addWidget(thumb, row, col)
+                if thumb.isHidden():
+                    thumb.setVisible(True)
+        finally:
+            self._grid_layout.setEnabled(True)
         self._enqueue_visible_thumbnail_renders()
 
     def _remove_page_thumbnails(self, page_indices: list[int]) -> None:
@@ -1837,11 +1995,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # ページ番号がずれるため、ページ別 Ink xref キャッシュも破棄する。
         self._ink_xrefs_by_page_cache = None
         # グリッドから全サムネイルを一旦取り除く
-        while self._grid_layout.count():
-            item = self._grid_layout.takeAt(0)
-            widget = item.widget()
-            if widget and widget in self._thumbnails:
-                widget.setParent(None)
+        self._detach_all_from_grid_layout()
 
         # 指定されたインデックスのサムネイルを削除（逆順で処理）
         for idx in sorted(page_indices, reverse=True):
@@ -1849,6 +2003,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 thumb = self._thumbnails.pop(idx)
                 if thumb in self._selected_thumbnails:
                     self._selected_thumbnails.remove(thumb)
+                thumb.hide()  # 親から外さないので、削除されるまで残像が出ないよう隠す
                 thumb.deleteLater()
 
         # ページ番号を再割り当て
@@ -2802,9 +2957,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._refresh_grid()
-        # The vertical scrollbar may be created by the refresh above. Run one
-        # more pass after Qt has settled the viewport geometry.
+        # 並べ直しは直接呼ばず、デバウンスして _on_grid_resize_settled に任せる
+        # (読み込み中は抑止され、列数・サムネイルサイズが変わらなければ省かれる)。
         self._grid_resize_timer.start()
 
     def showEvent(self, event) -> None:
@@ -3210,6 +3364,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             return
 
         self._reset_thumbnail_render_queue()
+        self._release_held_doc()
         # 未確定のフォーム編集(スライダー/スピン)があれば先に確定する。
         self._flush_zoom_annotation_form_commit()
         # 予約中・実行中の PII 注釈スタイル反映は、閉じる前に同期で済ませる。

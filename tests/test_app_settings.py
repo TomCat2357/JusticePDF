@@ -92,7 +92,7 @@ def test_heavy_pdf_settings_default_to_constants():
     assert app_settings.heavy_pdf_page_count_threshold() == 300
     assert app_settings.heavy_pdf_file_size_mb() == 150
     assert app_settings.heavy_pdf_file_size_bytes() == 150 * 1024 * 1024
-    assert app_settings.heavy_pdf_widget_chunk_size() == 120
+    assert app_settings.heavy_pdf_widget_chunk_size() == 60
     assert app_settings.heavy_pdf_render_batch_size() == 1
     assert app_settings.pixmap_cache_max_entries() == 256
 

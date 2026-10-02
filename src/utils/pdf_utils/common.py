@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -543,6 +544,7 @@ def _release_session_before_disk_write(pdf_path: str) -> None:
     変更が無ければ(保存済みなら)ハンドルを閉じるだけ。未保存の変更があれば、
     ディスクへ書いても保持内容と食い違うため、保存し忘れとして例外にする。
     """
+    release_held_docs(pdf_path)
     session = get_session(pdf_path)
     if session is None or session.doc is None:
         return
@@ -586,7 +588,117 @@ def _acquire_doc(pdf_path: str) -> fitz.Document:
         if session.owner_thread == threading.get_ident():
             return session._attach()
         logger.debug("session doc requested from another thread; opening from disk: %s", pdf_path)
+    held = _held_docs.get((threading.get_ident(), pdf_path))
+    if held is not None and held.depth > 0 and held.is_current():
+        return held.doc
     return fitz.open(pdf_path)
+
+
+# hold_doc() で使い回しているドキュメント: (スレッドID, パス) -> _HeldDoc
+_held_docs: "dict[tuple[int, str], _HeldDoc]" = {}
+
+# 保持(linger)するときにファイル全体をメモリへ読み込む上限。超える文書は保持せず従来どおり開き直す。
+HELD_DOC_STREAM_MAX_BYTES = 768 * 1024 * 1024
+
+
+def _file_token(pdf_path: str) -> "tuple[int, int] | None":
+    try:
+        st = os.stat(pdf_path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+class _HeldDoc:
+    """hold_doc() が持つドキュメント。``depth`` はスコープの入れ子数(>0 の間だけ ``_open_doc`` が使う)。"""
+
+    __slots__ = ("doc", "path", "token", "linger", "depth", "last_used")
+
+    def __init__(self, doc: fitz.Document, path: str, token, linger: bool) -> None:
+        self.doc = doc
+        self.path = path
+        self.token = token
+        self.linger = linger
+        self.depth = 0
+        self.last_used = time.monotonic()
+
+    def is_current(self) -> bool:
+        """開いた後にファイルが書き換えられていないか(更新日時とサイズで判定)。"""
+        return not self.doc.is_closed and self.token == _file_token(self.path)
+
+    def close(self) -> None:
+        try:
+            if not self.doc.is_closed:
+                self.doc.close()
+        except Exception:
+            logger.debug("failed to close held doc: %s", self.path, exc_info=True)
+
+
+def release_held_docs(pdf_path: "str | None" = None) -> None:
+    """``hold_doc(..., linger=True)`` が保持しているドキュメントを閉じる(スコープ使用中のものは残す)。
+
+    *pdf_path* を省略すると全パスが対象。保持ドキュメントはファイルのメモリ上の写しで、
+    ファイルハンドルは掴んでいないため書き込み・置換を妨げない。このため呼び忘れても
+    ファイルは壊れない(開いた後の更新はファイルの更新日時・サイズで検出して使わない)。
+    メモリを早く手放すために、アイドル・ウィンドウを閉じる・書き込みの前に呼ぶ。
+    他スレッドが持つものは触らない(次の使用時に更新検出で捨てられる)。
+    """
+    tid = threading.get_ident()
+    for key, held in tuple(_held_docs.items()):
+        if key[0] != tid or held.depth > 0:
+            continue
+        if pdf_path is not None and key[1] != pdf_path:
+            continue
+        _held_docs.pop(key, None)
+        held.close()
+
+
+@contextmanager
+def hold_doc(pdf_path: str, *, linger: bool = False) -> Iterator[None]:
+    """スコープ内の ``_open_doc(pdf_path)`` が同じドキュメントを使い回すようにする。
+
+    重量文書は開き直すたびに最初の ``load_page`` でページツリー解析が走り数百ミリ秒かかる。
+    1回の描画バッチで複数の関数が開き直すのを避けるために使う。セッションがあるパスでは
+    既に保持中のドキュメントが使われるので何もしない。スコープ内では書き込み系の関数
+    (``_open_doc_for_write``)を呼ばないこと。
+
+    ``linger=False``: スコープを抜けるとき必ず閉じる(ファイルを直接開く)。
+    ``linger=True``: スコープを抜けても閉じず、次の ``hold_doc(..., linger=True)`` で使い回す
+    (バッチをまたいで開き直しを避ける)。ファイル全体を読み込んだメモリ上の写しを使うのでファイル
+    ハンドルを掴まない。更新日時・サイズが変わると捨てて開き直す。``release_held_docs()`` で閉じる。
+    """
+    key = (threading.get_ident(), pdf_path)
+    if get_session(pdf_path) is not None:
+        yield
+        return
+    held = _held_docs.get(key)
+    if held is not None and not (held.depth > 0 or (held.linger and held.is_current())):
+        _held_docs.pop(key, None)
+        held.close()
+        held = None
+    created = False
+    if held is None:
+        token = _file_token(pdf_path)
+        use_stream = linger and token is not None and token[1] <= HELD_DOC_STREAM_MAX_BYTES
+        if use_stream:
+            with open(pdf_path, "rb") as f:
+                data = f.read()
+            doc = fitz.open("pdf", data)
+        else:
+            doc = fitz.open(pdf_path)
+        held = _HeldDoc(doc, pdf_path, token, linger=use_stream)
+        _held_docs[key] = held
+        created = True
+    held.depth += 1
+    try:
+        yield
+    finally:
+        held.depth -= 1
+        held.last_used = time.monotonic()
+        if held.depth == 0 and not held.linger:
+            if _held_docs.get(key) is held:
+                _held_docs.pop(key, None)
+            held.close()
 
 
 def _mark_edit_failed(doc: fitz.Document) -> None:
@@ -605,6 +717,8 @@ def _release_doc(doc: fitz.Document) -> None:
     for session in tuple(_sessions.values()):
         if session.doc is doc:
             return
+    if any(h.doc is doc for h in tuple(_held_docs.values())):
+        return  # hold_doc() の持ち主が閉じる
     doc.close()
 
 

@@ -20,7 +20,7 @@ HEAVY_PDF_FILE_SIZE_MB = 150
 HEAVY_PDF_FILE_SIZE_BYTES = HEAVY_PDF_FILE_SIZE_MB * 1024 * 1024
 # 重量文書でサムネイルウィジェットを生成する際、1回のイベントループ処理で
 # 生成するページ数。大きいほど初期表示は速いがUIブロック時間が伸びる。
-HEAVY_PDF_WIDGET_CHUNK_SIZE = 120
+HEAVY_PDF_WIDGET_CHUNK_SIZE = 60
 # 重量文書でサムネイルを描画する際、1回のタイマー発火で処理するページ数
 # (通常文書は 5 ページ/回)。1ページずつに絞ることで、埋め込み画像が
 # 大きく描画が重いページがあっても他の操作を挟める。
