@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QSignalBlocker, pyqtSignal
@@ -17,7 +18,9 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QColorDialog,
+    QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -43,8 +46,10 @@ from PyQt6.QtWidgets import (
 from src.pii.entity_types import (
     ENTITY_TYPES,
     ENTITY_TYPES_WITH_MANUAL,
+    MANUAL_ENTITY_TYPE,
     get_entity_type_name_ja,
 )
+from src.pii.text_normalize import normalize_pattern
 from src.utils.pdf_utils import ShapeAnnotData, ShapeType, TextMarkupAnnotData
 
 logger = logging.getLogger(__name__)
@@ -177,17 +182,268 @@ def rows_to_tsv(rows: "list[PiiResultRow]") -> str:
     return "\n".join(lines)
 
 
+# 正規表現の入力補助。「一致のしかた」と「空白を許容する」の2つの部品から、基になる語句の
+# 正規表現を組み立ててテキストボックスに入れる。テキストボックスを手で編集すると
+# 「自由入力」状態になる(部品を操作すると、また部品から作り直す)。
+# 検出語は、ページ本文全体(``re.MULTILINE``)に ``finditer`` で当てるため ``^``/``$`` は
+# 行頭・行末の意味にしかならず、「一致のしかた」は出さない(空白を許容のみ)。
+# 除外パターンは、検出された1件の文字列に ``re.search`` で当てるため、
+# 完全一致(``^…$``)・前方一致・後方一致のいずれにも意味がある。
+MATCH_EXACT = "exact"
+MATCH_PREFIX = "prefix"
+MATCH_SUFFIX = "suffix"
+MATCH_PARTIAL = "partial"
+MATCH_MODES: "tuple[tuple[str, str], ...]" = (
+    (MATCH_EXACT, "完全一致"),
+    (MATCH_PREFIX, "前方一致"),
+    (MATCH_SUFFIX, "後方一致"),
+    (MATCH_PARTIAL, "部分一致"),
+)
+GAP_CHECK_LABEL = "空白を許容する（各文字の間の空白・改行を許す）"
+FREE_INPUT_HINT = "手で編集中（自由入力）です。「一致のしかた」「空白を許容する」を変えると、語句から作り直します。"
+
+# 検出語に追加するときの種別の選択肢のうち、設定に登録しない「手動」の表示名。
+MANUAL_CHOICE_LABEL = "手動（検出語には追加しない）"
+
+
+def build_pattern(match: str, gap: bool, base: str, gap_base: "str | None" = None) -> str:
+    r"""「一致のしかた」と「空白を許容」から正規表現を組み立てる。
+
+    ``base`` は語句を ``re.escape`` した本体(空白の扱いは設定どおり)、``gap_base`` は
+    語句の空白を除いた各文字を ``re.escape`` して ``\s*`` でつないだ本体
+    (``\s`` は半角・全角空白や改行にも一致する)。``gap`` が True なら ``gap_base`` を使う
+    (省略時は ``base``)。``match`` は完全一致 ``^…$`` / 前方一致 ``^…`` / 後方一致 ``…$`` /
+    部分一致(``…`` そのまま)。
+    """
+    body = (gap_base if gap_base is not None else base) if gap else base
+    if match == MATCH_EXACT:
+        return f"^{body}$"
+    if match == MATCH_PREFIX:
+        return f"^{body}"
+    if match == MATCH_SUFFIX:
+        return f"{body}$"
+    return body
+
+
+def validate_pii_pattern(pattern: str) -> str:
+    """正規表現として使えるか調べ、使えなければ日本語のエラー文を、使えれば空文字を返す。
+
+    検出時と同じく、全角記号などの正規化(``normalize_pattern``)をかけた後でコンパイルする。
+    """
+    if not pattern.strip():
+        return "正規表現が空です。語句を入力してください。"
+    try:
+        re.compile(normalize_pattern(pattern))
+    except re.error as error:
+        return f"正規表現が正しくありません: {error}"
+    return ""
+
+
+class PiiPatternInputDialog(QDialog):
+    """「検出語に追加」「除外パターンに追加」で最初に開く、語句(正規表現)の入力ダイアログ。
+
+    - 語句(読み取り専用)は、右クリックした結果の語句。
+    - 入力補助は独立した2つの部品: 「一致のしかた」(完全/前方/後方/部分。``with_match`` が
+      True のときだけ出す=除外パターン用)と「空白を許容する」チェック。変えるたびに
+      テキストボックスを基の語句から作り直す。テキストボックスを手で編集すると
+      「自由入力」状態になる(``free``)。
+    - ``with_entity`` が True のときは種別のドロップダウンも出す(「検出語に追加」用。
+      末尾に「手動(検出語には追加しない)」を含む)。
+    - OK(Enterキー)で確定。正規表現が不正なときはエラーを示して閉じない。
+
+    ``state()`` は ``{"entity", "match", "gap", "free", "text"}``。戻るボタンで呼び直すとき
+    ``state=`` に渡すと入力内容(種類・部品・自由入力か・テキスト)を復元する。
+    """
+
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        word: str,
+        base_pattern: str,
+        gap_pattern: str | None = None,
+        *,
+        with_entity: bool = False,
+        with_match: bool = False,
+        default_match: str = MATCH_PARTIAL,
+        default_gap: bool = False,
+        default_entity: str = "PERSON",
+        state: "dict | None" = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        self._base = base_pattern
+        self._gap_base = gap_pattern if gap_pattern is not None else base_pattern
+        self._with_match = with_match
+        self._free = False
+
+        layout = QVBoxLayout(self)
+        self._message_label = QLabel(message)
+        self._message_label.setWordWrap(True)
+        layout.addWidget(self._message_label)
+
+        form = QFormLayout()
+        self._word_edit = QPlainTextEdit(word)
+        self._word_edit.setReadOnly(True)
+        self._word_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self._word_edit.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self._word_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        line_h = self._word_edit.fontMetrics().lineSpacing()
+        self._word_edit.setMinimumHeight(line_h * 2 + 12)
+        self._word_edit.setMaximumHeight(line_h * 4 + 12)
+        form.addRow("選んだ語句:", self._word_edit)
+
+        self._entity_combo: QComboBox | None = None
+        if with_entity:
+            self._entity_combo = QComboBox()
+            for entity_type in ENTITY_TYPES:
+                self._entity_combo.addItem(get_entity_type_name_ja(entity_type), entity_type)
+            self._entity_combo.addItem(MANUAL_CHOICE_LABEL, MANUAL_ENTITY_TYPE)
+            form.addRow("種類:", self._entity_combo)
+
+        self._match_combo: QComboBox | None = None
+        if with_match:
+            self._match_combo = QComboBox()
+            for key, label in MATCH_MODES:
+                self._match_combo.addItem(label, key)
+            form.addRow("一致のしかた:", self._match_combo)
+
+        self._gap_check = QCheckBox(GAP_CHECK_LABEL)
+        form.addRow("", self._gap_check)
+
+        self._pattern_edit = QLineEdit()
+        form.addRow("正規表現:", self._pattern_edit)
+        layout.addLayout(form)
+
+        self._free_label = QLabel(FREE_INPUT_HINT)
+        self._free_label.setWordWrap(True)
+        self._free_label.setVisible(False)
+        layout.addWidget(self._free_label)
+
+        self._error_label = QLabel("")
+        self._error_label.setWordWrap(True)
+        self._error_label.setStyleSheet("color: #c0392b;")
+        self._error_label.setVisible(False)
+        layout.addWidget(self._error_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("OK（次へ）")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
+        buttons.accepted.connect(self._on_ok)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # 初期値(戻ってきたときは前回の入力内容を復元する)。
+        src = state or {}
+        if self._entity_combo is not None:
+            idx = self._entity_combo.findData(src.get("entity", default_entity))
+            if idx >= 0:
+                self._entity_combo.setCurrentIndex(idx)
+        self._set_parts(src.get("match", default_match), bool(src.get("gap", default_gap)))
+        if state and "text" in state:
+            self._pattern_edit.setText(str(state["text"]))
+            self._set_free(bool(state.get("free", False)))
+        else:
+            self._pattern_edit.setText(self._build())
+
+        if self._match_combo is not None:
+            self._match_combo.currentIndexChanged.connect(self._on_parts_changed)
+        self._gap_check.toggled.connect(self._on_parts_changed)
+        self._pattern_edit.textEdited.connect(self._on_text_edited)
+        self._pattern_edit.textChanged.connect(lambda _t: self._error_label.setVisible(False))
+        self._pattern_edit.returnPressed.connect(self._on_ok)
+        self._pattern_edit.setFocus()
+        self._pattern_edit.selectAll()
+
+    # --- 入力補助 ---
+    def _set_parts(self, match: str, gap: bool) -> None:
+        if self._match_combo is not None:
+            idx = self._match_combo.findData(match)
+            with QSignalBlocker(self._match_combo):
+                self._match_combo.setCurrentIndex(max(idx, 0))
+        with QSignalBlocker(self._gap_check):
+            self._gap_check.setChecked(gap)
+
+    def _set_free(self, free: bool) -> None:
+        self._free = free
+        self._free_label.setVisible(free)
+
+    def _build(self) -> str:
+        return build_pattern(self.match(), self.gap(), self._base, self._gap_base)
+
+    def _on_parts_changed(self, *_args) -> None:
+        self._set_free(False)
+        self._pattern_edit.setText(self._build())
+
+    def _on_text_edited(self, _text: str) -> None:
+        """テキストボックスを手で編集したら「自由入力」状態にする。"""
+        self._set_free(True)
+
+    def _on_ok(self) -> None:
+        error = validate_pii_pattern(self._pattern_edit.text())
+        if error:
+            self._error_label.setText(error)
+            self._error_label.setVisible(True)
+            return
+        self.accept()
+
+    # --- 結果 ---
+    def match(self) -> str:
+        """「一致のしかた」(``MATCH_*``)。この部品を出さない検出語側は部分一致。"""
+        if self._match_combo is None:
+            return MATCH_PARTIAL
+        return str(self._match_combo.currentData())
+
+    def gap(self) -> bool:
+        return self._gap_check.isChecked()
+
+    def is_free(self) -> bool:
+        return self._free
+
+    def pattern(self) -> str:
+        return self._pattern_edit.text()
+
+    def entity(self) -> str:
+        if self._entity_combo is None:
+            return ""
+        return str(self._entity_combo.currentData())
+
+    def state(self) -> dict:
+        return {
+            "entity": self.entity(),
+            "match": self.match(),
+            "gap": self.gap(),
+            "free": self._free,
+            "text": self.pattern(),
+        }
+
+    @staticmethod
+    def ask(*args, **kwargs) -> "dict | None":
+        """ダイアログを表示し、OKなら ``state()`` を、キャンセルなら None を返す。"""
+        dialog = PiiPatternInputDialog(*args, **kwargs)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.state()
+
+
 class ScopeChoiceDialog(QDialog):
-    """「検出語に追加」「除外パターンに追加」の後に開く、範囲選択の小さなダイアログ。
+    """「検出語に追加」「除外パターンに追加」の入力の後に開く、範囲選択の小さなダイアログ。
 
     語句(読み取り専用)と説明文を示し、「全ページ / このページだけ / しない」の
     3択(ボタン文言は呼び出し側が指定)から選ばせる。ダイアログを閉じた場合は
-    「しない」扱い。
+    「しない」扱い。``allow_back`` が True のときだけ「← 語句の入力に戻る」ボタンを
+    出し、押すと ``SCOPE_BACK`` を返す(戻り先の入力ダイアログが無い呼び出しでは出さない)。
     """
 
     SCOPE_ALL = "all"
     SCOPE_PAGE = "page"
     SCOPE_NONE = "none"
+    SCOPE_BACK = "back"
+    BACK_LABEL = "← 語句の入力に戻る"
 
     def __init__(
         self,
@@ -196,6 +452,7 @@ class ScopeChoiceDialog(QDialog):
         word: str,
         labels: "tuple[str, str, str]",
         parent: QWidget | None = None,
+        allow_back: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -220,6 +477,13 @@ class ScopeChoiceDialog(QDialog):
         layout.addWidget(self._message_label)
 
         buttons = QHBoxLayout()
+        self._back_btn: QPushButton | None = None
+        if allow_back:
+            self._back_btn = QPushButton(self.BACK_LABEL)
+            self._back_btn.setAutoDefault(False)
+            self._back_btn.clicked.connect(lambda _checked=False: self._choose(self.SCOPE_BACK))
+            buttons.addWidget(self._back_btn)
+            buttons.addStretch(1)
         self._all_btn = QPushButton(labels[0])
         self._page_btn = QPushButton(labels[1])
         self._none_btn = QPushButton(labels[2])
@@ -247,9 +511,10 @@ class ScopeChoiceDialog(QDialog):
         word: str,
         labels: "tuple[str, str, str]",
         parent: QWidget | None = None,
+        allow_back: bool = False,
     ) -> str:
         """ダイアログを表示し、選ばれた範囲(``SCOPE_*``)を返す。閉じた場合は SCOPE_NONE。"""
-        dialog = ScopeChoiceDialog(title, message, word, labels, parent)
+        dialog = ScopeChoiceDialog(title, message, word, labels, parent, allow_back)
         dialog.exec()
         return dialog.scope()
 
@@ -273,14 +538,14 @@ class PiiPanel(QFrame):
         「塗り丸」ツールのON/OFF。
     remove_selected_requested()
         「削除」ボタン押下時、または結果一覧でDeleteキー押下時。
-    add_detect_word_requested(str, str)
-        結果一覧の右クリックメニュー「検出語に追加」の種別サブメニュー選択時。
-        (entity_type, text) を伴う。
+    add_detect_word_requested(str)
+        結果一覧の右クリックメニュー「検出語に追加」。text を伴う。種類・正規表現・範囲は
+        続く入力ダイアログで選ぶ(種類に「手動」を選ぶと検出語には登録しない)。
     add_exclude_word_requested(str)
         結果一覧の右クリックメニュー「除外パターンに追加」。text を伴う。
     detect_manual_requested(str)
-        結果一覧の右クリックメニュー「手動扱いで検出(検出語に登録しない)」。
-        text を伴う。設定は保存せず、手動扱いの候補として検出する。
+        手動扱いの候補としての検出要求(設定は保存しない)。右クリックメニューからは
+        直接出さず、「検出語に追加」の種類「手動」から行う。
     remove_detected_requested(str)
         結果一覧の右クリックメニュー「検出結果から削除(除外に登録しない)」。
         text を伴う。設定は保存せず、検出済みの同じ語句の結果だけを削除する。
@@ -308,7 +573,7 @@ class PiiPanel(QFrame):
     mask_rect_tool_toggled = pyqtSignal(bool)
     mask_ellipse_tool_toggled = pyqtSignal(bool)
     remove_selected_requested = pyqtSignal()
-    add_detect_word_requested = pyqtSignal(str, str)
+    add_detect_word_requested = pyqtSignal(str)
     add_exclude_word_requested = pyqtSignal(str)
     detect_manual_requested = pyqtSignal(str)
     remove_detected_requested = pyqtSignal(str)
@@ -848,17 +1113,11 @@ class PiiPanel(QFrame):
         menu = QMenu(self._result_tree)
         copy_action = menu.addAction("コピー")
         menu.addSeparator()
-        # 検出語: 種別のサブメニューから選ぶ(手動追加分の行でも、語句があれば登録できる)。
-        detect_menu = menu.addMenu("検出語に追加")
-        detect_menu.setEnabled(bool(row.text))
-        detect_actions: dict = {}
-        for entity_type in ENTITY_TYPES:
-            action = detect_menu.addAction(get_entity_type_name_ja(entity_type))
-            detect_actions[action] = entity_type
-        # 設定を保存しない版(検出語/除外パターンに登録せず、この場限りで扱う)は、
-        # 対応する永続版のすぐ隣に置く。
-        manual_action = menu.addAction("手動扱いで検出(検出語に登録しない)")
-        manual_action.setEnabled(bool(row.text))
+        # 検出語/除外パターンへの追加は、どちらも入力ダイアログ(種類・正規表現・範囲)で
+        # 続きを選ぶ(手動追加分の行でも、語句があれば登録できる)。「手動」で検出したい
+        # ときも「検出語に追加」の種類で「手動(検出語には追加しない)」を選ぶ。
+        detect_action = menu.addAction("検出語に追加")
+        detect_action.setEnabled(bool(row.text))
         exclude_action = menu.addAction("除外パターンに追加")
         exclude_action.setEnabled(bool(row.text))
         remove_action = menu.addAction("検出結果から削除(除外に登録しない)")
@@ -870,12 +1129,10 @@ class PiiPanel(QFrame):
             self.copy_results_to_clipboard()
         elif chosen is exclude_action:
             self.add_exclude_word_requested.emit(row.text)
-        elif chosen is manual_action:
-            self.detect_manual_requested.emit(row.text)
         elif chosen is remove_action:
             self.remove_detected_requested.emit(row.text)
-        elif chosen in detect_actions:
-            self.add_detect_word_requested.emit(detect_actions[chosen], row.text)
+        elif chosen is detect_action:
+            self.add_detect_word_requested.emit(row.text)
 
     def _update_button_states(self) -> None:
         has_results = self._result_tree.topLevelItemCount() > 0

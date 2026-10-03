@@ -256,21 +256,17 @@ MANUAL_LABEL = "手動扱いで検出(検出語に登録しない)"
 REMOVE_LABEL = "検出結果から削除(除外に登録しない)"
 
 
-def test_context_menu_new_items_placed_next_to_persistent_ones_and_emit(qtbot, monkeypatch):
+def test_context_menu_remove_item_placed_next_to_exclude_and_emits(qtbot, monkeypatch):
     panel = PiiPanel()
     qtbot.addWidget(panel)
     panel.set_results([_row(0, "PERSON", "山田太郎")])
-    manual, removed = [], []
-    panel.detect_manual_requested.connect(manual.append)
+    removed = []
     panel.remove_detected_requested.connect(removed.append)
 
-    opened = _open_context_menu(panel, monkeypatch, MANUAL_LABEL)
+    opened = _open_context_menu(panel, monkeypatch, REMOVE_LABEL)
     texts = [a.text() for a in opened["menu"].actions()]
-    assert texts.index("検出語に追加") + 1 == texts.index(MANUAL_LABEL)
     assert texts.index("除外パターンに追加") + 1 == texts.index(REMOVE_LABEL)
-    assert manual == ["山田太郎"] and removed == []
-
-    _open_context_menu(panel, monkeypatch, REMOVE_LABEL)
+    assert MANUAL_LABEL not in texts  # 「手動」は「検出語に追加」の種類から選ぶ
     assert removed == ["山田太郎"]
 
 
@@ -281,7 +277,6 @@ def test_context_menu_new_items_disabled_without_text(qtbot, monkeypatch):
 
     opened = _open_context_menu(panel, monkeypatch, None)
 
-    assert _find_action(opened["menu"], MANUAL_LABEL).isEnabled() is False
     assert _find_action(opened["menu"], REMOVE_LABEL).isEnabled() is False
 
 

@@ -309,7 +309,6 @@ def test_result_context_menu_has_copy_first(qtbot, monkeypatch):
     assert seen["texts"][0] == "コピー"
     assert seen["texts"][1:] == [
         "検出語に追加",
-        "手動扱いで検出(検出語に登録しない)",
         "除外パターンに追加",
         "検出結果から削除(除外に登録しない)",
     ]
@@ -420,23 +419,22 @@ def _open_context_menu(panel, monkeypatch, pick: str | None):
     return opened
 
 
-def test_context_menu_detect_word_submenu_lists_eight_entities_and_emits(qtbot, monkeypatch):
-    from src.pii.entity_types import ENTITY_TYPES, get_entity_type_name_ja
-
+def test_context_menu_has_two_add_actions_and_emits_text(qtbot, monkeypatch):
     panel = PiiPanel()
     qtbot.addWidget(panel)
     panel.set_results([_row(3, "PERSON", "山田太郎")])
     captured = []
-    panel.add_detect_word_requested.connect(lambda entity, text: captured.append((entity, text)))
+    panel.add_detect_word_requested.connect(captured.append)
 
-    opened = _open_context_menu(panel, monkeypatch, "場所")
+    opened = _open_context_menu(panel, monkeypatch, "検出語に追加")
 
     detect_action = _find_action(opened["menu"], "検出語に追加")
     assert detect_action.isEnabled() is True
-    submenu_texts = [a.text() for a in detect_action.menu().actions()]
-    assert submenu_texts == [get_entity_type_name_ja(e) for e in ENTITY_TYPES]
-    assert len(submenu_texts) == 8 and "手動" not in submenu_texts
-    assert captured == [("LOCATION", "山田太郎")]
+    assert detect_action.menu() is None  # 種類のサブメニューは廃止(入力ダイアログで選ぶ)
+    assert _find_action(opened["menu"], "除外パターンに追加") is not None
+    texts = [a.text() for a in opened["menu"].actions()]
+    assert not any("手動扱いで検出" in t for t in texts)
+    assert captured == ["山田太郎"]
 
 
 def test_context_menu_detect_word_is_enabled_for_manual_rows(qtbot, monkeypatch):
@@ -444,12 +442,12 @@ def test_context_menu_detect_word_is_enabled_for_manual_rows(qtbot, monkeypatch)
     qtbot.addWidget(panel)
     panel.set_results([_row(0, MANUAL_ENTITY_TYPE, "テスト")])
     captured = []
-    panel.add_detect_word_requested.connect(lambda entity, text: captured.append((entity, text)))
+    panel.add_detect_word_requested.connect(captured.append)
 
-    opened = _open_context_menu(panel, monkeypatch, "人名")
+    opened = _open_context_menu(panel, monkeypatch, "検出語に追加")
 
     assert _find_action(opened["menu"], "検出語に追加").isEnabled() is True
-    assert captured == [("PERSON", "テスト")]
+    assert captured == ["テスト"]
 
 
 def test_context_menu_exclude_word_emits_text(qtbot, monkeypatch):
@@ -614,3 +612,149 @@ def test_copy_is_full_text_regardless_of_display_mode(qtbot, mode):
     panel._result_tree.selectAll()
     qtbot.keyClick(panel._result_tree, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
     assert _clipboard_text().split("\n")[1] == f"{_LONG}\t人名\t1"
+
+
+# ---------------------------------------------------------------------------
+# 語句(正規表現)の入力ダイアログ・入力補助・範囲選択の「戻る」
+# ---------------------------------------------------------------------------
+
+
+def test_build_pattern_combines_match_mode_and_gap():
+    import re as _re
+
+    from src.pii.settings import literal_to_pattern
+    from src.views.pii_panel import build_pattern
+
+    word = "山田 (仮)"
+    base = literal_to_pattern(word, "literal")
+    gap = literal_to_pattern(word, "any_gap")
+    assert gap == r"山\s*田\s*\(\s*仮\s*\)"
+    assert build_pattern("partial", False, base, gap) == base
+    assert build_pattern("exact", False, base, gap) == "^" + base + "$"
+    assert build_pattern("prefix", False, base, gap) == "^" + base
+    assert build_pattern("suffix", False, base, gap) == base + "$"
+    assert build_pattern("partial", True, base, gap) == gap
+    assert build_pattern("exact", True, base, gap) == "^" + gap + "$"
+    assert build_pattern("prefix", True, base, gap) == "^" + gap
+    assert build_pattern("suffix", True, base, gap) == gap + "$"
+    # 空白を許容: 半角・全角空白・改行を挟んでも一致し、特殊文字は文字どおり扱う。
+    for text in ("山田(仮)", "山田 (仮)", "山　田(仮)", "山田\n(仮)"):
+        assert _re.search(gap, text)
+    assert not _re.search(gap, "山田[仮]")
+    # 完全/前方/後方一致は、候補文字列の全体/先頭/末尾に対してだけ一致する。
+    assert _re.search(build_pattern("exact", True, base, gap), "山田\u3000(仮)")
+    assert not _re.search(build_pattern("exact", True, base, gap), "旧山田(仮)")
+    assert _re.search(build_pattern("prefix", False, base, gap), "山田 (仮)さん")
+    assert not _re.search(build_pattern("prefix", False, base, gap), "旧山田 (仮)")
+    assert _re.search(build_pattern("suffix", False, base, gap), "旧山田 (仮)")
+    assert not _re.search(build_pattern("suffix", False, base, gap), "山田 (仮)さん")
+
+
+def _input_dialog(qtbot, **kwargs):
+    from src.pii.settings import literal_to_pattern
+    from src.views.pii_panel import PiiPatternInputDialog
+
+    gap = literal_to_pattern("山田(仮)", "any_gap")
+    dialog = PiiPatternInputDialog("t", "m", "山田(仮)", r"山田\(仮\)", gap, **kwargs)
+    qtbot.addWidget(dialog)
+    return dialog
+
+
+def test_input_dialog_match_combo_only_for_exclude_side(qtbot):
+    detect = _input_dialog(qtbot, with_entity=True)
+    assert detect._match_combo is None  # 検出語側は ^ $ が意味を持たないので出さない
+    assert detect.match() == "partial" and detect.gap() is False
+    assert detect.pattern() == r"山田\(仮\)"
+
+    exclude = _input_dialog(qtbot, with_match=True, default_match="exact")
+    combo = exclude._match_combo
+    assert [combo.itemText(i) for i in range(combo.count())] == [
+        "完全一致", "前方一致", "後方一致", "部分一致",
+    ]
+    assert exclude.match() == "exact" and exclude.gap() is False
+    assert exclude.pattern() == r"^山田\(仮\)$"  # 現状の除外パターンと同じ初期値
+
+
+def test_input_dialog_parts_regenerate_text_and_edit_switches_to_free(qtbot):
+    dialog = _input_dialog(qtbot, with_match=True, default_match="exact")
+    dialog._match_combo.setCurrentIndex(dialog._match_combo.findData("prefix"))
+    assert dialog.pattern() == r"^山田\(仮\)"
+    dialog._gap_check.setChecked(True)
+    assert dialog.pattern() == r"^山\s*田\s*\(\s*仮\s*\)"
+    dialog._match_combo.setCurrentIndex(dialog._match_combo.findData("suffix"))
+    assert dialog.pattern() == r"山\s*田\s*\(\s*仮\s*\)$"
+    assert dialog.is_free() is False
+
+    # 手で編集すると「自由入力」状態になる(部品の設定とテキストはそのまま保持)。
+    dialog.show()
+    qtbot.keyClick(dialog._pattern_edit, Qt.Key.Key_X)
+    assert dialog.is_free() is True and dialog._free_label.isVisible()
+    edited = dialog.pattern()
+    assert edited != r"山\s*田\s*\(\s*仮\s*\)$"
+    # 部品を操作すると、手編集は捨てて語句から作り直し、自由入力は解除される。
+    dialog._gap_check.setChecked(False)
+    assert dialog.is_free() is False and not dialog._free_label.isVisible()
+    assert dialog.pattern() == r"山田\(仮\)$"
+
+
+def test_input_dialog_gap_checkbox_on_detect_side(qtbot):
+    dialog = _input_dialog(qtbot, with_entity=True)
+    dialog._gap_check.setChecked(True)
+    assert dialog.pattern() == r"山\s*田\s*\(\s*仮\s*\)"
+    dialog._gap_check.setChecked(False)
+    assert dialog.pattern() == r"山田\(仮\)"
+
+
+def test_input_dialog_entity_choices_include_manual_label(qtbot):
+    from src.pii.entity_types import ENTITY_TYPES, get_entity_type_name_ja
+
+    dialog = _input_dialog(qtbot, with_entity=True)
+    combo = dialog._entity_combo
+    labels = [combo.itemText(i) for i in range(combo.count())]
+    assert labels == [get_entity_type_name_ja(e) for e in ENTITY_TYPES] + ["手動（検出語には追加しない）"]
+    combo.setCurrentIndex(combo.count() - 1)
+    assert dialog.entity() == MANUAL_ENTITY_TYPE
+    # 除外パターン用(with_entity なし)には種類のドロップダウンが無い。
+    assert _input_dialog(qtbot)._entity_combo is None
+
+
+def test_input_dialog_invalid_regex_shows_error_and_stays_open(qtbot):
+    from PyQt6.QtWidgets import QDialog
+
+    dialog = _input_dialog(qtbot)
+    dialog.show()
+    dialog._pattern_edit.setText("(未閉じ")
+    dialog._on_ok()
+    assert dialog.result() != QDialog.DialogCode.Accepted
+    assert dialog._error_label.isVisible() and "正規表現" in dialog._error_label.text()
+    dialog._pattern_edit.setText("")  # 空もエラー
+    dialog._on_ok()
+    assert dialog.result() != QDialog.DialogCode.Accepted
+    # 編集するとエラー表示は消え、正しければ確定できる。
+    dialog._pattern_edit.setText(r"^山田\(仮\)$")
+    assert not dialog._error_label.isVisible()
+    dialog._on_ok()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+
+
+def test_input_dialog_state_restores_entity_preset_and_text(qtbot):
+    saved = {"entity": "LOCATION", "match": "prefix", "gap": True, "free": True, "text": r"^山田.*$"}
+    dialog = _input_dialog(qtbot, with_entity=True, with_match=True, state=saved)
+    assert dialog.state() == saved
+    # 部品の状態も復元され、自由入力のテキストは作り直されない。
+    assert dialog.match() == "prefix" and dialog.gap() is True and dialog.is_free() is True
+
+
+def test_scope_choice_dialog_back_button_only_when_allowed(qtbot):
+    from src.views.pii_panel import ScopeChoiceDialog
+
+    labels = ("a", "b", "c")
+    plain = ScopeChoiceDialog("t", "m", "w", labels)
+    qtbot.addWidget(plain)
+    assert plain._back_btn is None
+
+    dialog = ScopeChoiceDialog("t", "m", "w", labels, allow_back=True)
+    qtbot.addWidget(dialog)
+    assert dialog._back_btn.text() == "← 語句の入力に戻る"
+    dialog._back_btn.click()
+    assert dialog.scope() == ScopeChoiceDialog.SCOPE_BACK

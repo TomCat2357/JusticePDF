@@ -71,7 +71,14 @@ from src.utils.pdf_utils import (
     set_pii_annot_style,
 )
 from src.views.export_dialog import ExportOptionsDialog
-from src.views.pii_panel import PiiPanel, PiiResultRow, ScopeChoiceDialog
+from src.views.pii_panel import (
+    MATCH_EXACT,
+    MATCH_PARTIAL,
+    PiiPanel,
+    PiiPatternInputDialog,
+    PiiResultRow,
+    ScopeChoiceDialog,
+)
 from src.views.pii_settings_dialog import PiiSettingsDialog
 from src.workers.pii_detect_worker import PiiDetectWorker
 
@@ -118,8 +125,8 @@ class PiiDrawerMixin:
         self._pii_panel.mask_rect_tool_toggled.connect(self._on_pii_mask_rect_toggled)
         self._pii_panel.mask_ellipse_tool_toggled.connect(self._on_pii_mask_ellipse_toggled)
         self._pii_panel.remove_selected_requested.connect(self._on_pii_remove_selected)
-        self._pii_panel.add_exclude_word_requested.connect(self._on_pii_add_exclude_word)
-        self._pii_panel.add_detect_word_requested.connect(self._on_pii_add_detect_word)
+        self._pii_panel.add_exclude_word_requested.connect(self._on_pii_add_exclude_word_requested)
+        self._pii_panel.add_detect_word_requested.connect(self._on_pii_add_detect_word_requested)
         self._pii_panel.detect_manual_requested.connect(self._on_pii_detect_manual)
         self._pii_panel.remove_detected_requested.connect(self._on_pii_remove_detected)
         self._pii_panel.settings_requested.connect(self._on_pii_settings_requested)
@@ -983,46 +990,101 @@ class PiiDrawerMixin:
     # ------------------------------------------------------------------
     # 結果一覧の右クリックメニュー: 除外パターンに追加 / 検出語に追加
     # ------------------------------------------------------------------
-    def _ask_pii_exclude_scope(self, text: str) -> str:
-        """「除外パターンに追加」の後の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
+    def _ask_pii_exclude_input(self, text: str, state: "dict | None" = None) -> "dict | None":
+        """「除外パターンに追加」の入力ダイアログ(正規表現+入力補助)。キャンセルなら None。
 
         テストからはこのメソッドを差し替えてモーダル表示を避ける。
         """
+        base = literal_to_pattern(text, self._pii_settings().pattern_whitespace_mode)
+        gap = literal_to_pattern(text, "any_gap")
+        return PiiPatternInputDialog.ask(
+            "除外パターンに追加",
+            "選んだ語句を、今後の検出から除外する「除外パターン」として登録します。\n"
+            "正規表現を確認・編集して OK を押すと、次に「検出済みの結果を削除する範囲」を選びます。",
+            text,
+            base,
+            gap,
+            with_match=True,
+            default_match=MATCH_EXACT,  # 従来どおり完全一致(^語句$)が既定
+            state=state,
+            parent=self,
+        )
+
+    def _ask_pii_detect_input(self, text: str, state: "dict | None" = None) -> "dict | None":
+        """「検出語に追加」の入力ダイアログ(種類+正規表現+入力補助)。キャンセルなら None。
+
+        テストからはこのメソッドを差し替えてモーダル表示を避ける。
+        """
+        normalized = normalize_1to1(text)
+        base = literal_to_pattern(normalized, self._pii_settings().pattern_whitespace_mode)
+        gap = literal_to_pattern(normalized, "any_gap")
+        return PiiPatternInputDialog.ask(
+            "検出語に追加",
+            "選んだ語句を、今後も必ず検出する「検出語」として登録します。\n"
+            "種類と正規表現を確認・編集して OK を押すと、次に「今すぐ検出する範囲」を選びます。"
+            "種類を「手動」にすると、検出語には登録せず、この PDF にだけ手動扱いで検出します。",
+            text,
+            base,
+            gap,
+            with_entity=True,
+            with_match=False,  # 検出語は本文全体に当てるため ^ $ は意味が薄い(空白許容のみ)
+            default_match=MATCH_PARTIAL,
+            state=state,
+            parent=self,
+        )
+
+    def _ask_pii_exclude_scope(
+        self, text: str, allow_back: bool = False, pattern: "str | None" = None
+    ) -> str:
+        """「除外パターンに追加」の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
+
+        テストからはこのメソッドを差し替えてモーダル表示を避ける。
+        """
+        shown = f"「{pattern}」" if pattern else "この語句"
         return ScopeChoiceDialog.ask(
             "除外パターンに追加",
-            "除外パターンに追加しました(今後の検出から除外されます)。\n"
-            "すでに検出済みのこの語句の結果を削除しますか?(手動で追加した分は削除しません)",
+            f"除外パターン{shown}を登録します(今後の検出から除外されます)。\n"
+            "すでに検出済みの、このパターンに合う結果も削除しますか?(手動で追加した分は削除しません)",
             text,
             ("全ページの検出済みを削除", "このページだけ削除", "削除しない"),
             self,
+            allow_back=allow_back,
         )
 
-    def _ask_pii_detect_scope(self, text: str, entity: str) -> str:
-        """「検出語に追加」の後の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
+    def _ask_pii_detect_scope(
+        self, text: str, entity: str, allow_back: bool = False, pattern: "str | None" = None
+    ) -> str:
+        """「検出語に追加」の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
 
         テストからはこのメソッドを差し替えてモーダル表示を避ける。
         """
+        shown = f"「{pattern}」" if pattern else "この語句"
         return ScopeChoiceDialog.ask(
             "検出語に追加",
-            f"検出語({get_entity_type_name_ja(entity)})に追加しました。\n"
+            f"検出語({get_entity_type_name_ja(entity)})に{shown}を登録します。\n"
             "この語句を今すぐ検出して塗りつぶし候補に追加しますか?",
             text,
             ("全ページで検出", "このページだけ検出", "検出しない"),
             self,
+            allow_back=allow_back,
         )
 
-    def _ask_pii_manual_detect_scope(self, text: str) -> str:
+    def _ask_pii_manual_detect_scope(
+        self, text: str, allow_back: bool = False, pattern: "str | None" = None
+    ) -> str:
         """「手動扱いで検出」の範囲選択ダイアログ。``ScopeChoiceDialog.SCOPE_*`` を返す。
 
         テストからはこのメソッドを差し替えてモーダル表示を避ける。
         """
+        shown = f"「{pattern}」" if pattern else "この語句"
         return ScopeChoiceDialog.ask(
             "手動扱いで検出",
-            "この語句を検出して、手動扱いの塗りつぶし候補に追加しますか?\n"
-            "(検出語には登録しません。除外パターンに入っている語句でも検出します)",
+            f"{shown}を検出して、手動扱いの塗りつぶし候補に追加しますか?\n"
+            "(検出語には登録せず、設定も変更しません。除外パターンに入っている語句でも検出します)",
             text,
             ("全ページで検出", "このページだけ検出", "検出しない"),
             self,
+            allow_back=allow_back,
         )
 
     def _ask_pii_remove_detected_scope(self, text: str) -> str:
@@ -1064,7 +1126,7 @@ class PiiDrawerMixin:
     def _remove_detected_same_text(
         self, text: str, pattern: str, scope: str, description: str
     ) -> None:
-        """範囲内で、``pattern``(``^...$`` の完全一致)に合う検出済みの結果をまとめて削除する。
+        """範囲内で、``pattern``(正規表現。除外と同じ ``re.search`` の部分一致)に合う検出済みの結果をまとめて削除する。
 
         手動追加分は削除しない。Undo は1回分。``scope`` が「しない」なら何もしない。
         「除外パターンに追加」と「検出結果から削除」で共用する。
@@ -1077,13 +1139,17 @@ class PiiDrawerMixin:
             if page_filter is None:
                 return
         # 検出は normalize_1to1 済みテキストに対して行われるため、パターン
-        # (空白の扱いによっては ``\\s*`` などを含む)も同じ正規化をかけて完全一致で比べる。
-        compiled = re.compile(normalize_pattern(pattern[1:-1]))
+        # (空白の扱いによっては ``\\s*`` などを含む)も同じ正規化をかけ、除外判定と同じ
+        # ``re.search`` で比べる(``^語句$`` なら完全一致、アンカー無しなら部分一致)。
+        try:
+            compiled = re.compile(normalize_pattern(pattern))
+        except re.error:
+            return
         targets = [
             r.annot
             for r in self._build_pii_result_rows()
             if r.entity != MANUAL_ENTITY_TYPE
-            and compiled.fullmatch(normalize_1to1(r.text.strip()))
+            and compiled.search(normalize_1to1(r.text.strip()))
             and (page_filter is None or r.page_num == page_filter)
         ]
         if targets:
@@ -1127,23 +1193,48 @@ class PiiDrawerMixin:
             removed = True
         return removed
 
-    def _on_pii_add_exclude_word(self, text: str) -> None:
-        """右クリック「除外パターンに追加」。
+    def _on_pii_add_exclude_word_requested(self, text: str) -> None:
+        """右クリック「除外パターンに追加」の流れ(入力 → 範囲選択。範囲選択から入力へ戻れる)。
 
-        語句を完全一致の除外パターン(``^語句$``、記号はエスケープ)に登録し
-        (検出パターン=検出語には触れない)、範囲を選ばせて、
-        すでに検出済みの同じ語句の結果(手動追加分を除く)をまとめて削除する
-        (Undo は1回分)。
+        1. 入力ダイアログ(正規表現+入力補助)。キャンセルなら何もしない。
+        2. 範囲選択ダイアログ。「← 語句の入力に戻る」で1へ戻る(入力内容は保持)。
+        3. 確定後に除外パターンを登録し、範囲内の検出済みの結果を削除する。
+        設定の登録は範囲を確定した後に行う(戻った場合に登録が残らないように)。
+        """
+        if not text or not text.strip():
+            return
+        state: "dict | None" = None
+        while True:
+            state = self._ask_pii_exclude_input(text, state)
+            if state is None:
+                return
+            pattern = state["text"]
+            scope = self._ask_pii_exclude_scope(text, allow_back=True, pattern=pattern)
+            if scope != ScopeChoiceDialog.SCOPE_BACK:
+                break
+        self._on_pii_add_exclude_word(text, pattern=pattern, scope=scope)
+
+    def _on_pii_add_exclude_word(
+        self, text: str, pattern: "str | None" = None, scope: "str | None" = None
+    ) -> None:
+        """「除外パターンに追加」の実処理。
+
+        ``pattern`` の除外パターン(省略時は語句の完全一致 ``^語句$``、記号はエスケープ)を
+        登録し(検出パターン=検出語には触れない)、範囲を選ばせて(``scope`` 省略時に
+        ダイアログを出す)、すでに検出済みの、除外パターンに合う結果(手動追加分を除く)を
+        まとめて削除する(Undo は1回分)。
         """
         if not text or not text.strip():
             return
         settings = self._pii_settings().copy()
-        pattern = exact_match_pattern(text, settings.pattern_whitespace_mode)
+        if pattern is None:
+            pattern = exact_match_pattern(text, settings.pattern_whitespace_mode)
         if settings.add_exclusion(pattern):
             settings.save()
             self._pii_settings_cache = settings
 
-        scope = self._ask_pii_exclude_scope(text)
+        if scope is None:
+            scope = self._ask_pii_exclude_scope(text)
         self._remove_detected_same_text(
             text, pattern, scope, f"除外パターン「{text.strip()}」の検出済みを削除"
         )
@@ -1162,22 +1253,27 @@ class PiiDrawerMixin:
             text, pattern, scope, f"検出結果「{text.strip()}」を削除"
         )
 
-    def _on_pii_detect_manual(self, text: str) -> None:
-        """右クリック「手動扱いで検出(検出語に登録しない)」。
+    def _on_pii_detect_manual(
+        self, text: str, pattern: "str | None" = None, scope: "str | None" = None
+    ) -> None:
+        """手動扱いでの検出(検出語に登録しない)。「検出語に追加」の種類「手動」から呼ばれる。
 
-        設定(検出語・除外パターン)は変えず、範囲を選ばせて、その語句を検出し、
-        結果を種別「手動」の塗りつぶし候補として追加する(重複しない新規分だけ)。
+        設定(検出語・除外パターン)は変えず、範囲を選ばせて(``scope`` 省略時にダイアログ)、
+        その語句(``pattern`` 省略時は語句そのまま)を検出し、結果を種別「手動」の
+        塗りつぶし候補として追加する(重複しない新規分だけ)。
         除外設定は無視する(除外に入っている語句でも検出できる)。
         """
         if not text or not text.strip():
             return
-        scope = self._ask_pii_manual_detect_scope(text)
+        if scope is None:
+            scope = self._ask_pii_manual_detect_scope(text)
         page_indices = self._pii_page_indices_for_scope(scope)
         if page_indices is None:
             return
-        pattern = literal_to_pattern(
-            normalize_1to1(text), self._pii_settings().pattern_whitespace_mode
-        )
+        if pattern is None:
+            pattern = literal_to_pattern(
+                normalize_1to1(text), self._pii_settings().pattern_whitespace_mode
+            )
         # 手動は自動検出の対象種別ではないため、実在の種別(その他)で検出して手動へ付け替える。
         self._run_pattern_only_detection(
             "OTHER",
@@ -1188,20 +1284,55 @@ class PiiDrawerMixin:
             description="手動扱いで検出",
         )
 
-    def _on_pii_add_detect_word(self, entity: str, text: str) -> None:
-        """右クリック「検出語に追加」(種別はサブメニューで選択済み)。
+    def _on_pii_add_detect_word_requested(self, text: str) -> None:
+        """右クリック「検出語に追加」の流れ(入力 → 範囲選択。範囲選択から入力へ戻れる)。
 
-        選んだ語句をそのまま(``re.escape`` した)追加検出パターンとして登録し、
-        同じ語句の除外設定を取り除く。続けて範囲(全ページ/このページだけ/検出しない)
-        を選ばせ、選ばれたら、そのパターンだけで部分再検出する(既存の検出結果は
-        そのまま、重複しない新規分だけを追加する)。
+        1. 入力ダイアログ(種類+正規表現+入力補助)。キャンセルなら何もしない。
+        2. 範囲選択ダイアログ。「← 語句の入力に戻る」で1へ戻る(入力内容は保持)。
+        3. 確定後に処理する。種類が「手動」なら検出語・設定は変えず、手動扱いで検出するだけ。
+           それ以外は検出語として登録(同じ語句の除外設定は外す)し、範囲を検出する。
+        設定の登録は範囲を確定した後に行う(戻った場合に登録が残らないように)。
+        """
+        if not text or not text.strip():
+            return
+        state: "dict | None" = None
+        while True:
+            state = self._ask_pii_detect_input(text, state)
+            if state is None:
+                return
+            entity, pattern = state["entity"], state["text"]
+            if entity == MANUAL_ENTITY_TYPE:
+                scope = self._ask_pii_manual_detect_scope(text, allow_back=True, pattern=pattern)
+            else:
+                scope = self._ask_pii_detect_scope(text, entity, allow_back=True, pattern=pattern)
+            if scope != ScopeChoiceDialog.SCOPE_BACK:
+                break
+        if entity == MANUAL_ENTITY_TYPE:
+            self._on_pii_detect_manual(text, pattern=pattern, scope=scope)
+        else:
+            self._on_pii_add_detect_word(entity, text, pattern=pattern, scope=scope)
+
+    def _on_pii_add_detect_word(
+        self,
+        entity: str,
+        text: str,
+        pattern: "str | None" = None,
+        scope: "str | None" = None,
+    ) -> None:
+        """「検出語に追加」の実処理(種類は検出対象の種別)。
+
+        ``pattern``(省略時は語句をそのまま ``re.escape`` した形)を追加検出パターンとして
+        登録し、同じ語句の除外設定を取り除く。続けて範囲(全ページ/このページだけ/
+        検出しない。``scope`` 省略時にダイアログ)に従い、そのパターンだけで部分再検出する
+        (既存の検出結果はそのまま、重複しない新規分だけを追加する)。
         """
         if not text or not text.strip() or entity not in ENTITY_TYPES:
             return
         # パターンは、全角→半角へ1文字ずつ揃えた検出用テキストに対して使われるため、
         # 語句も同じ正規化をかけてから(記号をエスケープして)登録する。
         settings = self._pii_settings().copy()
-        pattern = literal_to_pattern(normalize_1to1(text), settings.pattern_whitespace_mode)
+        if pattern is None:
+            pattern = literal_to_pattern(normalize_1to1(text), settings.pattern_whitespace_mode)
         entry = (entity, pattern)
         added = settings.add_additional_pattern(*entry)
         removed_exclusion = self._drop_exclusions_for_text(settings, text)
@@ -1209,7 +1340,8 @@ class PiiDrawerMixin:
             settings.save()
             self._pii_settings_cache = settings
 
-        scope = self._ask_pii_detect_scope(text, entity)
+        if scope is None:
+            scope = self._ask_pii_detect_scope(text, entity)
         page_indices = self._pii_page_indices_for_scope(scope)
         if page_indices is None:
             return
