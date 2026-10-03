@@ -42,7 +42,7 @@ class VirtualPageGrid(QWidget):
         scroll_area: QScrollArea,
         *,
         pdf_path_provider: Callable[[], str],
-        state_provider: Callable[[int], tuple[bool, bool, bool]],
+        state_provider: Callable[[int], tuple[bool, bool, bool, bool]],
         bind_hook: Callable[[PageThumbnail, int], None],
         drag_pages_provider: Callable[[int], list[int]],
         thumb_size: int = PageThumbnail.THUMBNAIL_SIZE,
@@ -268,7 +268,7 @@ class VirtualPageGrid(QWidget):
             self._rubber_band.raise_()
 
     def update_page(self, page: int) -> None:
-        """ページの状態(選択・ドロップ先・検索ヒット)をウィジェットへ反映する(割り当て中のみ)。"""
+        """ページの状態(選択・ドロップ先・検索ヒット・現在のヒット)をウィジェットへ反映する(割り当て中のみ)。"""
         widget = self._bound.get(page)
         if widget is not None:
             widget.set_state(*self._state_provider(page))
@@ -290,6 +290,11 @@ class VirtualPageGrid(QWidget):
                 vbar.setValue(max(0, rect.top() - m.margin))
             elif rect.bottom() + m.margin > value + height - 1:
                 vbar.setValue(rect.bottom() + m.margin - height + 1)
+        self._scroll_x_into_view(rect)
+        self.relayout()
+
+    def _scroll_x_into_view(self, rect: QRect) -> None:
+        m = self._metrics
         hbar = self._scroll.horizontalScrollBar()
         width = self._scroll.viewport().width()
         if width > 0:
@@ -298,6 +303,29 @@ class VirtualPageGrid(QWidget):
                 hbar.setValue(max(0, rect.left() - m.margin))
             elif rect.right() + m.margin > hvalue + width - 1:
                 hbar.setValue(rect.right() + m.margin - width + 1)
+
+    # 中央寄せを省く「十分に見えている」範囲(ビューポート高さに対する割合)。中央 70% に収まっていれば動かさない。
+    CENTER_COMFORT_MARGIN = 0.15
+
+    def scroll_page_to_center(self, page: int) -> None:
+        """そのページの行がビューポートの縦中央に来るようスクロールする(検索ジャンプ用)。
+
+        既に中央 70% に全体が収まっていれば動かさない。スクロール範囲の端では端に止まる。
+        """
+        m = self._metrics
+        if not 0 <= page < m.count:
+            return
+        rect = m.cell_rect(page)
+        vbar = self._scroll.verticalScrollBar()
+        height = self._scroll.viewport().height()
+        if height > 0:
+            value = vbar.value()
+            lo = height * self.CENTER_COMFORT_MARGIN
+            hi = height * (1.0 - self.CENTER_COMFORT_MARGIN)
+            if not (rect.top() - value >= lo and rect.bottom() - value <= hi):
+                target = rect.top() + rect.height() // 2 - height // 2
+                vbar.setValue(max(0, min(target, vbar.maximum())))
+        self._scroll_x_into_view(rect)
         self.relayout()
 
     def _on_vscroll(self, _value: int) -> None:

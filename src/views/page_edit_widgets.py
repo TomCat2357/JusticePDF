@@ -391,6 +391,7 @@ class PageThumbnail(QFrame):
         self._is_selected = False
         self._is_drop_target = False
         self._is_search_hit = False
+        self._is_current_hit = False
         self._drag_start_pos = None
         self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
         self._thumbnail_loaded = False
@@ -451,22 +452,31 @@ class PageThumbnail(QFrame):
         """ページへの割り当てを解く。画像・塗りつぶし重ね描き・状態を空に戻す(隠すのは呼び出し側)。"""
         self._drag_start_pos = None
         self._page_num = -1
-        self.set_state(False, False, False)
+        self.set_state(False, False, False, False)
         self.invalidate_thumbnail()
         self._image_label.set_overlay([], (0.0, 0.0))
 
-    def set_state(self, selected: bool, drop_target: bool, search_hit: bool) -> None:
-        """選択・ドロップ先・検索ヒットの表示状態をまとめて設定する(変化が無ければ何もしない)。"""
-        selected, drop_target, search_hit = bool(selected), bool(drop_target), bool(search_hit)
+    def set_state(
+        self,
+        selected: bool,
+        drop_target: bool,
+        search_hit: bool,
+        current_hit: bool = False,
+    ) -> None:
+        """選択・ドロップ先・検索ヒット・現在のヒットの表示状態をまとめて設定する(変化が無ければ何もしない)。"""
+        selected, drop_target = bool(selected), bool(drop_target)
+        search_hit, current_hit = bool(search_hit), bool(current_hit)
         if (
             selected == self._is_selected
             and drop_target == self._is_drop_target
             and search_hit == self._is_search_hit
+            and current_hit == self._is_current_hit
         ):
             return
         self._is_selected = selected
         self._is_drop_target = drop_target
         self._is_search_hit = search_hit
+        self._is_current_hit = current_hit
         self._update_style()
 
     @property
@@ -514,17 +524,21 @@ class PageThumbnail(QFrame):
             self._image_label.setText("")
             self._thumbnail_loaded = True
 
-    def _update_style(self) -> None:
-        """Update style based on selection and drop-target state."""
+    def _style_state(self) -> str:
+        """QSS の ``state`` に使う、表示状態の組み合わせ名(ドロップ先 > 現在のヒット > 選択 > ヒット)。"""
         if self._is_drop_target:
-            state = "droptarget"
-        elif self._is_selected:
-            state = "selected"
-        elif self._is_search_hit:
-            state = "search_hit"
-        else:
-            state = "normal"
-        self.setProperty("state", state)
+            return "droptarget"
+        if self._is_current_hit:
+            return "selected_current" if self._is_selected else "current_hit"
+        if self._is_selected:
+            return "selected_hit" if self._is_search_hit else "selected"
+        if self._is_search_hit:
+            return "search_hit"
+        return "normal"
+
+    def _update_style(self) -> None:
+        """選択・ドロップ先・検索ヒット・現在のヒットの組み合わせに応じてスタイルを更新する。"""
+        self.setProperty("state", self._style_state())
         self.style().unpolish(self)
         self.style().polish(self)
 
@@ -533,14 +547,18 @@ class PageThumbnail(QFrame):
         return self._is_search_hit
 
     def set_search_hit(self, on: bool) -> None:
-        self.set_state(self._is_selected, self._is_drop_target, on)
+        self.set_state(self._is_selected, self._is_drop_target, on, self._is_current_hit)
+
+    @property
+    def is_current_hit(self) -> bool:
+        return self._is_current_hit
 
     @property
     def is_drop_target(self) -> bool:
         return self._is_drop_target
 
     def set_drop_target(self, on: bool) -> None:
-        self.set_state(self._is_selected, on, self._is_search_hit)
+        self.set_state(self._is_selected, on, self._is_search_hit, self._is_current_hit)
 
     @property
     def page_num(self) -> int:
@@ -551,7 +569,7 @@ class PageThumbnail(QFrame):
         return self._is_selected
 
     def set_selected(self, selected: bool) -> None:
-        self.set_state(selected, self._is_drop_target, self._is_search_hit)
+        self.set_state(selected, self._is_drop_target, self._is_search_hit, self._is_current_hit)
 
     def refresh(self) -> None:
         self.invalidate_thumbnail()

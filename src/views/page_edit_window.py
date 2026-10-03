@@ -442,7 +442,12 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._search_hits: dict[int, list] = {}
         self._search_hit_pages: list[int] = []
         self._search_hit_set: set[int] = set()
-        self._search_cursor: int = -1
+        # 次へ/前へで見ている「現在のヒット」のページ(選択とは独立)。
+        self._search_current: int | None = None
+        # 現在のヒットへジャンプした後に、ユーザーが一覧でクリックしたページ。次へ/前への起点になる。
+        self._search_nav_anchor: int | None = None
+        # 検索を始めたときの基準ページ(最初のジャンプはこのページ以降の最初のヒット)。
+        self._search_ref: int = 0
         # 検索の走査ジョブ(UIスレッドでQTimer駆動のチャンク処理)とページ別テキストの索引
         self._search_scan: "SearchScan | None" = None
         self._search_sync: bool = False
@@ -1591,12 +1596,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         """ページ一覧をスクロールして、そのページを見える位置へ持ってくる。"""
         self._grid.scroll_to_page(page)
 
-    def _grid_page_state(self, page: int) -> tuple[bool, bool, bool]:
-        """(選択中か, ドロップ先か, 検索ヒットか)。グリッドがウィジェットへ反映するときに呼ぶ。"""
+    def _grid_page_state(self, page: int) -> tuple[bool, bool, bool, bool]:
+        """(選択中か, ドロップ先か, 検索ヒットか, 現在のヒットか)。グリッドがウィジェットへ反映するときに呼ぶ。"""
         return (
             page in self._selected_pages,
             page in self._drop_target_pages,
             page in self._search_hit_set,
+            page == self._search_current,
         )
 
     def _read_pii_mask_style(self) -> "tuple[tuple[float, float, float], float, frozenset[str]]":
@@ -2130,6 +2136,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         return super().eventFilter(obj, event)
 
     def _on_page_clicked(self, page: int) -> None:
+        self._search_nav_anchor = page  # 検索の次へ/前へは、クリックしたページから進む
         modifiers = QApplication.keyboardModifiers()
 
         if modifiers & Qt.KeyboardModifier.ControlModifier:
@@ -2200,6 +2207,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._relayout_grid()
         # 最後に表示していたページを選択状態にする
         if last_page is not None:
+            self._search_nav_anchor = last_page
             self._select_page_thumbnail(last_page)
         self._apply_panel_context()
         self._sync_grid_pii_thumbnails()
@@ -3080,6 +3088,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         """選択をラバーバンド内のページ(昇順)に置き換える。変化したページだけ表示を更新する。"""
         if list(self._selected_pages) == pages:
             return
+        if pages:
+            self._search_nav_anchor = pages[0]
         previous = set(self._selected_pages)
         current = set(pages)
         self._selected_pages = dict.fromkeys(pages)
@@ -3495,11 +3505,22 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._clear_search_highlights()
         if not query:
             if self._search_dialog is not None:
-                self._search_dialog.set_status(0, 0)
+                self._search_dialog.set_status(0, 0, 0)
             return
         self._search_query = query
         self._search_jumped = False
+        self._search_ref = self._search_reference_page()
         self._start_search_scan()
+
+    def _search_reference_page(self) -> int:
+        """検索を始める基準のページ: 拡大表示中は表示中のページ、一覧では最初の選択ページ、
+        選択が無ければ見えている最初のページ。"""
+        if self._zoom_view and self._zoom_view.isVisible() and self._zoom_page_num is not None:
+            return int(self._zoom_page_num)
+        if self._selected_pages:
+            return min(self._selected_pages)
+        first = self._grid.first_visible_page() if self._grid is not None else None
+        return first or 0
 
     def _search_index_for_current(self) -> PageTextIndex:
         """現在の文書に対応するページ別テキスト索引を返す(変更されたページ分だけ無効化して再利用)。"""
@@ -3526,7 +3547,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._search_scan = SearchScan(index, self._search_query, self._page_count)
         self._search_sync = self._page_count <= self.SEARCH_SYNC_MAX_PAGES
         if self._search_dialog is not None and not self._search_scan.done:
-            self._search_dialog.set_progress(0, self._page_count, 0)
+            self._search_dialog.set_progress(0, self._page_count, 0, 0)
         if self._search_sync:
             while self._search_scan is not None:
                 self._search_step()
@@ -3552,7 +3573,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._reset_search_hit_pages()
         self._search_hits = {}
         self._search_hit_pages = []
-        self._search_cursor = -1
         if self._zoom_label is not None:
             self._zoom_label.set_search_hit_rects([])
 
@@ -3602,7 +3622,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             )
             self._clear_search_highlights()
             if self._search_dialog is not None:
-                self._search_dialog.set_status(0, 0)
+                self._search_dialog.set_status(0, 0, 0)
             return
         for page, rects in found:
             self._add_search_hit(page, rects)
@@ -3641,7 +3661,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def _apply_search_page_result(self, page: int, rects: "list | None") -> None:
         """既に走査済みのページの検索結果を差し替える(ヒットの追加・更新・削除、並びは昇順)。"""
         pages = self._search_hit_pages
-        current = pages[self._search_cursor] if 0 <= self._search_cursor < len(pages) else None
         known = page in self._search_hits
         if rects:
             if known:
@@ -3659,12 +3678,14 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._grid.update_page(page)
             if page == self._zoom_page_num and self._zoom_label is not None:
                 self._zoom_label.set_search_hit_rects([])
-        if current is not None and current in self._search_hits:
-            self._search_cursor = bisect.bisect_left(pages, current)
-        elif pages:
-            self._search_cursor = min(max(self._search_cursor, 0), len(pages) - 1)
-        else:
-            self._search_cursor = -1
+        current = self._search_current
+        if current is not None and current not in self._search_hits:
+            # 現在のヒットが無くなったので、近くのヒット(無ければ無し)へ移す
+            moved = pages[min(bisect.bisect_left(pages, current), len(pages) - 1)] if pages else None
+            self._search_current = moved
+            self._grid.update_page(current)
+            if moved is not None:
+                self._grid.update_page(moved)
 
     def _add_search_hit(self, page: int, rects: list, *, append: bool = True) -> None:
         self._search_hits[page] = rects
@@ -3674,76 +3695,112 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._grid.update_page(page)
         if page == self._zoom_page_num and self._zoom_label is not None:
             self._zoom_label.set_search_hit_rects(rects)
-        if not self._search_jumped:
+        # 基準ページ以降の最初のヒットが見つかった時点でジャンプする(以後は動かさない)。
+        # 基準より後に1件も無いときは、走査の終わりに先頭のヒットへ戻る(_finish_search_scan)。
+        if not self._search_jumped and page >= self._search_ref:
             self._search_jumped = True
-            self._search_cursor = 0
             self._jump_to_search_page(page)
 
-    def _update_search_progress(self) -> None:
-        scan = self._search_scan
-        if scan is None or self._search_dialog is None:
+    def _search_current_index(self) -> int:
+        """現在のヒットがヒットページの何番目か(1 始まり)。無ければ 0。"""
+        current, pages = self._search_current, self._search_hit_pages
+        if current is None:
+            return 0
+        i = bisect.bisect_left(pages, current)
+        return i + 1 if i < len(pages) and pages[i] == current else 0
+
+    def _show_search_status(self) -> None:
+        """ヒットしたページ数・全件数・現在位置(走査中は進み具合も)をダイアログへ表示する。"""
+        dialog = self._search_dialog
+        if dialog is None:
             return
-        self._search_dialog.set_progress(
-            scan.next_page,
-            scan.page_count,
-            len(self._search_hit_pages),
-            self._search_cursor + 1 if self._search_cursor >= 0 else 0,
-        )
+        pages = len(self._search_hit_pages)
+        occurrences = sum(len(rects) for rects in self._search_hits.values())
+        current = self._search_current_index()
+        scan = self._search_scan
+        if scan is not None:
+            dialog.set_progress(scan.next_page, scan.page_count, pages, occurrences, current)
+        else:
+            dialog.set_status(current, pages, occurrences)
+
+    def _update_search_progress(self) -> None:
+        if self._search_scan is not None:
+            self._show_search_status()
+
+    def _jump_to_first_hit_if_not_jumped(self) -> None:
+        """基準ページ以降にヒットが無いまま走査が終わった(中止された)とき、先頭のヒットへ移る。"""
+        if not self._search_jumped and self._search_hit_pages:
+            self._search_jumped = True
+            self._jump_to_search_page(self._search_hit_pages[0])
 
     def _finish_search_scan(self) -> None:
         self._search_scan = None
         self._held_doc_idle_timer.start()
         self._idle_scheduler.poke()
-        if self._search_dialog is None:
-            return
-        if not self._search_hit_pages:
-            self._search_cursor = -1
-            self._search_dialog.set_status(0, 0)
-            return
-        if self._search_cursor < 0:
-            self._search_cursor = 0
-        self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+        self._jump_to_first_hit_if_not_jumped()
+        self._show_search_status()
 
     def _on_search_cancel(self) -> None:
         """ダイアログの「中止」: 走査を止め、ここまでの結果で表示を確定する。"""
         if self._search_scan is None:
             return
         self._stop_search_scan()
-        if self._search_dialog is None:
-            return
-        if self._search_hit_pages:
-            if self._search_cursor < 0:
-                self._search_cursor = 0
-            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
-        else:
-            self._search_dialog.set_status(0, 0)
+        self._jump_to_first_hit_if_not_jumped()
+        self._show_search_status()
 
-    def _search_nav_status(self) -> None:
-        if self._search_dialog is None:
-            return
-        if self._search_scan is not None:
-            self._update_search_progress()
+    def _search_step_target(self, direction: int) -> int | None:
+        """次へ(+1)/前へ(-1)で移るヒットページ。端はぐるっと回る。
+
+        拡大表示中は表示中のページ、一覧では最後にクリックしたページ(ジャンプ後に
+        クリックしていれば)、無ければ現在のヒットを起点に、その前後の最初のヒットを返す。
+        """
+        pages = self._search_hit_pages
+        if not pages:
+            return None
+        if self._zoom_view and self._zoom_view.isVisible() and self._zoom_page_num is not None:
+            base: int | None = int(self._zoom_page_num)
+        elif self._search_nav_anchor is not None:
+            base = self._search_nav_anchor
         else:
-            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+            base = self._search_current
+        if base is None:
+            return pages[0] if direction > 0 else pages[-1]
+        if direction > 0:
+            i = bisect.bisect_right(pages, base)
+            return pages[i] if i < len(pages) else pages[0]
+        i = bisect.bisect_left(pages, base)
+        return pages[i - 1]  # i == 0 のとき pages[-1](末尾へ回る)
 
     def _on_search_next(self) -> None:
-        if not self._search_hit_pages:
-            return
-        self._search_cursor = (self._search_cursor + 1) % len(self._search_hit_pages)
-        self._jump_to_search_page(self._search_hit_pages[self._search_cursor])
-        self._search_nav_status()
+        self._search_move(1)
 
     def _on_search_prev(self) -> None:
-        if not self._search_hit_pages:
+        self._search_move(-1)
+
+    def _search_move(self, direction: int) -> None:
+        target = self._search_step_target(direction)
+        if target is None:
             return
-        self._search_cursor = (self._search_cursor - 1) % len(self._search_hit_pages)
-        self._jump_to_search_page(self._search_hit_pages[self._search_cursor])
-        self._search_nav_status()
+        self._jump_to_search_page(target)
+        self._show_search_status()
+
+    def _set_search_current(self, page: int | None) -> None:
+        """現在のヒットを設定する(選択とは独立)。ジャンプしたので、クリックの起点はリセットする。"""
+        old = self._search_current
+        self._search_current = page
+        self._search_nav_anchor = None
+        if self._grid is None:
+            return
+        if old is not None and old != page:
+            self._grid.update_page(old)
+        if page is not None:
+            self._grid.update_page(page)
 
     def _jump_to_search_page(self, page_num: int) -> None:
         if page_num < 0 or page_num >= self._page_count:
             return
         zoom_visible = bool(self._zoom_view and self._zoom_view.isVisible())
+        self._set_search_current(page_num)
         if zoom_visible:
             # ズーム表示中は対応ページに切り替えてヒット矩形を表示
             self._commit_inline_annotation_editor()
@@ -3752,10 +3809,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_page_num = page_num
             self._render_zoom()
         else:
-            # サムネイルグリッド表示中は選択 + スクロール
-            self._select_pages([page_num])
-            self._grid.scroll_to_page(page_num)
-            self._update_button_states()
+            # サムネイルグリッド表示中は、ユーザーの選択は変えず、現在のヒットを中央へスクロールする
+            self._grid.scroll_page_to_center(page_num)
 
     def _apply_search_highlights(self) -> None:
         self._search_hit_set = set(self._search_hit_pages)
@@ -3766,6 +3821,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         """検索ヒットの強調を解除する(以前ヒットしていたページの表示だけ更新する)。"""
         previous = self._search_hit_set
         self._search_hit_set = set()
+        current, self._search_current = self._search_current, None
+        self._search_nav_anchor = None
+        if current is not None and current not in previous:
+            previous = previous | {current}
         for page in previous:
             if self._grid is not None:
                 self._grid.update_page(page)
@@ -3775,7 +3834,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._reset_search_hit_pages()
         self._search_hits = {}
         self._search_hit_pages = []
-        self._search_cursor = -1
         if self._zoom_label is not None:
             self._zoom_label.set_search_hit_rects([])
 
@@ -3786,7 +3844,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._reset_search_hit_pages()
         self._search_hits = {}
         self._search_hit_pages = []
-        self._search_cursor = -1
         if self._zoom_label is not None:
             self._zoom_label.set_search_hit_rects([])
         if self._search_dialog is not None:
