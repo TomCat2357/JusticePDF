@@ -116,7 +116,14 @@ from src.utils.pdf_utils import (
 )
 from src.utils import app_settings
 from src.utils.pdf_utils.search_index import PageTextIndex, SearchScan
-from src.views.idle_work_scheduler import IdleWorkScheduler, SearchIndexJob
+from src.views.idle_work_scheduler import (
+    IdleWorkScheduler,
+    InkScanJob,
+    PiiScanJob,
+    SearchIndexJob,
+    ThumbPrefetchJob,
+    ZoomPrerenderJob,
+)
 from src.utils.pdf_utils.common import (
     PdfSession,
     PdfSessionConflictError,
@@ -396,7 +403,16 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._held_doc_idle_timer.setInterval(3000)
         self._held_doc_idle_timer.timeout.connect(self._release_held_doc)
         # 操作していない間の先回り処理(検索索引の取り込みなど)。優先順にジョブを並べる。
-        self._idle_scheduler = IdleWorkScheduler(self, [SearchIndexJob(self)])
+        self._idle_scheduler = IdleWorkScheduler(
+            self,
+            [
+                SearchIndexJob(self),
+                ZoomPrerenderJob(self),
+                PiiScanJob(self),
+                InkScanJob(self),
+                ThumbPrefetchJob(self),
+            ],
+        )
         _held_path = self._pdf_path
         self.destroyed.connect(lambda *_a, _p=_held_path: release_held_docs(_p))
         self._scroll_debounce_timer = QTimer(self)
@@ -1722,6 +1738,68 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             widget.invalidate_thumbnail()
         self._enqueue_visible_thumbnail_renders()
 
+    def _render_thumbnail_batch(self, batch: list[int]) -> None:
+        """*batch* のサムネイルを描いて保持(``_rendered``)へ入れ、割り当て済みウィジェットへ反映する。"""
+        # 手書き(Ink)注釈を非表示にする設定なら、対象ページ分だけ xref を隠す。
+        # 塗りつぶし対象(個人情報検出)も実PDF注釈の暗く薄い見た目では縮小時に
+        # 判別できないため、ページ画像からは隠して後から見やすく重ね描きする。
+        # 重量文書は描画バッチのページ分だけ集計する(全ページ走査でフリーズするため)。
+        scan_pages = batch if self._is_heavy_document else None
+        hide_xrefs_by_page: dict[int, set[int]] = {}
+        # 走査と描画で同じドキュメントを使い回す(重量文書は開き直すたびに
+        # 最初の load_page でページツリー解析が走り、バッチごとに約1秒ブロックするため)。
+        # 重量文書はバッチをまたいで保持する(アイドル・閉じる・ファイル更新時に閉じる)。
+        with hold_doc(self._pdf_path, linger=self._is_heavy_document):
+            pii_targets_by_page = self._get_pii_targets_by_page(scan_pages)
+            ink_xrefs_by_page = (
+                None if self._show_ink_annots else self._get_ink_xrefs_by_page(scan_pages)
+            )
+            for pn in batch:
+                xrefs: set[int] = set()
+                if ink_xrefs_by_page:
+                    xrefs.update(ink_xrefs_by_page.get(pn, ()))
+                if pn in pii_targets_by_page:
+                    xrefs.update(t.xref for t in pii_targets_by_page[pn][1])
+                if xrefs:
+                    hide_xrefs_by_page[pn] = xrefs
+            pixmaps = render_page_thumbnails_batch(
+                self._pdf_path, batch, self._thumb_size, hide_xrefs=hide_xrefs_by_page or None
+            )
+        # 設定の変更が経由せず反映されていない場合に備え、塗りつぶしの見た目を読み直して流し込む。
+        style = self._read_pii_mask_style()
+        if style != self._pii_mask_style:
+            self._pii_mask_style = style
+            for widget in self._grid.bound_widgets():
+                widget.set_pii_mask_style(*style)
+        for pn in batch:
+            if pn >= self._page_count:
+                continue
+            pixmap = pixmaps.get(pn, QPixmap())
+            if pixmap.isNull():
+                widget = self._grid.widget_for_page(pn)
+                if widget is not None:
+                    widget.set_pixmap_direct(pixmap)
+                continue
+            # 塗りつぶし対象はピクセルへ焼き込まず、サムネイルの paint 時に重ねる
+            # (色・透明度・種別の変更で画像を再レンダリングしなくて済む)。
+            if pn in pii_targets_by_page:
+                page_size, targets = pii_targets_by_page[pn]
+            else:
+                page_size, targets = (0.0, 0.0), []
+            self._rendered[pn] = _RenderedThumb(
+                pixmap=pixmap,
+                pii_targets=list(targets),
+                pii_page_size=page_size,
+                pii_xrefs=tuple(t.xref for t in targets),
+            )
+            self._rendered.move_to_end(pn)
+            self._evict_rendered()
+            widget = self._grid.widget_for_page(pn)
+            if widget is not None and pn in self._rendered:
+                self._bind_page_widget(widget, pn)
+        if self._is_heavy_document:
+            self._held_doc_idle_timer.start()
+
     def _process_thumbnail_render_queue(self) -> None:
         if self._grid_slider_down():
             return
@@ -1748,65 +1826,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 continue
             batch.append(page_num)
         if batch:
-            # 手書き(Ink)注釈を非表示にする設定なら、対象ページ分だけ xref を隠す。
-            # 塗りつぶし対象(個人情報検出)も実PDF注釈の暗く薄い見た目では縮小時に
-            # 判別できないため、ページ画像からは隠して後から見やすく重ね描きする。
-            # 重量文書は描画バッチのページ分だけ集計する(全ページ走査でフリーズするため)。
-            scan_pages = batch if self._is_heavy_document else None
-            hide_xrefs_by_page: dict[int, set[int]] = {}
-            # 走査と描画で同じドキュメントを使い回す(重量文書は開き直すたびに
-            # 最初の load_page でページツリー解析が走り、バッチごとに約1秒ブロックするため)。
-            # 重量文書はバッチをまたいで保持する(アイドル・閉じる・ファイル更新時に閉じる)。
-            with hold_doc(self._pdf_path, linger=self._is_heavy_document):
-                pii_targets_by_page = self._get_pii_targets_by_page(scan_pages)
-                ink_xrefs_by_page = (
-                    None if self._show_ink_annots else self._get_ink_xrefs_by_page(scan_pages)
-                )
-                for pn in batch:
-                    xrefs: set[int] = set()
-                    if ink_xrefs_by_page:
-                        xrefs.update(ink_xrefs_by_page.get(pn, ()))
-                    if pn in pii_targets_by_page:
-                        xrefs.update(t.xref for t in pii_targets_by_page[pn][1])
-                    if xrefs:
-                        hide_xrefs_by_page[pn] = xrefs
-                pixmaps = render_page_thumbnails_batch(
-                    self._pdf_path, batch, self._thumb_size, hide_xrefs=hide_xrefs_by_page or None
-                )
-            # 設定の変更が経由せず反映されていない場合に備え、塗りつぶしの見た目を読み直して流し込む。
-            style = self._read_pii_mask_style()
-            if style != self._pii_mask_style:
-                self._pii_mask_style = style
-                for widget in self._grid.bound_widgets():
-                    widget.set_pii_mask_style(*style)
-            for pn in batch:
-                if pn >= self._page_count:
-                    continue
-                pixmap = pixmaps.get(pn, QPixmap())
-                if pixmap.isNull():
-                    widget = self._grid.widget_for_page(pn)
-                    if widget is not None:
-                        widget.set_pixmap_direct(pixmap)
-                    continue
-                # 塗りつぶし対象はピクセルへ焼き込まず、サムネイルの paint 時に重ねる
-                # (色・透明度・種別の変更で画像を再レンダリングしなくて済む)。
-                if pn in pii_targets_by_page:
-                    page_size, targets = pii_targets_by_page[pn]
-                else:
-                    page_size, targets = (0.0, 0.0), []
-                self._rendered[pn] = _RenderedThumb(
-                    pixmap=pixmap,
-                    pii_targets=list(targets),
-                    pii_page_size=page_size,
-                    pii_xrefs=tuple(t.xref for t in targets),
-                )
-                self._rendered.move_to_end(pn)
-                self._evict_rendered()
-                widget = self._grid.widget_for_page(pn)
-                if widget is not None and pn in self._rendered:
-                    self._bind_page_widget(widget, pn)
-            if self._is_heavy_document:
-                self._held_doc_idle_timer.start()
+            self._render_thumbnail_batch(batch)
         self._schedule_thumbnail_render()
 
     def _release_held_doc(self) -> None:
@@ -2379,6 +2399,46 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         with self._hold_doc_scope():
             self._render_zoom_page_body()
 
+    def _zoom_overlay_and_hidden_xrefs(self, page_data: dict) -> "tuple[list, set[int]]":
+        """ズーム表示の(オーバーレイで描く注釈, ページ画像側で隠す xref 集合)。
+
+        ライブ描画と先回り描画(ZoomPrerenderJob)が同じ描画キャッシュのキーになるよう、
+        この関数を共用する。
+        """
+        merged = (
+            page_data["freetext"] + page_data["shape"] + page_data["markup"] + page_data["note"]
+        )
+        # オーバーレイで描く注釈(フリーテキスト・図形・マークアップ・ノート)は
+        # 二重描画を避けるためページ画像側では隠す。それ以外(Ink など本アプリが
+        # 編集対象としない注釈)はページ画像にそのまま焼き込んで表示する。
+        hide_xrefs = {a.xref for a in merged}
+        if not self._show_ink_annots:
+            # 手書き(Ink)注釈を非表示にする設定の場合、この xref もページ画像側で隠す。
+            hide_xrefs |= set(page_data["ink_xrefs"])
+        return merged, hide_xrefs
+
+    def _zoom_page_pixmap(self, page_num: int, dpr: float, hide_xrefs: "set[int]") -> QPixmap:
+        """ズーム表示のページ画像(描画キャッシュ経由)。ライブ描画と先回り描画で共用する。"""
+        return get_page_pixmap(
+            self._pdf_path,
+            page_num,
+            self._zoom_factor * dpr,
+            annots=True,
+            hide_xrefs=hide_xrefs,
+        )
+
+    def _zoom_page_text(self, page_num: int) -> "tuple[list[tuple], list[dict], list[dict]]":
+        """ズーム表示のページ文字情報(単語・リンク・文字)。ページ別にキャッシュする。"""
+        cached = self._zoom_text_cache.get(page_num)
+        if cached is None:
+            cached = (
+                get_page_words(self._pdf_path, page_num),
+                get_page_links(self._pdf_path, page_num),
+                get_page_chars(self._pdf_path, page_num),
+            )
+            self._zoom_text_cache[page_num] = cached
+        return cached
+
     def _render_zoom_page_body(self) -> None:
         # ページ数・注釈4種・描画順・Ink xref を1回の open でまとめて取得する
         # (以前は7回 open していた。大きいPDFで各20〜25ms)。
@@ -2393,34 +2453,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._exit_zoom_view()
             return
         dpr = self._zoom_label.devicePixelRatioF()
-        merged = (
-            page_data["freetext"] + page_data["shape"] + page_data["markup"] + page_data["note"]
-        )
-        # オーバーレイで描く注釈(フリーテキスト・図形・マークアップ・ノート)は
-        # 二重描画を避けるためページ画像側では隠す。それ以外(Ink など本アプリが
-        # 編集対象としない注釈)はページ画像にそのまま焼き込んで表示する。
-        hide_xrefs = {a.xref for a in merged}
-        if not self._show_ink_annots:
-            # 手書き(Ink)注釈を非表示にする設定の場合、この xref もページ画像側で隠す。
-            hide_xrefs |= set(page_data["ink_xrefs"])
-        pixmap = get_page_pixmap(
-            self._pdf_path,
-            self._zoom_page_num,
-            self._zoom_factor * dpr,
-            annots=True,
-            hide_xrefs=hide_xrefs,
-        )
+        merged, hide_xrefs = self._zoom_overlay_and_hidden_xrefs(page_data)
+        pixmap = self._zoom_page_pixmap(self._zoom_page_num, dpr, hide_xrefs)
         pixmap.setDevicePixelRatio(dpr)
-        words = []
-        links = []
-        chars = []
-        if self._zoom_page_num in self._zoom_text_cache:
-            words, links, chars = self._zoom_text_cache[self._zoom_page_num]
-        else:
-            words = get_page_words(self._pdf_path, self._zoom_page_num)
-            links = get_page_links(self._pdf_path, self._zoom_page_num)
-            chars = get_page_chars(self._pdf_path, self._zoom_page_num)
-            self._zoom_text_cache[self._zoom_page_num] = (words, links, chars)
+        words, links, chars = self._zoom_page_text(self._zoom_page_num)
         xref_order = page_data["xref_order"]
         order_index = {x: i for i, x in enumerate(xref_order)}
         # PDF の /Annots 配列順（描画順）に並べ替え。未登録 xref は末尾に置く。

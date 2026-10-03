@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections.abc import Callable, Sequence
@@ -27,8 +28,14 @@ from PyQt6.QtCore import QEvent, QObject, Qt, QTimer
 from PyQt6.QtWidgets import QApplication
 
 from src.utils import app_settings
+from src.utils.pdf_utils.annotations import load_zoom_page_annotations
+from src.utils.pdf_utils.annotations import load_zoom_page_annotations
 from src.utils.pdf_utils.common import _get_file_cache_token, _open_doc, hold_doc
 from src.utils.pdf_utils.search_index import fill_index_page
+
+logger = logging.getLogger(__name__)
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from src.views.page_edit_window import PageEditWindow
@@ -412,3 +419,347 @@ class SearchIndexJob:
                     return False
         self._complete = True
         return True
+
+
+class ZoomPrerenderJob:
+    """拡大ビュー(1ページ表示)で、次のページ・前のページを先に描いておく。
+
+    ライブ描画(``_render_zoom_page_body``)と同じ補助関数で注釈の隠し集合・倍率・ページ画像を
+    決めるので、ページ送りしたときは同じ描画キャッシュのエントリに当たる。1スライスで1つ
+    (ページ画像 → ページ文字情報の順、次ページが先)だけ進める。
+    """
+
+    name = "zoom_prerender"
+    _MAX_DONE = 64
+
+    def __init__(self, window: "PageEditWindow") -> None:
+        self._w = window
+        self._done: set[tuple] = set()
+
+    def reset(self) -> None:
+        self._done.clear()
+
+    def _next_target(self) -> "tuple[int, str, tuple] | None":
+        w = self._w
+        page = w._zoom_page_num
+        zoom_view = getattr(w, "_zoom_view", None)
+        label = getattr(w, "_zoom_label", None)
+        if page is None or zoom_view is None or label is None or not zoom_view.isVisible():
+            return None
+        if w._page_count <= 0 or w._zoom_page_layout_is_multi():
+            return None
+        scale = round(w._zoom_factor * label.devicePixelRatioF(), 4)
+        for p in (page + 1, page - 1):
+            if p < 0 or p >= w._page_count:
+                continue
+            for stage in ("pixmap", "text"):
+                key = (p, stage, scale, bool(w._show_ink_annots))
+                if key in self._done:
+                    continue
+                if stage == "text" and p in w._zoom_text_cache:
+                    continue
+                return p, stage, key
+        return None
+
+    def wants_run(self) -> bool:
+        if not app_settings.idle_zoom_prerender_enabled():
+            return False
+        return self._next_target() is not None
+
+    def step(self, deadline: float) -> bool:
+        target = self._next_target()
+        if target is None:
+            return True
+        page, stage, key = target
+        w = self._w
+        if len(self._done) >= self._MAX_DONE:
+            self._done.clear()
+        self._done.add(key)  # 失敗しても同じ対象を繰り返さない
+        if stage == "pixmap":
+            page_data = load_zoom_page_annotations(
+                w._pdf_path, page, include_ink=not w._show_ink_annots
+            )
+            if page < page_data["page_count"]:
+                _, hide_xrefs = w._zoom_overlay_and_hidden_xrefs(page_data)
+                w._zoom_page_pixmap(page, w._zoom_label.devicePixelRatioF(), hide_xrefs)
+        else:
+            w._zoom_page_text(page)
+        return self._next_target() is None
+
+
+class _HeavyScanJob:
+    """重量文書のページ別集計(PII 対象・Ink xref)を、見えている範囲から外側へ少しずつ進める。
+
+    集計の実体とキャッシュは ``PageEditWindow`` の ``_get_*_by_page(pages=...)`` に任せる。
+    全ページ走査済みの印(``*_scanned_pages = None``)は、後の ``pages=None`` 呼び出しで
+    再走査されないための「完了」の印。完了かどうかはウィンドウ側の状態から毎回判定する
+    (他の経路でキャッシュが破棄されたら自然に再開する)。
+    """
+
+    name = ""
+    _START_CHUNK = 4
+    _MAX_CHUNK = 64
+
+    def __init__(self, window: "PageEditWindow") -> None:
+        self._w = window
+        self._order: "list[int] | None" = None
+        self._pos = 0
+        self._ms_per_page: "float | None" = None
+        self._failed = False
+
+    def reset(self) -> None:
+        self._order = None
+        self._pos = 0
+        self._failed = False
+
+    # --- サブクラスが埋める ---
+    def _applicable(self) -> bool:
+        raise NotImplementedError
+
+    def _scanned(self) -> "set[int] | None":
+        raise NotImplementedError
+
+    def _cache_present(self) -> bool:
+        raise NotImplementedError
+
+    def _scan(self, pages: "list[int]") -> None:
+        raise NotImplementedError
+
+    def _mark_complete(self) -> None:
+        raise NotImplementedError
+
+    def _is_complete(self) -> bool:
+        return self._cache_present() and self._scanned() is None
+
+    def wants_run(self) -> bool:
+        w = self._w
+        if self._failed or w._page_count <= 0 or not w._is_heavy_document:
+            return False
+        if not app_settings.idle_pii_scan_enabled() or not self._applicable():
+            return False
+        return not self._is_complete()
+
+    def _start_page(self) -> int:
+        w = self._w
+        zoom_view = getattr(w, "_zoom_view", None)
+        if w._zoom_page_num is not None and zoom_view is not None and zoom_view.isVisible():
+            return w._zoom_page_num
+        first = w._grid.first_visible_page()
+        return first if first is not None else 0
+
+    def _next_chunk(self, limit: int) -> "list[int]":
+        scanned = self._scanned() or set()
+        order = self._order
+        chunk: list[int] = []
+        while order is not None and self._pos < len(order) and len(chunk) < limit:
+            p = order[self._pos]
+            self._pos += 1
+            if p not in scanned:
+                chunk.append(p)
+        return chunk
+
+    def step(self, deadline: float) -> bool:
+        w = self._w
+        if not w._is_heavy_document or w._page_count <= 0:
+            return True
+        try:
+            self._scan([])  # トークン変化の反映と、集計用の入れ物の初期化(走査はしない)
+            if self._order is None:
+                self._order = SearchIndexJob._outward_order(self._start_page(), w._page_count)
+                self._pos = 0
+            while True:
+                if self._ms_per_page is None:
+                    limit = self._START_CHUNK
+                else:
+                    remaining_ms = (deadline - time.perf_counter()) * 1000.0
+                    limit = max(1, int(min(self._MAX_CHUNK, remaining_ms / max(self._ms_per_page, 0.01))))
+                chunk = self._next_chunk(limit)
+                if not chunk:
+                    scanned = self._scanned() or set()
+                    if all(p in scanned for p in range(w._page_count)):
+                        self._mark_complete()
+                        return True
+                    self._order = None  # 取りこぼし(トークン変化で戻された分)は最初から見直す
+                    return False
+                t0 = time.perf_counter()
+                self._scan(chunk)
+                dt_ms = (time.perf_counter() - t0) * 1000.0 / len(chunk)
+                prev = self._ms_per_page
+                self._ms_per_page = dt_ms if prev is None else 0.5 * prev + 0.5 * dt_ms
+                if time.perf_counter() >= deadline:
+                    return False
+        except Exception:  # noqa: BLE001 - 先回り処理の失敗でアプリを巻き込まない
+            logger.debug("idle scan job failed: %s", self.name, exc_info=True)
+            self._failed = True
+            return True
+
+
+class PiiScanJob(_HeavyScanJob):
+    name = "pii_scan"
+
+    def _applicable(self) -> bool:
+        return True
+
+    def _scanned(self):
+        return self._w._pii_targets_scanned_pages
+
+    def _cache_present(self) -> bool:
+        return self._w._pii_targets_by_page_cache is not None
+
+    def _scan(self, pages):
+        self._w._get_pii_targets_by_page(pages)
+
+    def _mark_complete(self) -> None:
+        self._w._pii_targets_scanned_pages = None
+
+
+class InkScanJob(_HeavyScanJob):
+    name = "ink_scan"
+
+    def _applicable(self) -> bool:
+        return not self._w._show_ink_annots
+
+    def _scanned(self):
+        return self._w._ink_xrefs_scanned_pages
+
+    def _cache_present(self) -> bool:
+        return self._w._ink_xrefs_by_page_cache is not None
+
+    def _scan(self, pages):
+        self._w._get_ink_xrefs_by_page(pages)
+
+    def _mark_complete(self) -> None:
+        self._w._ink_xrefs_scanned_pages = None
+
+
+class ThumbPrefetchJob:
+    """ページ一覧で、先読み範囲の外側のサムネイルも保持上限の余裕の範囲で先に描いておく。
+
+    表示範囲に近いページから外側へ、1スライスに重量文書は1ページ・それ以外は2ページ描く。
+    描いたエントリは ``_rendered`` の先頭へ回すので、足りなくなったときは最初に追い出される
+    (表示中・直近に使ったページは追い出さない)。保持ぶんは「保持上限 - 先読み範囲 - 8」まで。
+    """
+
+    name = "thumb_prefetch"
+    _MARGIN = 8
+
+    def __init__(self, window: "PageEditWindow") -> None:
+        self._w = window
+        self._range: "tuple[int, int] | None" = None
+        self._order: "list[int] | None" = None
+        self._pos = 0
+        self._exhausted = False
+
+    def reset(self) -> None:
+        self._range = None
+        self._order = None
+        self._pos = 0
+        self._exhausted = False
+
+    def _grid_visible(self) -> bool:
+        w = self._w
+        return w._grid_scroll is not None and w._grid_scroll.isVisible()
+
+    @staticmethod
+    def _distance(p: int, rng: "tuple[int, int]") -> int:
+        """先読み範囲からの距離(範囲内は 0)。"""
+        if p < rng[0]:
+            return rng[0] - p
+        if p >= rng[1]:
+            return p - rng[1] + 1
+        return 0
+
+    def _budget(self, rng: "tuple[int, int]") -> int:
+        return self._w._rendered_cap() - (rng[1] - rng[0]) - self._MARGIN
+
+    def _headroom(self, rng: "tuple[int, int]") -> int:
+        """あと何ページ先読みしてよいか。範囲の外で近い(距離が予算以内の)保持ぶんだけ数える。
+
+        遠くに残った古い先読み分は数えず、必要なら ``step`` が遠い順に追い出して場所を空ける。
+        """
+        budget = self._budget(rng)
+        near = sum(1 for p in self._w._rendered if 0 < self._distance(p, rng) <= budget)
+        return budget - near
+
+    def _make_room(self, rng: "tuple[int, int]", batch: "list[int]") -> "list[int]":
+        """*batch* を入れても保持上限を超えないよう、範囲から遠い保持分を追い出す。
+
+        表示範囲・先読み範囲の中は追い出さない。入れ替えは、追い出す側より近いページだけ。
+        入りきらないページは *batch* から外して返す。
+        """
+        w = self._w
+        cap = w._rendered_cap()
+        batch = list(batch)
+        while batch and len(w._rendered) + len(batch) > cap:
+            victim = max(w._rendered, key=lambda q: self._distance(q, rng), default=None)
+            nearest_far = max(self._distance(q, rng) for q in batch)
+            if victim is None or self._distance(victim, rng) <= nearest_far:
+                batch.pop()  # 一番遠い候補をあきらめる
+                continue
+            w._rendered.pop(victim, None)
+        return batch
+
+    def _sync_range(self) -> "tuple[int, int] | None":
+        rng = self._w._grid.prefetch_page_range()
+        if rng[1] <= rng[0]:
+            return None
+        if rng != self._range:
+            self._range = rng
+            self._order = None
+            self._pos = 0
+            self._exhausted = False
+        return rng
+
+    def wants_run(self) -> bool:
+        w = self._w
+        if not app_settings.idle_thumb_prefetch_enabled():
+            return False
+        if w._page_count <= 0 or not self._grid_visible() or w._prerender_all_pages():
+            return False
+        rng = self._sync_range()
+        if rng is None or self._exhausted:
+            return False
+        return self._headroom(rng) > 0
+
+    def _build_order(self, rng: "tuple[int, int]") -> "list[int]":
+        n = self._w._page_count
+        lo, hi = rng
+        span = max(8, 2 * self._w._rendered_cap())
+        order: list[int] = []
+        for d in range(span):
+            up, down = hi + d, lo - 1 - d
+            if up < n:
+                order.append(up)
+            if down >= 0:
+                order.append(down)
+            if up >= n and down < 0:
+                break
+        return order
+
+    def step(self, deadline: float) -> bool:
+        w = self._w
+        rng = self._sync_range()
+        if rng is None or not self._grid_visible():
+            return True
+        if self._order is None:
+            self._order = self._build_order(rng)
+        per_slice = 1 if w._is_heavy_document else 2
+        headroom = self._headroom(rng)
+        batch: list[int] = []
+        while self._pos < len(self._order) and len(batch) < min(per_slice, headroom):
+            p = self._order[self._pos]
+            self._pos += 1
+            if p not in w._rendered:
+                batch.append(p)
+        batch = self._make_room(rng, batch)
+        if batch:
+            w._render_thumbnail_batch(batch)
+            for p in batch:
+                if p in w._rendered:
+                    w._rendered.move_to_end(p, last=False)
+        elif headroom > 0 and self._pos < len(self._order):
+            return False  # 今回は全部描画済みだった。続きを見る
+        if self._pos >= len(self._order) or self._headroom(rng) <= 0:
+            self._exhausted = True
+            return True
+        return False

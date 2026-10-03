@@ -479,6 +479,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             return
         app_settings.set_library_dir(folder)
         dialog.save_heavy_pdf_settings()
+        for window in self._get_open_page_edit_windows():
+            window._idle_scheduler.poke()  # バックグラウンド処理の設定変更を即時反映する
         QMessageBox.information(
             self,
             "設定",
