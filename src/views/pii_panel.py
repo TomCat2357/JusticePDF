@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QEvent, Qt, QSignalBlocker, pyqtSignal
-from PyQt6.QtGui import QColor, QGuiApplication, QKeySequence
+from PyQt6.QtGui import QColor, QGuiApplication, QKeySequence, QTextOption
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSlider,
@@ -191,8 +192,15 @@ class ScopeChoiceDialog(QDialog):
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self._text_edit = QLineEdit(word)
+        # 長い語句は折り返して全文を見せる(1行の横スクロールにしない)。
+        self._text_edit = QPlainTextEdit(word)
         self._text_edit.setReadOnly(True)
+        self._text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self._text_edit.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self._text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        line_h = self._text_edit.fontMetrics().lineSpacing()
+        self._text_edit.setMinimumHeight(line_h * 3 + 12)
+        self._text_edit.setMaximumHeight(line_h * 6 + 12)
         form.addRow("語句:", self._text_edit)
         layout.addLayout(form)
 

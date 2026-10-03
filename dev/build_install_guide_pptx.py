@@ -583,10 +583,10 @@ def slide_update(prs):
         step_row(s, 0.5, y, 9.0, 0.95, i, [runs])
         y += 1.1
     note_box(s, 0.5, 6.0, 9.0, 0.95, [
-        [B("設定や作業フォルダ（ドキュメント\\PDFs）は消えません。",
-           GREEN, size=20)],
-        ["安心して入れ替えてください。"],
-    ], kind="ok", size=20)
+        [B("※仮想デスクトップでは、既定の保存場所（ドキュメント\\PDFs）の"
+           "ファイルが消えてしまうことがあります。", RED, size=18)],
+        ["大切な PDF は、Google ドライブに保存してください。"],
+    ], kind="warn", size=18)
 
 
 def slide_trouble_shortcut(prs):

@@ -482,7 +482,7 @@ def test_scope_choice_dialog_labels_and_scopes(qtbot):
     dialog = ScopeChoiceDialog("検出語に追加", "説明文", "山田太郎", labels)
     qtbot.addWidget(dialog)
     assert dialog.windowTitle() == "検出語に追加"
-    assert dialog._text_edit.isReadOnly() is True and dialog._text_edit.text() == "山田太郎"
+    assert dialog._text_edit.isReadOnly() is True and dialog._text_edit.toPlainText() == "山田太郎"
     assert dialog._message_label.text() == "説明文"
     assert [dialog._all_btn.text(), dialog._page_btn.text(), dialog._none_btn.text()] == list(labels)
     # 何も押さずに閉じた場合は「しない」扱い。
@@ -495,6 +495,19 @@ def test_scope_choice_dialog_labels_and_scopes(qtbot):
     dialog2._all_btn.click()
     assert dialog2.scope() == ScopeChoiceDialog.SCOPE_ALL
 
+
+def test_scope_choice_dialog_wraps_long_word(qtbot):
+    from PyQt6.QtWidgets import QPlainTextEdit
+    from src.views.pii_panel import ScopeChoiceDialog
+
+    word = "長い語句" * 60
+    dialog = ScopeChoiceDialog("t", "m", word, ("a", "b", "c"))
+    qtbot.addWidget(dialog)
+    dialog.show()
+    edit = dialog._text_edit
+    assert edit.lineWrapMode() == QPlainTextEdit.LineWrapMode.WidgetWidth
+    assert edit.toPlainText() == word
+    assert edit.horizontalScrollBar().maximum() == 0
 
 def test_old_context_menu_signals_removed(qtbot):
     panel = PiiPanel()
