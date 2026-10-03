@@ -531,3 +531,86 @@ def test_result_row_display_text_is_always_a_single_line():
     assert "\n" not in row("x\ny").display_text
     # 元のデータ(右クリックの除外/検出登録に使う text)は変えない。
     assert row("申）\n").text == "申）\n"
+
+
+# ---------------------------------------------------------------------------
+# 語句列の表示方法(1行省略 / 折り返し)
+# ---------------------------------------------------------------------------
+
+_LONG = "あ" * 200
+
+
+def test_text_display_default_is_single_line_ellipsis(qtbot):
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.set_results([_row(0, "PERSON", _LONG)])
+    shown = _texts(panel)[0]
+    assert shown.endswith("…") and len(shown) < len(_LONG)
+    assert panel._result_tree.itemDelegateForColumn(0).__class__.__name__ != "_WrapTextDelegate"
+
+
+def test_text_display_wrap_keeps_full_text_and_uses_delegate(qtbot):
+    from src.views.pii_panel import _WrapTextDelegate
+
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.set_results([_row(0, "PERSON", _LONG)])
+    panel.set_result_text_display("wrap", 3)
+    assert _texts(panel)[0] == _LONG  # 表示用テキストは省略しない(省略は描画時)
+    delegate = panel._result_tree.itemDelegateForColumn(0)
+    assert isinstance(delegate, _WrapTextDelegate) and delegate.max_lines == 3
+    panel.set_result_text_display("ellipsis", 3)
+    assert _texts(panel)[0].endswith("…")
+
+
+def test_fit_wrapped_text_limits_lines_with_ellipsis(qtbot):
+    from PyQt6.QtCore import QRect
+    from PyQt6.QtGui import QFontMetrics
+    from PyQt6.QtWidgets import QApplication
+
+    from src.views.pii_panel import fit_wrapped_text
+
+    fm = QFontMetrics(QApplication.font())
+    width = fm.horizontalAdvance("あ") * 10
+    assert fit_wrapped_text(fm, "あいう", width, 3) == "あいう"
+    fitted = fit_wrapped_text(fm, _LONG, width, 3)
+    assert fitted.endswith("…") and len(fitted) < len(_LONG)
+    flags = int(Qt.TextFlag.TextWordWrap) | int(Qt.TextFlag.TextWrapAnywhere)
+    assert fm.boundingRect(QRect(0, 0, width, 100000), flags, fitted).height() <= fm.lineSpacing() * 3
+
+
+def test_wrap_row_height_grows_up_to_max_lines(qtbot):
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.resize(400, 400)
+    panel.show()
+    panel.set_results([_row(0, "PERSON", _LONG)])
+    tree = panel._result_tree
+    tree.setColumnWidth(0, 120)
+    panel.set_result_text_display("wrap", 3)
+    tree.setColumnWidth(0, 120)
+    delegate = tree.itemDelegateForColumn(0)
+    from PyQt6.QtWidgets import QStyleOptionViewItem
+
+    index = tree.model().index(0, 0)
+    opt = QStyleOptionViewItem()
+    opt.font = tree.font()
+    h3 = delegate.sizeHint(opt, index).height()
+    delegate.max_lines = 6
+    h6 = delegate.sizeHint(opt, index).height()
+    assert h6 > h3 > QFontMetricsHeight(tree)
+
+
+def QFontMetricsHeight(tree) -> int:
+    return tree.fontMetrics().lineSpacing() + 6
+
+
+@pytest.mark.parametrize("mode", ["ellipsis", "wrap"])
+def test_copy_is_full_text_regardless_of_display_mode(qtbot, mode):
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.set_results([_row(0, "PERSON", _LONG)])
+    panel.set_result_text_display(mode, 3)
+    panel._result_tree.selectAll()
+    qtbot.keyClick(panel._result_tree, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    assert _clipboard_text().split("\n")[1] == f"{_LONG}\t人名\t1"

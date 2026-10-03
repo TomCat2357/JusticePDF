@@ -152,6 +152,9 @@ class PiiDrawerMixin:
             panel.set_mask_style(settings.mask_color, settings.mask_transparency)
             panel.set_manual_tools_enabled(settings.manual_visible)
             panel.set_result_order_mode(settings.result_order_mode)
+            panel.set_result_text_display(
+                settings.result_text_display_mode, settings.result_text_max_lines
+            )
         self._apply_pii_visual_settings()
 
     def _apply_pii_visual_settings(self) -> None:

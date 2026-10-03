@@ -82,6 +82,33 @@ def normalize_result_order_mode(value) -> str:
     return value if value in _RESULT_ORDER_MODE_KEYS else DEFAULT_RESULT_ORDER_MODE
 
 
+# 結果一覧の「語句」列の表示方法(キー, 表示名)。既定は末尾を省略して1行表示。
+RESULT_TEXT_DISPLAY_MODES: tuple[tuple[str, str], ...] = (
+    ("ellipsis", "1行で表示(長い語句は末尾を「…」で省略)"),
+    ("wrap", "折り返して複数行で表示(上限行数を超えたら「…」で省略)"),
+)
+DEFAULT_RESULT_TEXT_DISPLAY_MODE = "ellipsis"
+_RESULT_TEXT_DISPLAY_MODE_KEYS = tuple(key for key, _ in RESULT_TEXT_DISPLAY_MODES)
+RESULT_TEXT_MAX_LINES_RANGE = (2, 10)
+DEFAULT_RESULT_TEXT_MAX_LINES = 3
+
+
+def normalize_result_text_display_mode(value) -> str:
+    """不正な表示方法は既定値(``ellipsis``)にする。"""
+    value = str(value or "")
+    return value if value in _RESULT_TEXT_DISPLAY_MODE_KEYS else DEFAULT_RESULT_TEXT_DISPLAY_MODE
+
+
+def normalize_result_text_max_lines(value) -> int:
+    """折り返し表示の上限行数を許容範囲に収める(不正値は既定の3行)。"""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_RESULT_TEXT_MAX_LINES
+    lo, hi = RESULT_TEXT_MAX_LINES_RANGE
+    return max(lo, min(hi, n))
+
+
 OCR_MODEL_TIERS: tuple[str, ...] = ("light", "heavy")
 
 
@@ -263,6 +290,10 @@ class PiiSettings:
     # 結果一覧のページ内の並び順(``RESULT_ORDER_MODES`` のキー)。
     # horizontal: 上→下・同じ行は左→右 / vertical: 右の列→左の列・同じ列は上→下。
     result_order_mode: str = DEFAULT_RESULT_ORDER_MODE
+    # 結果一覧の「語句」列の表示方法(``RESULT_TEXT_DISPLAY_MODES`` のキー)と、
+    # 折り返し表示のときの最大行数。コピーは表示に関係なく常に全文。
+    result_text_display_mode: str = DEFAULT_RESULT_TEXT_DISPLAY_MODE
+    result_text_max_lines: int = DEFAULT_RESULT_TEXT_MAX_LINES
 
     def add_exclusion(self, pattern: str, added_at: str | None = None) -> bool:
         """除外パターンを追加し追加日時を記録する。すでにあれば何もせず False。"""
@@ -569,6 +600,19 @@ class PiiSettings:
                     type=str,
                 )
             ),
+            result_text_display_mode=normalize_result_text_display_mode(
+                s.value(
+                    _key("result_text_display_mode"),
+                    default.result_text_display_mode,
+                    type=str,
+                )
+            ),
+            result_text_max_lines=normalize_result_text_max_lines(
+                s.value(
+                    _key("result_text_max_lines"),
+                    default.result_text_max_lines,
+                )
+            ),
         )
 
     def save(self, settings: QSettings | None = None) -> None:
@@ -621,6 +665,14 @@ class PiiSettings:
         s.setValue(
             _key("result_order_mode"),
             normalize_result_order_mode(self.result_order_mode),
+        )
+        s.setValue(
+            _key("result_text_display_mode"),
+            normalize_result_text_display_mode(self.result_text_display_mode),
+        )
+        s.setValue(
+            _key("result_text_max_lines"),
+            normalize_result_text_max_lines(self.result_text_max_lines),
         )
 
     def copy(self) -> "PiiSettings":

@@ -46,6 +46,10 @@ from src.pii.engines import ENGINES, is_engine_available
 from src.pii.entity_types import ENTITY_TYPES, get_entity_type_name_ja
 from src.pii.settings import (
     RESULT_ORDER_MODES,
+    RESULT_TEXT_DISPLAY_MODES,
+    RESULT_TEXT_MAX_LINES_RANGE,
+    normalize_result_text_display_mode,
+    normalize_result_text_max_lines,
     WHITESPACE_MODES,
     PiiSettings,
     format_added_at,
@@ -381,7 +385,41 @@ class PiiSettingsDialog(QDialog):
         result_order_row.addWidget(self._result_order_combo, 1)
         layout.addLayout(result_order_row)
 
+        text_display_row = QHBoxLayout()
+        text_display_row.addWidget(QLabel("結果一覧の語句の表示:"))
+        self._result_text_display_combo = QComboBox()
+        for key, label in RESULT_TEXT_DISPLAY_MODES:
+            self._result_text_display_combo.addItem(label, key)
+        self._set_combo_value(
+            self._result_text_display_combo, self._settings.result_text_display_mode
+        )
+        self._result_text_display_combo.setToolTip(
+            "個人情報検出パネルの結果一覧の「語句」列の見せ方です。\n"
+            "コピーしたときは、表示に関係なく語句の全文が入ります。"
+        )
+        text_display_row.addWidget(self._result_text_display_combo, 1)
+        layout.addLayout(text_display_row)
+
+        max_lines_row = QHBoxLayout()
+        max_lines_row.addWidget(QLabel("折り返し表示の最大行数:"))
+        self._result_text_max_lines_spin = QSpinBox()
+        self._result_text_max_lines_spin.setRange(*RESULT_TEXT_MAX_LINES_RANGE)
+        self._result_text_max_lines_spin.setSuffix(" 行")
+        self._result_text_max_lines_spin.setValue(self._settings.result_text_max_lines)
+        max_lines_row.addWidget(self._result_text_max_lines_spin)
+        max_lines_row.addStretch(1)
+        layout.addLayout(max_lines_row)
+        self._result_text_display_combo.currentIndexChanged.connect(
+            self._update_result_text_max_lines_enabled
+        )
+        self._update_result_text_max_lines_enabled()
+
         return widget
+
+    def _update_result_text_max_lines_enabled(self) -> None:
+        self._result_text_max_lines_spin.setEnabled(
+            self._result_text_display_combo.currentData() == "wrap"
+        )
 
     def _on_add_exclusion(self) -> None:
         text = self._exclusion_edit.text().strip()
@@ -596,6 +634,12 @@ class PiiSettingsDialog(QDialog):
         self._settings.pattern_whitespace_mode = self._whitespace_mode_combo.currentData()
         self._settings.result_order_mode = normalize_result_order_mode(
             self._result_order_combo.currentData()
+        )
+        self._settings.result_text_display_mode = normalize_result_text_display_mode(
+            self._result_text_display_combo.currentData()
+        )
+        self._settings.result_text_max_lines = normalize_result_text_max_lines(
+            self._result_text_max_lines_spin.value()
         )
         self._settings.ocr_enabled = self._ocr_enabled_check.isChecked()
         self._settings.ocr_dpi = self._ocr_dpi_spin.value()

@@ -495,3 +495,36 @@ def test_generic_honorific_words_are_not_person(word):
 def test_real_names_with_honorific_still_detected():
     assert _person_texts("田中さんと林様と森くん") == ["田中さん", "林様", "森くん"]
     assert _person_texts("皆さんと田中さん") == ["田中さん"]
+
+
+def test_result_text_display_settings_default_round_trip_and_invalid():
+    from PyQt6.QtCore import QSettings
+
+    s = PiiSettings()
+    assert s.result_text_display_mode == "ellipsis"
+    assert s.result_text_max_lines == 3
+    s.result_text_display_mode = "wrap"
+    s.result_text_max_lines = 5
+    s.save()
+    loaded = PiiSettings.load()
+    assert (loaded.result_text_display_mode, loaded.result_text_max_lines) == ("wrap", 5)
+    assert s.copy().result_text_max_lines == 5
+    QSettings().setValue("pii/result_text_display_mode", "bogus")
+    QSettings().setValue("pii/result_text_max_lines", 999)
+    loaded = PiiSettings.load()
+    assert loaded.result_text_display_mode == "ellipsis"
+    assert loaded.result_text_max_lines == 10
+
+
+def test_settings_dialog_result_text_display(qtbot):
+    settings = PiiSettings()
+    dialog = PiiSettingsDialog(settings)
+    qtbot.addWidget(dialog)
+    assert dialog._result_text_display_combo.currentData() == "ellipsis"
+    assert not dialog._result_text_max_lines_spin.isEnabled()
+    combo = dialog._result_text_display_combo
+    combo.setCurrentIndex(combo.findData("wrap"))
+    assert dialog._result_text_max_lines_spin.isEnabled()
+    dialog._result_text_max_lines_spin.setValue(4)
+    result = dialog.result_settings()
+    assert (result.result_text_display_mode, result.result_text_max_lines) == ("wrap", 4)

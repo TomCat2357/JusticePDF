@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QEvent, Qt, QSignalBlocker, pyqtSignal
-from PyQt6.QtGui import QColor, QGuiApplication, QKeySequence, QTextOption
+from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QSignalBlocker, pyqtSignal
+from PyQt6.QtGui import QColor, QFontMetrics, QGuiApplication, QKeySequence, QTextOption
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -28,6 +28,9 @@ from PyQt6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QProgressBar,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QPushButton,
     QSlider,
     QToolButton,
@@ -71,6 +74,14 @@ class PiiResultRow:
     # ページ内の出現位置(x0, y0, x1, y1)。一覧の並び(ページ内の読み順)にだけ使う隠しデータ
     # (マーカーは先頭quad、図形は矩形。ページの表示座標系=回転ページでは回転後)。
     bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+
+    @property
+    def wrap_text(self) -> str:
+        """折り返し表示用の語句(改行・連続空白だけ整形し、省略はしない)。"""
+        return self._single_line() or ("[図形]" if self.kind == "shape" else "(テキストなし)")
+
+    def _single_line(self) -> str:
+        return " ".join(self.text.split()) if self.text else ""
 
     @property
     def display_text(self) -> str:
@@ -475,6 +486,8 @@ class PiiPanel(QFrame):
         self._sort_field = "page"
         self._sort_ascending = True
         self._result_order_vertical = False  # ページ内の並び順(False=横書き)
+        self._text_wrap = False  # 語句列: False=1行で末尾省略 / True=折り返し(上限行数まで)
+        self._text_max_lines = 3
         self._result_tree = _ResultTree()
         self._result_tree.setObjectName("piiResultTree")
         self._result_tree.setColumnCount(3)
@@ -491,6 +504,7 @@ class PiiPanel(QFrame):
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
         header.sectionClicked.connect(self._on_result_header_clicked)
+        header.sectionResized.connect(self._on_result_section_resized)
         self._update_sort_indicator()
         panel_layout.addWidget(self._result_tree, 1)
 
@@ -775,6 +789,23 @@ class PiiPanel(QFrame):
         self._result_order_vertical = vertical
         self._rebuild_result_tree()
 
+    def set_result_text_display(self, mode: str, max_lines: int = 3) -> None:
+        """語句列の表示方法("ellipsis" 1行省略 | "wrap" 折り返し)と折り返しの最大行数を設定する。
+
+        表示用テキストだけを変える。実データ(``_ANNOT_ROLE``/``row.text``)とコピーには影響しない。
+        """
+        wrap = mode == "wrap"
+        max_lines = max(1, int(max_lines))
+        if wrap == self._text_wrap and max_lines == self._text_max_lines:
+            return
+        self._text_wrap = wrap
+        self._text_max_lines = max_lines
+        self._rebuild_result_tree()
+
+    def _on_result_section_resized(self, column: int, _old: int, _new: int) -> None:
+        if column == 0 and self._text_wrap:
+            self._result_tree.scheduleDelayedItemsLayout()  # 行の高さを再計算
+
     def _rebuild_result_tree(self) -> None:
         self._result_tree.clear()
         orders = reading_order_keys(self._rows, self._result_order_vertical)
@@ -785,13 +816,22 @@ class PiiPanel(QFrame):
         )
         for row, _order in keyed:
             entity_ja = get_entity_type_name_ja(row.entity or "OTHER")
-            item = QTreeWidgetItem([row.display_text, entity_ja, f"p.{row.page_num + 1}"])
-            if row.text and row.display_text != row.text:
+            shown = row.wrap_text if self._text_wrap else row.display_text
+            item = QTreeWidgetItem([shown, entity_ja, f"p.{row.page_num + 1}"])
+            if row.text and shown != row.text:
                 item.setToolTip(0, row.text)  # 省略・整形前の全文
             item.setData(0, _ANNOT_ROLE, row)
             self._result_tree.addTopLevelItem(item)
+        if self._text_wrap:
+            self._result_tree.setItemDelegateForColumn(
+                0, _WrapTextDelegate(self._result_tree, self._text_max_lines)
+            )
+        else:
+            self._result_tree.setItemDelegateForColumn(0, None)
         for col in range(3):
             self._result_tree.resizeColumnToContents(col)
+        if self._text_wrap and self._result_tree.columnWidth(0) > 260:
+            self._result_tree.setColumnWidth(0, 260)  # 長い語句で列が広がりすぎないように
 
     def _on_result_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         row: PiiResultRow | None = item.data(0, _ANNOT_ROLE)
@@ -841,6 +881,61 @@ class PiiPanel(QFrame):
         has_results = self._result_tree.topLevelItemCount() > 0
         self._export_btn.setEnabled(has_results)
         self._remove_selected_btn.setEnabled(bool(self._result_tree.selectedItems()))
+
+
+def fit_wrapped_text(fm: QFontMetrics, text: str, width: int, max_lines: int) -> str:
+    """``width`` px で折り返したとき ``max_lines`` 行に収まるよう、超える分を「…」で省略する。"""
+    if width <= 0:
+        return text
+    flags = int(Qt.TextFlag.TextWordWrap) | int(Qt.TextFlag.TextWrapAnywhere)
+    limit = fm.lineSpacing() * max_lines
+
+    def fits(t: str) -> bool:
+        return fm.boundingRect(QRect(0, 0, width, 100000), flags, t).height() <= limit
+
+    if fits(text):
+        return text
+    lo, hi = 0, len(text)  # 「text[:lo] + …」が収まる最大の lo を探す
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(text[:mid] + "…"):
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "…"
+
+
+class _WrapTextDelegate(QStyledItemDelegate):
+    """「語句」列を最大 ``max_lines`` 行で折り返して描画する(超過分は「…」)。"""
+
+    _MARGIN = 8  # 左右の余白の合計(px)
+
+    def __init__(self, view: QTreeWidget, max_lines: int) -> None:
+        super().__init__(view)
+        self._view = view
+        self.max_lines = max_lines
+
+    def _fitted(self, option: QStyleOptionViewItem, text: str) -> str:
+        width = self._view.columnWidth(0) - self._MARGIN
+        return fit_wrapped_text(QFontMetrics(option.font), text, width, self.max_lines)
+
+    def paint(self, painter, option, index) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = self._fitted(opt, opt.text)
+        opt.features |= QStyleOptionViewItem.ViewItemFeature.WrapText
+        style = opt.widget.style() if opt.widget else self._view.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+
+    def sizeHint(self, option, index) -> QSize:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        fm = QFontMetrics(opt.font)
+        text = self._fitted(opt, opt.text)
+        flags = int(Qt.TextFlag.TextWordWrap) | int(Qt.TextFlag.TextWrapAnywhere)
+        width = max(1, self._view.columnWidth(0) - self._MARGIN)
+        h = fm.boundingRect(QRect(0, 0, width, 100000), flags, text).height()
+        return QSize(self._view.columnWidth(0), max(h, fm.lineSpacing()) + 6)
 
 
 class _ResultTree(QTreeWidget):
