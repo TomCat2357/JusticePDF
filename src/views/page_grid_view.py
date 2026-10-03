@@ -190,8 +190,22 @@ class VirtualPageGrid(QWidget):
         return self._metrics.visible_range(y0 - height, y1 + height, 0)
 
     def first_visible_page(self) -> int | None:
-        start, stop = self.visible_page_range(0)
-        return start if stop > start else None
+        """表示範囲の最上行にある先頭のページ(その行の左端のページ)。ページが無ければ None。"""
+        m = self._metrics
+        if m.count == 0 or self._scroll.viewport().height() <= 0:
+            return None
+        row = m.first_visible_row(self._scroll.verticalScrollBar().value())
+        return row * m.cols
+
+    def scroll_page_row_to_top(self, page: int) -> None:
+        """そのページの行がビューポートの上端(余白ぶんを残した位置)に来るようスクロールする。
+
+        列数・サムネイルサイズが変わった後に、見ていた位置を保つために使う。
+        """
+        m = self._metrics
+        if not 0 <= page < m.count:
+            return
+        self._scroll.verticalScrollBar().setValue(max(0, m.cell_rect(page).top() - m.margin))
 
     def relayout(self) -> None:
         """表示範囲(+前後の行)のページへウィジェットを割り当て、範囲外は解放する。

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
-from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtGui import QDragLeaveEvent, QMouseEvent
 from PyQt6.QtTest import QTest
 
 from src.models.undo_manager import UndoManager
@@ -535,3 +535,240 @@ def test_ctrl_wheel_size_change_clears_rendered_and_resizes_pool(big_window):
         assert widget.width() == m.item_w
     # 新しい大きさでの描画が積まれる。
     assert window._thumb_render_queue
+
+
+# --- ドラッグ中の自動スクロール -------------------------------------------
+
+
+def _drag_move(window, grid_viewport_y: int):
+    """一覧のビューポート内の指定 y(x は中央付近)でドラッグ移動イベントを送る。"""
+    from PyQt6.QtCore import QMimeData
+    from PyQt6.QtGui import QDragMoveEvent
+
+    viewport = window._grid_scroll.viewport()
+    pos = window.mapFromGlobal(viewport.mapToGlobal(QPoint(viewport.width() // 2, grid_viewport_y)))
+    mime = build_page_drag_mime(window._pdf_path, [0])
+    assert isinstance(mime, QMimeData)
+    event = QDragMoveEvent(
+        pos,
+        Qt.DropAction.MoveAction | Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    window.dragMoveEvent(event)
+    return pos, mime
+
+
+def test_drag_near_bottom_edge_autoscrolls_and_updates_drop_index(big_window):
+    window = big_window
+    vbar = window._grid_scroll.verticalScrollBar()
+    height = window._grid_scroll.viewport().height()
+    assert vbar.value() == 0
+
+    pos, _mime = _drag_move(window, height - 5)
+    assert window._drag_autoscroll_timer.isActive()
+    assert window._drag_autoscroll_timer.interval() == 50
+    index_before = window._get_drop_page_index(window._grid.mapFrom(window, pos))
+
+    window._on_drag_autoscroll_tick()
+    assert vbar.value() >= 20
+    for _ in range(15):
+        window._on_drag_autoscroll_tick()
+    # 同じカーソル位置でも、スクロールした分だけ後ろのページが挿入先になる。
+    index_after = window._get_drop_page_index(window._grid.mapFrom(window, pos))
+    assert index_after > index_before
+    assert window._drop_indicator_index == index_after
+    assert window._grid.drop_indicator_visible
+
+    window.dragLeaveEvent(QDragLeaveEvent())
+    assert not window._drag_autoscroll_timer.isActive()
+    assert not window._grid.drop_indicator_visible
+
+
+def test_drag_near_top_edge_autoscrolls_up_and_leaving_the_edge_stops(big_window):
+    window = big_window
+    vbar = window._grid_scroll.verticalScrollBar()
+    height = window._grid_scroll.viewport().height()
+    window.scroll_to_page(150)
+    start = vbar.value()
+    assert start > 100
+
+    _drag_move(window, 5)
+    assert window._drag_autoscroll_timer.isActive()
+    window._on_drag_autoscroll_tick()
+    assert vbar.value() < start
+
+    # 端の帯から出たら止まる。
+    _drag_move(window, height // 2)
+    assert not window._drag_autoscroll_timer.isActive()
+    value = vbar.value()
+    window._on_drag_autoscroll_tick()
+    assert vbar.value() == value
+
+
+def test_autoscroll_speeds_up_near_the_edge_and_stops_on_drop(big_window):
+    window = big_window
+    height = window._grid_scroll.viewport().height()
+    _drag_move(window, height - 29)
+    slow = window._drag_autoscroll_step
+    _drag_move(window, height - 1)
+    fast = window._drag_autoscroll_step
+    assert 20 <= slow < fast
+
+    class _DropEvent:
+        def __init__(self, mime, pos):
+            self._mime, self._pos = mime, pos
+
+        def mimeData(self):
+            return self._mime
+
+        def position(self):
+            class _P:
+                def __init__(s, p):
+                    s._p = p
+
+                def toPoint(s):
+                    return s._p
+
+            return _P(self._pos)
+
+        def modifiers(self):
+            return Qt.KeyboardModifier.NoModifier
+
+        def acceptProposedAction(self):
+            pass
+
+    pos, mime = _drag_move(window, height - 5)
+    assert window._drag_autoscroll_timer.isActive()
+    window._handle_page_reorder = lambda *a, **k: None  # 並べ替え自体は別テストで確認済み
+    window.dropEvent(_DropEvent(mime, pos))
+    assert not window._drag_autoscroll_timer.isActive()
+
+
+# --- スクロールバーのつまみ操作中は描画しない -----------------------------------
+
+
+def test_render_queue_is_paused_while_slider_is_held_and_resumes_on_release(big_window):
+    window = big_window
+    vbar = window._grid_scroll.verticalScrollBar()
+    window._reset_thumbnail_render_queue()
+    window._rendered.clear()
+
+    vbar.setSliderDown(True)
+    window.scroll_to_page(200)
+    window._enqueue_visible_thumbnail_renders()
+    queued = list(window._thumb_render_queue)
+    assert queued
+    window._process_thumbnail_render_queue()
+    # つまみを掴んでいる間は 1 ページも描かれず、タイマーも回らない。
+    assert list(window._thumb_render_queue) == queued
+    assert not window._thumb_render_timer.isActive()
+    assert not any(window.is_page_rendered(p) for p in queued)
+
+    vbar.setSliderDown(False)  # sliderReleased を発行する
+    visible_start, visible_stop = window._grid.visible_page_range(0)
+    assert window._thumb_render_timer.isActive() or window._thumb_render_queue
+    _drain_render_queue(window)
+    assert all(window.is_page_rendered(p) for p in range(visible_start, visible_stop))
+
+
+def test_stale_queue_entries_outside_prefetch_range_are_not_rendered(big_window):
+    window = big_window
+    window._reset_thumbnail_render_queue()
+    window._rendered.clear()
+    window.scroll_to_page(250)
+    p0, p1 = window._grid.prefetch_page_range()
+    assert p0 > 10
+    window._enqueue_thumbnail_render(0)  # 画面から遠く離れた古い予約
+    window._enqueue_thumbnail_render(p0)
+    _drain_render_queue(window)
+    assert not window.is_page_rendered(0)
+    assert window.is_page_rendered(p0)
+
+
+# --- 列数・サムネイルサイズの変更でも見ていたページを保つ -------------------------
+
+
+def test_thumbnail_size_change_keeps_first_visible_page_in_view(big_window):
+    window = big_window
+    grid = window._grid
+    window.scroll_to_page(150)
+    window._grid_scroll.verticalScrollBar().setValue(
+        grid.metrics.cell_rect(150).top() - grid.metrics.margin
+    )
+    anchor = grid.first_visible_page()
+    assert anchor is not None and anchor > 50
+    old_metrics = grid.metrics
+
+    window._set_thumbnail_size(window._preferred_thumb_size + 3 * window.PREVIEW_THUMB_STEP)
+
+    new_metrics = grid.metrics
+    assert (new_metrics.cols, new_metrics.item_w) != (old_metrics.cols, old_metrics.item_w)
+    new_first = grid.first_visible_page()
+    # 最上行は、元の最上行のページを含む(行頭 <= anchor < 行頭 + 列数)。
+    assert new_first <= anchor < new_first + new_metrics.cols
+    assert window.widget_for_page(anchor) is not None
+
+
+def test_column_count_change_by_resize_keeps_first_visible_page(big_window):
+    window = big_window
+    grid = window._grid
+    window.scroll_to_page(200)
+    window._grid_scroll.verticalScrollBar().setValue(
+        grid.metrics.cell_rect(200).top() - grid.metrics.margin
+    )
+    anchor = grid.first_visible_page()
+    old_cols = grid.metrics.cols
+
+    window.resize(window.width() + 3 * (grid.metrics.item_w + grid.metrics.spacing), window.height())
+    window._relayout_grid()
+
+    assert grid.metrics.cols != old_cols
+    new_first = grid.first_visible_page()
+    assert new_first <= anchor < new_first + grid.metrics.cols
+
+
+def test_relayout_without_metric_change_does_not_move_scroll_position(big_window):
+    window = big_window
+    window.scroll_to_page(120)
+    vbar = window._grid_scroll.verticalScrollBar()
+    vbar.setValue(vbar.value() + 7)  # 行の途中
+    value = vbar.value()
+    window._relayout_grid()
+    assert vbar.value() == value
+
+
+def test_relayout_does_not_anchor_while_grid_is_hidden(big_window):
+    window = big_window
+    window.scroll_to_page(150)
+    vbar = window._grid_scroll.verticalScrollBar()
+    value = vbar.value()
+    window._open_zoom_view(0)
+    assert window._grid_scroll.isHidden()
+    window._preferred_thumb_size += 2 * window.PREVIEW_THUMB_STEP
+    window._relayout_grid()
+    # 非表示の間はスクロール位置を触らない(復帰時に拡大表示側が位置を決める)。
+    assert vbar.value() == value
+
+
+# --- 文書の使い回し(開き直しを減らす) ---------------------------------------
+
+
+def test_load_pages_keeps_the_doc_open_only_for_heavy_documents(qtbot, tmp_path):
+    from src.utils.pdf_utils import common
+
+    heavy = tmp_path / "heavy-hold.pdf"
+    make_pdf(heavy, pages=PAGES, width=80, height=80)
+    window = create_page_edit_window(qtbot, heavy)
+    window._release_held_doc()
+    window._load_pages()
+    assert any(key[1] == str(heavy) for key in common._held_docs)
+    assert window._held_doc_idle_timer.isActive()
+    window._release_held_doc()
+    assert not any(key[1] == str(heavy) for key in common._held_docs)
+
+    light = tmp_path / "light-hold.pdf"
+    make_pdf(light, pages=5, width=80, height=80)
+    window2 = create_page_edit_window(qtbot, light)
+    assert not any(key[1] == str(light) for key in common._held_docs)

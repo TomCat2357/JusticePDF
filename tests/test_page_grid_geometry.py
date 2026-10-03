@@ -349,3 +349,19 @@ def test_drop_then_indicator_roundtrip_never_leaves_grid(count, cols):
             assert rect is not None
             assert rect.top() >= g.margin
             assert rect.bottom() <= g.content_height
+
+
+def test_first_visible_row_ignores_rows_whose_bottom_is_at_the_viewport_top():
+    m = GridMetrics(cols=3, item_w=100, item_h=100, margin=10, spacing=10, count=30)
+    pitch = m.pitch_y
+    assert m.first_visible_row(0) == 0
+    # 行 r の最後の 1px だけが見えている → その行。
+    r_bottom = m.cell_rect(3 * 4).bottom()
+    assert m.first_visible_row(r_bottom) == 4
+    # その下(行間の隙間)なら次の行。
+    assert m.first_visible_row(r_bottom + 1) == 5
+    # スクロール値 = 行 r の上端 - margin に合わせると、最上行は r になる(往復で安定)。
+    for r in range(m.rows):
+        assert m.first_visible_row(r * pitch) == r
+    assert m.first_visible_row(10**6) == m.rows - 1
+    assert GridMetrics(3, 100, 100, 10, 10, 0).first_visible_row(50) == 0

@@ -87,6 +87,16 @@ class GridMetrics:
         r1 = min(last_row, last + ov)
         return (r0 * self.cols, min(self.count, (r1 + 1) * self.cols))
 
+    def first_visible_row(self, y0: int) -> int:
+        """縦位置 y0(ビューポートの上端)に少しでもかかっている最初の行。
+
+        セルの下端が y0 より下にある最初の行(行間の隙間だけが見えている行は数えない)。
+        """
+        if self.count == 0:
+            return 0
+        row = (y0 - self.margin - self.item_h) // self.pitch_y + 1
+        return min(max(row, 0), self.rows - 1)
+
     def pages_in_rect(self, rect: QRect) -> list[int]:
         """rect と交差するセルのページ番号(昇順)。余白や隙間だけに重なる矩形は空。"""
         if self.count == 0 or rect.isEmpty():

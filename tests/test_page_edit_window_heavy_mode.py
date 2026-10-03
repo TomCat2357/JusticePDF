@@ -125,8 +125,9 @@ def test_heavy_document_render_batch_is_single_page(qtbot, tmp_path):
     make_pdf(pdf_path, pages=page_count, width=80, height=80)
     window = create_page_edit_window(qtbot, pdf_path)
 
-    # ウィンドウ下端付近(通常は表示範囲外)のページを手動でキューに積み、
-    # 1回のタイマー発火でどこまで描画されるかを検証する。
+    # 文書末尾のページを手動でキューに積み、1回のタイマー発火でどこまで描画されるかを検証する
+    # (表示範囲から外れた予約は描かずに捨てるので、先にそこまでスクロールしておく)。
+    window.scroll_to_page(page_count - 1)
     target_pages = list(range(page_count - 10, page_count))
     window._reset_thumbnail_render_queue()
     window._rendered.clear()

@@ -4,7 +4,8 @@ import os
 import shutil
 import logging
 from collections import OrderedDict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace as dataclass_replace
 from enum import Enum, auto
 from PyQt6.QtWidgets import (
@@ -235,6 +236,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     PREVIEW_THUMB_MIN = 80
     PREVIEW_THUMB_MAX = 400
     PREVIEW_THUMB_STEP = 20
+    # ドラッグ中の自動スクロール: 端からこの距離(px)の帯で、この間隔・速さでスクロールする。
+    DRAG_AUTOSCROLL_EDGE = 30
+    DRAG_AUTOSCROLL_INTERVAL_MS = 50
+    DRAG_AUTOSCROLL_STEP = 20
+    DRAG_AUTOSCROLL_STEP_EXTRA = 40  # 端(以遠)にいるときに加わる最大の追加量
 
     def __init__(self, pdf_path: str, undo_manager: UndoManager, parent=None):
         super().__init__(parent)
@@ -394,6 +400,13 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._grid_resize_timer = QTimer(self)
         self._grid_resize_timer.setSingleShot(True)
         self._grid_resize_timer.timeout.connect(self._on_grid_resize_settled)
+        # ページのドラッグ中、一覧の上端/下端にカーソルがあるあいだ自動でスクロールする。
+        self._drag_autoscroll_timer = QTimer(self)
+        self._drag_autoscroll_timer.setInterval(self.DRAG_AUTOSCROLL_INTERVAL_MS)
+        self._drag_autoscroll_timer.timeout.connect(self._on_drag_autoscroll_tick)
+        self._drag_autoscroll_pos: "QPoint | None" = None  # 最後のドラッグ位置(ウィンドウ座標)
+        self._drag_autoscroll_dir = 0
+        self._drag_autoscroll_step = 0
 
         # Drop indicator(縦線の実体はグリッドの子)。
         self._drop_indicator_index = -1
@@ -456,6 +469,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._grid_scroll.viewport().installEventFilter(self)
         self._grid_scroll.verticalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
+        # スクロールバーのつまみを掴んでいる間は描画を止め、離したら見えている範囲を描く。
+        self._grid_scroll.verticalScrollBar().sliderReleased.connect(
+            self._on_grid_slider_released
+        )
         self._grid_scroll.horizontalScrollBar().valueChanged.connect(self._on_grid_viewport_changed)
         layout.addWidget(self._grid_scroll)
 
@@ -1451,9 +1468,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._thumb_render_queue.clear()
         self._thumb_render_queue_set.clear()
 
+    def _grid_slider_down(self) -> bool:
+        scroll = getattr(self, "_grid_scroll", None)
+        return scroll is not None and scroll.verticalScrollBar().isSliderDown()
+
     def _schedule_thumbnail_render(self) -> None:
+        # つまみを掴んでいる間は描画しない(sliderReleased で積み直して再開する)。
+        if self._grid_slider_down():
+            return
         if self._thumb_render_queue and not self._thumb_render_timer.isActive():
             self._thumb_render_timer.start(0)
+
+    def _on_grid_slider_released(self) -> None:
+        self._enqueue_visible_thumbnail_renders()
 
     def _enqueue_thumbnail_render(self, page_num: int, *, priority: bool = False) -> None:
         if page_num < 0 or page_num >= self._page_count:
@@ -1666,16 +1693,24 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._enqueue_visible_thumbnail_renders()
 
     def _process_thumbnail_render_queue(self) -> None:
+        if self._grid_slider_down():
+            return
         batch: list[int] = []
         batch_limit = (
             max(1, app_settings.heavy_pdf_render_batch_size()) if self._is_heavy_document else 5
         )
+        # 素早いスクロール中に、既に表示範囲(+先読み)から外れた予約は描かずに捨てる。
+        keep_start, keep_stop = 0, 0
+        if self._grid_scroll is not None and self._grid_scroll.isVisible():
+            keep_start, keep_stop = self._grid.prefetch_page_range()
         while self._thumb_render_queue and len(batch) < batch_limit:
             page_num = self._thumb_render_queue.popleft()
             self._thumb_render_queue_set.discard(page_num)
             if page_num < 0 or page_num >= self._page_count:
                 continue
             if page_num in self._rendered:
+                continue
+            if keep_stop > keep_start and not (keep_start <= page_num < keep_stop):
                 continue
             batch.append(page_num)
         if batch:
@@ -1779,8 +1814,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._grid.set_page_count(0)
             return
 
-        page_count = get_page_count(self._pdf_path)
+        page_count = self._count_pages_keeping_doc()
         if page_count == 0:
+            self._release_held_doc()
             self._grid.set_page_count(0)
             return
 
@@ -1791,6 +1827,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_page_num = max(0, page_count - 1)
 
         self._is_heavy_document = is_heavy_pdf(self._pdf_path, page_count)
+        if self._is_heavy_document:
+            self._held_doc_idle_timer.start()  # 最初の描画バッチが使い回す。使われなければ閉じる。
+        else:
+            self._release_held_doc()
         self._page_count = page_count
 
         # ウィジェットは見えている範囲にだけ割り当てるので、ページ数に依らず一瞬で済む。
@@ -1801,6 +1841,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._enqueue_visible_thumbnail_renders()
         if self._zoom_view and self._zoom_view.isVisible():
             self._render_zoom()
+
+    def _count_pages_keeping_doc(self) -> int:
+        """ページ数を数える。開いた文書は保持し、直後の描画バッチに使い回させる。
+
+        しおりのある大きな文書は開くだけで数百ミリ秒かかるため、ページ数の取得と最初の描画で
+        2回開き直すのを避ける。重量でなければ呼び出し側がすぐ手放す(``_release_held_doc``)。
+        """
+        try:
+            with hold_doc(self._pdf_path, linger=True):
+                return get_page_count(self._pdf_path)
+        except Exception:
+            logger.debug("hold_doc failed in _load_pages: %s", self._pdf_path, exc_info=True)
+            return get_page_count(self._pdf_path)
 
     def _refresh_page_bound_views(self) -> None:
         """ページ構成が変わった(並べ替え・削除・挿入・Undo/Redo)後に、ページ番号を持つ表示を追従させる。
@@ -1876,8 +1929,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         return cols
 
     def _relayout_grid(self) -> None:
-        """寸法を再計算してウィジェットを割り当て直し、表示範囲の描画を予約する。"""
+        """寸法を再計算してウィジェットを割り当て直し、表示範囲の描画を予約する。
+
+        列数やサムネイルサイズが変わるとページの縦位置が大きく動くので、変更前に最上行にあった
+        ページを覚えておき、並べ直した後にその行が上端に来るようスクロールし直す。
+        """
+        anchor = None
+        before = self._grid.metrics
+        if self._page_count > 0 and self._grid_scroll.isVisible():
+            anchor = self._grid.first_visible_page()
         self._apply_grid_metrics()
+        after = self._grid.metrics
+        if anchor is not None and (before.cols, before.item_w) != (after.cols, after.item_w):
+            self._grid.scroll_page_row_to_top(anchor)
         self._grid.relayout()
         self._enqueue_visible_thumbnail_renders()
 
@@ -2177,7 +2241,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def _on_zoom_next_page(self) -> None:
         if self._zoom_page_num is None:
             return
-        page_count = get_page_count(self._pdf_path)
+        page_count = self._page_count_on_disk()
         if self._zoom_page_layout_is_multi():
             # 複数ページ表示は最後のグループ先頭で停止する。
             last_start = self._last_zoom_group_start(page_count)
@@ -2216,7 +2280,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def _on_zoom_last_page(self) -> None:
         if self._zoom_page_num is None:
             return
-        page_count = get_page_count(self._pdf_path)
+        page_count = self._page_count_on_disk()
         if page_count <= 0:
             return
         last_index = page_count - 1
@@ -2256,11 +2320,31 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._zoom_prev_btn.setEnabled(self._zoom_page_num > 0)
         self._zoom_next_btn.setEnabled(self._zoom_page_num < page_count - 1)
 
+    @contextmanager
+    def _hold_doc_scope(self) -> Iterator[None]:
+        """スコープ内の PDF 読み取りで文書を使い回す(拡大表示の1ページ分は7回前後開き直すため)。
+
+        重量文書はスコープをまたいで保持し(ページ送りで開き直さない)、アイドルで閉じる。
+        スコープ内で書き込み系の関数を呼ばないこと。
+        """
+        with hold_doc(self._pdf_path, linger=self._is_heavy_document):
+            yield
+        if self._is_heavy_document:
+            self._held_doc_idle_timer.start()
+
+    def _page_count_on_disk(self) -> int:
+        with self._hold_doc_scope():
+            return get_page_count(self._pdf_path)
+
     def _render_zoom_page(self) -> None:
         if not self._zoom_annotation_text_commit_in_progress:
             self._commit_inline_annotation_editor()
         if self._zoom_page_num is None or not self._zoom_label:
             return
+        with self._hold_doc_scope():
+            self._render_zoom_page_body()
+
+    def _render_zoom_page_body(self) -> None:
         # ページ数・注釈4種・描画順・Ink xref を1回の open でまとめて取得する
         # (以前は7回 open していた。大きいPDFで各20〜25ms)。
         page_data = load_zoom_page_annotations(
@@ -2958,19 +3042,69 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             else:
                 event.setDropAction(Qt.DropAction.MoveAction)
             event.acceptProposedAction()
-            drop_pos = self._grid.mapFrom(self, event.position().toPoint())
-            self._show_drop_indicator(drop_pos)
+            window_pos = event.position().toPoint()
+            self._show_drop_indicator(self._grid.mapFrom(self, window_pos))
+            self._update_drag_autoscroll(window_pos)
         elif event.mimeData().hasFormat(PDFCARD_MIME_TYPE):
             source_path = event.mimeData().data(PDFCARD_MIME_TYPE).data().decode('utf-8')
             if source_path != self._pdf_path:
                 event.acceptProposedAction()
-                drop_pos = self._grid.mapFrom(self, event.position().toPoint())
-                self._show_drop_indicator(drop_pos)
+                window_pos = event.position().toPoint()
+                self._show_drop_indicator(self._grid.mapFrom(self, window_pos))
+                self._update_drag_autoscroll(window_pos)
 
     def dragLeaveEvent(self, event) -> None:
         """Handle drag leave event - hide drop indicator."""
+        self._stop_drag_autoscroll()
         self._hide_drop_indicator()
         super().dragLeaveEvent(event)
+
+    # --- ドラッグ中の自動スクロール ---
+
+    def _update_drag_autoscroll(self, window_pos) -> None:
+        """カーソルが一覧の上端/下端の帯にあれば自動スクロールを開始(続行)し、外れたら止める。
+
+        上端/下端に近いほど速い。位置はウィンドウ座標で覚え、スクロールのたびに
+        ドロップ位置の表示を更新し直す(グリッド座標はスクロールで変わるため)。
+        """
+        if self._grid_scroll is None or self._grid_scroll.isHidden():
+            self._stop_drag_autoscroll()
+            return
+        viewport = self._grid_scroll.viewport()
+        y = viewport.mapFrom(self, window_pos).y()
+        edge = self.DRAG_AUTOSCROLL_EDGE
+        height = viewport.height()
+        if y < edge:
+            direction = -1
+            depth = min(edge, edge - y)
+        elif y > height - edge:
+            direction = 1
+            depth = min(edge, y - (height - edge))
+        else:
+            self._stop_drag_autoscroll()
+            return
+        self._drag_autoscroll_pos = QPoint(window_pos)
+        self._drag_autoscroll_dir = direction
+        self._drag_autoscroll_step = self.DRAG_AUTOSCROLL_STEP + (
+            self.DRAG_AUTOSCROLL_STEP_EXTRA * depth // max(1, edge)
+        )
+        if not self._drag_autoscroll_timer.isActive():
+            self._drag_autoscroll_timer.start()
+
+    def _stop_drag_autoscroll(self) -> None:
+        self._drag_autoscroll_timer.stop()
+        self._drag_autoscroll_pos = None
+        self._drag_autoscroll_dir = 0
+
+    def _on_drag_autoscroll_tick(self) -> None:
+        pos = self._drag_autoscroll_pos
+        if pos is None or self._drag_autoscroll_dir == 0 or self._grid_scroll.isHidden():
+            self._stop_drag_autoscroll()
+            return
+        vbar = self._grid_scroll.verticalScrollBar()
+        vbar.setValue(vbar.value() + self._drag_autoscroll_dir * self._drag_autoscroll_step)
+        # スクロール後のグリッド座標でドロップ位置を更新する(ドロップ時も同じ変換を使う)。
+        self._show_drop_indicator(self._grid.mapFrom(self, pos))
 
     def _show_drop_indicator(self, pos) -> None:
         """Show drop indicator at the appropriate position."""
@@ -3002,6 +3136,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def dropEvent(self, event) -> None:
         """Handle drop event."""
         logger.debug(f"PageEditWindow.dropEvent called, mimeData formats: {event.mimeData().formats()}")
+        self._stop_drag_autoscroll()
         self._hide_drop_indicator()
 
         if event.mimeData().hasFormat(PAGETHUMBNAIL_MIME_TYPE):
@@ -3045,7 +3180,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             return
 
         page_count = get_page_count(self._pdf_path)
-        remaining = [i for i in range(page_count) if i not in source_pages]
+        source_set = set(source_pages)  # list の in は O(k) になり、数千ページ選択で O(N*k) に膨らむ
+        remaining = [i for i in range(page_count) if i not in source_set]
         removed_before = sum(1 for p in source_pages if p < target_page)
         insert_index = max(0, min(target_page - removed_before, len(remaining)))
         new_order = remaining[:insert_index] + source_pages + remaining[insert_index:]

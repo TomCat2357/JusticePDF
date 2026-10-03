@@ -597,11 +597,72 @@ def rotate_pages(pdf_path: str, page_indices: list[int], angle: int = 90) -> Non
         doc.close()
 
 
+# select() は数千ページを超えると極端に遅い(15,000ページで約40秒)。少数のページを動かすだけの
+# 並べ替えは move_page(1回数ミリ秒)で行う。動かすページ数がこれを超えたら select() にする。
+_REORDER_MOVE_PAGE_MAX_MOVES = 64
+_REORDER_MOVE_PAGE_MIN_PAGES = 400
+
+
+def _pages_to_move(new_order: list[int]) -> list[int]:
+    """new_order(元の添字の並び)のうち、相対順を保てる最長部分列に入らない要素(= 動かすページ)を、
+    移動先の順に返す。"""
+    import bisect
+
+    tails: list[int] = []  # 長さ k+1 の増加部分列の末尾の最小値
+    tail_pos: list[int] = []
+    prev: list[int] = [-1] * len(new_order)
+    for i, value in enumerate(new_order):
+        k = bisect.bisect_left(tails, value)
+        if k == len(tails):
+            tails.append(value)
+            tail_pos.append(i)
+        else:
+            tails[k] = value
+            tail_pos[k] = i
+        prev[i] = tail_pos[k - 1] if k > 0 else -1
+    keep: set[int] = set()
+    i = tail_pos[-1] if tail_pos else -1
+    while i >= 0:
+        keep.add(i)
+        i = prev[i]
+    return [new_order[i] for i in range(len(new_order)) if i not in keep]
+
+
+def _reorder_with_move_page(doc: "fitz.Document", new_order: list[int]) -> bool:
+    """少数ページの移動だけで new_order にする。動かすページが多すぎるときは何もせず False。"""
+    n = len(new_order)
+    if n < _REORDER_MOVE_PAGE_MIN_PAGES or sorted(new_order) != list(range(n)):
+        return False
+    moved = _pages_to_move(new_order)
+    if len(moved) > _REORDER_MOVE_PAGE_MAX_MOVES:
+        return False
+    target_index = {page: i for i, page in enumerate(new_order)}
+    current = list(range(n))  # 現在のページ位置 -> 元の添字
+    ops: list[tuple[int, int]] = []  # (move_page の pno, to)
+    for page in moved:
+        src = current.index(page)
+        t = target_index[page]
+        current.pop(src)
+        dest = 0 if t == 0 else current.index(new_order[t - 1]) + 1  # 直前のページの後ろ
+        if dest >= len(current):
+            ops.append((src, -1))
+        else:
+            # move_page は「元の並びでの to 番目のページの前」へ動かす。
+            ops.append((src, dest if dest < src else dest + 1))
+        current.insert(dest, page)
+    if current != new_order:  # 文書を触る前に検算する(合わなければ select に任せる)
+        return False
+    for src, to in ops:
+        doc.move_page(src, to)
+    return True
+
+
 def reorder_pages(pdf_path: str, new_order: list[int]) -> None:
     """Reorder pages in a PDF (in place)."""
     doc = _open_doc_for_write(pdf_path)
     try:
-        doc.select(new_order)
+        if not _reorder_with_move_page(doc, new_order):
+            doc.select(new_order)
         _save_document_in_place(doc, pdf_path, incremental=True)
     finally:
         doc.close()
