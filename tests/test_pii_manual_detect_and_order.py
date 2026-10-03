@@ -1,4 +1,4 @@
-"""結果一覧の右クリック「手動扱いで検出」「検出結果から削除」、ページ内の並び順、
+"""結果一覧の右クリック「手動扱いで検出」、ページ内の並び順、
 「皆さん/皆様」の人名誤検出のテスト。"""
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import fitz
 import pytest
 from PyQt6.QtWidgets import QMenu
 
-from src.pii.entity_types import MANUAL_ENTITY_TYPE
+from src.pii.entity_types import ENTITY_TYPES, MANUAL_ENTITY_TYPE, get_entity_type_name_ja
 from src.pii.regex_recognizers import detect_regex_entities
 from src.pii.settings import PiiSettings
 from src.utils.pdf_utils import MarkupType, TextMarkupAnnotData, create_markup_annot, list_pii_markup_annots
@@ -74,7 +74,7 @@ def _entities(pdf_path) -> list[tuple[int, str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# 手動扱いで検出(検出語に登録しない)
+# 手動扱いで検出(検出パターンに登録しない)
 # ---------------------------------------------------------------------------
 
 
@@ -96,6 +96,45 @@ def test_detect_manual_adds_manual_candidates_without_touching_settings(qtbot, m
     # Undo 1回で戻る
     window._undo_manager.undo()
     assert _entities(pdf_path) == []
+
+
+def test_detect_manual_twice_does_not_duplicate_rows(qtbot, monkeypatch, tmp_path):
+    pdf_path = tmp_path / "m.pdf"
+    _make_pdf(pdf_path, pages=1)
+    window = _open_window(qtbot, monkeypatch, pdf_path)
+    _stub(window, "_ask_pii_manual_detect_scope", ScopeChoiceDialog.SCOPE_ALL)
+
+    window._on_pii_detect_manual("SECRET")
+    window._on_pii_detect_manual("SECRET")
+
+    assert _entities(pdf_path) == [(0, MANUAL_ENTITY_TYPE, "SECRET")]
+
+
+def test_dedupe_filter_same_entity_text_position_only(qtbot, monkeypatch, tmp_path):
+    pdf_path = tmp_path / "m.pdf"
+    _make_pdf(pdf_path, pages=1)
+    window = _open_window(qtbot, monkeypatch, pdf_path)
+    _add_markup(pdf_path, 0, "SECRET", "PERSON")
+    existing = list_pii_markup_annots(str(pdf_path))
+    base = existing[0]
+
+    def item(entity, text, dx=0.0):
+        q = tuple((x0 + dx, y0, x1 + dx, y1) for x0, y0, x1, y1 in base.quads)
+        return TextMarkupAnnotData(
+            page_num=0, xref=0, quads=q, markup_type=MarkupType.HIGHLIGHT,
+            color=(0.0, 0.0, 0.0), opacity=0.35, pii_entity=entity, pii_text=text,
+        )
+
+    f = window._filter_new_markup_duplicates
+    assert f([item("PERSON", "SECRET")], existing) == []
+    assert f([item("PERSON", "SECRET", 0.5)], existing) == []  # 小さな誤差は許容
+    assert len(f([item("PERSON", "SECRET", 20.0)], existing)) == 1  # 位置が違う
+    assert len(f([item("LOCATION", "SECRET")], existing)) == 1  # 種類が違えば残す(dedupe設定に委ねる)
+    assert len(f([item("PERSON", "OTHER")], existing)) == 1  # 語句が違う
+    kinds = [item("PERSON", "NEW", 40.0), item("LOCATION", "NEW", 40.0), item("PERSON", "NEW", 40.0)]
+    assert [i.pii_entity for i in f(kinds, existing)] == ["PERSON", "LOCATION"]  # 同種類のみ弾く
+    twice = [item("PERSON", "NEW", 30.0), item("PERSON", "NEW", 30.0)]
+    assert len(f(twice, existing)) == 1  # 新規分どうしも
 
 
 def test_detect_manual_page_scope_only_current_page(qtbot, monkeypatch, tmp_path):
@@ -141,75 +180,21 @@ def test_detect_manual_ignores_exclusions_and_survives_exclude_add(qtbot, monkey
     assert _entities(pdf_path) == [(0, MANUAL_ENTITY_TYPE, "SECRET")]
 
 
-# ---------------------------------------------------------------------------
-# 検出結果から削除(除外に登録しない)
-# ---------------------------------------------------------------------------
-
-
-def _prepare_removal_pdf(tmp_path):
+def test_panel_detect_manual_signal_is_connected_to_window_handler(qtbot, monkeypatch, tmp_path):
     pdf_path = tmp_path / "r.pdf"
     _make_pdf(pdf_path, pages=2)
-    _add_markup(pdf_path, 0, "SECRET", "PERSON")
-    _add_markup(pdf_path, 1, "SECRET", "PERSON")
-    _add_markup(pdf_path, 0, "SECRET", MANUAL_ENTITY_TYPE)  # 手動は消さない
-    _add_markup(pdf_path, 0, "KEEPME", "PERSON")  # 別の語句は消さない
-    return pdf_path
-
-
-def test_remove_detected_all_pages_keeps_manual_and_settings_and_undo(qtbot, monkeypatch, tmp_path):
-    pdf_path = _prepare_removal_pdf(tmp_path)
+    _add_markup(pdf_path, 0, "KEEPME", "PERSON")
     window = _open_window(qtbot, monkeypatch, pdf_path)
-    before = window._pii_settings().copy()
-    calls = _stub(window, "_ask_pii_remove_detected_scope", ScopeChoiceDialog.SCOPE_ALL)
-    original = _entities(pdf_path)
-
-    window._on_pii_remove_detected("SECRET")
-
-    assert calls == ["SECRET"]
-    assert _entities(pdf_path) == [
-        (0, MANUAL_ENTITY_TYPE, "SECRET"),
-        (0, "PERSON", "KEEPME"),
-    ]
-    assert window._pii_settings() == before
-    assert PiiSettings.load().text_exclusions_regex == []
-    window._undo_manager.undo()  # 1回で全部戻る
-    assert _entities(pdf_path) == original
-
-
-def test_remove_detected_page_scope_only_current_page(qtbot, monkeypatch, tmp_path):
-    pdf_path = _prepare_removal_pdf(tmp_path)
-    window = _open_window(qtbot, monkeypatch, pdf_path)
-    _stub(window, "_ask_pii_remove_detected_scope", ScopeChoiceDialog.SCOPE_PAGE)
-
-    window._on_pii_remove_detected("SECRET")
-
-    page = window._zoom_page_num
-    remaining = [e for e in _entities(pdf_path) if e[2] == "SECRET" and e[1] == "PERSON"]
-    assert remaining == [(p, "PERSON", "SECRET") for p in (0, 1) if p != page]
-
-
-def test_remove_detected_none_scope_does_nothing(qtbot, monkeypatch, tmp_path):
-    pdf_path = _prepare_removal_pdf(tmp_path)
-    window = _open_window(qtbot, monkeypatch, pdf_path)
-    _stub(window, "_ask_pii_remove_detected_scope", ScopeChoiceDialog.SCOPE_NONE)
-    original = _entities(pdf_path)
-
-    window._on_pii_remove_detected("SECRET")
-
-    assert _entities(pdf_path) == original
-
-
-def test_panel_signals_are_connected_to_window_handlers(qtbot, monkeypatch, tmp_path):
-    pdf_path = _prepare_removal_pdf(tmp_path)
-    window = _open_window(qtbot, monkeypatch, pdf_path)
-    _stub(window, "_ask_pii_remove_detected_scope", ScopeChoiceDialog.SCOPE_ALL)
-    window._pii_panel.remove_detected_requested.emit("SECRET")
-    assert (0, "PERSON", "SECRET") not in _entities(pdf_path)
     _stub(window, "_ask_pii_manual_detect_scope", ScopeChoiceDialog.SCOPE_ALL)
     window._pii_panel.detect_manual_requested.emit("KEEPME")
-    # 同じページ・位置・語句が検出済み(PERSON)の箇所は重複として追加されない
-    assert (0, MANUAL_ENTITY_TYPE, "KEEPME") not in _entities(pdf_path)
+    # 種類が違う(PERSON検出済み)箇所でも、手動扱いは別種類として追加される
+    assert (0, "PERSON", "KEEPME") in _entities(pdf_path)
+    assert (0, MANUAL_ENTITY_TYPE, "KEEPME") in _entities(pdf_path)
     assert (1, MANUAL_ENTITY_TYPE, "KEEPME") in _entities(pdf_path)
+    # 同じ種類・同じ語句・同じ場所での再実行は重複しない
+    n = len(_entities(pdf_path))
+    window._pii_panel.detect_manual_requested.emit("KEEPME")
+    assert len(_entities(pdf_path)) == n
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +218,14 @@ def _row(page_num, entity, text, bbox=(0.0, 0.0, 10.0, 10.0)) -> PiiResultRow:
 
 
 def _find_action(menu, text):
+    """メニュー(サブメニュー含む)から表示名の一致する QAction を探す。"""
     for action in menu.actions():
         if action.text() == text:
             return action
+        if action.menu() is not None:
+            found = _find_action(action.menu(), text)
+            if found is not None:
+                return found
     return None
 
 
@@ -252,22 +242,30 @@ def _open_context_menu(panel, monkeypatch, pick):
     return opened
 
 
-MANUAL_LABEL = "手動扱いで検出(検出語に登録しない)"
-REMOVE_LABEL = "検出結果から削除(除外に登録しない)"
+MANUAL_LABEL = "手動扱いで検出(検出パターンに登録しない)"
 
 
-def test_context_menu_remove_item_placed_next_to_exclude_and_emits(qtbot, monkeypatch):
+def test_context_menu_has_only_copy_and_add_items(qtbot, monkeypatch):
     panel = PiiPanel()
     qtbot.addWidget(panel)
     panel.set_results([_row(0, "PERSON", "山田太郎")])
-    removed = []
-    panel.remove_detected_requested.connect(removed.append)
 
-    opened = _open_context_menu(panel, monkeypatch, REMOVE_LABEL)
-    texts = [a.text() for a in opened["menu"].actions()]
-    assert texts.index("除外パターンに追加") + 1 == texts.index(REMOVE_LABEL)
-    assert MANUAL_LABEL not in texts  # 「手動」は「検出語に追加」の種類から選ぶ
-    assert removed == ["山田太郎"]
+    opened = _open_context_menu(panel, monkeypatch, None)
+    texts = [a.text() for a in opened["menu"].actions() if a.text()]
+    assert texts == ["コピー", "検出パターンに追加", "除外パターンに追加"]
+    assert MANUAL_LABEL not in texts  # 「手動」は「検出パターンに追加」の種類から選ぶ
+    detect_menu = _find_action(opened["menu"], "検出パターンに追加").menu()
+    exclude_menu = _find_action(opened["menu"], "除外パターンに追加").menu()
+    assert detect_menu is not None and exclude_menu is not None
+    detect_texts = [a.text() for a in detect_menu.actions() if a.text()]
+    expected_types = [get_entity_type_name_ja(e) for e in ENTITY_TYPES]
+    assert detect_texts == expected_types + ["手動（検出パターンには追加しない）", "詳細指定…（正規表現を編集）"]
+    assert [a.text() for a in exclude_menu.actions() if a.text()] == [
+        "簡易指定（完全一致）",
+        "詳細指定…（正規表現を編集）",
+    ]
+    # 詳細指定の項目は区切り線の後ろ(最後)で、両サブメニューで同じ名前・位置。
+    assert detect_menu.actions()[-2].isSeparator() and exclude_menu.actions()[-2].isSeparator()
 
 
 def test_context_menu_new_items_disabled_without_text(qtbot, monkeypatch):
@@ -277,7 +275,8 @@ def test_context_menu_new_items_disabled_without_text(qtbot, monkeypatch):
 
     opened = _open_context_menu(panel, monkeypatch, None)
 
-    assert _find_action(opened["menu"], REMOVE_LABEL).isEnabled() is False
+    assert _find_action(opened["menu"], "検出パターンに追加").isEnabled() is False
+    assert _find_action(opened["menu"], "除外パターンに追加").isEnabled() is False
 
 
 # ---------------------------------------------------------------------------

@@ -308,9 +308,8 @@ def test_result_context_menu_has_copy_first(qtbot, monkeypatch):
 
     assert seen["texts"][0] == "コピー"
     assert seen["texts"][1:] == [
-        "検出語に追加",
+        "検出パターンに追加",
         "除外パターンに追加",
-        "検出結果から削除(除外に登録しない)",
     ]
     assert "同じ語句をすべて削除" not in seen["texts"]
     # 旧メニュー項目は撤去済み。
@@ -419,22 +418,63 @@ def _open_context_menu(panel, monkeypatch, pick: str | None):
     return opened
 
 
-def test_context_menu_has_two_add_actions_and_emits_text(qtbot, monkeypatch):
+def test_context_menu_has_two_add_submenus(qtbot, monkeypatch):
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.set_results([_row(3, "PERSON", "山田太郎")])
+
+    opened = _open_context_menu(panel, monkeypatch, None)
+
+    detect_action = _find_action(opened["menu"], "検出パターンに追加")
+    exclude_action = _find_action(opened["menu"], "除外パターンに追加")
+    assert detect_action.isEnabled() is True and exclude_action.isEnabled() is True
+    assert detect_action.menu() is not None and exclude_action.menu() is not None
+    texts = [a.text() for a in opened["menu"].actions()]
+    assert not any("手動扱いで検出" in t for t in texts)
+
+
+@pytest.mark.parametrize(
+    "pick, expected",
+    [
+        ("人名", ("山田太郎", "PERSON")),
+        ("場所", ("山田太郎", "LOCATION")),
+        ("手動（検出パターンには追加しない）", ("山田太郎", MANUAL_ENTITY_TYPE)),
+    ],
+)
+def test_context_menu_detect_submenu_emits_text_and_entity(qtbot, monkeypatch, pick, expected):
     panel = PiiPanel()
     qtbot.addWidget(panel)
     panel.set_results([_row(3, "PERSON", "山田太郎")])
     captured = []
-    panel.add_detect_word_requested.connect(captured.append)
+    panel.add_detect_word_requested.connect(lambda t, e: captured.append((t, e)))
 
-    opened = _open_context_menu(panel, monkeypatch, "検出語に追加")
+    _open_context_menu(panel, monkeypatch, pick)
 
-    detect_action = _find_action(opened["menu"], "検出語に追加")
-    assert detect_action.isEnabled() is True
-    assert detect_action.menu() is None  # 種類のサブメニューは廃止(入力ダイアログで選ぶ)
-    assert _find_action(opened["menu"], "除外パターンに追加") is not None
-    texts = [a.text() for a in opened["menu"].actions()]
-    assert not any("手動扱いで検出" in t for t in texts)
-    assert captured == ["山田太郎"]
+    assert captured == [expected]
+
+
+def _open_submenu_item(panel, monkeypatch, submenu_title: str, pick: str):
+    """``submenu_title`` のサブメニュー内の ``pick`` が選ばれたことにして右クリックメニューを開く。"""
+
+    def fake_exec(self, *_args, **_kwargs):
+        sub = _find_action(self, submenu_title).menu()
+        return _find_action(sub, pick)
+
+    monkeypatch.setattr(QMenu, "exec", fake_exec)
+    item = panel._result_tree.topLevelItem(0)
+    panel._on_result_context_menu(panel._result_tree.visualItemRect(item).center())
+
+
+def test_context_menu_detect_detail_emits_empty_entity(qtbot, monkeypatch):
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.set_results([_row(0, "PERSON", "山田太郎")])
+    captured = []
+    panel.add_detect_word_requested.connect(lambda t, e: captured.append((t, e)))
+
+    _open_submenu_item(panel, monkeypatch, "検出パターンに追加", "詳細指定…（正規表現を編集）")
+
+    assert captured == [("山田太郎", "")]  # 種類が空 = 詳細指定(入力ダイアログ)
 
 
 def test_context_menu_detect_word_is_enabled_for_manual_rows(qtbot, monkeypatch):
@@ -442,24 +482,25 @@ def test_context_menu_detect_word_is_enabled_for_manual_rows(qtbot, monkeypatch)
     qtbot.addWidget(panel)
     panel.set_results([_row(0, MANUAL_ENTITY_TYPE, "テスト")])
     captured = []
-    panel.add_detect_word_requested.connect(captured.append)
+    panel.add_detect_word_requested.connect(lambda t, e: captured.append((t, e)))
 
-    opened = _open_context_menu(panel, monkeypatch, "検出語に追加")
+    opened = _open_context_menu(panel, monkeypatch, "人名")
 
-    assert _find_action(opened["menu"], "検出語に追加").isEnabled() is True
-    assert captured == ["テスト"]
+    assert _find_action(opened["menu"], "検出パターンに追加").isEnabled() is True
+    assert captured == [("テスト", "PERSON")]
 
 
-def test_context_menu_exclude_word_emits_text(qtbot, monkeypatch):
+def test_context_menu_exclude_simple_and_detail_emit_flag(qtbot, monkeypatch):
     panel = PiiPanel()
     qtbot.addWidget(panel)
     panel.set_results([_row(0, "PERSON", "山田太郎")])
     captured = []
-    panel.add_exclude_word_requested.connect(captured.append)
+    panel.add_exclude_word_requested.connect(lambda t, simple: captured.append((t, simple)))
 
-    _open_context_menu(panel, monkeypatch, "除外パターンに追加")
+    _open_submenu_item(panel, monkeypatch, "除外パターンに追加", "簡易指定（完全一致）")
+    _open_submenu_item(panel, monkeypatch, "除外パターンに追加", "詳細指定…（正規表現を編集）")
 
-    assert captured == ["山田太郎"]
+    assert captured == [("山田太郎", True), ("山田太郎", False)]
 
 
 def test_context_menu_word_actions_disabled_when_no_text(qtbot, monkeypatch):
@@ -469,7 +510,7 @@ def test_context_menu_word_actions_disabled_when_no_text(qtbot, monkeypatch):
 
     opened = _open_context_menu(panel, monkeypatch, None)
 
-    assert _find_action(opened["menu"], "検出語に追加").isEnabled() is False
+    assert _find_action(opened["menu"], "検出パターンに追加").isEnabled() is False
     assert _find_action(opened["menu"], "除外パターンに追加").isEnabled() is False
 
 
@@ -477,10 +518,10 @@ def test_scope_choice_dialog_labels_and_scopes(qtbot):
     from src.views.pii_panel import ScopeChoiceDialog
 
     labels = ("全ページで検出", "このページだけ検出", "検出しない")
-    dialog = ScopeChoiceDialog("検出語に追加", "説明文", "山田太郎", labels)
+    dialog = ScopeChoiceDialog("検出パターンに追加", "説明文", "山田太郎", labels)
     qtbot.addWidget(dialog)
-    assert dialog.windowTitle() == "検出語に追加"
-    assert dialog._text_edit.isReadOnly() is True and dialog._text_edit.toPlainText() == "山田太郎"
+    assert dialog.windowTitle() == "検出パターンに追加"
+    assert dialog._text_edit.full_text() == "山田太郎"
     assert dialog._message_label.text() == "説明文"
     assert [dialog._all_btn.text(), dialog._page_btn.text(), dialog._none_btn.text()] == list(labels)
     # 何も押さずに閉じた場合は「しない」扱い。
@@ -495,17 +536,89 @@ def test_scope_choice_dialog_labels_and_scopes(qtbot):
 
 
 def test_scope_choice_dialog_wraps_long_word(qtbot):
-    from PyQt6.QtWidgets import QPlainTextEdit
     from src.views.pii_panel import ScopeChoiceDialog
 
     word = "長い語句" * 60
-    dialog = ScopeChoiceDialog("t", "m", word, ("a", "b", "c"))
+    dialog = ScopeChoiceDialog("t", "m", word, ("a", "b", "c"), text_display=("wrap", 3))
     qtbot.addWidget(dialog)
     dialog.show()
-    edit = dialog._text_edit
-    assert edit.lineWrapMode() == QPlainTextEdit.LineWrapMode.WidgetWidth
-    assert edit.toPlainText() == word
-    assert edit.horizontalScrollBar().maximum() == 0
+    label = dialog._text_edit
+    assert label.max_lines() == 3
+    assert label.full_text() == word and label.toolTip() == word
+    shown = label.shown_text()
+    assert shown.endswith("…") and len(shown) < len(word)  # 最大行数を超える分は省略
+    # 折り返しで高さは1行より高い
+    assert label.height() > label.fontMetrics().lineSpacing() * 2
+
+
+def test_scope_choice_dialog_single_line_mode_ellipsizes(qtbot):
+    from src.views.pii_panel import ScopeChoiceDialog
+
+    word = "長い語句" * 60
+    dialog = ScopeChoiceDialog("t", "m", word, ("a", "b", "c"), text_display=("ellipsis", 3))
+    qtbot.addWidget(dialog)
+    dialog.show()
+    label = dialog._text_edit
+    assert label.max_lines() == 1
+    assert label.shown_text().endswith("…")
+    assert label.height() < label.fontMetrics().lineSpacing() * 2 + 16
+    assert label.toolTip() == word  # 全文はツールチップ
+
+
+def test_scope_choice_dialog_shows_word_once(qtbot):
+    from src.views.pii_panel import ScopeChoiceDialog, scope_target
+
+    # 語句とパターンが同じなら「語句」、異なれば実際に使う「パターン」を1か所だけ出す。
+    assert scope_target("山田", None) == ("語句", "山田")
+    assert scope_target("山田", "^山田$") == ("パターン", "^山田$")
+    dialog = ScopeChoiceDialog(
+        "t", "このパターンを検出しますか?", "山田", ("a", "b", "c"), pattern="山\s*田"
+    )
+    qtbot.addWidget(dialog)
+    assert dialog._text_edit.full_text() == "山\s*田"
+    assert "山" not in dialog._message_label.text()
+
+
+def test_pattern_input_dialog_selected_word_follows_display_setting(qtbot):
+    from src.views.pii_panel import PiiPatternInputDialog
+
+    word = "長い語句" * 60
+    dialog = PiiPatternInputDialog("t", "m", word, word, text_display=("ellipsis", 3))
+    qtbot.addWidget(dialog)
+    dialog.show()
+    assert dialog._word_edit.max_lines() == 1
+    assert dialog._word_edit.shown_text().endswith("…")
+    dialog2 = PiiPatternInputDialog("t", "m", word, word, text_display=("wrap", 4))
+    qtbot.addWidget(dialog2)
+    assert dialog2._word_edit.max_lines() == 4
+
+
+@pytest.mark.parametrize("wrap", [False, True])
+def test_result_columns_fit_panel_without_horizontal_scroll(qtbot, wrap):
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.set_result_text_display("wrap" if wrap else "ellipsis", 3)
+    panel.show()
+    panel.set_results([_row(0, "PERSON", "とても長い語句" * 50), _row(1, "PERSON", "短い")])
+    qtbot.waitUntil(lambda: panel._result_tree.viewport().width() > 0)
+    tree = panel._result_tree
+    assert tree.horizontalScrollBar().maximum() == 0
+    total = sum(tree.columnWidth(c) for c in range(3))
+    assert total <= tree.viewport().width()
+    # 語句列が残り幅を使い、種別・ページは内容幅
+    assert tree.columnWidth(0) > tree.columnWidth(1) + tree.columnWidth(2)
+
+
+def test_result_text_column_user_drag_allows_horizontal_scroll(qtbot):
+    panel = PiiPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.set_results([_row(0, "PERSON", "語句")])
+    tree = panel._result_tree
+    tree.setColumnWidth(0, tree.viewport().width() + 400)  # ユーザーが広げた
+    panel._rebuild_result_tree()
+    assert tree.columnWidth(0) > tree.viewport().width()  # 自動の幅合わせで戻さない
+
 
 def test_old_context_menu_signals_removed(qtbot):
     panel = PiiPanel()
@@ -662,7 +775,7 @@ def _input_dialog(qtbot, **kwargs):
 
 def test_input_dialog_match_combo_only_for_exclude_side(qtbot):
     detect = _input_dialog(qtbot, with_entity=True)
-    assert detect._match_combo is None  # 検出語側は ^ $ が意味を持たないので出さない
+    assert detect._match_combo is None  # 検出パターン側は ^ $ が意味を持たないので出さない
     assert detect.match() == "partial" and detect.gap() is False
     assert detect.pattern() == r"山田\(仮\)"
 
@@ -711,7 +824,7 @@ def test_input_dialog_entity_choices_include_manual_label(qtbot):
     dialog = _input_dialog(qtbot, with_entity=True)
     combo = dialog._entity_combo
     labels = [combo.itemText(i) for i in range(combo.count())]
-    assert labels == [get_entity_type_name_ja(e) for e in ENTITY_TYPES] + ["手動（検出語には追加しない）"]
+    assert labels == [get_entity_type_name_ja(e) for e in ENTITY_TYPES] + ["手動（検出パターンには追加しない）"]
     combo.setCurrentIndex(combo.count() - 1)
     assert dialog.entity() == MANUAL_ENTITY_TYPE
     # 除外パターン用(with_entity なし)には種類のドロップダウンが無い。

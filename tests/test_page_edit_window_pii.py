@@ -11,7 +11,7 @@ import pytest
 
 from src.models.undo_manager import UndoManager
 from src.pii.entity_types import MANUAL_ENTITY_TYPE
-from src.pii.settings import PiiSettings, exact_match_pattern, pattern_key
+from src.pii.settings import PiiSettings, exact_match_pattern, literal_to_pattern, pattern_key
 from src.utils.pdf_utils import list_pii_markup_annots
 from src.views import page_edit_pii as page_edit_pii_module
 from src.views.page_edit_window import PageEditWindow
@@ -52,7 +52,7 @@ def _create_window(qtbot, pdf_path) -> PageEditWindow:
 
 
 def _stub_detect_scope(window, scope: str):
-    """「検出語に追加」の範囲選択ダイアログ(``_ask_pii_detect_scope``)を、実際のモーダル表示無しに
+    """「検出パターンに追加」の範囲選択ダイアログ(``_ask_pii_detect_scope``)を、実際のモーダル表示無しに
     指定の範囲が選ばれたことにするスタブ。呼び出し引数は返り値のリストに記録される。
     """
     calls: list[tuple[str, str]] = []
@@ -311,7 +311,7 @@ def test_keep_existing_detect_does_not_duplicate_or_remove_prior_results(qtbot, 
 
 
 # ---------------------------------------------------------------------------
-# 結果一覧の右クリック「検出語に追加」「除外パターンに追加」
+# 結果一覧の右クリック「検出パターンに追加」「除外パターンに追加」
 # ---------------------------------------------------------------------------
 
 
@@ -473,7 +473,7 @@ def test_ask_detect_and_exclude_scope_factories_use_scope_dialog(qtbot, monkeypa
     window = _create_window(qtbot, pdf_path)
     seen = []
 
-    def fake_ask(title, message, word, labels, parent=None, allow_back=False):
+    def fake_ask(title, message, word, labels, parent=None, allow_back=False, **kwargs):
         seen.append((title, word, labels, parent))
         return ScopeChoiceDialog.SCOPE_PAGE
 
@@ -481,7 +481,7 @@ def test_ask_detect_and_exclude_scope_factories_use_scope_dialog(qtbot, monkeypa
 
     assert window._ask_pii_detect_scope("語", "PERSON") == "page"
     assert window._ask_pii_exclude_scope("語") == "page"
-    assert seen[0] == ("検出語に追加", "語", ("全ページで検出", "このページだけ検出", "検出しない"), window)
+    assert seen[0] == ("検出パターンに追加", "語", ("全ページで検出", "このページだけ検出", "検出しない"), window)
     assert seen[1] == (
         "除外パターンに追加",
         "語",
@@ -1230,16 +1230,96 @@ def test_flow_exclude_cancel_input_changes_nothing(qtbot, monkeypatch, tmp_path)
     assert window._pii_settings().text_exclusions_regex == []
 
 
-def test_remove_detected_scope_dialog_has_no_back_button(qtbot, monkeypatch, tmp_path):
-    pdf_path = tmp_path / "pii-remove-no-back.pdf"
-    _make_pii_pdf(pdf_path)
+
+# ---------------------------------------------------------------------------
+# 簡易指定(入力ダイアログ無しで、すぐ範囲選択へ)
+# ---------------------------------------------------------------------------
+
+
+def _forbid_inputs(window) -> None:
+    """簡易指定では入力ダイアログを出さないことを確かめるため、出たら失敗させる。"""
+
+    def boom(*_a, **_k):
+        raise AssertionError("簡易指定では入力ダイアログを出さない")
+
+    window._ask_pii_detect_input = boom
+    window._ask_pii_exclude_input = boom
+
+
+def _prepare_simple(qtbot, monkeypatch, tmp_path, name: str, mode: str):
+    pdf_path = tmp_path / name
+    _make_job_title_pdf(pdf_path)
     window = _create_window(qtbot, pdf_path)
-    seen = []
+    open_zoom(window, qtbot)
+    window._toggle_pii_drawer()
+    _silence_message_boxes(monkeypatch)
+    settings = window._pii_settings().copy()
+    settings.pattern_whitespace_mode = mode
+    window._pii_settings_cache = settings
+    _forbid_inputs(window)
+    return pdf_path, window
 
-    def fake_ask(title, message, word, labels, parent=None, allow_back=False):
-        seen.append(allow_back)
-        return ScopeChoiceDialog.SCOPE_NONE
 
-    monkeypatch.setattr(page_edit_pii_module.ScopeChoiceDialog, "ask", staticmethod(fake_ask))
-    window._ask_pii_remove_detected_scope("語")
-    assert seen == [False]
+def test_simple_detect_registers_partial_pattern_with_setting_whitespace(qtbot, monkeypatch, tmp_path):
+    _pdf, window = _prepare_simple(qtbot, monkeypatch, tmp_path, "simple-detect.pdf", "any_gap")
+    log = _stub_flow(window, [], [ScopeChoiceDialog.SCOPE_NONE], kind="detect")
+
+    window._on_pii_add_detect_word_requested("公務員", "PERSON")
+
+    expected = literal_to_pattern("公務員", "any_gap")  # 部分一致(アンカー無し)・空白は設定どおり
+    assert window._pii_settings().additional_patterns == [("PERSON", expected)]
+    assert log["input_states"] == []
+    (args, kwargs), = log["scope_calls"]
+    assert kwargs.get("allow_back") is False  # 戻り先の入力ダイアログが無いので戻るボタンは出さない
+    assert kwargs.get("pattern") == expected
+
+
+def test_simple_detect_manual_does_not_change_settings(qtbot, monkeypatch, tmp_path):
+    pdf_path, window = _prepare_simple(qtbot, monkeypatch, tmp_path, "simple-manual.pdf", "optional")
+    before = window._pii_settings().copy()
+    log = _stub_flow(window, [], [ScopeChoiceDialog.SCOPE_PAGE], kind="detect")
+
+    window._on_pii_add_detect_word_requested("公務員", MANUAL_ENTITY_TYPE)
+
+    after = window._pii_settings()
+    assert after.additional_patterns == before.additional_patterns == []
+    assert after.text_exclusions_regex == before.text_exclusions_regex
+    assert PiiSettings.load().additional_patterns == []
+    assert log["scope_calls"][0][1].get("allow_back") is False
+    annots = list_pii_markup_annots(str(pdf_path))
+    assert any(a.pii_text == "公務員" and a.pii_entity == MANUAL_ENTITY_TYPE for a in annots)
+
+
+def test_simple_exclude_registers_exact_pattern_with_setting_whitespace(qtbot, monkeypatch, tmp_path):
+    _pdf, window = _prepare_simple(qtbot, monkeypatch, tmp_path, "simple-exclude.pdf", "any_gap")
+    log = _stub_flow(window, [], [ScopeChoiceDialog.SCOPE_NONE], kind="exclude")
+
+    window._on_pii_add_exclude_word_requested("公務員", True)
+
+    expected = "^" + literal_to_pattern("公務員", "any_gap") + "$"
+    assert window._pii_settings().text_exclusions_regex == [expected]
+    assert log["input_states"] == []
+    (args, kwargs), = log["scope_calls"]
+    assert kwargs.get("allow_back") is False
+    assert kwargs.get("pattern") == expected
+
+
+def test_panel_signals_route_simple_and_detail(qtbot, monkeypatch, tmp_path):
+    """パネルの signal 経由で、種類あり=簡易(入力ダイアログ無し)、空=詳細(入力ダイアログ)になる。"""
+    _pdf, window = _prepare_simple(qtbot, monkeypatch, tmp_path, "simple-route.pdf", "optional")
+    _stub_flow(window, [], [ScopeChoiceDialog.SCOPE_NONE, ScopeChoiceDialog.SCOPE_NONE], kind="detect")
+    _stub_flow(window, [], [ScopeChoiceDialog.SCOPE_NONE], kind="exclude")
+    _forbid_inputs(window)
+
+    window._pii_panel.add_detect_word_requested.emit("公務員", "LOCATION")
+    window._pii_panel.add_exclude_word_requested.emit("公務員", True)
+
+    assert window._pii_settings().additional_patterns == [("LOCATION", "公務員")]
+    assert window._pii_settings().text_exclusions_regex == ["^公務員$"]
+
+    # 詳細指定(種類が空・simple=False)は従来どおり入力ダイアログを開く。
+    state = {"entity": "PERSON", "match": "partial", "gap": False, "free": False, "text": "公務員X"}
+    log = _stub_flow(window, [state], [ScopeChoiceDialog.SCOPE_NONE], kind="detect")
+    window._pii_panel.add_detect_word_requested.emit("公務員", "")
+    assert log["input_states"] == [None]
+    assert ("PERSON", "公務員X") in window._pii_settings().additional_patterns

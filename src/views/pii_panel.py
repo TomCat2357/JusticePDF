@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QSignalBlocker, pyqtSignal
-from PyQt6.QtGui import QColor, QFontMetrics, QGuiApplication, QKeySequence, QTextOption
+from PyQt6.QtGui import QColor, QFontMetrics, QGuiApplication, QKeySequence, QPainter, QPalette
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -29,8 +29,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
-    QPlainTextEdit,
     QProgressBar,
+    QSizePolicy,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
@@ -185,7 +185,7 @@ def rows_to_tsv(rows: "list[PiiResultRow]") -> str:
 # 正規表現の入力補助。「一致のしかた」と「空白を許容する」の2つの部品から、基になる語句の
 # 正規表現を組み立ててテキストボックスに入れる。テキストボックスを手で編集すると
 # 「自由入力」状態になる(部品を操作すると、また部品から作り直す)。
-# 検出語は、ページ本文全体(``re.MULTILINE``)に ``finditer`` で当てるため ``^``/``$`` は
+# 検出パターンは、ページ本文全体(``re.MULTILINE``)に ``finditer`` で当てるため ``^``/``$`` は
 # 行頭・行末の意味にしかならず、「一致のしかた」は出さない(空白を許容のみ)。
 # 除外パターンは、検出された1件の文字列に ``re.search`` で当てるため、
 # 完全一致(``^…$``)・前方一致・後方一致のいずれにも意味がある。
@@ -202,8 +202,11 @@ MATCH_MODES: "tuple[tuple[str, str], ...]" = (
 GAP_CHECK_LABEL = "空白を許容する（各文字の間の空白・改行を許す）"
 FREE_INPUT_HINT = "手で編集中（自由入力）です。「一致のしかた」「空白を許容する」を変えると、語句から作り直します。"
 
-# 検出語に追加するときの種別の選択肢のうち、設定に登録しない「手動」の表示名。
-MANUAL_CHOICE_LABEL = "手動（検出語には追加しない）"
+# 検出パターンに追加するときの種別の選択肢のうち、設定に登録しない「手動」の表示名。
+MANUAL_CHOICE_LABEL = "手動（検出パターンには追加しない）"
+# 右クリックメニューのサブメニュー項目(検出・除外で共通)。
+DETAIL_ACTION_LABEL = "詳細指定…（正規表現を編集）"
+EXCLUDE_SIMPLE_LABEL = "簡易指定（完全一致）"
 
 
 def build_pattern(match: str, gap: bool, base: str, gap_base: "str | None" = None) -> str:
@@ -239,16 +242,101 @@ def validate_pii_pattern(pattern: str) -> str:
     return ""
 
 
+def scope_target(word: str, pattern: "str | None" = None) -> "tuple[str, str]":
+    """範囲選択ダイアログに出す「(見出し, 表示する文字列)」を返す。
+
+    語句とパターンを二重に出さず1か所にまとめる。パターンが語句と異なる(簡易指定で
+    ``^…$`` や ``\s*`` が付く、詳細指定で編集した等)ときは、実際に登録・検出に使う
+    パターンを「パターン」として、そうでなければ「語句」として出す。
+    """
+    if pattern and pattern != word:
+        return "パターン", pattern
+    return "語句", word
+
+
+class FittedTextLabel(QFrame):
+    """読み取り専用の語句表示。設定「結果一覧の語句の表示」と同じ規則で表示する。
+
+    ``mode`` が "wrap" なら ``max_lines`` 行まで折り返し、それ以外は1行。入りきらない分は
+    末尾を「…」で省略する(全文はツールチップ)。改行・連続空白は空白1つにまとめる。
+    横スクロールは出さず、ダイアログの幅に合わせて再計算する。
+    """
+
+    _PAD = 4
+
+    def __init__(self, text: str, mode: str = "ellipsis", max_lines: int = 3, parent=None) -> None:
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setFrameShadow(QFrame.Shadow.Sunken)
+        self.setAutoFillBackground(True)
+        self.setBackgroundRole(QPalette.ColorRole.Base)
+        self._full = text or ""
+        self._lines = max(1, int(max_lines)) if mode == "wrap" else 1
+        self._flat = " ".join(self._full.split())
+        sp = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
+        self.setToolTip(self._full)  # 省略されても全文を確認できるように
+
+    def full_text(self) -> str:
+        return self._full
+
+    def max_lines(self) -> int:
+        return self._lines
+
+    def _text_width(self, total: "int | None" = None) -> int:
+        total = self.width() if total is None else total
+        width = total - 2 * (self.frameWidth() + self._PAD)
+        return width if width > 20 else 420  # 未表示(幅が未確定)のときの仮の幅
+
+    def shown_text(self, total_width: "int | None" = None) -> str:
+        """現在の幅で実際に表示する(省略済みの)文字列。"""
+        return fit_wrapped_text(self.fontMetrics(), self._flat, self._text_width(total_width), self._lines)
+
+    def _flags(self) -> int:
+        return int(Qt.TextFlag.TextWordWrap) | int(Qt.TextFlag.TextWrapAnywhere)
+
+    def _height_for(self, total_width: "int | None") -> int:
+        fm = self.fontMetrics()
+        width = self._text_width(total_width)
+        shown = fit_wrapped_text(fm, self._flat, width, self._lines)
+        h = fm.boundingRect(QRect(0, 0, width, 100000), self._flags(), shown).height()
+        h = max(h, fm.lineSpacing())
+        return h + 2 * (self.frameWidth() + self._PAD)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._height_for(width)
+
+    def sizeHint(self) -> QSize:
+        return QSize(420, self._height_for(420))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(120, self._height_for(120))
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        inset = self.frameWidth() + self._PAD
+        rect = self.rect().adjusted(inset, inset, -inset, -inset)
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        flags = self._flags() | int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignTop)
+        painter.drawText(rect, flags, self.shown_text())
+        painter.end()
+
+
 class PiiPatternInputDialog(QDialog):
-    """「検出語に追加」「除外パターンに追加」で最初に開く、語句(正規表現)の入力ダイアログ。
+    """「検出パターンに追加」「除外パターンに追加」で最初に開く、語句(正規表現)の入力ダイアログ。
 
     - 語句(読み取り専用)は、右クリックした結果の語句。
     - 入力補助は独立した2つの部品: 「一致のしかた」(完全/前方/後方/部分。``with_match`` が
       True のときだけ出す=除外パターン用)と「空白を許容する」チェック。変えるたびに
       テキストボックスを基の語句から作り直す。テキストボックスを手で編集すると
       「自由入力」状態になる(``free``)。
-    - ``with_entity`` が True のときは種別のドロップダウンも出す(「検出語に追加」用。
-      末尾に「手動(検出語には追加しない)」を含む)。
+    - ``with_entity`` が True のときは種別のドロップダウンも出す(「検出パターンに追加」用。
+      末尾に「手動(検出パターンには追加しない)」を含む)。
     - OK(Enterキー)で確定。正規表現が不正なときはエラーを示して閉じない。
 
     ``state()`` は ``{"entity", "match", "gap", "free", "text"}``。戻るボタンで呼び直すとき
@@ -270,6 +358,7 @@ class PiiPatternInputDialog(QDialog):
         default_entity: str = "PERSON",
         state: "dict | None" = None,
         parent: QWidget | None = None,
+        text_display: "tuple[str, int]" = ("ellipsis", 3),
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -285,14 +374,9 @@ class PiiPatternInputDialog(QDialog):
         layout.addWidget(self._message_label)
 
         form = QFormLayout()
-        self._word_edit = QPlainTextEdit(word)
-        self._word_edit.setReadOnly(True)
-        self._word_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self._word_edit.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
-        self._word_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        line_h = self._word_edit.fontMetrics().lineSpacing()
-        self._word_edit.setMinimumHeight(line_h * 2 + 12)
-        self._word_edit.setMaximumHeight(line_h * 4 + 12)
+        # 設定「結果一覧の語句の表示」(1行省略/折り返し+最大行数)に従って表示する(読み取り専用)。
+        mode, max_lines = text_display
+        self._word_edit = FittedTextLabel(word, mode, max_lines)
         form.addRow("選んだ語句:", self._word_edit)
 
         self._entity_combo: QComboBox | None = None
@@ -393,7 +477,7 @@ class PiiPatternInputDialog(QDialog):
 
     # --- 結果 ---
     def match(self) -> str:
-        """「一致のしかた」(``MATCH_*``)。この部品を出さない検出語側は部分一致。"""
+        """「一致のしかた」(``MATCH_*``)。この部品を出さない検出パターン側は部分一致。"""
         if self._match_combo is None:
             return MATCH_PARTIAL
         return str(self._match_combo.currentData())
@@ -431,7 +515,7 @@ class PiiPatternInputDialog(QDialog):
 
 
 class ScopeChoiceDialog(QDialog):
-    """「検出語に追加」「除外パターンに追加」の入力の後に開く、範囲選択の小さなダイアログ。
+    """「検出パターンに追加」「除外パターンに追加」の入力の後に開く、範囲選択の小さなダイアログ。
 
     語句(読み取り専用)と説明文を示し、「全ページ / このページだけ / しない」の
     3択(ボタン文言は呼び出し側が指定)から選ばせる。ダイアログを閉じた場合は
@@ -453,23 +537,23 @@ class ScopeChoiceDialog(QDialog):
         labels: "tuple[str, str, str]",
         parent: QWidget | None = None,
         allow_back: bool = False,
+        *,
+        pattern: "str | None" = None,
+        text_display: "tuple[str, int]" = ("ellipsis", 3),
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
+        self.setMinimumWidth(460)
         self._scope: str = self.SCOPE_NONE
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        # 長い語句は折り返して全文を見せる(1行の横スクロールにしない)。
-        self._text_edit = QPlainTextEdit(word)
-        self._text_edit.setReadOnly(True)
-        self._text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self._text_edit.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
-        self._text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        line_h = self._text_edit.fontMetrics().lineSpacing()
-        self._text_edit.setMinimumHeight(line_h * 3 + 12)
-        self._text_edit.setMaximumHeight(line_h * 6 + 12)
-        form.addRow("語句:", self._text_edit)
+        # 語句(パターン)の表示は1か所だけ。設定「結果一覧の語句の表示」に従い、
+        # 1行なら末尾「…」省略、折り返しなら最大行数まで折り返して超過分を「…」省略する。
+        label, shown = scope_target(word, pattern)
+        mode, max_lines = text_display
+        self._text_edit = FittedTextLabel(shown, mode, max_lines)
+        form.addRow(f"{label}:", self._text_edit)
         layout.addLayout(form)
 
         self._message_label = QLabel(message)
@@ -512,9 +596,15 @@ class ScopeChoiceDialog(QDialog):
         labels: "tuple[str, str, str]",
         parent: QWidget | None = None,
         allow_back: bool = False,
+        *,
+        pattern: "str | None" = None,
+        text_display: "tuple[str, int]" = ("ellipsis", 3),
     ) -> str:
         """ダイアログを表示し、選ばれた範囲(``SCOPE_*``)を返す。閉じた場合は SCOPE_NONE。"""
-        dialog = ScopeChoiceDialog(title, message, word, labels, parent, allow_back)
+        dialog = ScopeChoiceDialog(
+            title, message, word, labels, parent, allow_back,
+            pattern=pattern, text_display=text_display,
+        )
         dialog.exec()
         return dialog.scope()
 
@@ -538,17 +628,16 @@ class PiiPanel(QFrame):
         「塗り丸」ツールのON/OFF。
     remove_selected_requested()
         「削除」ボタン押下時、または結果一覧でDeleteキー押下時。
-    add_detect_word_requested(str)
-        結果一覧の右クリックメニュー「検出語に追加」。text を伴う。種類・正規表現・範囲は
-        続く入力ダイアログで選ぶ(種類に「手動」を選ぶと検出語には登録しない)。
-    add_exclude_word_requested(str)
-        結果一覧の右クリックメニュー「除外パターンに追加」。text を伴う。
+    add_detect_word_requested(str, str)
+        結果一覧の右クリックメニュー「検出パターンに追加」。(text, 種類)。種類が空文字なら
+        「詳細指定…」(入力ダイアログで種類・正規表現を選ぶ)、種類があれば簡易指定
+        (入力ダイアログ無しで範囲選択へ。「手動」なら検出パターンには登録しない)。
+    add_exclude_word_requested(str, bool)
+        結果一覧の右クリックメニュー「除外パターンに追加」。(text, 簡易か)。
+        True=簡易指定(完全一致で、入力ダイアログ無しで範囲選択へ)、False=詳細指定…。
     detect_manual_requested(str)
         手動扱いの候補としての検出要求(設定は保存しない)。右クリックメニューからは
-        直接出さず、「検出語に追加」の種類「手動」から行う。
-    remove_detected_requested(str)
-        結果一覧の右クリックメニュー「検出結果から削除(除外に登録しない)」。
-        text を伴う。設定は保存せず、検出済みの同じ語句の結果だけを削除する。
+        直接出さず、「検出パターンに追加」の種類「手動」から行う。
     settings_requested()
         「設定...」ボタン押下時。
     export_requested()
@@ -573,10 +662,9 @@ class PiiPanel(QFrame):
     mask_rect_tool_toggled = pyqtSignal(bool)
     mask_ellipse_tool_toggled = pyqtSignal(bool)
     remove_selected_requested = pyqtSignal()
-    add_detect_word_requested = pyqtSignal(str)
-    add_exclude_word_requested = pyqtSignal(str)
+    add_detect_word_requested = pyqtSignal(str, str)
+    add_exclude_word_requested = pyqtSignal(str, bool)
     detect_manual_requested = pyqtSignal(str)
-    remove_detected_requested = pyqtSignal(str)
     settings_requested = pyqtSignal()
     export_requested = pyqtSignal()
     result_activated = pyqtSignal(object)
@@ -585,6 +673,7 @@ class PiiPanel(QFrame):
     mask_transparency_changed = pyqtSignal(int, bool)
 
     DRAWER_WIDTH = 340
+    _MIN_TEXT_COLUMN_WIDTH = 60
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -751,6 +840,8 @@ class PiiPanel(QFrame):
         self._sort_field = "page"
         self._sort_ascending = True
         self._result_order_vertical = False  # ページ内の並び順(False=横書き)
+        self._columns_user_sized = False  # ユーザーが列幅をドラッグしたら True(自動の幅合わせを止める)
+        self._fitting_columns = False
         self._text_wrap = False  # 語句列: False=1行で末尾省略 / True=折り返し(上限行数まで)
         self._text_max_lines = 3
         self._result_tree = _ResultTree()
@@ -770,6 +861,8 @@ class PiiPanel(QFrame):
         header.setSortIndicatorShown(True)
         header.sectionClicked.connect(self._on_result_header_clicked)
         header.sectionResized.connect(self._on_result_section_resized)
+        header.setStretchLastSection(False)
+        self._result_tree.resized.connect(self._fit_result_columns)
         self._update_sort_indicator()
         panel_layout.addWidget(self._result_tree, 1)
 
@@ -1068,8 +1161,35 @@ class PiiPanel(QFrame):
         self._rebuild_result_tree()
 
     def _on_result_section_resized(self, column: int, _old: int, _new: int) -> None:
+        if not self._fitting_columns:
+            # ユーザーが列幅をドラッグした。以降は自動の幅合わせをやめ、その幅を尊重する
+            # (一覧に収まらなければ横スクロールになる)。
+            self._columns_user_sized = True
         if column == 0 and self._text_wrap:
             self._result_tree.scheduleDelayedItemsLayout()  # 行の高さを再計算
+
+    def _fit_result_columns(self) -> None:
+        """既定の列幅: 「種別」「ページ」は内容幅、「語句」は残り幅いっぱいに伸縮させる。
+
+        一覧がパネル幅に収まり、長い語句は「…」で省略(折り返しは折り返し)されて横スクロールが
+        出ない。ユーザーが列幅をドラッグした後は何もしない(その幅を保つ)。
+        """
+        tree = self._result_tree
+        if self._columns_user_sized or self._fitting_columns:
+            return
+        self._fitting_columns = True
+        try:
+            for col in (1, 2):
+                tree.resizeColumnToContents(col)
+            avail = tree.viewport().width()
+            if avail <= 0:
+                return  # まだ表示されていない(表示時のリサイズで合わせ直す)
+            rest = avail - tree.columnWidth(1) - tree.columnWidth(2)
+            tree.setColumnWidth(0, max(self._MIN_TEXT_COLUMN_WIDTH, rest))
+        finally:
+            self._fitting_columns = False
+        if self._text_wrap:
+            tree.scheduleDelayedItemsLayout()
 
     def _rebuild_result_tree(self) -> None:
         self._result_tree.clear()
@@ -1093,10 +1213,7 @@ class PiiPanel(QFrame):
             )
         else:
             self._result_tree.setItemDelegateForColumn(0, None)
-        for col in range(3):
-            self._result_tree.resizeColumnToContents(col)
-        if self._text_wrap and self._result_tree.columnWidth(0) > 260:
-            self._result_tree.setColumnWidth(0, 260)  # 長い語句で列が広がりすぎないように
+        self._fit_result_columns()
 
     def _on_result_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         row: PiiResultRow | None = item.data(0, _ANNOT_ROLE)
@@ -1113,26 +1230,38 @@ class PiiPanel(QFrame):
         menu = QMenu(self._result_tree)
         copy_action = menu.addAction("コピー")
         menu.addSeparator()
-        # 検出語/除外パターンへの追加は、どちらも入力ダイアログ(種類・正規表現・範囲)で
-        # 続きを選ぶ(手動追加分の行でも、語句があれば登録できる)。「手動」で検出したい
-        # ときも「検出語に追加」の種類で「手動(検出語には追加しない)」を選ぶ。
-        detect_action = menu.addAction("検出語に追加")
-        detect_action.setEnabled(bool(row.text))
-        exclude_action = menu.addAction("除外パターンに追加")
-        exclude_action.setEnabled(bool(row.text))
-        remove_action = menu.addAction("検出結果から削除(除外に登録しない)")
-        remove_action.setEnabled(bool(row.text))
+        # 検出パターン/除外パターンへの追加は、どちらもサブメニュー。「簡易」(入力ダイアログ無しで
+        # すぐ範囲選択へ)と「詳細指定…」(入力ダイアログで正規表現を編集)の構成にそろえる
+        # (手動追加分の行でも、語句があれば登録できる)。「手動」で検出したいときは
+        # 検出パターン側の「手動(検出パターンには追加しない)」を選ぶ。
+        has_text = bool(row.text)
+        detect_menu = menu.addMenu("検出パターンに追加")
+        detect_menu.menuAction().setEnabled(has_text)
+        for entity_type in ENTITY_TYPES:
+            act = detect_menu.addAction(get_entity_type_name_ja(entity_type))
+            act.setData(("detect", entity_type))
+        detect_menu.addAction(MANUAL_CHOICE_LABEL).setData(("detect", MANUAL_ENTITY_TYPE))
+        detect_menu.addSeparator()
+        detect_menu.addAction(DETAIL_ACTION_LABEL).setData(("detect", ""))
+        exclude_menu = menu.addMenu("除外パターンに追加")
+        exclude_menu.menuAction().setEnabled(has_text)
+        exclude_menu.addAction(EXCLUDE_SIMPLE_LABEL).setData(("exclude", True))
+        exclude_menu.addSeparator()
+        exclude_menu.addAction(DETAIL_ACTION_LABEL).setData(("exclude", False))
         chosen = menu.exec(self._result_tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
         if chosen is copy_action:
             self.copy_results_to_clipboard()
-        elif chosen is exclude_action:
-            self.add_exclude_word_requested.emit(row.text)
-        elif chosen is remove_action:
-            self.remove_detected_requested.emit(row.text)
-        elif chosen is detect_action:
-            self.add_detect_word_requested.emit(row.text)
+            return
+        data = chosen.data()
+        if not data:
+            return
+        kind, value = data
+        if kind == "detect":
+            self.add_detect_word_requested.emit(row.text, value)
+        elif kind == "exclude":
+            self.add_exclude_word_requested.emit(row.text, value)
 
     def _update_button_states(self) -> None:
         has_results = self._result_tree.topLevelItemCount() > 0
@@ -1205,6 +1334,13 @@ class _ResultTree(QTreeWidget):
 
     delete_pressed = pyqtSignal()
     copy_pressed = pyqtSignal()
+    resized = pyqtSignal()
+
+    def viewportEvent(self, event) -> bool:
+        handled = super().viewportEvent(event)
+        if event.type() == QEvent.Type.Resize:
+            self.resized.emit()  # 縦スクロールバーの出入りによる幅の変化も含む
+        return handled
 
     def event(self, event) -> bool:
         if event.type() == QEvent.Type.ShortcutOverride and (
