@@ -25,6 +25,7 @@ class SearchDialog(QDialog):
     search_requested = pyqtSignal(str)
     next_requested = pyqtSignal()
     prev_requested = pyqtSignal()
+    cancel_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -58,6 +59,11 @@ class SearchDialog(QDialog):
         self._next_btn.setEnabled(False)
         nav_row.addWidget(self._next_btn)
 
+        self._cancel_btn = QPushButton("中止")
+        self._cancel_btn.clicked.connect(self.cancel_requested.emit)
+        self._cancel_btn.setVisible(False)
+        nav_row.addWidget(self._cancel_btn)
+
         nav_row.addStretch(1)
 
         self._status_label = QLabel("")
@@ -69,8 +75,19 @@ class SearchDialog(QDialog):
         text = self._input.text().strip()
         self.search_requested.emit(text)
 
+    def set_progress(self, scanned: int, total: int, hits: int, current: int = 0) -> None:
+        """検索の途中経過を表示する(見つかった分だけ前へ/次へを使える)。"""
+        text = f"検索中… {scanned:,} / {total:,} ページ（{hits:,} 件）"
+        if current > 0 and hits > 0:
+            text = f"{current} / {hits:,} 件 ・ 検索中… {scanned:,} / {total:,} ページ"
+        self._status_label.setText(text)
+        self._prev_btn.setEnabled(hits > 0)
+        self._next_btn.setEnabled(hits > 0)
+        self._cancel_btn.setVisible(True)
+
     def set_status(self, current: int, total: int) -> None:
         """Update the hit count display and enable/disable nav buttons."""
+        self._cancel_btn.setVisible(False)
         if total <= 0:
             self._status_label.setText("見つかりません")
             self._prev_btn.setEnabled(False)
@@ -81,6 +98,7 @@ class SearchDialog(QDialog):
             self._next_btn.setEnabled(True)
 
     def clear_status(self) -> None:
+        self._cancel_btn.setVisible(False)
         self._status_label.setText("")
         self._prev_btn.setEnabled(False)
         self._next_btn.setEnabled(False)

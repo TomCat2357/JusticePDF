@@ -5,7 +5,7 @@ import shutil
 import logging
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace as dataclass_replace
 from enum import Enum, auto
 from PyQt6.QtWidgets import (
@@ -115,12 +115,15 @@ from src.utils.pdf_utils import (
     is_heavy_pdf,
 )
 from src.utils import app_settings
+from src.utils.pdf_utils.search_index import PageTextIndex, SearchScan
 from src.utils.pdf_utils.common import (
     PdfSession,
     PdfSessionConflictError,
+    _open_doc,
     hold_doc,
     open_session,
     release_held_docs,
+    HELD_DOC_STREAM_MAX_BYTES,
     release_session_for_path,
 )
 from src.utils.constants import (
@@ -421,6 +424,18 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._search_hit_pages: list[int] = []
         self._search_hit_set: set[int] = set()
         self._search_cursor: int = -1
+        # 検索の走査ジョブ(UIスレッドでQTimer駆動のチャンク処理)とページ別テキストの索引
+        self._search_scan: "SearchScan | None" = None
+        self._search_sync: bool = False
+        self._search_query: str = ""
+        self._search_token = None
+        self._search_jumped: bool = False
+        self._search_index: "PageTextIndex | None" = None
+        self._search_hold: "ExitStack | None" = None  # 走査中、文書の写しを保持する hold_doc
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(0)
+        self._search_timer.timeout.connect(self._search_step)
 
         self._setup_ui()
         self._setup_toolbar()
@@ -3382,6 +3397,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             event.ignore()
             return
 
+        self._stop_search_scan()
         self._reset_thumbnail_render_queue()
         self._release_held_doc()
         # 未確定のフォーム編集(スライダー/スピン)があれば先に確定する。
@@ -3392,6 +3408,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._compact_pdf_if_bloated()
         self._undo_manager.remove_listener(self._on_undo_manager_changed)
 
+        self._stop_search_scan()
+        self._search_index = None
         if self._search_dialog is not None:
             self._search_dialog.close()
             self._search_dialog = None
@@ -3413,6 +3431,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._search_dialog.next_requested.connect(self._on_search_next)
             self._search_dialog.prev_requested.connect(self._on_search_prev)
             self._search_dialog.finished.connect(self._on_search_dialog_finished)
+            self._search_dialog.cancel_requested.connect(self._on_search_cancel)
         self._search_dialog.show()
         self._search_dialog.raise_()
         self._search_dialog.activateWindow()
@@ -3421,42 +3440,259 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def _on_search_dialog_finished(self, _result: int) -> None:
         self._clear_search_highlights()
 
+    # 小さい文書(このページ数以下)は、検索を _on_search_execute の中で最後まで同期実行する
+    SEARCH_SYNC_MAX_PAGES = 300
+    # チャンク検索の1回あたりの時間予算(秒)。UIが固まらない程度に短くする
+    SEARCH_TICK_BUDGET_S = 0.03
+
     def _on_search_execute(self, query: str) -> None:
         query = (query or "").strip()
-        # まず以前のハイライトをクリア
+        # まず以前のハイライトをクリア(実行中の検索も止まる)
         self._clear_search_highlights()
         if not query:
             if self._search_dialog is not None:
                 self._search_dialog.set_status(0, 0)
             return
-        self._search_hits = search_text_in_pdf(self._pdf_path, query)
-        self._search_hit_pages = sorted(self._search_hits.keys())
-        self._apply_search_highlights()
-        if not self._search_hit_pages:
-            self._search_cursor = -1
+        self._search_query = query
+        self._search_jumped = False
+        self._start_search_scan()
+
+    def _search_index_for_current(self) -> PageTextIndex:
+        """現在の文書に対応するページ別テキスト索引を返す(変更されたページ分だけ無効化して再利用)。"""
+        token = _get_file_cache_token(self._pdf_path)
+        index = self._search_index
+        if index is not None and index.token != token:
+            changed = pages_changed_since(self._pdf_path, index.token)
+            if changed is None or index.page_count != self._page_count:
+                index = None
+            else:
+                index.invalidate_pages(changed)
+                index.token = token
+        if index is None or index.page_count != self._page_count:
+            index = PageTextIndex(self._page_count, token)
+        self._search_index = index
+        return index
+
+    def _start_search_scan(self) -> None:
+        """``self._search_query`` の走査ジョブを(再)開始する。結果は空から作り直す。"""
+        self._search_timer.stop()
+        self._end_search_hold()
+        index = self._search_index_for_current()
+        self._search_token = index.token
+        self._search_scan = SearchScan(index, self._search_query, self._page_count)
+        self._search_sync = self._page_count <= self.SEARCH_SYNC_MAX_PAGES
+        if self._search_dialog is not None and not self._search_scan.done:
+            self._search_dialog.set_progress(0, self._page_count, 0)
+        if self._search_sync:
+            while self._search_scan is not None:
+                self._search_step()
+        else:
+            self._search_timer.start()
+
+    def _end_search_hold(self) -> None:
+        hold, self._search_hold = self._search_hold, None
+        if hold is not None:
+            hold.close()
+
+    def _stop_search_scan(self) -> None:
+        """実行中の検索ジョブを止める(結果の表示状態は触らない)。"""
+        self._search_timer.stop()
+        had_job = self._search_scan is not None
+        self._search_scan = None
+        self._end_search_hold()
+        if had_job:
+            self._held_doc_idle_timer.start()
+
+    def _reset_search_results(self) -> None:
+        self._reset_search_hit_pages()
+        self._search_hits = {}
+        self._search_hit_pages = []
+        self._search_cursor = -1
+        if self._zoom_label is not None:
+            self._zoom_label.set_search_hit_rects([])
+
+    def _search_step(self) -> None:
+        scan = self._search_scan
+        if scan is None:
+            return
+        sync = self._search_sync
+        budget = None if sync else self.SEARCH_TICK_BUDGET_S
+        try:
+            with ExitStack() as stack:
+                opened: list = []
+
+                def get_doc():
+                    if not opened:
+                        if not sync and self._search_hold is None:
+                            # 走査の間は文書の写しを1回だけ読み込んで保持する(ファイルハンドルは
+                            # 掴まないので書き込みを妨げない。更新は is_current が検出して開き直す)。
+                            # 大きすぎて写しを持てないファイルは従来どおりティックごとに開き直す。
+                            hold = ExitStack()
+                            try:
+                                size = os.path.getsize(self._pdf_path)
+                            except OSError:
+                                size = HELD_DOC_STREAM_MAX_BYTES + 1
+                            if size <= HELD_DOC_STREAM_MAX_BYTES:
+                                hold.enter_context(hold_doc(self._pdf_path, linger=True))
+                                self._search_hold = hold
+                        if not sync and self._search_hold is None:
+                            stack.enter_context(hold_doc(self._pdf_path, linger=True))
+                        doc = stack.enter_context(_open_doc(self._pdf_path))
+                        if len(doc) != scan.page_count:
+                            raise RuntimeError("page count changed during search")
+                        opened.append(doc)
+                    return opened[0]
+
+                # ファイル/セッションが変わった(書き込み・外部更新)とき
+                token = _get_file_cache_token(self._pdf_path)
+                if token != self._search_token:
+                    if not self._reconcile_search_after_change(scan, token, get_doc):
+                        return
+                    if self._search_scan is not scan:
+                        return
+                found = scan.step(get_doc, budget)
+        except Exception:
+            logger.debug(
+                "search failed: pdf=%s query=%r", self._pdf_path, self._search_query, exc_info=True
+            )
+            self._clear_search_highlights()
             if self._search_dialog is not None:
                 self._search_dialog.set_status(0, 0)
             return
-        self._search_cursor = 0
-        self._jump_to_search_page(self._search_hit_pages[0])
-        if self._search_dialog is not None:
-            self._search_dialog.set_status(1, len(self._search_hit_pages))
+        for page, rects in found:
+            self._add_search_hit(page, rects)
+            if self._search_scan is not scan:
+                return  # ジャンプ中の確認ダイアログ等で、走査が中止・置き換えられた
+        if scan.done:
+            self._finish_search_scan()
+            return
+        self._held_doc_idle_timer.start()
+        self._update_search_progress()
+        self._search_timer.start()
+
+    def _reconcile_search_after_change(self, scan: SearchScan, token, get_doc) -> bool:
+        """走査中にファイルが変わったとき、変更ページ分だけ直して続行できるようにする。
+
+        追跡できない変更(履歴が途切れた・ページ数が変わった)は最初からやり直す。
+        続行するなら True、やり直し(または中止)したなら False を返す。
+        """
+        self._end_search_hold()  # 古い写しは捨てて、次に必要になったとき読み直す
+        changed = pages_changed_since(self._pdf_path, self._search_token)
+        if changed is None or scan.index.page_count != self._page_count:
+            self._reset_search_results()
+            self._start_search_scan()
+            return False
+        index = scan.index
+        index.invalidate_pages(changed)
+        index.token = token
+        self._search_token = token
+        for page in sorted(p for p in changed if 0 <= p < scan.next_page):
+            rects = scan.check_page(get_doc(), page)
+            self._apply_search_page_result(page, rects)
+            if self._search_scan is not scan:
+                return False
+        return True
+
+    def _apply_search_page_result(self, page: int, rects: "list | None") -> None:
+        """既に走査済みのページの検索結果を差し替える(ヒットの追加・更新・削除、並びは昇順)。"""
+        pages = self._search_hit_pages
+        current = pages[self._search_cursor] if 0 <= self._search_cursor < len(pages) else None
+        known = page in self._search_hits
+        if rects:
+            if known:
+                self._search_hits[page] = rects
+                self._grid.update_page(page)
+                if page == self._zoom_page_num and self._zoom_label is not None:
+                    self._zoom_label.set_search_hit_rects(rects)
+            else:
+                bisect.insort(pages, page)
+                self._add_search_hit(page, rects, append=False)
+        elif known:
+            del self._search_hits[page]
+            pages.remove(page)
+            self._search_hit_set.discard(page)
+            self._grid.update_page(page)
+            if page == self._zoom_page_num and self._zoom_label is not None:
+                self._zoom_label.set_search_hit_rects([])
+        if current is not None and current in self._search_hits:
+            self._search_cursor = bisect.bisect_left(pages, current)
+        elif pages:
+            self._search_cursor = min(max(self._search_cursor, 0), len(pages) - 1)
+        else:
+            self._search_cursor = -1
+
+    def _add_search_hit(self, page: int, rects: list, *, append: bool = True) -> None:
+        self._search_hits[page] = rects
+        if append:
+            self._search_hit_pages.append(page)  # 昇順に走査するので並びは保たれる
+        self._search_hit_set.add(page)
+        self._grid.update_page(page)
+        if page == self._zoom_page_num and self._zoom_label is not None:
+            self._zoom_label.set_search_hit_rects(rects)
+        if not self._search_jumped:
+            self._search_jumped = True
+            self._search_cursor = 0
+            self._jump_to_search_page(page)
+
+    def _update_search_progress(self) -> None:
+        scan = self._search_scan
+        if scan is None or self._search_dialog is None:
+            return
+        self._search_dialog.set_progress(
+            scan.next_page,
+            scan.page_count,
+            len(self._search_hit_pages),
+            self._search_cursor + 1 if self._search_cursor >= 0 else 0,
+        )
+
+    def _finish_search_scan(self) -> None:
+        self._search_scan = None
+        self._held_doc_idle_timer.start()
+        if self._search_dialog is None:
+            return
+        if not self._search_hit_pages:
+            self._search_cursor = -1
+            self._search_dialog.set_status(0, 0)
+            return
+        if self._search_cursor < 0:
+            self._search_cursor = 0
+        self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+
+    def _on_search_cancel(self) -> None:
+        """ダイアログの「中止」: 走査を止め、ここまでの結果で表示を確定する。"""
+        if self._search_scan is None:
+            return
+        self._stop_search_scan()
+        if self._search_dialog is None:
+            return
+        if self._search_hit_pages:
+            if self._search_cursor < 0:
+                self._search_cursor = 0
+            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+        else:
+            self._search_dialog.set_status(0, 0)
+
+    def _search_nav_status(self) -> None:
+        if self._search_dialog is None:
+            return
+        if self._search_scan is not None:
+            self._update_search_progress()
+        else:
+            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
 
     def _on_search_next(self) -> None:
         if not self._search_hit_pages:
             return
         self._search_cursor = (self._search_cursor + 1) % len(self._search_hit_pages)
         self._jump_to_search_page(self._search_hit_pages[self._search_cursor])
-        if self._search_dialog is not None:
-            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+        self._search_nav_status()
 
     def _on_search_prev(self) -> None:
         if not self._search_hit_pages:
             return
         self._search_cursor = (self._search_cursor - 1) % len(self._search_hit_pages)
         self._jump_to_search_page(self._search_hit_pages[self._search_cursor])
-        if self._search_dialog is not None:
-            self._search_dialog.set_status(self._search_cursor + 1, len(self._search_hit_pages))
+        self._search_nav_status()
 
     def _jump_to_search_page(self, page_num: int) -> None:
         if page_num < 0 or page_num >= self._page_count:
@@ -3489,6 +3725,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 self._grid.update_page(page)
 
     def _clear_search_highlights(self) -> None:
+        self._stop_search_scan()
         self._reset_search_hit_pages()
         self._search_hits = {}
         self._search_hit_pages = []
@@ -3497,7 +3734,9 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_label.set_search_hit_rects([])
 
     def _invalidate_search_results(self) -> None:
-        """ページ構成が変わったときに呼び、検索状態とダイアログ表示を初期化する。"""
+        """ページ構成が変わったときに呼び、検索状態とダイアログ表示を初期化する(索引も破棄)。"""
+        self._stop_search_scan()
+        self._search_index = None
         self._reset_search_hit_pages()
         self._search_hits = {}
         self._search_hit_pages = []
