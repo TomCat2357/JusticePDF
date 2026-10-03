@@ -427,3 +427,78 @@ def test_heavy_window_close_releases_held_doc(qtbot, tmp_path):
     window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
     window.close()
     assert not _held_docs
+
+
+# ---------------------------------------------------------------------------
+# 通常文書の背景先読み(全ページ)
+# ---------------------------------------------------------------------------
+
+def test_normal_document_prerenders_every_page_in_background(qtbot, tmp_path):
+    page_count = 50
+    pdf_path = tmp_path / "prerender-all.pdf"
+    make_pdf(pdf_path, pages=page_count, width=80, height=80)
+    window = create_page_edit_window(qtbot, pdf_path)
+
+    window._reset_thumbnail_render_queue()
+    window._rendered.clear()
+    window._enqueue_visible_thumbnail_renders()
+    assert sorted(window._thumb_render_queue) == list(range(page_count))
+
+    qtbot.waitUntil(lambda: len(window._rendered) == page_count, timeout=20000)
+    assert all(window.is_page_rendered(p) for p in range(page_count))
+
+
+def test_prerender_renders_visible_pages_before_offscreen_ones(qtbot, tmp_path):
+    page_count = 50
+    pdf_path = tmp_path / "prerender-order.pdf"
+    make_pdf(pdf_path, pages=page_count, width=80, height=80)
+    window = create_page_edit_window(qtbot, pdf_path)
+
+    window._reset_thumbnail_render_queue()
+    window._rendered.clear()
+    window.scroll_to_page(page_count - 1)
+    window._reset_thumbnail_render_queue()
+    window._enqueue_visible_thumbnail_renders()
+
+    v0, v1 = window._grid.visible_page_range(0)
+    head = list(window._thumb_render_queue)[: v1 - v0]
+    assert head == list(range(v0, v1))
+    # 先頭バッチ(5ページ)は表示中のページから描かれる。
+    window._process_thumbnail_render_queue()
+    assert window.is_page_rendered(v0)
+    assert not window.is_page_rendered(0)
+    # 範囲外の背景ページが予約として捨てられない。
+    assert 0 in window._thumb_render_queue_set
+
+
+def test_heavy_document_does_not_prerender_everything(qtbot, tmp_path):
+    page_count = HEAVY_PDF_PAGE_COUNT_THRESHOLD + 5
+    pdf_path = tmp_path / "heavy-no-prerender.pdf"
+    make_pdf(pdf_path, pages=page_count, width=80, height=80)
+    window = create_page_edit_window(qtbot, pdf_path)
+    assert window._is_heavy_document is True
+    assert window._prerender_all_pages() is False
+
+    window._reset_thumbnail_render_queue()
+    window._rendered.clear()
+    window._enqueue_visible_thumbnail_renders()
+    assert len(window._thumb_render_queue) < page_count
+    qtbot.wait(300)
+    assert len(window._rendered) < page_count
+
+
+def test_document_larger_than_cap_does_not_prerender_everything(qtbot, tmp_path, monkeypatch):
+    from src.utils import app_settings
+
+    page_count = 120
+    pdf_path = tmp_path / "over-cap.pdf"
+    make_pdf(pdf_path, pages=page_count, width=80, height=80)
+    window = create_page_edit_window(qtbot, pdf_path)
+    monkeypatch.setattr(window, "_rendered_cap", lambda: 40)
+    assert window._is_heavy_document is False
+    assert window._prerender_all_pages() is False
+
+    window._reset_thumbnail_render_queue()
+    window._rendered.clear()
+    window._enqueue_visible_thumbnail_renders()
+    assert len(window._thumb_render_queue) < page_count

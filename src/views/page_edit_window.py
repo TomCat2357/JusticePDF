@@ -1514,9 +1514,20 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         prefetch.sort(key=lambda p: min(abs(p - v0), abs(p - (v1 - 1))))
         new_queue = deque(visible)
         new_queue.extend(prefetch)
+        if self._prerender_all_pages():
+            # 通常文書(保持上限に全ページ収まる)は、残りも表示範囲に近い順で最後尾へ積み、
+            # 裏で全ページを描いておく(スクロールしても空のサムネイルが出ない)。
+            queued = set(new_queue)
+            rest = [p for p in range(self._page_count) if p not in self._rendered and p not in queued]
+            rest.sort(key=lambda p: min(abs(p - v0), abs(p - (v1 - 1))))
+            new_queue.extend(rest)
         self._thumb_render_queue = new_queue
         self._thumb_render_queue_set = set(new_queue)
         self._schedule_thumbnail_render()
+
+    def _prerender_all_pages(self) -> bool:
+        """全ページを裏で先に描画してよい文書か(重量文書でなく、保持上限に全ページ収まる)。"""
+        return not self._is_heavy_document and self._page_count <= self._rendered_cap()
 
     def _request_thumbnail_refresh(self, page_num: int) -> None:
         if page_num < 0 or page_num >= self._page_count:
@@ -1701,7 +1712,11 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         )
         # 素早いスクロール中に、既に表示範囲(+先読み)から外れた予約は描かずに捨てる。
         keep_start, keep_stop = 0, 0
-        if self._grid_scroll is not None and self._grid_scroll.isVisible():
+        if (
+            self._grid_scroll is not None
+            and self._grid_scroll.isVisible()
+            and not self._prerender_all_pages()
+        ):
             keep_start, keep_stop = self._grid.prefetch_page_range()
         while self._thumb_render_queue and len(batch) < batch_limit:
             page_num = self._thumb_render_queue.popleft()
