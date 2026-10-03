@@ -3505,7 +3505,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._clear_search_highlights()
         if not query:
             if self._search_dialog is not None:
-                self._search_dialog.set_status(0, 0, 0)
+                self._search_dialog.set_status(0, 0)
             return
         self._search_query = query
         self._search_jumped = False
@@ -3547,7 +3547,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._search_scan = SearchScan(index, self._search_query, self._page_count)
         self._search_sync = self._page_count <= self.SEARCH_SYNC_MAX_PAGES
         if self._search_dialog is not None and not self._search_scan.done:
-            self._search_dialog.set_progress(0, self._page_count, 0, 0)
+            self._search_dialog.set_progress(0, self._page_count, 0)
         if self._search_sync:
             while self._search_scan is not None:
                 self._search_step()
@@ -3622,7 +3622,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             )
             self._clear_search_highlights()
             if self._search_dialog is not None:
-                self._search_dialog.set_status(0, 0, 0)
+                self._search_dialog.set_status(0, 0)
             return
         for page, rects in found:
             self._add_search_hit(page, rects)
@@ -3710,18 +3710,17 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         return i + 1 if i < len(pages) and pages[i] == current else 0
 
     def _show_search_status(self) -> None:
-        """ヒットしたページ数・全件数・現在位置(走査中は進み具合も)をダイアログへ表示する。"""
+        """ヒットしたページ数・現在位置(走査中は進み具合も)をダイアログへ表示する。"""
         dialog = self._search_dialog
         if dialog is None:
             return
         pages = len(self._search_hit_pages)
-        occurrences = sum(len(rects) for rects in self._search_hits.values())
         current = self._search_current_index()
         scan = self._search_scan
         if scan is not None:
-            dialog.set_progress(scan.next_page, scan.page_count, pages, occurrences, current)
+            dialog.set_progress(scan.next_page, scan.page_count, pages, current)
         else:
-            dialog.set_status(current, pages, occurrences)
+            dialog.set_status(current, pages)
 
     def _update_search_progress(self) -> None:
         if self._search_scan is not None:

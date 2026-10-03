@@ -311,12 +311,12 @@ def test_status_counts_pages_and_occurrences(qtbot, tmp_path):
     window = _window(qtbot, tmp_path, pages=20, counts=counts)
     window._on_search_execute("needle")
     assert len(window._search_hit_pages) == 12
-    assert _status(window) == "ページ 1 / 12（全 25 件）"
+    assert _status(window) == "ページ 1 / 12"
     window._on_search_next()
-    assert _status(window) == "ページ 2 / 12（全 25 件）"
+    assert _status(window) == "ページ 2 / 12"
     window._on_search_prev()
     window._on_search_prev()
-    assert _status(window) == "ページ 12 / 12（全 25 件）"
+    assert _status(window) == "ページ 12 / 12"
     window._on_search_execute("zzz-none")
     assert _status(window) == "見つかりません"
 
@@ -329,17 +329,20 @@ def test_status_label_strings_and_stable_width(qtbot):
     label = dialog._status_label
     min_width = label.minimumWidth()
     assert min_width > 0
-    dialog.set_progress(50, 300, 3, 5)
-    assert label.text() == "検索中… 50 / 300 ページ（5 件）"
-    dialog.set_progress(50, 300, 3, 5, 2)
-    assert label.text() == "ページ 2 / 3（全 5 件）・検索中… 50 / 300 ページ"
-    dialog.set_status(2, 3, 5)
-    assert label.text() == "ページ 2 / 3（全 5 件）"
-    dialog.set_status(0, 0, 0)
+    dialog.set_progress(50, 300, 3)
+    assert label.text() == "検索中… 50 / 300 ページ（ヒット 3 ページ）"
+    dialog.set_progress(50, 300, 3, 2)
+    assert label.text() == "ページ 2 / 3 ・検索中… 50 / 300 ページ"
+    dialog.set_status(2, 3)
+    assert label.text() == "ページ 2 / 3"
+    dialog.set_status(0, 0)
     assert label.text() == "見つかりません"
     assert label.minimumWidth() == min_width
-    longest = "ページ 999 / 999（全 9,999 件）・検索中… 99,999 / 99,999 ページ"
-    assert label.fontMetrics().horizontalAdvance(longest) <= min_width
+    for longest in (
+        "ページ 999 / 999 ・検索中… 99,999 / 99,999 ページ",
+        "検索中… 99,999 / 99,999 ページ（ヒット 999 ページ）",
+    ):
+        assert label.fontMetrics().horizontalAdvance(longest) <= min_width
 
 
 def test_status_during_chunked_scan(qtbot, tmp_path, chunked):
@@ -348,4 +351,4 @@ def test_status_during_chunked_scan(qtbot, tmp_path, chunked):
     assert window._search_scan is not None
     assert "検索中… " in _status(window)
     qtbot.waitUntil(lambda: window._search_scan is None, timeout=15000)
-    assert _status(window) == "ページ 1 / 4（全 4 件）"
+    assert _status(window) == "ページ 1 / 4"

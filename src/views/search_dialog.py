@@ -71,9 +71,11 @@ class SearchDialog(QDialog):
         # 状態表示は専用の行に置き、文言が変わってもダイアログの大きさが変わらないよう
         # 最も長い表示が収まる最小幅を確保する。
         self._status_label = QLabel("")
-        longest = "ページ 9,999 / 9,999（全 99,999 件）・検索中… 99,999 / 99,999 ページ"
+        longest = "検索中… 99,999 / 99,999 ページ（ヒット 9,999 ページ）"
+        longest_jump = "ページ 9,999 / 9,999 ・検索中… 99,999 / 99,999 ページ"
+        metrics = self._status_label.fontMetrics()
         self._status_label.setMinimumWidth(
-            self._status_label.fontMetrics().horizontalAdvance(longest)
+            max(metrics.horizontalAdvance(longest), metrics.horizontalAdvance(longest_jump))
         )
         self._status_label.setMinimumHeight(self._status_label.fontMetrics().height() + 2)
         layout.addWidget(self._status_label)
@@ -82,25 +84,23 @@ class SearchDialog(QDialog):
         text = self._input.text().strip()
         self.search_requested.emit(text)
 
-    def set_progress(
-        self, scanned: int, total: int, hit_pages: int, occurrences: int, current: int = 0
-    ) -> None:
+    def set_progress(self, scanned: int, total: int, hit_pages: int, current: int = 0) -> None:
         """検索の途中経過を表示する(見つかった分だけ前へ/次へを使える)。
 
-        *hit_pages* はヒットしたページ数、*occurrences* は全ヒット件数、*current* は
+        *hit_pages* はヒットしたページ数、*current* は
         現在のヒットが何ページ目か(1 始まり。まだ移動していなければ 0)。
         """
         scan = f"検索中… {scanned:,} / {total:,} ページ"
         if current > 0 and hit_pages > 0:
-            text = f"ページ {current:,} / {hit_pages:,}（全 {occurrences:,} 件）・{scan}"
+            text = f"ページ {current:,} / {hit_pages:,} ・{scan}"
         else:
-            text = f"{scan}（{occurrences:,} 件）"
+            text = f"{scan}（ヒット {hit_pages:,} ページ）"
         self._status_label.setText(text)
         self._prev_btn.setEnabled(hit_pages > 0)
         self._next_btn.setEnabled(hit_pages > 0)
         self._cancel_btn.setVisible(True)
 
-    def set_status(self, current: int, hit_pages: int, occurrences: int) -> None:
+    def set_status(self, current: int, hit_pages: int) -> None:
         """結果の表示を更新し、前へ/次への有効・無効を切り替える。"""
         self._cancel_btn.setVisible(False)
         if hit_pages <= 0:
@@ -109,9 +109,9 @@ class SearchDialog(QDialog):
             self._next_btn.setEnabled(False)
         else:
             if current > 0:
-                text = f"ページ {current:,} / {hit_pages:,}（全 {occurrences:,} 件）"
+                text = f"ページ {current:,} / {hit_pages:,}"
             else:
-                text = f"{hit_pages:,} ページ（全 {occurrences:,} 件）"
+                text = f"{hit_pages:,} ページ"
             self._status_label.setText(text)
             self._prev_btn.setEnabled(True)
             self._next_btn.setEnabled(True)
