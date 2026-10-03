@@ -5,10 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -106,8 +108,40 @@ class SettingsDialog(QDialog):
         save_mode_note.setWordWrap(True)
         form.addRow(save_mode_note)
 
+        # ---------------------------------------------------------------
+        # バックグラウンド処理(操作していない間の先回り処理)
+        # ---------------------------------------------------------------
+        bg_group = QGroupBox("バックグラウンド処理")
+        bg_layout = QVBoxLayout(bg_group)
+        self._idle_master_check = QCheckBox("操作していない間に先回りして処理する")
+        self._idle_master_check.setChecked(app_settings.idle_work_enabled())
+        bg_layout.addWidget(self._idle_master_check)
+        self._idle_job_checks: dict[str, QCheckBox] = {}
+        for key, label, getter in (
+            (app_settings.IDLE_SEARCH_INDEX_KEY, "検索用の文字の取り込み",
+             app_settings.idle_search_index_enabled),
+            (app_settings.IDLE_ZOOM_PRERENDER_KEY, "拡大表示の前後ページの先読み",
+             app_settings.idle_zoom_prerender_enabled),
+            (app_settings.IDLE_PII_SCAN_KEY, "PII・インク注釈の事前スキャン",
+             app_settings.idle_pii_scan_enabled),
+            (app_settings.IDLE_THUMB_PREFETCH_KEY, "一覧サムネイルの先読み",
+             app_settings.idle_thumb_prefetch_enabled),
+        ):
+            box = QCheckBox(label)
+            box.setChecked(getter())
+            box.setStyleSheet("margin-left: 18px;")
+            bg_layout.addWidget(box)
+            self._idle_job_checks[key] = box
+        self._idle_master_check.toggled.connect(self._update_idle_sub_enabled)
+        self._update_idle_sub_enabled(self._idle_master_check.isChecked())
+        layout.addWidget(bg_group)
+
         btn_box, self._ok_btn = build_accept_cancel_box(self, "OK")
         layout.addWidget(btn_box)
+
+    def _update_idle_sub_enabled(self, enabled: bool) -> None:
+        for box in self._idle_job_checks.values():
+            box.setEnabled(bool(enabled))
 
     def _on_browse(self) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -145,3 +179,14 @@ class SettingsDialog(QDialog):
         app_settings.set_edit_save_mode(self._save_mode_combo.currentData())
         # キャッシュ上限は実行中のキャッシュへ即時反映する。
         set_pixmap_cache_max_entries(app_settings.pixmap_cache_max_entries())
+        # バックグラウンド処理の設定(実行中のウィンドウにも次の判定から即時反映される)。
+        app_settings.set_idle_work_enabled(self._idle_master_check.isChecked())
+        checks = self._idle_job_checks
+        app_settings.set_idle_search_index_enabled(
+            checks[app_settings.IDLE_SEARCH_INDEX_KEY].isChecked())
+        app_settings.set_idle_zoom_prerender_enabled(
+            checks[app_settings.IDLE_ZOOM_PRERENDER_KEY].isChecked())
+        app_settings.set_idle_pii_scan_enabled(
+            checks[app_settings.IDLE_PII_SCAN_KEY].isChecked())
+        app_settings.set_idle_thumb_prefetch_enabled(
+            checks[app_settings.IDLE_THUMB_PREFETCH_KEY].isChecked())

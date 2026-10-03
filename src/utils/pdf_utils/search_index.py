@@ -82,6 +82,17 @@ class PageTextIndex:
         return sum(1 for t in self.texts if t is not None)
 
 
+def fill_index_page(index: PageTextIndex, page: "fitz.Page", i: int) -> "fitz.TextPage":
+    """1ページ分の TextPage を SEARCH_TEXT_FLAGS で抽出し、正規化して索引へ入れる。
+
+    SearchScan と先行取り込み(アイドル処理)が共有する唯一の抽出経路。TextPage を返すので、
+    呼び出し側は ``search_for(textpage=...)`` に使い回せる。
+    """
+    tp = page.get_textpage(flags=SEARCH_TEXT_FLAGS)
+    index.set_text(i, tp.extractText())
+    return tp
+
+
 class SearchScan:
     """ページを昇順に走査する検索の状態。``step`` を時間予算つきで繰り返し呼ぶ。"""
 
@@ -104,8 +115,8 @@ class SearchScan:
         page = doc[i]
         tp = None
         if text is None and index.can_store():
-            tp = page.get_textpage(flags=SEARCH_TEXT_FLAGS)
-            text = index.set_text(i, tp.extractText())
+            tp = fill_index_page(index, page, i)
+            text = index.texts[i]
         if text is None:
             candidate = True  # キャッシュ上限超過: 絞り込まず直接検索
         else:

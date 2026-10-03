@@ -176,3 +176,45 @@ def test_edit_save_mode_invalid_value_falls_back_to_auto(env, raw):
     assert app_settings.edit_save_mode() == "auto"
     app_settings.set_edit_save_mode(raw if isinstance(raw, str) else "x")
     assert app_settings.edit_save_mode() == "auto"
+
+
+def test_idle_work_settings_defaults_and_round_trip():
+    # conftest が既定でマスターを切るので、キーを消して本来の既定値を確認する。
+    QSettings().remove(app_settings.IDLE_WORK_ENABLED_KEY)
+    assert app_settings.idle_work_enabled() is True
+    assert app_settings.idle_search_index_enabled() is True
+    assert app_settings.idle_zoom_prerender_enabled() is True
+    assert app_settings.idle_pii_scan_enabled() is True
+    assert app_settings.idle_thumb_prefetch_enabled() is True
+
+    app_settings.set_idle_work_enabled(False)
+    app_settings.set_idle_search_index_enabled(False)
+    app_settings.set_idle_zoom_prerender_enabled(False)
+    app_settings.set_idle_pii_scan_enabled(False)
+    app_settings.set_idle_thumb_prefetch_enabled(False)
+    assert app_settings.idle_work_enabled() is False
+    assert app_settings.idle_search_index_enabled() is False
+    assert app_settings.idle_zoom_prerender_enabled() is False
+    assert app_settings.idle_pii_scan_enabled() is False
+    assert app_settings.idle_thumb_prefetch_enabled() is False
+    app_settings.set_idle_work_enabled(True)
+    assert app_settings.idle_work_enabled() is True
+
+
+def test_settings_dialog_idle_work_group(qtbot):
+    from src.views.settings_dialog import SettingsDialog
+
+    app_settings.set_idle_work_enabled(True)
+    dialog = SettingsDialog()
+    qtbot.addWidget(dialog)
+    assert dialog._idle_master_check.isChecked()
+    checks = list(dialog._idle_job_checks.values())
+    assert len(checks) == 4 and all(c.isEnabled() and c.isChecked() for c in checks)
+
+    dialog._idle_master_check.setChecked(False)
+    assert all(not c.isEnabled() for c in checks)
+    dialog._idle_job_checks[app_settings.IDLE_PII_SCAN_KEY].setChecked(False)
+    dialog.save_heavy_pdf_settings()
+    assert app_settings.idle_work_enabled() is False
+    assert app_settings.idle_pii_scan_enabled() is False
+    assert app_settings.idle_search_index_enabled() is True

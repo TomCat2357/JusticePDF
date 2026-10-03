@@ -116,6 +116,7 @@ from src.utils.pdf_utils import (
 )
 from src.utils import app_settings
 from src.utils.pdf_utils.search_index import PageTextIndex, SearchScan
+from src.views.idle_work_scheduler import IdleWorkScheduler, SearchIndexJob
 from src.utils.pdf_utils.common import (
     PdfSession,
     PdfSessionConflictError,
@@ -394,6 +395,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._held_doc_idle_timer.setSingleShot(True)
         self._held_doc_idle_timer.setInterval(3000)
         self._held_doc_idle_timer.timeout.connect(self._release_held_doc)
+        # 操作していない間の先回り処理(検索索引の取り込みなど)。優先順にジョブを並べる。
+        self._idle_scheduler = IdleWorkScheduler(self, [SearchIndexJob(self)])
         _held_path = self._pdf_path
         self.destroyed.connect(lambda *_a, _p=_held_path: release_held_docs(_p))
         self._scroll_debounce_timer = QTimer(self)
@@ -1518,6 +1521,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         (スクロールで戻ってきたときに改めて積まれる)。ページ一覧が隠れている間
         (拡大表示中)は何もしない。
         """
+        self._idle_scheduler.poke()  # スクロールが落ち着いた
         if self._page_count <= 0 or self._grid_scroll is None or self._grid_scroll.isHidden():
             return
         v0, v1 = self._grid.visible_page_range(0)
@@ -1862,6 +1866,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         else:
             self._release_held_doc()
         self._page_count = page_count
+        self._idle_scheduler.reset_all()
 
         # ウィジェットは見えている範囲にだけ割り当てるので、ページ数に依らず一瞬で済む。
         self._apply_grid_metrics()
@@ -2444,6 +2449,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._render_zoom_pages()
         else:
             self._render_zoom_page()
+        self._idle_scheduler.poke()  # ズームの開始・ページ移動・倍率変更(先回り処理の起点を更新)
 
     # 複数ページ表示のページ間ゲター(論理px)。
     SPREAD_GUTTER = 12
@@ -3001,6 +3007,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._idle_scheduler.start()
         # Run one post-show reflow so initial column count uses stable viewport width.
         if not self._did_initial_grid_layout:
             self._did_initial_grid_layout = True
@@ -3398,6 +3405,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             return
 
         self._stop_search_scan()
+        self._idle_scheduler.stop()
         self._reset_thumbnail_render_queue()
         self._release_held_doc()
         # 未確定のフォーム編集(スライダー/スピン)があれば先に確定する。
@@ -3502,6 +3510,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._end_search_hold()
         if had_job:
             self._held_doc_idle_timer.start()
+            self._idle_scheduler.poke()
 
     def _reset_search_results(self) -> None:
         self._reset_search_hit_pages()
@@ -3648,6 +3657,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     def _finish_search_scan(self) -> None:
         self._search_scan = None
         self._held_doc_idle_timer.start()
+        self._idle_scheduler.poke()
         if self._search_dialog is None:
             return
         if not self._search_hit_pages:

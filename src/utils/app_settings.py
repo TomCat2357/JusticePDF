@@ -43,6 +43,67 @@ EDIT_SAVE_MODE_AUTO = "auto"
 EDIT_SAVE_MODE_MANUAL = "manual"
 
 
+# ---------------------------------------------------------------------------
+# バックグラウンド処理(操作していない間の先回り処理)
+# ---------------------------------------------------------------------------
+IDLE_WORK_ENABLED_KEY = "background/idle_work_enabled"
+IDLE_SEARCH_INDEX_KEY = "background/idle_search_index"
+IDLE_ZOOM_PRERENDER_KEY = "background/idle_zoom_prerender"
+IDLE_PII_SCAN_KEY = "background/idle_pii_scan"
+IDLE_THUMB_PREFETCH_KEY = "background/idle_thumb_prefetch"
+IDLE_JOB_KEYS = (
+    IDLE_SEARCH_INDEX_KEY,
+    IDLE_ZOOM_PRERENDER_KEY,
+    IDLE_PII_SCAN_KEY,
+    IDLE_THUMB_PREFETCH_KEY,
+)
+
+
+def _get_bool(key: str, default: bool) -> bool:
+    return QSettings().value(key, default, type=bool)
+
+
+def idle_work_enabled() -> bool:
+    """操作していない間の先回り処理のマスタースイッチ(既定: 有効)。"""
+    return _get_bool(IDLE_WORK_ENABLED_KEY, True)
+
+
+def set_idle_work_enabled(value: bool) -> None:
+    QSettings().setValue(IDLE_WORK_ENABLED_KEY, bool(value))
+
+
+def idle_search_index_enabled() -> bool:
+    return _get_bool(IDLE_SEARCH_INDEX_KEY, True)
+
+
+def set_idle_search_index_enabled(value: bool) -> None:
+    QSettings().setValue(IDLE_SEARCH_INDEX_KEY, bool(value))
+
+
+def idle_zoom_prerender_enabled() -> bool:
+    return _get_bool(IDLE_ZOOM_PRERENDER_KEY, True)
+
+
+def set_idle_zoom_prerender_enabled(value: bool) -> None:
+    QSettings().setValue(IDLE_ZOOM_PRERENDER_KEY, bool(value))
+
+
+def idle_pii_scan_enabled() -> bool:
+    return _get_bool(IDLE_PII_SCAN_KEY, True)
+
+
+def set_idle_pii_scan_enabled(value: bool) -> None:
+    QSettings().setValue(IDLE_PII_SCAN_KEY, bool(value))
+
+
+def idle_thumb_prefetch_enabled() -> bool:
+    return _get_bool(IDLE_THUMB_PREFETCH_KEY, True)
+
+
+def set_idle_thumb_prefetch_enabled(value: bool) -> None:
+    QSettings().setValue(IDLE_THUMB_PREFETCH_KEY, bool(value))
+
+
 def _clamp(value: int, value_range: tuple[int, int]) -> int:
     lo, hi = value_range
     return max(lo, min(hi, value))

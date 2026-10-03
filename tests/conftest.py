@@ -26,6 +26,14 @@ def _isolated_qsettings(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _disable_idle_work(_isolated_qsettings):
+    """オフスクリーンのテストには入力が無く永久にアイドルなので、先回り処理は既定で切る。"""
+    from src.utils import app_settings
+
+    app_settings.set_idle_work_enabled(False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_pii_annot_style():
     """PII注釈のスタイル(モジュール内の共有状態)をテストごとに既定へ戻す。"""
     from src.utils.pdf_utils import reset_pii_annot_style
