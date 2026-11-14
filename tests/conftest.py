@@ -64,3 +64,13 @@ def _flush_qt_events_after_test():
     if app is None:
         return
     app.processEvents()
+
+
+@pytest.fixture(autouse=True)
+def _reset_theme():
+    """表示テーマ(theme.COLORS はモジュール内の共有状態)をテストごとに標準へ戻す。"""
+    from src.views import theme
+
+    theme.set_theme("standard")
+    yield
+    theme.set_theme("standard")

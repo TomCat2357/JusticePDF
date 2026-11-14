@@ -8,6 +8,7 @@ from PyQt6.QtGui import QDrag, QPixmap
 
 from src.views import icons
 from src.views.card_widgets import ElidedNameLabel, card_width_for
+from src.views import theme
 from src.views.theme import COLORS
 from src.views.view_helpers import apply_drag_pixmap
 from src.utils.constants import (
@@ -100,6 +101,7 @@ class FolderCard(QFrame):
         layout.addWidget(self._name_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self._update_style()
+        theme.bind(self, lambda w: w._render_folder_icon(), call_now=False)
 
     def _render_folder_icon(self) -> None:
         size = max(16, int(round(self._thumb_size * 0.4)))

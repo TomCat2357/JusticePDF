@@ -36,6 +36,7 @@ from src.views.filter_bar import FilterBar, name_matches, parse_name_filter
 from src.views.help_dialogs import AboutDialog, HelpDialog
 from src.views.mode_bar import ModeBar
 from src.views.ops import OPS, make_action, make_tool_button
+from src.views import theme
 from src.views.theme import COLORS
 
 from src.views.pdf_card import PDFCard
@@ -325,7 +326,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         # Drop indicator line（挿入位置の縦線）
         self._drop_indicator = QFrame(self._container)
         self._drop_indicator.setFrameShape(QFrame.Shape.VLine)
-        self._drop_indicator.setStyleSheet(f"background-color: {COLORS['insert-line']};")
+        theme.bind(self._drop_indicator, lambda w: w.setStyleSheet(
+            f"background-color: {COLORS['insert-line']};"))
         self._drop_indicator.setFixedWidth(3)
         self._drop_indicator.hide()
 
@@ -628,7 +630,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         """ドロップダウンの 1 行（右端にキー表記。実際のショートカットは登録しない）。"""
         action = QAction(f"{text}\t{keys}" if keys else text, menu)
         if icon:
-            action.setIcon(icons.icon(icon, "#64748b", size=14))
+            action.setIcon(icons.icon(icon, "@icon-muted", size=14))
         action.setCheckable(checkable)
         action.triggered.connect(lambda _checked=False: slot())
         menu.addAction(action)
@@ -948,6 +950,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             return
         app_settings.set_library_dir(folder)
         dialog.save_heavy_pdf_settings()
+        if app_settings.theme_id() != theme.current_theme():
+            theme.apply_theme(QApplication.instance(), app_settings.theme_id())  # 表示テーマは即時反映
         for window in self._get_open_page_edit_windows():
             window._idle_scheduler.poke()  # バックグラウンド処理の設定変更を即時反映する
         QMessageBox.information(

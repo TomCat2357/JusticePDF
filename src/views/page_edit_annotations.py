@@ -238,7 +238,7 @@ class _ColorSwatchButton(QPushButton):
             painter.drawRect(rect)
             painter.setPen(_SWATCH_DISABLED_TEXT)
         else:
-            painter.setPen(QColor("#cbd5e1"))
+            painter.setPen(QColor(COLORS["slate-300"]))
             painter.drawRect(rect)
             painter.setPen(text_color)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
@@ -308,6 +308,7 @@ def _pick_color(
 
 from src.models.undo_manager import UndoManager, UndoAction
 from src.views.bookmarks_panel import BookmarksPanel
+from src.views.theme import COLORS
 from src.views.panel_parts import (
     flow_widget,
     icon_label,

@@ -19,6 +19,7 @@ from PyQt6.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QDrag
 from PyQt6.QtWidgets import QFrame, QRubberBand, QScrollArea, QWidget
 
+from src.views import theme
 from src.views.page_edit_widgets import PageThumbnail, build_page_drag_mime
 from src.views.page_grid_geometry import GridMetrics
 from src.views.view_helpers import apply_drag_pixmap
@@ -74,7 +75,8 @@ class VirtualPageGrid(QWidget):
         # ドロップ位置の縦線と、ラバーバンド(どちらも描画専用の子ウィジェット)。
         self._drop_indicator = QFrame(self)
         self._drop_indicator.setFrameShape(QFrame.Shape.VLine)
-        self._drop_indicator.setStyleSheet("background-color: #2563eb;")  # insert-line
+        theme.bind(self._drop_indicator, lambda w: w.setStyleSheet(
+            f"background-color: {theme.COLORS['insert-line']};"))  # insert-line
         self._drop_indicator.setFixedWidth(3)
         self._drop_indicator.hide()
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)

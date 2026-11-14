@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import icons
+from . import icons, theme
 from .ops import OPS, tooltip_text
 
 
@@ -65,7 +65,7 @@ class SearchBar(QWidget):
         lay.setSpacing(6)
 
         icon_label = QLabel(self)
-        icon_label.setPixmap(icons.pixmap("Search", "#475569", 15))
+        theme.bind(icon_label, lambda w: w.setPixmap(icons.pixmap("Search", "@icon-strong", 15)))
         icon_label.setFixedSize(15, 15)
         lay.addWidget(icon_label)
 

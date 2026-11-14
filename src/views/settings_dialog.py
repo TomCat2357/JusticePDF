@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PyQt6.QtCore import QRect, QSize, Qt
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -14,6 +16,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -29,7 +33,22 @@ from src.utils.constants import (
     PIXMAP_CACHE_MAX_ENTRIES_RANGE,
 )
 from src.utils.pdf_utils import set_pixmap_cache_max_entries
+from src.views.themes import THEMES
 from src.views.view_helpers import build_accept_cancel_box
+
+_SWATCH_SIZE = QSize(64, 24)
+
+
+def _swatch_icon(header: str, bg: str, card: str, accent: str) -> QIcon:
+    """テーマの色見本（ヘッダー・地・カード・アクセントの 4 色を横に並べた小さな絵）。"""
+    pm = QPixmap(_SWATCH_SIZE)
+    pm.fill(QColor("#94a3b8"))
+    painter = QPainter(pm)
+    w = (_SWATCH_SIZE.width() - 2) // 4
+    for i, color in enumerate((header, bg, card, accent)):
+        painter.fillRect(QRect(1 + i * w, 1, w, _SWATCH_SIZE.height() - 2), QColor(color))
+    painter.end()
+    return QIcon(pm)
 
 
 class SettingsDialog(QDialog):
@@ -111,6 +130,27 @@ class SettingsDialog(QDialog):
         # ---------------------------------------------------------------
         # バックグラウンド処理(操作していない間の先回り処理)
         # ---------------------------------------------------------------
+        theme_group = QGroupBox("デザイン")
+        theme_layout = QVBoxLayout(theme_group)
+        self._theme_list = QListWidget()
+        self._theme_list.setIconSize(_SWATCH_SIZE)
+        self._theme_list.setMinimumHeight(190)
+        current_theme = app_settings.theme_id()
+        for info in THEMES:
+            item = QListWidgetItem(
+                _swatch_icon(info.header, info.bg, info.card, info.accent),
+                f"{info.label}\n{info.desc}",
+            )
+            item.setData(Qt.ItemDataRole.UserRole, info.id)
+            self._theme_list.addItem(item)
+            if info.id == current_theme:
+                self._theme_list.setCurrentItem(item)
+        theme_layout.addWidget(self._theme_list)
+        theme_note = QLabel("表示色だけが変わります。OK を押すとすぐに反映されます。")
+        theme_note.setWordWrap(True)
+        theme_layout.addWidget(theme_note)
+        layout.addWidget(theme_group)
+
         bg_group = QGroupBox("バックグラウンド処理")
         bg_layout = QVBoxLayout(bg_group)
         self._idle_master_check = QCheckBox("操作していない間に先回りして処理する")
@@ -163,6 +203,11 @@ class SettingsDialog(QDialog):
             path = Path.cwd() / path
         return str(path)
 
+    def selected_theme(self) -> str:
+        """一覧で選ばれている表示テーマの ID。"""
+        item = self._theme_list.currentItem()
+        return str(item.data(Qt.ItemDataRole.UserRole)) if item is not None else app_settings.theme_id()
+
     def save_heavy_pdf_settings(self) -> None:
         """重量文書関連の設定を保存する。
 
@@ -180,6 +225,7 @@ class SettingsDialog(QDialog):
         # キャッシュ上限は実行中のキャッシュへ即時反映する。
         set_pixmap_cache_max_entries(app_settings.pixmap_cache_max_entries())
         # バックグラウンド処理の設定(実行中のウィンドウにも次の判定から即時反映される)。
+        app_settings.set_theme_id(self.selected_theme())
         app_settings.set_idle_work_enabled(self._idle_master_check.isChecked())
         checks = self._idle_job_checks
         app_settings.set_idle_search_index_enabled(

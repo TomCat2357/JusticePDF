@@ -14,7 +14,7 @@ from . import icons
 from .ops import CTX_GROUPS, OPS, PROP_GROUP, PROP_ICON, PROP_OP_ID
 
 MENU_ICON_SIZE = 14
-MENU_ICON_COLOR = "#64748b"  # slate-500
+MENU_ICON_COLOR = "@icon-muted"  # slate-500（文字用。テーマに追従）
 
 
 def _group_rank(group: str) -> int:

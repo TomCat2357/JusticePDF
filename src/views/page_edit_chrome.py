@@ -48,6 +48,7 @@ from src.utils.pdf_utils import (
 )
 from src.utils.pdf_utils.pages import insert_blank_pages
 from src.views import icons
+from src.views.theme import COLORS
 from src.views.context_menu import MENU_ICON_COLOR, MENU_ICON_SIZE, build_context_menu
 from src.views.mode_bar import ModeBar
 from src.views.ops import OPS, make_action, make_tool_button, tooltip_text
@@ -101,7 +102,7 @@ class _TextMenuButton(QToolButton):
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().paintEvent(event)
-        color = "#334155" if self.isEnabled() else "#94a3b8"
+        color = COLORS["text"] if self.isEnabled() else COLORS["icon-disabled"]
         pm = icons.pixmap("ChevronDown", color, self.CHEVRON, self.devicePixelRatioF())
         painter = QPainter(self)
         try:

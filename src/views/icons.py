@@ -10,14 +10,19 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QRectF, Qt
-from PyQt6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPixmap
+from PyQt6.QtCore import QByteArray, QPoint, QRect, QRectF, QSize, Qt
+from PyQt6.QtGui import QColor, QGuiApplication, QIcon, QIconEngine, QPainter, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
+
+from src.views.theme import COLORS
 
 ICONS_DIR = Path(__file__).resolve().parent.parent / "resources" / "icons"
 _SEARCH_DIRS = (ICONS_DIR / "lucide", ICONS_DIR / "custom")
 
-DEFAULT_COLOR = "#334155"  # slate-700（theme.TEXT_COLOR と同じ）
+# 色の指定: ``"#rrggbb"`` などの固定色、または ``"@text"`` のようにテーマの色トークン名を
+# ``@`` で始めて書く（QIcon は描画のたびにその時のテーマの色で描くので、テーマを切り替えても
+# 作り直さずに追従する）。省略（None）は ``"@text"``（標準テーマでは slate-700 = #334155）。
+DEFAULT_COLOR = "@text"
 CHEVRON_SIZE = 12
 CHEVRON_GAP = 2
 
@@ -47,7 +52,12 @@ def _svg_source(name: str) -> str:
 
 
 def _color_hex(color) -> str:
-    c = QColor(color if color is not None else DEFAULT_COLOR)
+    """固定色・トークン名（``@名前``）を ``#rrggbb`` へ。トークンはいまのテーマの値。"""
+    if color is None:
+        color = DEFAULT_COLOR
+    if isinstance(color, str) and color.startswith("@"):
+        color = COLORS[color[1:]]
+    c = QColor(color)
     if not c.isValid():
         raise ValueError(f"色を解釈できません: {color!r}")
     return c.name(QColor.NameFormat.HexRgb)
@@ -76,23 +86,85 @@ def _render_parts(parts, width: int, height: int, dpr: float, color: str,
     return pm
 
 
-def _build_icon(parts, width: int, height: int, color: str, disabled_opacity: float) -> QIcon:
-    ic = QIcon()
-    for dpr in (1.0, 2.0):
-        ic.addPixmap(_render_parts(parts, width, height, dpr, color), QIcon.Mode.Normal)
-        ic.addPixmap(_render_parts(parts, width, height, dpr, color, disabled_opacity),
-                     QIcon.Mode.Disabled)
-    return ic
+_renderer_cache: dict[tuple[str, str], QSvgRenderer] = {}
 
 
-def icon(name: str, color=None, *, size: int = 17, disabled_opacity: float = 0.4) -> QIcon:
-    """アイコン名（PascalCase / kebab-case）から QIcon を作る。無い名前は KeyError。"""
+def _renderer(name: str, color: str) -> QSvgRenderer:
+    key = (_kebab(name), color)
+    r = _renderer_cache.get(key)
+    if r is None:
+        svg = _svg_source(name).replace("currentColor", color)
+        r = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        _renderer_cache[key] = r
+    return r
+
+
+class _ThemedIconEngine(QIconEngine):
+    """色をテーマのトークンで持ち、描かれるたびにその時の色で SVG を描く QIcon の中身。"""
+
+    def __init__(self, parts, width: int, height: int, color, disabled_opacity: float,
+                 on_color=None) -> None:
+        super().__init__()
+        self._on_color = on_color  # State.On（チェック ON）のときだけ使う色
+        self._parts = parts
+        self._w = width
+        self._h = height
+        self._color = color
+        self._disabled_opacity = disabled_opacity
+
+    def paint(self, painter, rect, mode, state) -> None:  # noqa: D102 - Qt override
+        use_on = self._on_color is not None and state == QIcon.State.On
+        color = _color_hex(self._on_color if use_on else self._color)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if mode == QIcon.Mode.Disabled:
+            painter.setOpacity(painter.opacity() * self._disabled_opacity)
+        sx = rect.width() / self._w
+        sy = rect.height() / self._h
+        for name, x, size in self._parts:
+            y = (self._h - size) / 2
+            _renderer(name, color).render(
+                painter,
+                QRectF(rect.x() + x * sx, rect.y() + y * sy, size * sx, size * sy),
+            )
+        painter.restore()
+
+    def actualSize(self, size, mode, state) -> QSize:  # noqa: D102 - Qt override
+        return QSize(self._w, self._h).scaled(size, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def pixmap(self, size, mode, state) -> QPixmap:  # noqa: D102 - Qt override
+        actual = self.actualSize(size, mode, state)
+        pm = QPixmap(actual)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        self.paint(painter, QRect(QPoint(0, 0), actual), mode, state)
+        painter.end()
+        return pm
+
+    def clone(self) -> "_ThemedIconEngine":  # noqa: D102 - Qt override
+        return _ThemedIconEngine(self._parts, self._w, self._h, self._color,
+                                 self._disabled_opacity, self._on_color)
+
+
+def _build_icon(parts, width: int, height: int, color, disabled_opacity: float,
+                on_color=None) -> QIcon:
+    return QIcon(_ThemedIconEngine(parts, width, height, color, disabled_opacity, on_color))
+
+
+def icon(name: str, color=None, *, size: int = 17, disabled_opacity: float = 0.4,
+         on_color=None) -> QIcon:
+    """アイコン名（PascalCase / kebab-case）から QIcon を作る。無い名前は KeyError。
+
+    ``on_color`` を渡すと、チェック ON（QIcon.State.On）のときだけその色で描く。
+    """
     _svg_source(name)  # 早めに KeyError
-    hex_color = _color_hex(color)
-    key = ("icon", _kebab(name), hex_color, size, disabled_opacity)
+    _color_hex(color)  # 色の指定の誤りも早めに
+    if on_color is not None:
+        _color_hex(on_color)
+    key = ("icon", _kebab(name), color, size, disabled_opacity, on_color)
     ic = _icon_cache.get(key)
     if ic is None:
-        ic = _build_icon([(name, 0, size)], size, size, hex_color, disabled_opacity)
+        ic = _build_icon([(name, 0, size)], size, size, color, disabled_opacity, on_color)
         _icon_cache[key] = ic
     return ic
 
@@ -116,12 +188,12 @@ def icon_with_chevron(name: str, color=None, size: int = 17) -> QIcon:
     メニュー記号を QSS で隠す（QToolButton::menu-indicator）前提。
     """
     _svg_source(name)
-    hex_color = _color_hex(color)
-    key = ("chevron", _kebab(name), hex_color, size)
+    _color_hex(color)
+    key = ("chevron", _kebab(name), color, size)
     ic = _icon_cache.get(key)
     if ic is None:
         w, h = chevron_icon_size(size)
         parts = [(name, 0, size), ("ChevronDown", size + CHEVRON_GAP, CHEVRON_SIZE)]
-        ic = _build_icon(parts, w, h, hex_color, 0.4)
+        ic = _build_icon(parts, w, h, color, 0.4)
         _icon_cache[key] = ic
     return ic

@@ -21,10 +21,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import icons
+from . import icons, theme
 
 TOOL_ICON_SIZE = 16
-_ICON_NORMAL = "#334155"
+_ICON_NORMAL = "@text"  # テーマの文字色（slate-700）
 _ICON_ON = "#ffffff"
 
 
@@ -44,7 +44,7 @@ class PanelHeader(QFrame):
         layout.addWidget(self._title, 1)
         self.close_button = QToolButton()
         self.close_button.setObjectName("panelClose")
-        self.close_button.setIcon(icons.icon("X", "#475569", size=15))
+        self.close_button.setIcon(icons.icon("X", "@icon-strong", size=15))
         self.close_button.setIconSize(QSize(15, 15))
         self.close_button.setToolTip("閉じる")
         self.close_button.setAutoRaise(True)
@@ -97,10 +97,10 @@ def section_label(text: str) -> QLabel:
     return label
 
 
-def icon_label(name: str, tooltip: str, color: str = "#475569") -> QLabel:
+def icon_label(name: str, tooltip: str, color: str = "@icon-strong") -> QLabel:
     """フォーム行の頭に置く小さなアイコン（ツールチップに名前）。"""
     label = QLabel()
-    label.setPixmap(icons.pixmap(name, color, 16))
+    theme.bind(label, lambda w: w.setPixmap(icons.pixmap(name, color, 16)))
     label.setFixedWidth(20)
     label.setToolTip(tooltip)
     label.setAccessibleName(tooltip)
@@ -110,16 +110,7 @@ def icon_label(name: str, tooltip: str, color: str = "#475569") -> QLabel:
 
 def tool_icon(name: str) -> QIcon:
     """通常は濃い灰色、押下中（チェック ON）は白のアイコン。"""
-    ic = QIcon()
-    size = QSize(TOOL_ICON_SIZE, TOOL_ICON_SIZE)
-    normal = icons.icon(name, _ICON_NORMAL, size=TOOL_ICON_SIZE)
-    on = icons.icon(name, _ICON_ON, size=TOOL_ICON_SIZE)
-    for mode in (QIcon.Mode.Normal, QIcon.Mode.Active, QIcon.Mode.Selected, QIcon.Mode.Disabled):
-        ic.addPixmap(normal.pixmap(size, mode), mode, QIcon.State.Off)
-    for mode in (QIcon.Mode.Normal, QIcon.Mode.Active, QIcon.Mode.Selected):
-        ic.addPixmap(on.pixmap(size), mode, QIcon.State.On)
-    ic.addPixmap(normal.pixmap(size, QIcon.Mode.Disabled), QIcon.Mode.Disabled, QIcon.State.On)
-    return ic
+    return icons.icon(name, _ICON_NORMAL, size=TOOL_ICON_SIZE, on_color=_ICON_ON)
 
 
 def tool_tip_text(label: str, desc: str | None = None) -> str:

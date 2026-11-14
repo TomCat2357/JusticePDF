@@ -28,6 +28,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_FOLDER_KEY = "general/default_folder"
 
 # ---------------------------------------------------------------------------
+# 表示テーマ(デザイン)
+# ---------------------------------------------------------------------------
+THEME_KEY = "appearance/theme"
+
+
+def theme_id() -> str:
+    """保存された表示テーマの ID。未設定・不正な値は "standard"（廃止 ID は読み替え）。"""
+    from src.views.themes import normalize_theme_id
+
+    return normalize_theme_id(QSettings().value(THEME_KEY, "standard"))
+
+
+def set_theme_id(value: str) -> None:
+    """表示テーマを保存する。不正な値は "standard" として保存する。"""
+    from src.views.themes import normalize_theme_id
+
+    QSettings().setValue(THEME_KEY, normalize_theme_id(value))
+
+
+# ---------------------------------------------------------------------------
 # 大容量PDFの逐次処理(重量文書モード)に関する設定
 # ---------------------------------------------------------------------------
 HEAVY_PDF_PAGE_COUNT_THRESHOLD_KEY = "heavy_pdf/page_count_threshold"
