@@ -276,7 +276,11 @@ def merge_pdfs_in_place(
         dest_doc.close()
 
 
-def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
+def merge_paths_to_pdf(
+    output_path: str,
+    paths: list[str],
+    converted: dict[str, str] | None = None,
+) -> int:
     """選択したファイル/フォルダを1つのPDFに結合し、フォルダ構成を反映した階層しおりを付ける。
 
     - ``paths`` の各要素はファイル(.pdf)またはフォルダ。与えられた順に処理する
@@ -287,9 +291,13 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
     - ファイルはファイル名の見出しになり、そのファイルが元々持つしおりを子として
       ぶら下げる(内部の階層もそのまま保持)。
     - PDF ページを1ページも含まないフォルダは見出しごと省略する。
+    - ``converted`` は「PDF 以外の元ファイル → 変換済みの一時 PDF」の対応。ここにあるファイルは
+      変換済み PDF の中身を結合し、しおりの見出しは「<拡張子なしの名前>.pdf」にする。
+      元が PDF でなく ``converted`` にもないファイルは無視する。
     - 戻り値は結合したページ総数。0 のとき出力ファイルは作成されない。
     """
     output_doc = fitz.open()
+    converted = converted or {}
 
     def build(path: str, level: int) -> list[TocEntry]:
         """``path`` 配下のページを output_doc に挿入しつつ、しおり項目を返す。"""
@@ -302,7 +310,7 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
                 names = []
             for name in names:
                 full = os.path.join(path, name)
-                if os.path.isdir(full) or is_pdf(name):
+                if os.path.isdir(full) or is_pdf(name) or full in converted:
                     child_entries.extend(build(full, level + 1))
             if len(output_doc) <= start0:
                 return []  # PDF ページを含まない空フォルダは省略
@@ -311,10 +319,15 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
 
         # ファイル(.pdf のみ): ファイル名を見出し(level)に、ファイルが元々持つしおりは
         # その子(level + 内部level)としてページをオフセットしてぶら下げる。
-        if not is_pdf(path):
+        source = converted.get(path)
+        if source is None and not is_pdf(path):
             return []
+        title = (
+            os.path.splitext(os.path.basename(path))[0] + ".pdf"
+            if source is not None else _file_bookmark_title(path)
+        )
         try:
-            with fitz.open(path) as src_doc:
+            with fitz.open(source or path) as src_doc:
                 count = len(src_doc)
                 if count == 0:
                     return []
@@ -324,7 +337,7 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
         except Exception:
             logger.warning("結合をスキップしました(開けません): %s", path)
             return []
-        entries = [TocEntry(level=level, title=_file_bookmark_title(path), page=start0 + 1)]
+        entries = [TocEntry(level=level, title=title, page=start0 + 1)]
         for sub_entry in _offset_toc_entries(sub, start0, page_count=count):
             entries.append(
                 TocEntry(

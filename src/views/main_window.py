@@ -75,13 +75,14 @@ CONVERT_DISABLED_TIP = "PDF に変換できる種類のファイルが選ばれ�
 from src.views.main_window_fileops import FileOpsMixin
 from src.views.main_window_split import SplitMixin
 from src.views.main_window_import import ImportMixin
+from src.views.main_window_merge import MergeMixin
 from src.views.main_window_export import ExportMixin
 from src.views.main_window_dragdrop import DragDropMixin
 
 logger = logging.getLogger(__name__)
 
 
-class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWindow):
+class MainWindow(FileOpsMixin, MergeMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWindow):
     """Main application window.
 
     Displays PDF files as cards in a grid layout.
@@ -879,8 +880,10 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._redo_btn.setEnabled(self._undo_manager.can_redo() and not busy)
         # エクスポート: ファイルまたはフォルダを1つ以上選択しているとき有効
         self._export_btn.setEnabled((n_pdf >= 1 or n_folders >= 1) and not busy)
-        # 結合: フォルダを1つ以上、または PDF を2つ以上選択しているとき
-        can_merge = n_folders >= 1 or n_pdf >= 2
+        # 結合: フォルダを1つ以上、または結合できるファイル(PDF + 変換できるもの)を2つ以上選択しているとき
+        n_mergeable = sum(
+            1 for c in self._selected_cards if c.is_pdf or file_kinds.convert_kind(c.pdf_path))
+        can_merge = n_folders >= 1 or n_mergeable >= 2
         # 分解: PDFをちょうど1つだけ選択しているとき（フォルダは含まない）
         can_split = n_pdf == 1 and n_folders == 0
         self._merge_action.setVisible(can_merge)
@@ -1887,10 +1890,13 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             entries.append(ctx("open", lambda: self.navigate_to(fc.folder_path)))
             entries.append(ctx("openNewWindow", lambda: self._open_folder_in_new_window(fc.folder_path)))
             entries.append(ctx("rename", self._on_rename_folder_selected, not busy))
-        # PDF 専用の操作は、選択に PDF を含まないとき無効（混在なら PDF だけが対象）
+        # 結合は PDF と変換できるファイル(Office・txt・Markdown・画像)が対象。分解は PDF だけ
+        n_mergeable = sum(
+            1 for c in self._selected_cards if c.is_pdf or file_kinds.convert_kind(c.pdf_path))
         if n_folders >= 1 or n_files >= 2:
             entries.append(ctx(
-                "merge", self._on_merge_selected, not busy and (n_folders >= 1 or n_pdf >= 2)))
+                "merge", self._on_merge_selected,
+                not busy and (n_folders >= 1 or n_mergeable >= 2)))
         if one_file:
             entries.append(ctx("split", self._on_split_selected, not busy and n_pdf == 1))
         convert_paths = self._selected_convertible_paths()

@@ -320,6 +320,7 @@ def test_text_to_pdf_renders_japanese(tmp_path):
 def test_pdf_only_buttons_disabled_without_pdf(make_window, work):
     (work / "a.docx").write_bytes(b"D")
     (work / "b.txt").write_bytes(b"T")
+    (work / "x.zip").write_bytes(b"Z")
     make_pdf(work / "c.pdf")
     make_pdf(work / "d.pdf")
     (work / "dir").mkdir()
@@ -334,13 +335,17 @@ def test_pdf_only_buttons_disabled_without_pdf(make_window, work):
         or not window._rename_title_action.isVisible()
     assert window._rename_btn.isEnabled()  # 名前変更は種類を問わない
 
-    _select(window, "a.docx", "b.txt")  # 非 PDF が 2 件でも結合できない
+    _select(window, "a.docx", "x.zip")  # 変換できない種類は結合の対象にならない
     assert not window._merge_split_btn.isEnabled()
 
-    _select(window, "a.docx", "c.pdf")  # 混在: PDF が 1 件 → 分解は可、結合は不可
+    _select(window, "a.docx", "b.txt")  # 変換できるファイルが 2 件なら、PDF でなくても結合できる
+    assert window._merge_action.isVisible() and window._merge_split_btn.isEnabled()
+    assert not window._rotate_btn.isEnabled() and not window._export_btn.isEnabled()
+
+    _select(window, "a.docx", "c.pdf")  # 混在: 結合も PDF の分解も可（回転・印刷・エクスポートは PDF だけ）
     assert window._rotate_btn.isEnabled() and window._export_btn.isEnabled()
     assert window._print_btn.isEnabled()
-    assert window._split_action.isVisible() and not window._merge_action.isVisible()
+    assert window._split_action.isVisible() and window._merge_action.isVisible()
 
     _select(window, "c.pdf", "d.pdf", "a.docx")
     assert window._merge_action.isVisible()
@@ -368,10 +373,10 @@ def test_context_menu_pdf_only_entries(make_window, work):
     assert one["エクスポート"] is False and one["印刷"] is False
 
     two = entries("a.docx", "b.docx")
-    assert two["結合"] is False and two["印刷"] is False
+    assert two["結合"] is True and two["印刷"] is False
 
     mixed = entries("a.docx", "c.pdf")
-    assert mixed["結合"] is False and mixed["印刷"] is True and mixed["エクスポート"] is True
+    assert mixed["結合"] is True and mixed["印刷"] is True and mixed["エクスポート"] is True
 
 
 def test_rotate_and_split_and_export_only_touch_pdfs(make_window, work, monkeypatch):
@@ -436,14 +441,14 @@ def test_card_merge_ignores_non_pdf(make_window, work, monkeypatch):
     assert (work / "c.pdf").read_bytes() == before
 
 
-def test_merge_selected_ignores_non_pdf(make_window, work, monkeypatch):
-    (work / "a.docx").write_bytes(b"D")
+def test_merge_selected_ignores_unsupported_kinds(make_window, work, monkeypatch):
+    (work / "a.zip").write_bytes(b"D")
     make_pdf(work / "c.pdf")
     window = make_window(work)
     asked: list = []
     monkeypatch.setattr(
         QMessageBox, "question", staticmethod(lambda *a, **k: asked.append(1) or QMessageBox.StandardButton.No))
-    _select(window, "a.docx", "c.pdf")  # PDF は 1 件 → 結合しない
+    _select(window, "a.zip", "c.pdf")  # 結合できるのは 1 件だけ → 結合しない
     window._on_merge_selected()
     assert asked == []
 
