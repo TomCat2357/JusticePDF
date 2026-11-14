@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.utils.pdf_utils import TocEntry
+from src.views.theme import COLORS
 from src.views.panel_parts import flow_widget, make_panel_shell, make_small_button, mark_plain_containers
 
 logger = logging.getLogger(__name__)
@@ -47,15 +48,20 @@ _DEFAULT_MAX_PAGE = 99999
 # グローバルQSS(QLineEdit の padding 6px 8px 等)でインライン編集欄が潰れないよう、
 # エディタ個別に上書きする。
 _EDITOR_STYLE = (
-    "{sel} {{ padding: 0 2px; margin: 0; border: 1px solid #2563eb;"
-    " border-radius: 0; background-color: #ffffff; }}"
+    "{sel} {{ padding: 0 2px; margin: 0; border: 1px solid {ring};"
+    " border-radius: 0; background-color: {bg}; color: {fg}; }}"
 )
 
 
+def _editor_style(selector: str) -> str:
+    return _EDITOR_STYLE.format(
+        sel=selector, ring=COLORS["blue-600"], bg=COLORS["white"], fg=COLORS["t-slate-800"]
+    )
+
+
 # 階層ごとの左端の色帯と題名の色（深さ 1〜4。それより深いものは 4 を使う）。
-_DEPTH_BAND = ("#2563eb", "#16a34a", "#ea580c", "#9333ea")
-_DEPTH_TEXT = ("#1e40af", "#166534", "#9a3412", "#6b21a8")
-_SELECTED_BG = "#dbeafe"
+# 色はテーマ（theme.COLORS の bm-band-N / bm-text-N）から描画のたびに読む。
+_DEPTH_LEVELS = 4
 _PAGE_COLUMN_WIDTH = 52
 
 
@@ -88,24 +94,24 @@ class _BookmarkDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         painter.save()
         if selected:
-            painter.fillRect(rect, QColor(_SELECTED_BG))
+            painter.fillRect(rect, QColor(COLORS["select-bg"]))
         elif option.state & QStyle.StateFlag.State_MouseOver:
-            painter.fillRect(rect, QColor("#f1f5f9"))
+            painter.fillRect(rect, QColor(COLORS["slate-100"]))
         text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
         kind = index.data(_NODE_KIND_ROLE)
         if index.column() == 1:
-            painter.setPen(QColor("#64748b"))
+            painter.setPen(QColor(COLORS["icon-muted"]))
             painter.drawText(
                 rect.adjusted(0, 0, -6, 0),
                 int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
                 text,
             )
         else:
-            depth = min(_index_depth(index), len(_DEPTH_BAND) - 1)
+            depth = min(_index_depth(index), _DEPTH_LEVELS - 1)
             if kind is None:
-                band, color = QColor(_DEPTH_BAND[depth]), QColor(_DEPTH_TEXT[depth])
+                band, color = QColor(COLORS[f"bm-band-{depth + 1}"]), QColor(COLORS[f"bm-text-{depth + 1}"])
             else:
-                band, color = QColor("#94a3b8"), QColor("#475569")
+                band, color = QColor(COLORS["icon-disabled"]), QColor(COLORS["icon-strong"])
             painter.fillRect(QRect(rect.left(), rect.top() + 2, 3, rect.height() - 4), band)
             painter.setPen(color)
             text_rect = rect.adjusted(9, 0, -4, 0)
@@ -121,12 +127,12 @@ class _BookmarkDelegate(QStyledItemDelegate):
         if index.column() == 1:
             spin = QSpinBox(parent)
             spin.setRange(1, self._panel._max_page())
-            spin.setStyleSheet(_EDITOR_STYLE.format(sel="QSpinBox"))
+            spin.setStyleSheet(_editor_style("QSpinBox"))
             spin.setMinimumHeight(_MIN_ROW_HEIGHT)
             spin.installEventFilter(self._panel)  # F2/Delete を窓のショートカットに取られない
             return spin
         edit = QLineEdit(parent)
-        edit.setStyleSheet(_EDITOR_STYLE.format(sel="QLineEdit"))
+        edit.setStyleSheet(_editor_style("QLineEdit"))
         edit.setMinimumHeight(_MIN_ROW_HEIGHT)
         edit.installEventFilter(self._panel)
         return edit

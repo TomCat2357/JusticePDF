@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QHBoxLayout, QLabel, QToolButton, QWidget
 
 from src.views import icons
 from src.views.ops import OPS
+from src.views import theme
 from src.views.theme import COLORS
 
 APP_TITLE = "JusticePDF"
@@ -35,10 +36,13 @@ class AppBar(QWidget):
         for b in (self.settings_btn, self.help_btn, self.about_btn):
             lay.addWidget(b)
 
+        theme.bind(self, lambda w: w._apply_style())
+
+    def _apply_style(self) -> None:
         fg = COLORS["app-bar-text"]
         self.setStyleSheet(f"""
             QWidget#appBar {{ background-color: {COLORS['app-bar']}; }}
-            QLabel#appBarTitle {{ background: transparent; color: {fg};
+            QLabel#appBarTitle {{ background: transparent; color: {COLORS['app-bar-title']};
                                  font-size: 16px; font-weight: bold; }}
             QToolButton#appBarBtn {{ background: transparent; color: {fg}; border: none;
                                     border-radius: 4px; padding: 2px 8px; font-size: 12px;
@@ -51,7 +55,7 @@ class AppBar(QWidget):
         b = QToolButton(self)
         b.setObjectName("appBarBtn")
         b.setText(op.label)
-        b.setIcon(icons.icon(op.icon, COLORS["app-bar-text"], size=14))
+        b.setIcon(icons.icon(op.icon, "@app-bar-text", size=14))
         b.setIconSize(QSize(14, 14))
         b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         b.setToolTip(op.label)

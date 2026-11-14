@@ -10,7 +10,7 @@ import unicodedata
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QToolButton, QWidget
 
-from src.views import icons
+from src.views import icons, theme
 
 PLACEHOLDER = "名前で絞り込み  例: 契約 見積 OR 請求"
 
@@ -65,7 +65,7 @@ class FilterBar(QWidget):
         lay.setContentsMargins(8, 4, 8, 4)
         lay.setSpacing(6)
         icon = QLabel(self)
-        icon.setPixmap(icons.pixmap("Search", "#64748b", 15))
+        theme.bind(icon, lambda w: w.setPixmap(icons.pixmap("Search", "@icon-muted", 15)))
         lay.addWidget(icon)
         self._edit = QLineEdit(self)
         self._edit.setPlaceholderText(PLACEHOLDER)

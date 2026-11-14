@@ -6,6 +6,7 @@ from PyQt6.QtGui import QDrag, QPixmap
 
 from src.views import icons
 from src.views.card_widgets import ElidedNameLabel, card_width_for, paper_pixmap
+from src.views import theme
 from src.views.theme import COLORS
 from src.views.view_helpers import apply_drag_pixmap
 from src.utils.pdf_utils import get_pdf_card_info
@@ -74,7 +75,7 @@ class PDFCard(QFrame):
         # 編集中（ロック）の錠前（左上）
         self._lock_label = QLabel(self._thumbnail_container)
         self._lock_label.setObjectName("cardLock")
-        self._lock_label.setPixmap(icons.pixmap("Lock", COLORS["star"], 16))
+        theme.bind(self._lock_label, lambda w: w.setPixmap(icons.pixmap("Lock", COLORS["star"], 16)))
         self._lock_label.setFixedSize(16, 16)
         self._lock_label.move(4, 4)
         self._lock_label.hide()

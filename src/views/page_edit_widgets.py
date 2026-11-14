@@ -52,6 +52,7 @@ from src.utils.pdf_utils import (
     NoteAnnotData,
 )
 from src.views.ocr_overlay import paint_ocr_lines
+from src.views import theme
 from src.views.theme import COLORS
 from src.utils.constants import (
     FREETEXT_LINE_HEIGHT,
@@ -346,7 +347,7 @@ class _PiiOverlayLabel(QLabel):
             edge.setPen(QColor(0, 0, 0, 40))
             edge.drawLine(QPointF(x1 + 0.5, y0 + 1.5), QPointF(x1 + 0.5, y1 + 0.5))
             edge.drawLine(QPointF(x0 + 1.5, y1 + 0.5), QPointF(x1 + 0.5, y1 + 0.5))
-            edge.setPen(QColor("#cbd5e1"))
+            edge.setPen(QColor(COLORS["slate-300"]))
             edge.drawRect(QRectF(x0 + 0.5, y0 + 0.5, logical_w - 1.0, logical_h - 1.0))
         finally:
             edge.end()
@@ -457,9 +458,10 @@ class PageThumbnail(QFrame):
         self._number_label.setObjectName("pageNumber")
         self._number_label.setFixedHeight(self.NUMBER_HEIGHT)
         self._number_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._number_label.setStyleSheet(
-            "background: transparent; border: none; color: #334155; font-size: 12px; font-weight: 500;"
-        )
+        theme.bind(self._number_label, lambda w: w.setStyleSheet(
+            f"background: transparent; border: none; color: {COLORS['text']};"
+            " font-size: 12px; font-weight: 500;"
+        ))
         layout.addWidget(self._number_label)
 
         self.invalidate_thumbnail()

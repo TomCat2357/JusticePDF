@@ -120,7 +120,7 @@ class ModeBar(QWidget):
         self._reload = self._nav_button("reload", "RefreshCw", self.reload_requested, px=14)
         lay.addWidget(self._reload)
 
-        self._apply_style()
+        theme.bind(self, lambda w: w._apply_style())
         self.set_mode("folder")
         self.set_nav_enabled(False, False, False)
 
