@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 from .common import _open_doc_for_write, _save_document_in_place, release_session_for_path
 from src.utils.path_utils import ensure_unique_path, sanitize_filename
+from src.utils.file_kinds import is_pdf
 
 
 @dataclass(slots=True)
@@ -301,7 +302,7 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
                 names = []
             for name in names:
                 full = os.path.join(path, name)
-                if os.path.isdir(full) or name.lower().endswith(".pdf"):
+                if os.path.isdir(full) or is_pdf(name):
                     child_entries.extend(build(full, level + 1))
             if len(output_doc) <= start0:
                 return []  # PDF ページを含まない空フォルダは省略
@@ -310,7 +311,7 @@ def merge_paths_to_pdf(output_path: str, paths: list[str]) -> int:
 
         # ファイル(.pdf のみ): ファイル名を見出し(level)に、ファイルが元々持つしおりは
         # その子(level + 内部level)としてページをオフセットしてぶら下げる。
-        if not path.lower().endswith(".pdf"):
+        if not is_pdf(path):
             return []
         try:
             with fitz.open(path) as src_doc:

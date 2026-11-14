@@ -7,6 +7,7 @@ from pathlib import Path
 import fitz
 from PyQt6.QtCore import QObject, QPoint, pyqtSignal
 
+from src.utils.file_kinds import is_library_file
 from src.models.undo_manager import UndoManager
 from src.views.page_edit_window import PageEditWindow
 
@@ -37,7 +38,7 @@ def make_pdf(
 class FakeWatcher(QObject):
     """FolderWatcher の差し替え用フェイク(監視スレッドは起動しない)。
 
-    ``get_pdf_files``/``get_subfolders`` は実 ``FolderWatcher`` と同じく
+    ``get_library_files``/``get_subfolders`` は実 ``FolderWatcher`` と同じく
     ディスクを読む(_load_existing_files() の復元ロジックをテストできるように)。
     """
 
@@ -57,7 +58,7 @@ class FakeWatcher(QObject):
     def stop(self) -> None:
         pass
 
-    def get_pdf_files(self) -> list[str]:
+    def get_library_files(self) -> list[str]:
         try:
             names = os.listdir(self._folder_path)
         except OSError:
@@ -65,7 +66,8 @@ class FakeWatcher(QObject):
         return [
             os.path.join(self._folder_path, name)
             for name in names
-            if name.lower().endswith(".pdf")
+            if os.path.isfile(os.path.join(self._folder_path, name))
+            and is_library_file(os.path.join(self._folder_path, name))
         ]
 
     def get_subfolders(self) -> list[str]:

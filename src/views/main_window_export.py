@@ -21,6 +21,7 @@ from src.utils.pdf_utils import (
 )
 from src.views.export_dialog import ExportOptionsDialog
 from src.utils.path_utils import ensure_unique_path
+from src.utils.file_kinds import is_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ class ExportMixin:
             parent = os.path.dirname(os.path.abspath(folder).rstrip(os.sep))
             for root, _dirs, files in os.walk(folder):
                 for fname in files:
-                    if not fname.lower().endswith(".pdf"):
+                    if not is_pdf(fname):
                         continue
                     src_full = os.path.join(root, fname)
                     rel = os.path.relpath(src_full, parent)

@@ -11,6 +11,7 @@ from src.views.card_widgets import ElidedNameLabel, card_width_for
 from src.views import theme
 from src.views.theme import COLORS
 from src.views.view_helpers import apply_drag_pixmap
+from src.utils.file_kinds import is_library_file
 from src.utils.constants import (
     PDFCARD_MIME_TYPE,
     FOLDERCARD_MIME_TYPE,
@@ -115,7 +116,7 @@ class FolderCard(QFrame):
                 full = os.path.join(self._folder_path, name)
                 if os.path.isdir(full):
                     count += 1
-                elif name.lower().endswith(".pdf"):
+                elif is_library_file(full):
                     count += 1
         except OSError:
             count = 0

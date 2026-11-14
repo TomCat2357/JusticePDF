@@ -38,6 +38,7 @@ from src.views.mode_bar import ModeBar
 from src.views.ops import OPS, make_action, make_tool_button
 from src.views import theme
 from src.views.theme import COLORS
+from src.utils import file_kinds
 
 from src.views.pdf_card import PDFCard
 from src.views.folder_card import FolderCard
@@ -1006,7 +1007,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         """Remember the on-disk version represented by a successfully loaded card."""
         normalized = self._normalize_path(card.pdf_path)
         signature = self._get_file_signature(card.pdf_path)
-        if card.page_count > 0 and signature is not None:
+        if (card.page_count > 0 or not card.is_pdf) and signature is not None:
             self._file_signatures[normalized] = signature
         else:
             # Keep failed/partial loads retryable even if their stat is stable.
@@ -1022,7 +1023,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         """
         normalized = self._normalize_path(path)
         signature = self._get_file_signature(path)
-        if signature is None or signature[0] <= 0:
+        non_pdf = not file_kinds.is_pdf(path)
+        # PDF 以外は 0 バイトでも有効なファイル。サイズ・更新時刻だけで判定する。
+        if signature is None or (signature[0] <= 0 and not non_pdf):
             self._file_stability.pop(normalized, None)
             return False
 
@@ -1031,7 +1034,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._file_stability[normalized] = (signature, count)
         if count < 2:
             return False
-        if get_page_count(path) <= 0:
+        if not non_pdf and get_page_count(path) <= 0:
             return False
 
         self._file_stability.pop(normalized, None)
@@ -1142,7 +1145,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._sort_ascending = sort_ascending
 
         disk_folders = list(self._watcher.get_subfolders())
-        disk_files = list(self._watcher.get_pdf_files())
+        disk_files = list(self._watcher.get_library_files())
 
         if self._sort_order == "manual":
             saved_subfolders = (entry or {}).get("manual_subfolders") or []
@@ -1325,15 +1328,15 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         except OSError:
             return
 
-        disk_pdf_norm: dict[str, str] = {}  # norm -> real path
+        disk_file_norm: dict[str, str] = {}  # norm -> real path
         disk_dir_norm: dict[str, str] = {}
         for name in entries:
             full = os.path.join(work_dir, name)
             try:
                 if os.path.isdir(full):
                     disk_dir_norm[self._normalize_path(full)] = full
-                elif name.lower().endswith(".pdf") and os.path.isfile(full):
-                    disk_pdf_norm[self._normalize_path(full)] = full
+                elif os.path.isfile(full) and file_kinds.is_library_file(full):
+                    disk_file_norm[self._normalize_path(full)] = full
             except OSError:
                 continue
 
@@ -1359,9 +1362,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
 
         changed = False
 
-        # --- PDF cards ---
+        # --- file cards (PDF と PDF 以外) ---
         card_by_norm = {self._normalize_path(c.pdf_path): c for c in self._cards}
-        for norm, real in disk_pdf_norm.items():
+        for norm, real in disk_file_norm.items():
             if norm in busy:
                 # Observe only; never mutate cards while an internal operation
                 # is protected.  If watchdog is lost, this lets the first pass
@@ -1372,7 +1375,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             signature = self._get_file_signature(real)
             if card is not None:
                 rendered_signature = self._file_signatures.get(norm)
-                if card.page_count > 0 and signature == rendered_signature:
+                if (card.page_count > 0 or not card.is_pdf) and signature == rendered_signature:
                     self._file_stability.pop(norm, None)
                     continue
                 if not self._is_file_ready(real):
@@ -1388,7 +1391,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             changed = True
         for card in self._cards[:]:
             norm = self._normalize_path(card.pdf_path)
-            if norm in disk_pdf_norm or norm in busy:
+            if norm in disk_file_norm or norm in busy:
                 continue
             self._remove_card(card.pdf_path)
             changed = True
@@ -1837,6 +1840,10 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         When ``open_zoom`` is True (Alt+double-click), the window is
         immediately switched into enlarged single-page mode on page 0.
         """
+        if not card.is_pdf:
+            # PDF 以外は編集画面を持たない。OS の既定アプリで開く。
+            QDesktopServices.openUrl(QUrl.fromLocalFile(card.pdf_path))
+            return
         from src.views.page_edit_window import PageEditWindow
         # If a window for this file is already open, bring it to front.
         for widget in QApplication.topLevelWidgets():

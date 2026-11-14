@@ -1,5 +1,6 @@
-"""Folder watcher for monitoring PDF and subfolder changes."""
+"""Folder watcher for monitoring library file (PDF and others) and subfolder changes."""
 import os
+from src.utils.file_kinds import is_library_file, is_pdf
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -12,8 +13,9 @@ class PDFEventHandler(FileSystemEventHandler):
         super().__init__()
         self._watcher = watcher
 
-    def _is_pdf(self, path: str) -> bool:
-        return path.lower().endswith(".pdf")
+    def _is_library_file(self, path: str) -> bool:
+        """ライブラリに載せるファイルか（PDF 以外も含む）。"""
+        return is_library_file(path)
 
     def _is_direct_child(self, path: str) -> bool:
         """Only emit for entries directly inside the watched folder."""
@@ -29,18 +31,18 @@ class PDFEventHandler(FileSystemEventHandler):
         if event.is_directory:
             if self._is_direct_child(event.src_path):
                 self._watcher.folder_added.emit(event.src_path)
-        elif self._is_pdf(event.src_path):
+        elif self._is_library_file(event.src_path):
             self._watcher.file_added.emit(event.src_path)
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             if self._is_direct_child(event.src_path):
                 self._watcher.folder_removed.emit(event.src_path)
-        elif self._is_pdf(event.src_path):
+        elif self._is_library_file(event.src_path):
             self._watcher.file_removed.emit(event.src_path)
 
     def on_modified(self, event: FileSystemEvent) -> None:
-        if not event.is_directory and self._is_pdf(event.src_path):
+        if not event.is_directory and self._is_library_file(event.src_path):
             self._watcher.file_modified.emit(event.src_path)
 
     def on_moved(self, event: FileSystemEvent) -> None:
@@ -50,9 +52,9 @@ class PDFEventHandler(FileSystemEventHandler):
             if self._is_direct_child(event.dest_path):
                 self._watcher.folder_added.emit(event.dest_path)
             return
-        if self._is_pdf(event.src_path):
+        if self._is_library_file(event.src_path):
             self._watcher.file_removed.emit(event.src_path)
-        if self._is_pdf(event.dest_path):
+        if self._is_library_file(event.dest_path):
             self._watcher.file_added.emit(event.dest_path)
 
 
@@ -87,12 +89,17 @@ class FolderWatcher(QObject):
         self._observer.stop()
         self._observer.join(timeout=1)
 
-    def get_pdf_files(self) -> list[str]:
+    def get_library_files(self) -> list[str]:
+        """直下のファイル（PDF 以外も含む。フォルダ・一時ファイル・隠しファイルは除く）。"""
         files = []
         for filename in os.listdir(self._folder_path):
-            if filename.lower().endswith(".pdf"):
-                files.append(os.path.join(self._folder_path, filename))
+            full = os.path.join(self._folder_path, filename)
+            if os.path.isfile(full) and is_library_file(full):
+                files.append(full)
         return files
+
+    def get_pdf_files(self) -> list[str]:
+        return [p for p in self.get_library_files() if is_pdf(p)]
 
     def get_subfolders(self) -> list[str]:
         dirs = []

@@ -126,6 +126,14 @@ def build_colors(theme_id: str = DEFAULT_THEME) -> dict[str, str]:
         "danger-muted": c("red-400") if dark else c("red-300"),
         "warn": t("amber-700"),
         "warn-soft": c("amber-50"),
+        # PDF 以外のファイルの種類色（アイコン）。文字系の 2 つはテーマの文字色に合わせる
+        "kind-excel": "#16a34a",
+        "kind-word": "#2563eb",
+        "kind-powerpoint": "#ea580c",
+        "kind-image": "#9333ea",
+        "kind-zip": "#d97706",
+        "kind-text": t("slate-600"),
+        "kind-other": t("slate-400"),
         # ラバーバンド
         "rubber-fill": _rgba(c("blue-500"), 0.2),
         # カードのホバー（slate-200 の 70%）
