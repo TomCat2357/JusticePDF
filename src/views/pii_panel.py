@@ -792,7 +792,7 @@ class PiiPanel(QFrame):
             "ここに表示されている項目はすべて塗りつぶし(黒塗り/文字削除)の対象になります。\n"
             "不要な項目は選択して「削除」で一覧から外してください。"
         )
-        panel_layout.addWidget(result_label)
+        # 見出しは一覧(下の _result_tree)のすぐ上に置く。
 
         # 種別ごとの「表示・検出する」チェックボックス(3列)。自動検出の8種別は
         # 検出対象の設定そのもの、「手動」は手動追加分の表示設定。
@@ -870,6 +870,7 @@ class PiiPanel(QFrame):
         header.setStretchLastSection(False)
         self._result_tree.resized.connect(self._fit_result_columns)
         self._update_sort_indicator()
+        panel_layout.addWidget(result_label)
         panel_layout.addWidget(self._result_tree, 1)
 
         # --- 操作ボタン ---

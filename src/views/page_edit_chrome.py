@@ -792,7 +792,9 @@ class PageEditChromeMixin:
             )
 
     def _on_open_pii_panel(self) -> None:
-        """ツールバーの「個人情報」: 個人情報パネルを開く。"""
+        """ツールバーの「個人情報」: 個人情報パネルを開く（複数ページ表示中は閲覧専用なので開かない）。"""
+        if self._zoom_page_layout_is_multi():
+            return
         self._zoom_pii_btn.setChecked(True)
         self._on_zoom_panel_pii_triggered(True)
 
@@ -928,6 +930,8 @@ class PageEditChromeMixin:
                 entries.append(self._ctx("toBack", S(lambda: self._reorder_selected_zoom_annotation("back"))))
             return build_context_menu(self, "注釈", entries)
         entries = [
+            self._ctx("undo", S(self._on_undo), enabled=self._undo_btn.isEnabled()),
+            self._ctx("redo", S(self._on_redo), enabled=self._redo_btn.isEnabled()),
             self._ctx("rotateRight", S(lambda: self._rotate_pages_by(90)), enabled=not multi),
             self._ctx("rotateLeft", S(lambda: self._rotate_pages_by(270)), enabled=not multi),
             self._ctx("rotate180", S(lambda: self._rotate_pages_by(180)), enabled=not multi),

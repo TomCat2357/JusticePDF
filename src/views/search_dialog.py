@@ -141,6 +141,8 @@ class SearchBar(QWidget):
         if query and query == self._last_query and self._next_btn.isEnabled():
             self.next_requested.emit()
             return
+        if query and query == self._last_query and not self._cancel_btn.isHidden():
+            return  # 同じ語の走査中（まだヒット 0 件）は、Enter で最初からやり直さない
         self._emit_search()
 
     def _on_next(self) -> None:

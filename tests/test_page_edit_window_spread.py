@@ -87,6 +87,22 @@ def test_spread_disables_rotate_delete_and_bookmark_edit(qtbot, tmp_path):
 
 
 @pytest.mark.usefixtures("qtbot")
+def test_spread_blocks_toolbar_pii_panel(qtbot, tmp_path):
+    pdf_path = tmp_path / "spread-pii.pdf"
+    make_pdf(pdf_path, pages=4)
+    window = create_page_edit_window(qtbot, pdf_path)
+    open_zoom(window, qtbot)
+    window._toggle_zoom_spread_view()
+
+    assert window._pii_action.isEnabled() is False
+    window._on_open_pii_panel()
+    assert window._pii_panel.is_open is False
+
+    window._toggle_zoom_spread_view()
+    assert window._pii_action.isEnabled() is True
+
+
+@pytest.mark.usefixtures("qtbot")
 def test_spread_next_prev_step_by_two(qtbot, tmp_path):
     pdf_path = tmp_path / "spread-nav.pdf"
     make_pdf(pdf_path, pages=4)

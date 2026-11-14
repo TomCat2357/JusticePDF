@@ -1069,6 +1069,9 @@ class PageEditWindow(
         for btn in self._menu_buttons.get("rename", ()):
             btn.setEnabled(True)
         self._select_all_btn.setEnabled(self._page_count > 0)
+        pii_action = getattr(self, "_pii_action", None)
+        if pii_action is not None:
+            pii_action.setEnabled(not spread)  # 墨消しは複数ページ表示(閲覧専用)では開けない
         self._undo_btn.setEnabled(not spread and self._undo_manager.can_undo())
         self._redo_btn.setEnabled(not spread and self._undo_manager.can_redo())
         self._update_save_button()
@@ -3304,7 +3307,7 @@ class PageEditWindow(
         self._clear_search_highlights()
         if not query:
             if self._search_bar is not None:
-                self._search_bar.set_status(0, 0)
+                self._search_bar.clear_status()
             return
         self._search_query = query
         self._search_jumped = False
