@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
@@ -9,8 +7,8 @@ from PyQt6.QtWidgets import QApplication, QLineEdit, QSpinBox, QStyle, QStyleOpt
 
 from src.utils.pdf_utils import TocEntry
 from src.views.bookmarks_panel import BookmarksPanel
+from src.views.theme import load_app_stylesheet
 
-QSS_PATH = Path(__file__).resolve().parent.parent / "src" / "views" / "style.qss"
 
 
 def _entries():
@@ -19,7 +17,7 @@ def _entries():
 
 @pytest.fixture
 def real_qss(qapp):
-    qapp.setStyleSheet(QSS_PATH.read_text(encoding="utf-8"))
+    qapp.setStyleSheet(load_app_stylesheet())
     yield
     qapp.setStyleSheet("")
 

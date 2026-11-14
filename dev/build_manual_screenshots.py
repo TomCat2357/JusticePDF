@@ -27,6 +27,7 @@ from PyQt6.QtGui import QFont, QFontDatabase, QGuiApplication
 from PyQt6.QtWidgets import QApplication, QToolBar
 
 from src.views import main_window, pdf_card
+from src.views.theme import load_app_stylesheet
 from src.views import page_edit_window as page_edit_window_module
 from src.views.export_dialog import ExportOptionsDialog
 from src.views.print_dialog import PrintDialog
@@ -604,9 +605,7 @@ def main() -> None:
             print(f"app font: {family}")
             break
 
-    qss_path = ROOT / "src" / "views" / "style.qss"
-    if qss_path.exists():
-        app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
+    app.setStyleSheet(load_app_stylesheet())
 
     with tempfile.TemporaryDirectory(prefix="justicepdf_manual_") as td:
         work_dir = Path(td) / "PDFs"

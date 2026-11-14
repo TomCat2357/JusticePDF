@@ -1,0 +1,86 @@
+/* =========================================================================
+ * 個別画面（ページ一覧・拡大表示）: ページのサムネイル・拡大ビューのボタン
+ * ========================================================================= */
+
+/* ページ一覧の背景(スクロール領域に objectName を付けたとき用の受け皿) */
+QScrollArea#pageEditScroll,
+QScrollArea#pageEditScroll > QWidget > QWidget {
+    background-color: @slate-200@;
+}
+
+/* ---------- PageThumbnail ------------------------------------------------ */
+
+PageThumbnail {
+    background-color: @slate-50@;
+    border: 1px solid @slate-200@;
+    border-radius: 6px;
+}
+PageThumbnail[state="selected"] {
+    background-color: @select-bg@;
+    border: 1px solid @select-ring@;
+}
+PageThumbnail[state="droptarget"] {
+    background-color: @dnd-bg@;
+    border: 1px solid @dnd-ring@;
+}
+PageThumbnail[state="search_hit"] {
+    background-color: @hit-bg@;
+    border: 2px solid @hit-ring@;
+}
+/* 選択 + 検索ヒット: 選択の枠線にヒットの黄色い塗り */
+PageThumbnail[state="selected_hit"] {
+    background-color: @hit-bg@;
+    border: 1px solid @select-ring@;
+}
+/* 現在のヒット(次へ/前へで見ているページ): 最も目立たせる */
+PageThumbnail[state="current_hit"] {
+    background-color: @hit-current-bg@;
+    border: 3px solid @hit-current-ring@;
+}
+/* 選択 + 現在のヒット: 現在のヒットの枠線に、選択の塗り */
+PageThumbnail[state="selected_current"] {
+    background-color: @select-bg@;
+    border: 3px solid @hit-current-ring@;
+}
+PageThumbnail QLabel {
+    color: @slate-500@;
+    font-size: 11px;
+}
+
+/* Zoom view navigation buttons (prev/next in page edit window) */
+QToolButton#zoomNav {
+    background-color: @white@;
+    border: 1px solid @slate-300@;
+    border-radius: 4px;
+    padding: 4px;
+}
+QToolButton#zoomNav:hover    { background-color: @slate-100@; }
+QToolButton#zoomNav:pressed  { background-color: @slate-200@; }
+QToolButton#zoomNav:disabled { background-color: @slate-100@; border-color: @slate-300@; }
+QToolButton#zoomNav::arrow   { width: 18px; height: 18px; }
+
+/* 拡大ビューの枠付きボタン（Justice Desk の box 変種） */
+QToolButton[variant="box"],
+QToolBar QToolButton[variant="box"] {
+    background-color: @white@;
+    border: 1px solid @slate-300@;
+    border-radius: 4px;
+    padding: 4px 10px;
+    min-height: 18px;
+    font-size: 13px;
+    font-weight: normal;
+    color: @slate-700@;
+}
+QToolButton[variant="box"]:hover,
+QToolBar QToolButton[variant="box"]:hover   { background-color: @slate-100@; }
+QToolButton[variant="box"]:checked,
+QToolBar QToolButton[variant="box"]:checked {
+    background-color: @blue-100@;
+    border: 1px solid @blue-500@;
+}
+QToolButton[variant="box"]:pressed,
+QToolBar QToolButton[variant="box"]:pressed { background-color: @slate-200@; }
+QToolButton[variant="box"]:disabled,
+QToolBar QToolButton[variant="box"]:disabled { color: @slate-400@; background-color: @white@; }
+QToolButton[variant="box"]::menu-indicator,
+QToolBar QToolButton[variant="box"]::menu-indicator { image: none; width: 0; }

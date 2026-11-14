@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import QApplication
 from src.utils import app_settings, order_store, settings_store
 from src.utils.pdf_utils import set_pixmap_cache_max_entries
 from src.views.main_window import MainWindow
+from src.views.theme import load_app_stylesheet
 
 
 def main():
@@ -55,9 +56,7 @@ def main():
     # (QSettings は上の組織名/アプリ名設定に依存するため、ここで初めて呼べる)。
     set_pixmap_cache_max_entries(app_settings.pixmap_cache_max_entries())
 
-    qss_path = Path(__file__).parent / "views" / "style.qss"
-    if qss_path.exists():
-        app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
+    app.setStyleSheet(load_app_stylesheet())
 
     # Drop stale/over-limit folder-order entries once per app launch (not per
     # window — a single run can open many MainWindow instances).

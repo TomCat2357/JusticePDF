@@ -1,0 +1,21 @@
+/* =========================================================================
+ * 右のドロワー類（注釈・しおり・OCR・個人情報）
+ * ========================================================================= */
+
+/* Annotation drawer panel in page edit window */
+QFrame#annotationDrawer {
+    background-color: @slate-100@;
+    border-left: 1px solid @slate-300@;
+}
+
+/* ---------- 個人情報検出: 結果一覧の選択行 ------------------------------- */
+/* 既定の選択色は薄く、フォーカスが外れると灰色になって見づらいため、
+   フォーカスの有無に関わらずアクセント色でくっきり表示する。 */
+QTreeWidget#piiResultTree::item:selected,
+QTreeWidget#piiResultTree::item:selected:!active {
+    background-color: @blue-600@;
+    color: @white@;
+}
+QTreeWidget#piiResultTree::item:hover:!selected {
+    background-color: @blue-50@;
+}
