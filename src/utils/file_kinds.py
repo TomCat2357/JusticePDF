@@ -104,6 +104,28 @@ def is_library_file(path: str) -> bool:
     return not (attrs & _FILE_ATTRIBUTE_HIDDEN)
 
 
+# ［PDFに変換］できるファイルの拡張子（Web 版 convertKind に合わせる。Markdown・csv・zip などは対象外）。
+_CONVERT_OFFICE = frozenset({"doc", "docx", "docm", "xls", "xlsx", "xlsm", "ppt", "pptx"})
+_CONVERT_TEXT = frozenset({"txt"})
+_CONVERT_IMAGE = frozenset({"png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff"})
+
+
+def convert_kind(path: str) -> str | None:
+    """PDF に変換できる種類なら ``office`` / ``text`` / ``image``、できなければ None（PDF も None）。"""
+    ext = extension(path)
+    if ext in _CONVERT_OFFICE:
+        return "office"
+    if ext in _CONVERT_TEXT:
+        return "text"
+    if ext in _CONVERT_IMAGE:
+        return "image"
+    return None
+
+
+def is_convertible(path: str) -> bool:
+    return convert_kind(path) is not None
+
+
 def format_size(size: int) -> str:
     """ファイルサイズの短い表記（例 ``12 KB``、``1.4 MB``）。"""
     n = float(max(0, int(size)))

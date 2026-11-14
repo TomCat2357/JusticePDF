@@ -70,6 +70,8 @@ from src.utils.path_utils import ensure_unique_path
 from src.utils.windows_shell import show_native_file_context_menu
 from src.workers.file_worker import FileOperationWorker
 from src.workers.import_worker import ImportWorker
+
+CONVERT_DISABLED_TIP = "PDF に変換できる種類のファイルが選ばれていません"
 from src.views.main_window_fileops import FileOpsMixin
 from src.views.main_window_split import SplitMixin
 from src.views.main_window_import import ImportMixin
@@ -99,7 +101,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._selected_folder_cards: list[FolderCard] = []
         self._selected_cards: list[PDFCard] = []
         self._child_windows: list[QMainWindow] = []
-        self._sort_order = "manual"  # "name", "date", or "manual"
+        self._sort_order = "manual"  # "name", "date", "kind", or "manual"
         self._sort_ascending = True
         # Ensure initial layout uses the same logic as subsequent resizes
         self._did_initial_grid_layout = False
@@ -130,6 +132,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._nav_forward: list[str] = []
         # 名前での絞り込み（空 = 絞り込みなし）
         self._filter_groups: list = []
+        # 種類での絞り込み（隠す種類。フォルダを移っても保持し、設定へ保存する）
+        self._hidden_kinds: set[str] = app_settings.hidden_file_kinds()
 
         # Zoom debounce timer for Ctrl+wheel
         self._zoom_debounce_timer = QTimer(self)
@@ -360,6 +364,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         ("name", False): "名前順（降順）",
         ("date", True): "日付順（昇順）",
         ("date", False): "日付順（降順）",
+        ("kind", True): "種類順（昇順）",
+        ("kind", False): "種類順（降順）",
     }
 
     @staticmethod
@@ -736,6 +742,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         toolbar.addWidget(self._export_btn)
         self._print_btn = make_tool_button(make_action(self, "print", self._on_print))
         toolbar.addWidget(self._print_btn)
+        # PDFに変換（Office・txt・画像。変換できるものが選ばれているときだけ有効）
+        self._convert_btn = make_tool_button(make_action(self, "convertPdf", self._on_convert_to_pdf))
+        toolbar.addWidget(self._convert_btn)
 
         toolbar.addSeparator()
 
@@ -760,6 +769,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._sort_action_name_desc = _add_sort_action("名前順（降順）", "name", False)
         self._sort_action_date_asc = _add_sort_action("日付順（昇順）", "date", True)
         self._sort_action_date_desc = _add_sort_action("日付順（降順）", "date", False)
+        self._sort_action_kind_asc = _add_sort_action("種類順（昇順）", "kind", True)
+        self._sort_action_kind_desc = _add_sort_action("種類順（降順）", "kind", False)
         self._sort_menu.addSeparator()
         self._sort_action_manual = self._menu_action(
             self._sort_menu, "手動順", self._apply_manual_sort, checkable=True)
@@ -769,6 +780,15 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             "sortMenu")
         toolbar.addWidget(self._sort_btn)
         self._sync_sort_menu_state()
+
+        # 種類での絞り込み（チェックを外した種類を隠す）
+        self._kind_menu = QMenu(self)
+        self._kind_menu.aboutToShow.connect(self._rebuild_kind_menu)
+        self._kind_btn = named(
+            make_tool_button(None, icon="Eye", tooltip=tip("kindFilter"), menu=self._kind_menu),
+            "kindFilter")
+        toolbar.addWidget(self._kind_btn)
+        self._update_kind_button()
 
         # 右寄せ: カードの大きさ（小 / 中 / 大 / 特大）
         spacer = QWidget()
@@ -842,18 +862,27 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         one_file = n_files == 1 and n_folders == 0
         one_folder = n_folders == 1 and n_files == 0
         self._rename_file_action.setVisible(one_file)
-        self._rename_title_action.setVisible(one_file)
+        pdf_cards = self._selected_pdf_cards()
+        n_pdf = len(pdf_cards)
+        # PDF のタイトル（メタデータ）の変更は PDF だけ。ファイル名の変更は種類を問わない。
+        self._rename_title_action.setVisible(one_file and n_pdf == 1)
         self._rename_folder_action.setVisible(one_folder)
         self._rename_btn.setEnabled((one_file or one_folder) and not busy)
-        self._rotate_btn.setEnabled(has_selection and not busy)
+        # PDF 専用の操作は、選択に PDF を含むときだけ有効（混在なら PDF だけが対象）
+        self._rotate_btn.setEnabled(n_pdf >= 1 and not busy)
+        self._print_btn.setEnabled(not (has_selection and n_pdf == 0) and not busy)
+        can_convert = bool(self._selected_convertible_paths())
+        self._convert_btn.setEnabled(can_convert and not busy)
+        self._convert_btn.setToolTip(
+            OPS["convertPdf"].label if can_convert else CONVERT_DISABLED_TIP)
         self._undo_btn.setEnabled(self._undo_manager.can_undo() and not busy)
         self._redo_btn.setEnabled(self._undo_manager.can_redo() and not busy)
         # エクスポート: ファイルまたはフォルダを1つ以上選択しているとき有効
-        self._export_btn.setEnabled((n_files >= 1 or n_folders >= 1) and not busy)
-        # 結合: フォルダを1つ以上、またはファイルを2つ以上選択しているとき
-        can_merge = n_folders >= 1 or n_files >= 2
-        # 分解: PDFファイルをちょうど1つだけ選択しているとき
-        can_split = n_files == 1 and n_folders == 0
+        self._export_btn.setEnabled((n_pdf >= 1 or n_folders >= 1) and not busy)
+        # 結合: フォルダを1つ以上、または PDF を2つ以上選択しているとき
+        can_merge = n_folders >= 1 or n_pdf >= 2
+        # 分解: PDFをちょうど1つだけ選択しているとき（フォルダは含まない）
+        can_split = n_pdf == 1 and n_folders == 0
         self._merge_action.setVisible(can_merge)
         self._split_action.setVisible(can_split)
         self._merge_split_btn.setEnabled((can_merge or can_split) and not busy)
@@ -865,7 +894,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         if not hasattr(self, "_status_count"):
             return
         total = len(self._cards) + len(self._folder_cards)
-        if self._filter_groups:
+        if self._filter_active():
             shown = sum(1 for it in (*self._folder_cards, *self._cards) if self._item_visible(it))
             text = f"{shown} / {total} 項目（絞り込み中）"
         else:
@@ -883,10 +912,75 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
 
     # ---- 名前での絞り込み ----------------------------------------------
     def _item_visible(self, item) -> bool:
+        if self._hidden_kinds and getattr(item, "kind", "folder") in self._hidden_kinds:
+            return False
         return name_matches(item.filename, self._filter_groups)
 
     def _filter_active(self) -> bool:
-        return bool(self._filter_groups)
+        return bool(self._filter_groups) or bool(self._hidden_kinds)
+
+    # ---- 種類での絞り込み ------------------------------------------------
+    def _kind_counts(self) -> dict[str, int]:
+        """今のフォルダにある項目の種類ごとの件数（絞り込みに関係なく数える）。"""
+        counts = {k: 0 for k in file_kinds.FILE_KINDS}
+        counts["folder"] = len(self._folder_cards)
+        for card in self._cards:
+            kind = card.kind if card.kind in counts else "other"
+            counts[kind] += 1
+        return counts
+
+    def _rebuild_kind_menu(self) -> None:
+        """メニューを開くたびに、種類ごとのチェックと件数を作り直す。"""
+        menu = self._kind_menu
+        menu.clear()
+        all_action = QAction("すべて", menu)
+        all_action.setCheckable(True)
+        all_action.setChecked(not self._hidden_kinds)
+        all_action.triggered.connect(lambda _c=False: self._set_hidden_kinds(set()))
+        menu.addAction(all_action)
+        menu.addSeparator()
+        counts = self._kind_counts()
+        for kind, label in file_kinds.FILE_KINDS.items():
+            action = QAction(f"{label}（{counts.get(kind, 0)}）", menu)
+            action.setCheckable(True)
+            action.setChecked(kind not in self._hidden_kinds)
+            action.setData(kind)
+            action.triggered.connect(lambda _c=False, k=kind: self._toggle_kind_hidden(k))
+            menu.addAction(action)
+
+    def _toggle_kind_hidden(self, kind: str) -> None:
+        hidden = set(self._hidden_kinds)
+        if kind in hidden:
+            hidden.discard(kind)
+        else:
+            hidden.add(kind)
+        self._set_hidden_kinds(hidden)
+
+    def _set_hidden_kinds(self, hidden: set[str]) -> None:
+        self._hidden_kinds = {k for k in hidden if k in file_kinds.FILE_KINDS}
+        app_settings.set_hidden_file_kinds(self._hidden_kinds)
+        self._update_kind_button()
+        self._prune_hidden_selection()
+        self._refresh_grid()
+        self._update_button_states()
+
+    def _update_kind_button(self) -> None:
+        tip = OPS["kindFilter"].label
+        if self._hidden_kinds:
+            tip += f"（{len(self._hidden_kinds)} 種類を隠しています）"
+        self._kind_btn.setToolTip(tip)
+        self._kind_btn.setProperty("filterActive", bool(self._hidden_kinds))
+
+    def _prune_hidden_selection(self) -> None:
+        """隠れる項目は選択から外す（見えない項目に操作が及ばないように）。"""
+        for card in list(self._selected_cards):
+            if not self._item_visible(card):
+                card.set_selected(False)
+                self._selected_cards.remove(card)
+        for fc in list(self._selected_folder_cards):
+            if not self._item_visible(fc):
+                fc.set_selected(False)
+                self._selected_folder_cards.remove(fc)
 
     def _on_search_toggled(self, on: bool) -> None:
         self._filter_bar.setVisible(on)
@@ -906,15 +1000,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
 
     def _on_filter_text_changed(self, text: str) -> None:
         self._filter_groups = parse_name_filter(text)
-        # 隠れる項目は選択から外す（見えない項目に操作が及ばないように）
-        for card in list(self._selected_cards):
-            if not self._item_visible(card):
-                card.set_selected(False)
-                self._selected_cards.remove(card)
-        for fc in list(self._selected_folder_cards):
-            if not self._item_visible(fc):
-                fc.set_selected(False)
-                self._selected_folder_cards.remove(fc)
+        self._prune_hidden_selection()
         self._refresh_grid()
         self._update_button_states()
 
@@ -1136,7 +1222,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         sort_ascending = True
         if entry is not None:
             saved_sort_order = entry.get("sort_order")
-            if saved_sort_order in ("manual", "name", "date"):
+            if saved_sort_order in ("manual", "name", "date", "kind"):
                 sort_order = saved_sort_order
             saved_ascending = entry.get("sort_ascending")
             if isinstance(saved_ascending, bool):
@@ -1547,6 +1633,14 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                     return 0.0
             self._cards.sort(key=lambda c: get_mtime(c.pdf_path), reverse=not self._sort_ascending)
             self._folder_cards.sort(key=lambda c: get_mtime(c.folder_path), reverse=not self._sort_ascending)
+        elif self._sort_order == "kind":
+            # 種類の順位（KIND_ORDER）→ 同じ種類の中は名前順。フォルダはフォルダ同士で名前順。
+            order = {k: i for i, k in enumerate(file_kinds.KIND_ORDER)}
+            self._cards.sort(
+                key=lambda c: (order.get(c.kind, len(order)), c.filename.lower()),
+                reverse=not self._sort_ascending,
+            )
+            self._folder_cards.sort(key=lambda c: c.filename.lower(), reverse=not self._sort_ascending)
 
     def _get_visible_cards(self) -> list[PDFCard]:
         """Return cards currently visible in the scroll area viewport."""
@@ -1586,6 +1680,13 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
     def _selected_card_paths_in_grid_order(self) -> list[str]:
         """Return selected card paths ordered by the visible card grid."""
         return [card.pdf_path for card in self._cards if card in self._selected_cards]
+
+    def _selected_pdf_cards(self) -> list[PDFCard]:
+        """選択中のカードのうち PDF のもの（PDF 専用の操作はこれだけを対象にする）。"""
+        return [c for c in self._cards if c in self._selected_cards and c.is_pdf]
+
+    def _selected_pdf_paths_in_grid_order(self) -> list[str]:
+        return [c.pdf_path for c in self._selected_pdf_cards()]
 
     def _selected_folder_paths_in_grid_order(self) -> list[str]:
         """Return selected folder paths ordered by the visible folder grid."""
@@ -1761,6 +1862,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         busy = self._operation_in_progress
         one_file = n_files == 1 and n_folders == 0
         one_folder = n_folders == 1 and n_files == 0
+        n_pdf = len(self._selected_pdf_cards())
         if n == 1:
             header = (self._selected_cards[0].filename if one_file
                       else self._selected_folder_cards[0].filename)
@@ -1770,22 +1872,35 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         entries: list = []
         if one_file:
             card = self._selected_cards[0]
-            entries.append(ctx("open", lambda: self._on_card_double_clicked(card)))
-            entries.append(ctx("openZoom", lambda: self._on_card_double_clicked(card, True)))
+            if card.is_pdf:
+                entries.append(ctx("open", lambda: self._on_card_double_clicked(card)))
+                entries.append(ctx("openZoom", lambda: self._on_card_double_clicked(card, True)))
+            else:
+                entries.append(ctx("openApp", lambda: self._on_card_double_clicked(card)))
             entries.append(ctx("rename", self._on_rename, not busy))
-            entries.append(ctx("renamePdf", self._on_rename_pdf_title, not busy))
+            if card.is_pdf:
+                entries.append(ctx("renamePdf", self._on_rename_pdf_title, not busy))
         elif one_folder:
             fc = self._selected_folder_cards[0]
             entries.append(ctx("open", lambda: self.navigate_to(fc.folder_path)))
             entries.append(ctx("openNewWindow", lambda: self._open_folder_in_new_window(fc.folder_path)))
             entries.append(ctx("rename", self._on_rename_folder_selected, not busy))
+        # PDF 専用の操作は、選択に PDF を含まないとき無効（混在なら PDF だけが対象）
         if n_folders >= 1 or n_files >= 2:
-            entries.append(ctx("merge", self._on_merge_selected, not busy))
+            entries.append(ctx(
+                "merge", self._on_merge_selected, not busy and (n_folders >= 1 or n_pdf >= 2)))
         if one_file:
-            entries.append(ctx("split", self._on_split_selected, not busy))
-        entries.append(ctx("export", self._on_export, not busy))
+            entries.append(ctx("split", self._on_split_selected, not busy and n_pdf == 1))
+        convert_paths = self._selected_convertible_paths()
+        convert_action = make_action(self, "convertPdf", self._on_convert_to_pdf)
+        convert_action.setEnabled(bool(convert_paths) and not busy)
+        if not convert_paths:
+            convert_action.setToolTip(CONVERT_DISABLED_TIP)
+            convert_action.setProperty("menu_tip", CONVERT_DISABLED_TIP)
+        entries.append(convert_action)
+        entries.append(ctx("export", self._on_export, not busy and (n_pdf >= 1 or n_folders >= 1)))
         if n_files >= 1:
-            entries.append(ctx("print", self._on_print, not busy))
+            entries.append(ctx("print", self._on_print, not busy and n_pdf >= 1))
         paths = self._selected_paths_in_grid_order()
         if n == 1:
             entries.append(ctx("showInExplorer", lambda: self._show_in_explorer(paths[0])))
@@ -2045,7 +2160,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         if not handled and url_payload:
             urls = [p for p in url_payload.split('|') if p]
             if urls:
-                self._import_paths(urls, dest_root=dest_dir)
+                self._import_paths(urls, dest_root=dest_dir, copy_only=True)
                 handled = True
 
         if handled:
@@ -2253,9 +2368,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
     def _on_print(self) -> None:
         """Print selected PDFs (or all PDFs if none selected)."""
         targets = (
-            [c.pdf_path for c in self._selected_cards]
+            self._selected_pdf_paths_in_grid_order()
             if self._selected_cards
-            else [c.pdf_path for c in self._cards if self._item_visible(c)]
+            else [c.pdf_path for c in self._cards if c.is_pdf and self._item_visible(c)]
         )
         if not targets:
             QMessageBox.information(self, "印刷", "印刷対象のPDFがありません。")
@@ -2273,7 +2388,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         # Store paths and page indices instead of widget references
         rotations = []
 
-        for card in self._selected_cards:
+        for card in self._selected_pdf_cards():
             page_count = get_page_count(card.pdf_path)
             if page_count > 0:
                 indices = list(range(page_count))
@@ -2424,6 +2539,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             self._sort_action_name_desc,
             self._sort_action_date_asc,
             self._sort_action_date_desc,
+            self._sort_action_kind_asc,
+            self._sort_action_kind_desc,
             self._sort_action_manual,
         )
         for action in actions:
@@ -2438,6 +2555,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             ("name", False): self._sort_action_name_desc,
             ("date", True): self._sort_action_date_asc,
             ("date", False): self._sort_action_date_desc,
+            ("kind", True): self._sort_action_kind_asc,
+            ("kind", False): self._sort_action_kind_desc,
         }
         action = mapping.get((self._sort_order, self._sort_ascending))
         if action is not None:

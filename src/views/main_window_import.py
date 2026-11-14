@@ -31,8 +31,15 @@ from src.utils.constants import (
     ZIP_EXTS as _ZIP_EXTS,
 )
 from src.utils.path_utils import ensure_unique_path
+from src.utils.file_kinds import convert_kind, is_library_name
 from src.utils.zip_utils import prepare_zip_imports
-from src.workers.import_worker import ImportWorker, find_soffice
+from src.workers.import_worker import (
+    MODE_CONVERT,
+    MODE_COPY,
+    MODE_IMPORT,
+    ImportWorker,
+    find_soffice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +88,8 @@ class ImportMixin:
         self,
         paths: list[str],
         dest_root: Path,
+        *,
+        copy_only: bool = False,
     ) -> tuple[list[tuple[str, str]], list[str]]:
         """Build a flat list of (src, dest) pairs for the importer.
 
@@ -89,6 +98,10 @@ class ImportMixin:
         resolved via ``ensure_unique_path`` so neither the real work dir nor
         any new subfolder ever sees a clobber.  Office/image sources are given
         ``.pdf`` destinations.
+
+        ``copy_only`` が真のときは変換しない取り込み（ドロップ用）: 拡張子を問わず
+        すべてのファイルを同じ名前のままコピー対象にする（一時ファイル・隠しファイルを除く）。
+        空のフォルダもそのまま作る。
 
         Returns ``(tree, top_dirs)`` where ``top_dirs`` lists the top-level
         folders newly created under ``dest_root`` for each imported directory
@@ -132,22 +145,31 @@ class ImportMixin:
                 target_root.mkdir(parents=True, exist_ok=True)
                 top_dirs.append(str(target_root))
                 for root, _dirs, files in os.walk(p):
+                    if copy_only:
+                        _dirs[:] = [d for d in _dirs if is_library_name(d)]
                     rel = os.path.relpath(root, p)
                     dest_parent = target_root if rel == "." else (target_root / rel)
                     dest_parent.mkdir(parents=True, exist_ok=True)
                     for fname in files:
                         src_full = os.path.join(root, fname)
                         ext = os.path.splitext(fname)[1].lower()
-                        if ext not in _IMPORT_EXTS:
+                        if copy_only:
+                            if not is_library_name(fname):
+                                continue
+                        elif ext not in _IMPORT_EXTS:
                             continue
-                        dest_name = _normalize_dest_name(fname)
+                        dest_name = fname if copy_only else _normalize_dest_name(fname)
                         dest_full = _alloc_dest(dest_parent, dest_name)
                         tree.append((src_full, str(dest_full)))
             elif os.path.isfile(p):
                 ext = os.path.splitext(p)[1].lower()
-                if ext not in _IMPORT_EXTS:
+                if copy_only:
+                    if not is_library_name(p):
+                        continue
+                elif ext not in _IMPORT_EXTS:
                     continue
-                dest_name = _normalize_dest_name(os.path.basename(p))
+                base = os.path.basename(p)
+                dest_name = base if copy_only else _normalize_dest_name(base)
                 dest_full = _alloc_dest(dest_root, dest_name)
                 tree.append((p, str(dest_full)))
         return tree, top_dirs
@@ -188,8 +210,13 @@ class ImportMixin:
         *,
         dest_root: Path | None = None,
         on_top_dirs: "Callable[[list[str]], None] | None" = None,
+        copy_only: bool = False,
     ) -> None:
         """Import PDF / Office / image files and folders into the work tree.
+
+        ``copy_only`` が真（OS からのドロップ）のときは変換も ZIP 展開もせず、
+        拡張子を問わずそのままコピーする。インポートメニュー・Explorer 連携は
+        従来どおり ``copy_only=False``（PDF に変換して取り込む）。
 
         This is the main entry for both the Import button, the Import Folder
         button, drag-and-drop onto the main window, and drops onto a
@@ -213,12 +240,15 @@ class ImportMixin:
 
         root = Path(dest_root) if dest_root else Path(self._work_dir)
 
-        prep = prepare_zip_imports(paths)
-        if prep.encrypted or prep.broken:
-            self._notify_zip_problems(prep.encrypted, prep.broken)
-        cleanup_dirs = prep.temp_dirs
+        if copy_only:
+            source_paths, cleanup_dirs = list(paths), []
+        else:
+            prep = prepare_zip_imports(paths)
+            if prep.encrypted or prep.broken:
+                self._notify_zip_problems(prep.encrypted, prep.broken)
+            source_paths, cleanup_dirs = prep.paths, prep.temp_dirs
 
-        tree, top_dirs = self._build_import_tree(prep.paths, root)
+        tree, top_dirs = self._build_import_tree(source_paths, root, copy_only=copy_only)
 
         # Open the copied folder(s) right away.  The directories already exist
         # (created during the build pass); the import worker fills them in
@@ -232,7 +262,7 @@ class ImportMixin:
             self._cleanup_temp_dirs(cleanup_dirs)
             return
 
-        office_count = self._count_office_files(tree)
+        office_count = 0 if copy_only else self._count_office_files(tree)
         if office_count > IMPORT_OFFICE_WARN_THRESHOLD:
             result = QMessageBox.question(
                 self,
@@ -248,7 +278,54 @@ class ImportMixin:
                 self._cleanup_temp_dirs(cleanup_dirs)
                 return
 
-        self._start_import_worker(tree, cleanup_dirs=cleanup_dirs)
+        self._start_import_worker(
+            tree, cleanup_dirs=cleanup_dirs, mode=MODE_COPY if copy_only else MODE_IMPORT,
+        )
+    # ---- ［PDFに変換］ -----------------------------------------------
+    def _selected_convertible_paths(self) -> list[str]:
+        """選択中のファイルのうち PDF に変換できるもの（グリッド順）。"""
+        return [
+            c.pdf_path for c in self._cards
+            if c in self._selected_cards and convert_kind(c.pdf_path)
+        ]
+
+    def _on_convert_to_pdf(self) -> None:
+        """選択した Office・txt・画像を、同じフォルダに「元の名前.pdf」として変換する。
+
+        元のファイルは残す。同名があれば「名前(1).pdf」の連番（置き換えは訊かない）。
+        PDF・フォルダ・変換できない種類は無視し、件数だけ完了時に伝える。
+        """
+        if self._operation_in_progress or self._active_import_worker is not None:
+            QMessageBox.information(self, "PDFに変換", "別の処理が進行中です。完了までお待ちください。")
+            return
+        targets = self._selected_convertible_paths()
+        if not targets:
+            return
+        unsupported = sum(
+            1 for c in self._selected_cards
+            if not c.is_pdf and not convert_kind(c.pdf_path)
+        )
+        tree = self._build_convert_tree(targets)
+        self._start_import_worker(tree, mode=MODE_CONVERT, unsupported=unsupported)
+
+    @staticmethod
+    def _build_convert_tree(paths: list[str]) -> list[tuple[str, str]]:
+        """``(元, 出力先)`` の一覧。出力先は元と同じフォルダの「<拡張子なしの名前>.pdf」で、重なれば連番。"""
+        used: set[str] = set()
+        tree: list[tuple[str, str]] = []
+        for src in paths:
+            folder = os.path.dirname(src)
+            name = os.path.splitext(os.path.basename(src))[0] + ".pdf"
+            stem = os.path.splitext(name)[0]
+            dest = os.path.join(folder, name)
+            i = 0
+            while os.path.exists(dest) or os.path.normcase(dest) in used:
+                i += 1
+                dest = os.path.join(folder, f"{stem}({i}).pdf")
+            dest = str(dest)
+            used.add(os.path.normcase(dest))
+            tree.append((src, dest))
+        return tree
     def _notify_zip_problems(
         self,
         encrypted: list[str],
@@ -277,6 +354,8 @@ class ImportMixin:
         tree: list[tuple[str, str]],
         *,
         cleanup_dirs: list[str] | None = None,
+        mode: str = MODE_IMPORT,
+        unsupported: int = 0,
     ) -> None:
         total = len(tree)
         if total == 0:
@@ -290,19 +369,20 @@ class ImportMixin:
             if dest_win is not None:
                 dest_win._register_internal_add([dest])
 
+        title = {MODE_COPY: "コピー", MODE_CONVERT: "PDFに変換"}.get(mode, "インポート")
         progress = QProgressDialog(
-            "インポート中...",
+            "変換中..." if mode == MODE_CONVERT else f"{title}中...",
             "キャンセル",
             0,
             total,
             self,
         )
-        progress.setWindowTitle("インポート")
+        progress.setWindowTitle(title)
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
 
-        worker = ImportWorker(tree, find_soffice(), parent=self)
+        worker = ImportWorker(tree, find_soffice(), parent=self, mode=mode)
 
         def _on_progress(current: int, total_: int, filename: str) -> None:
             progress.setMaximum(max(1, total_))
@@ -317,7 +397,8 @@ class ImportMixin:
             self._active_import_worker = None
             self._active_import_progress = None
             self._end_async_operation()
-            self._on_import_finished(imported, failed, cancelled, tree)
+            self._on_import_finished(
+                imported, failed, cancelled, tree, mode=mode, unsupported=unsupported)
             self._cleanup_temp_dirs(cleanup_dirs)
             worker.deleteLater()
 
@@ -335,6 +416,9 @@ class ImportMixin:
         failed: list[tuple[str, str]],
         cancelled: bool,
         tree: list[tuple[str, str]],
+        *,
+        mode: str = MODE_IMPORT,
+        unsupported: int = 0,
     ) -> None:
         # Drop any pre-registered adds that never happened.
         imported_norm = {self._normalize_path(p) for p in imported}
@@ -393,10 +477,17 @@ class ImportMixin:
                         shutil.copy2(backup_path, dest_path)
 
             self._undo_manager.add_action(UndoAction(
-                description=f"Import {len(imported)} file(s)",
+                description=(
+                    f"Convert {len(imported)} file(s) to PDF" if mode == MODE_CONVERT
+                    else f"Import {len(imported)} file(s)"
+                ),
                 undo_func=undo_import,
                 redo_func=redo_import,
             ))
+
+        if mode == MODE_CONVERT:
+            self._show_convert_result(imported, failed, cancelled, unsupported)
+            return
 
         if failed:
             details = "\n".join(f"- {os.path.basename(s)}: {r}" for s, r in failed[:20])
@@ -410,3 +501,26 @@ class ImportMixin:
                 "インポート",
                 f"インポートはキャンセルされました ({len(imported)} 件は既に処理済み)。",
             )
+
+    def _show_convert_result(
+        self,
+        imported: list[str],
+        failed: list[tuple[str, str]],
+        cancelled: bool,
+        unsupported: int,
+    ) -> None:
+        """［PDFに変換］の完了報告（成功件数・対象外件数・失敗件数と理由の先頭 3 件）。"""
+        lines: list[str] = []
+        if imported:
+            lines.append(f"{len(imported)} 件を PDF に変換しました")
+        if unsupported:
+            lines.append(f"PDF に変換できない種類のファイル {unsupported} 件は対象外です")
+        if failed:
+            lines.append(f"{len(failed)} 件は失敗")
+            lines.extend(f"- {os.path.basename(s)}: {r}" for s, r in failed[:3])
+        if cancelled:
+            lines.append("キャンセルされました")
+        if not lines:
+            return
+        box = QMessageBox.warning if failed else QMessageBox.information
+        box(self, "PDFに変換", "\n".join(lines))

@@ -104,6 +104,8 @@ class ExportMixin:
         """
         jobs: list[tuple[str, str]] = []
         for card in self._selected_cards:
+            if not card.is_pdf:
+                continue  # PDF 以外はエクスポートの対象外
             jobs.append((card.pdf_path, os.path.basename(card.pdf_path)))
         for fc in self._selected_folder_cards:
             folder = fc.folder_path

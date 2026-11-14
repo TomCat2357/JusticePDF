@@ -27,6 +27,8 @@ from src.utils.constants import (
     PPT_EXTS as _PPT_EXTS,
 )
 
+from src.utils.file_kinds import convert_kind
+
 logger = logging.getLogger(__name__)
 
 
@@ -120,7 +122,31 @@ def _convert_office(src_path: str, dest_pdf_path: Path, soffice: str | None) -> 
 
 def _convert_image(src_path: str, dest_pdf_path: Path) -> None:
     from src.utils.pdf_utils import images_to_pdf
-    images_to_pdf([src_path], str(dest_pdf_path))
+    try:
+        images_to_pdf([src_path], str(dest_pdf_path))
+        return
+    except Exception as first_error:
+        # PyMuPDF が開けない形式（WebP など）は Qt の画像読み込みで PNG にしてから PDF 化する。
+        from PyQt6.QtGui import QImage
+        image = QImage(src_path)
+        if image.isNull():
+            raise first_error
+        with tempfile.TemporaryDirectory() as tmpdir:
+            png = os.path.join(tmpdir, "image.png")
+            if not image.save(png, "PNG"):
+                raise first_error
+            images_to_pdf([png], str(dest_pdf_path))
+
+
+def _convert_text(src_path: str, dest_pdf_path: Path) -> None:
+    from src.utils.text_to_pdf import text_to_pdf
+    text_to_pdf(src_path, str(dest_pdf_path))
+
+
+# ImportWorker の動作モード。
+MODE_IMPORT = "import"    # 従来のインポート: PDF はコピー、Office・画像は PDF に変換
+MODE_COPY = "copy"        # 変換せず、そのままコピー（ドロップ用）
+MODE_CONVERT = "convert"  # ［PDFに変換］: Office・txt・画像を PDF に変換（元は残す）
 
 
 class ImportWorker(QThread):
@@ -146,8 +172,11 @@ class ImportWorker(QThread):
         tree: list[tuple[str, str]],
         soffice: str | None,
         parent: Any = None,
+        *,
+        mode: str = MODE_IMPORT,
     ) -> None:
         super().__init__(parent)
+        self._mode = mode
         self._tree = list(tree)
         self._soffice = soffice
         self._cancel = threading.Event()
@@ -181,7 +210,19 @@ class ImportWorker(QThread):
                     dest_path = Path(dest)
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
                     ext = os.path.splitext(src)[1].lower()
-                    if ext == ".pdf":
+                    if self._mode == MODE_COPY:
+                        shutil.copy2(src, dest_path)
+                    elif self._mode == MODE_CONVERT:
+                        kind = convert_kind(src)
+                        if kind == "office":
+                            _convert_office(src, dest_path, self._soffice)
+                        elif kind == "text":
+                            _convert_text(src, dest_path)
+                        elif kind == "image":
+                            _convert_image(src, dest_path)
+                        else:
+                            raise RuntimeError(f"PDF に変換できない種類です: {ext}")
+                    elif ext == ".pdf":
                         shutil.copy2(src, dest_path)
                     elif ext in _OFFICE_EXTS:
                         _convert_office(src, dest_path, self._soffice)
@@ -193,6 +234,12 @@ class ImportWorker(QThread):
                     self.file_imported.emit(src, str(dest_path))
                 except Exception as e:
                     reason = str(e)
+                    if self._mode == MODE_CONVERT:
+                        # 変換に失敗した出力先が中途半端に残らないようにする（新規名なので消してよい）。
+                        try:
+                            Path(dest).unlink(missing_ok=True)
+                        except OSError:
+                            pass
                     failed.append((src, reason))
                     self.file_failed.emit(src, reason)
         finally:
