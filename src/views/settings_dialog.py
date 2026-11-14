@@ -59,7 +59,7 @@ class SettingsDialog(QDialog):
         # 大容量PDF(重量文書)の逐次処理に関する設定
         # ---------------------------------------------------------------
         heavy_note = QLabel(
-            "ページ数またはファイルサイズが下記を超えるPDFは、フリーズを防ぐため\n"
+            "ページ数またはファイルサイズが下記を超えるPDFは、フリーズを防ぐため"
             "表示範囲だけを逐次読み込む方式に自動的に切り替わります。"
         )
         heavy_note.setWordWrap(True)
@@ -102,7 +102,7 @@ class SettingsDialog(QDialog):
         self._save_mode_combo.setCurrentIndex(max(0, idx))
         form.addRow("編集内容の保存方法:", self._save_mode_combo)
         save_mode_note = QLabel(
-            "次に開く編集画面から有効になります。保存ボタンで保存する場合、保存するまで\n"
+            "次に開く編集画面から有効になります。保存ボタンで保存する場合、保存するまで"
             "ファイルは変更されません(アプリの終了・異常終了時は未保存の変更が失われます)。"
         )
         save_mode_note.setWordWrap(True)
