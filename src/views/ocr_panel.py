@@ -14,7 +14,6 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QProgressBar,
@@ -26,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.ocr import OCR_INSTALL_HINT
+from src.views.panel_parts import make_action_button, make_panel_shell, mark_plain_containers, section_label
 
 
 class OcrPanel(QFrame):
@@ -81,10 +81,9 @@ class OcrPanel(QFrame):
         layout.addWidget(self._toggle_btn)
 
         self._panel = QWidget()
-        panel_layout = QVBoxLayout(self._panel)
+        body = make_panel_shell(self._panel, "OCR（文字認識）", lambda: self.set_open(False))
+        panel_layout = QVBoxLayout(body)
         panel_layout.setContentsMargins(10, 10, 10, 10)
-
-        panel_layout.addWidget(QLabel("OCR"))
 
         description = QLabel(
             "スキャン画像など、文字として選択できないページを文字認識(OCR)し、"
@@ -92,43 +91,43 @@ class OcrPanel(QFrame):
             "個人情報検出の対象になります。"
         )
         description.setWordWrap(True)
-        description.setStyleSheet("color: palette(dark);")
+        description.setObjectName("panelHint")
         panel_layout.addWidget(description)
 
         # 依存(rapidocr/onnxruntime)が未導入のときの案内。導入済みなら非表示。
         self._hint_label = QLabel(OCR_INSTALL_HINT)
         self._hint_label.setWordWrap(True)
-        self._hint_label.setStyleSheet("color: #b45309;")
+        self._hint_label.setObjectName("panelWarn")
         panel_layout.addWidget(self._hint_label)
 
-        run_group = QGroupBox("文字認識を実行")
-        run_layout = QHBoxLayout(run_group)
-        self._ocr_all_btn = QPushButton("全ページをOCR")
+        panel_layout.addWidget(section_label("文字認識を実行"))
+        run_layout = QHBoxLayout()
+        self._ocr_all_btn = make_action_button("ScanText", "全ページを OCR")
         self._ocr_all_btn.setToolTip("すべてのページを文字認識して、見えないテキストとして埋め込みます。")
         self._ocr_all_btn.clicked.connect(self.ocr_all_requested.emit)
         run_layout.addWidget(self._ocr_all_btn)
-        self._ocr_page_btn = QPushButton("このページだけOCR")
+        self._ocr_page_btn = make_action_button("ScanLine", "このページだけ OCR")
         self._ocr_page_btn.setToolTip("表示中のページだけを文字認識します。")
         self._ocr_page_btn.clicked.connect(self.ocr_page_requested.emit)
         run_layout.addWidget(self._ocr_page_btn)
-        panel_layout.addWidget(run_group)
+        panel_layout.addLayout(run_layout)
 
-        clear_group = QGroupBox("OCRテキストを削除")
-        clear_layout = QHBoxLayout(clear_group)
-        self._clear_all_btn = QPushButton("全ページ")
+        panel_layout.addWidget(section_label("OCRテキストを削除"))
+        clear_layout = QHBoxLayout()
+        self._clear_all_btn = make_action_button("Trash2", "全ページ")
         self._clear_all_btn.setToolTip("すべてのページの、埋め込んだOCRテキストを削除します。")
         self._clear_all_btn.clicked.connect(self.clear_all_requested.emit)
         clear_layout.addWidget(self._clear_all_btn)
-        self._clear_page_btn = QPushButton("このページ")
+        self._clear_page_btn = make_action_button("Trash2", "このページ")
         self._clear_page_btn.setToolTip("表示中のページの、埋め込んだOCRテキストを削除します。")
         self._clear_page_btn.clicked.connect(self.clear_page_requested.emit)
         clear_layout.addWidget(self._clear_page_btn)
-        panel_layout.addWidget(clear_group)
+        panel_layout.addLayout(clear_layout)
 
         # 認識した文字を画面に重ねて表示する(表示専用。PDFの埋め込みは変えない)。
         # 色・透明度は、OCR済みの文字にも再OCRなしでいつでも反映される。
-        text_group = QGroupBox("認識した文字の表示")
-        text_layout = QVBoxLayout(text_group)
+        panel_layout.addWidget(section_label("認識した文字の表示"))
+        text_layout = QVBoxLayout()
         self._text_visible_check = QCheckBox("認識した文字を画面に重ねて表示")
         self._text_visible_check.setToolTip(
             "埋め込んだOCRテキストを、認識した行の位置に重ねて表示します。\n"
@@ -157,7 +156,7 @@ class OcrPanel(QFrame):
         self._text_transparency_label.setMinimumWidth(36)
         style_row.addWidget(self._text_transparency_label)
         text_layout.addLayout(style_row)
-        panel_layout.addWidget(text_group)
+        panel_layout.addLayout(text_layout)
         self._refresh_text_color_button()
 
         self._progress_bar = QProgressBar()
@@ -165,12 +164,13 @@ class OcrPanel(QFrame):
         panel_layout.addWidget(self._progress_bar)
         self._status_label = QLabel("")
         self._status_label.setWordWrap(True)
-        self._status_label.setStyleSheet("color: palette(dark);")
+        self._status_label.setObjectName("panelHint")
         panel_layout.addWidget(self._status_label)
 
         panel_layout.addStretch()
         layout.addWidget(self._panel)
 
+        mark_plain_containers(self._panel)
         self.set_open(False)
         self.set_available(True)
 
@@ -229,7 +229,7 @@ class OcrPanel(QFrame):
     def _refresh_text_color_button(self) -> None:
         r, g, b = (max(0, min(255, round(c * 255))) for c in self._text_color)
         self._text_color_btn.setStyleSheet(
-            f"background-color: rgb({r}, {g}, {b}); border: 1px solid palette(mid);"
+            f"background-color: rgb({r}, {g}, {b}); border: 1px solid #cbd5e1; border-radius: 4px;"
         )
 
     def _emit_text_style(self, *_args, commit: bool = True) -> None:

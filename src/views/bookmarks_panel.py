@@ -10,8 +10,10 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from PyQt6.QtCore import QEvent, QModelIndex, QObject, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QModelIndex, QObject, QRect, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFontMetrics
 from PyQt6.QtWidgets import (
+    QHeaderView,
     QAbstractItemDelegate,
     QAbstractItemView,
     QFrame,
@@ -19,8 +21,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
-    QPushButton,
     QSpinBox,
+    QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QToolButton,
@@ -31,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.utils.pdf_utils import TocEntry
+from src.views.panel_parts import flow_widget, make_panel_shell, make_small_button, mark_plain_containers
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +47,25 @@ _DEFAULT_MAX_PAGE = 99999
 # グローバルQSS(QLineEdit の padding 6px 8px 等)でインライン編集欄が潰れないよう、
 # エディタ個別に上書きする。
 _EDITOR_STYLE = (
-    "{sel} {{ padding: 0 2px; margin: 0; border: 1px solid #4f46e5;"
+    "{sel} {{ padding: 0 2px; margin: 0; border: 1px solid #2563eb;"
     " border-radius: 0; background-color: #ffffff; }}"
 )
+
+
+# 階層ごとの左端の色帯と題名の色（深さ 1〜4。それより深いものは 4 を使う）。
+_DEPTH_BAND = ("#2563eb", "#16a34a", "#ea580c", "#9333ea")
+_DEPTH_TEXT = ("#1e40af", "#166534", "#9a3412", "#6b21a8")
+_SELECTED_BG = "#dbeafe"
+_PAGE_COLUMN_WIDTH = 52
+
+
+def _index_depth(index: QModelIndex) -> int:
+    depth = 0
+    parent = index.parent()
+    while parent.isValid():
+        depth += 1
+        parent = parent.parent()
+    return depth
 
 
 class _BookmarkDelegate(QStyledItemDelegate):
@@ -63,16 +82,53 @@ class _BookmarkDelegate(QStyledItemDelegate):
         size = super().sizeHint(option, index)
         return QSize(size.width(), max(size.height(), _MIN_ROW_HEIGHT))
 
+    def paint(self, painter, option, index) -> None:
+        """題名（左端に階層色の帯・階層色の文字）とページ番号（右寄せ・灰色）を描く。"""
+        rect: QRect = option.rect
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        painter.save()
+        if selected:
+            painter.fillRect(rect, QColor(_SELECTED_BG))
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(rect, QColor("#f1f5f9"))
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        kind = index.data(_NODE_KIND_ROLE)
+        if index.column() == 1:
+            painter.setPen(QColor("#64748b"))
+            painter.drawText(
+                rect.adjusted(0, 0, -6, 0),
+                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                text,
+            )
+        else:
+            depth = min(_index_depth(index), len(_DEPTH_BAND) - 1)
+            if kind is None:
+                band, color = QColor(_DEPTH_BAND[depth]), QColor(_DEPTH_TEXT[depth])
+            else:
+                band, color = QColor("#94a3b8"), QColor("#475569")
+            painter.fillRect(QRect(rect.left(), rect.top() + 2, 3, rect.height() - 4), band)
+            painter.setPen(color)
+            text_rect = rect.adjusted(9, 0, -4, 0)
+            elided = QFontMetrics(option.font).elidedText(
+                text, Qt.TextElideMode.ElideRight, max(0, text_rect.width())
+            )
+            painter.drawText(
+                text_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), elided
+            )
+        painter.restore()
+
     def createEditor(self, parent, option, index):
         if index.column() == 1:
             spin = QSpinBox(parent)
             spin.setRange(1, self._panel._max_page())
             spin.setStyleSheet(_EDITOR_STYLE.format(sel="QSpinBox"))
             spin.setMinimumHeight(_MIN_ROW_HEIGHT)
+            spin.installEventFilter(self._panel)  # F2/Delete を窓のショートカットに取られない
             return spin
         edit = QLineEdit(parent)
         edit.setStyleSheet(_EDITOR_STYLE.format(sel="QLineEdit"))
         edit.setMinimumHeight(_MIN_ROW_HEIGHT)
+        edit.installEventFilter(self._panel)
         return edit
 
     def setEditorData(self, editor, index) -> None:
@@ -158,15 +214,49 @@ class BookmarksPanel(QFrame):
         layout.addWidget(self._toggle_btn)
 
         self._panel = QWidget()
-        panel_layout = QVBoxLayout(self._panel)
+        body = make_panel_shell(self._panel, "しおり", lambda: self.set_open(False))
+        panel_layout = QVBoxLayout(body)
         panel_layout.setContentsMargins(10, 10, 10, 10)
 
-        panel_layout.addWidget(QLabel("しおり"))
+        hint = QLabel("ダブルクリックまたは F2 で名前・ページを編集")
+        hint.setObjectName("bookmarksHint")
+        hint.setWordWrap(True)
+        panel_layout.addWidget(hint)
+
+        # 追加 / 削除 / 名前変更 / 階層 / 並べ替え / 展開・折りたたみ（幅に収まらなければ折り返す）
+        self._add_btn = make_small_button("Plus", "追加", "現在のページにしおりを追加し、名前を入力します")
+        self._add_btn.clicked.connect(self._on_add)
+        self._delete_btn = make_small_button("Trash2", "削除", "選択中のしおりを削除します(Delete キー)")
+        self._delete_btn.clicked.connect(self._on_delete)
+        self._rename_btn = make_small_button("Pencil", "名前変更", "選択中のしおりの名前を編集します(F2)")
+        self._rename_btn.clicked.connect(lambda: self._start_title_edit(self._tree.currentItem()))
+        self._promote_btn = make_small_button("ArrowLeft", "昇格", "階層を一つ上げます")
+        self._promote_btn.clicked.connect(self._on_promote)
+        self._demote_btn = make_small_button("ArrowRight", "降格", "直前のしおりの子にします")
+        self._demote_btn.clicked.connect(self._on_demote)
+        self._up_btn = make_small_button("ArrowUp", "上へ", "同じ階層で一つ上へ移動します")
+        self._up_btn.clicked.connect(lambda: self._move_within_siblings(-1))
+        self._down_btn = make_small_button("ArrowDown", "下へ", "同じ階層で一つ下へ移動します")
+        self._down_btn.clicked.connect(lambda: self._move_within_siblings(1))
+        self._expand_btn = make_small_button("ChevronsUpDown", "", "すべて展開")
+        self._collapse_btn = make_small_button("ChevronsDownUp", "", "すべて折りたたむ")
+        # 旧名の互換エイリアス(「現在ページに追加」ボタンは「追加」に統合)
+        self._add_current_btn = self._add_btn
+        panel_layout.addWidget(flow_widget(
+            self._add_btn, self._delete_btn, self._rename_btn, self._promote_btn,
+            self._demote_btn, self._up_btn, self._down_btn, self._expand_btn, self._collapse_btn,
+        ))
 
         self._tree = QTreeWidget()
+        self._tree.setObjectName("bookmarksTree")
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["タイトル", "ページ"])
-        self._tree.setColumnWidth(0, 200)
+        self._tree.setHeaderHidden(True)
+        self._tree.header().setStretchLastSection(False)
+        self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self._tree.header().resizeSection(1, _PAGE_COLUMN_WIDTH)
+        self._tree.setMouseTracking(True)
         self._tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._tree.itemClicked.connect(self._on_item_clicked)
@@ -179,52 +269,12 @@ class BookmarksPanel(QFrame):
         self._delegate.closeEditor.connect(self._on_close_editor)
         self._tree.installEventFilter(self)
         panel_layout.addWidget(self._tree, 1)
-
-        hint = QLabel("ダブルクリックまたは F2 で名前・ページを編集")
-        hint.setObjectName("bookmarksHint")
-        hint.setWordWrap(True)
-        panel_layout.addWidget(hint)
-
-        # 追加/削除
-        add_row = QHBoxLayout()
-        self._add_btn = QPushButton("追加")
-        self._add_btn.setToolTip("現在のページにしおりを追加し、名前を入力します")
-        self._add_btn.clicked.connect(self._on_add)
-        add_row.addWidget(self._add_btn)
-        self._delete_btn = QPushButton("削除")
-        self._delete_btn.setToolTip("選択中のしおりを削除します(Delete キー)")
-        self._delete_btn.clicked.connect(self._on_delete)
-        add_row.addWidget(self._delete_btn)
-        panel_layout.addLayout(add_row)
-        # 旧名の互換エイリアス(「現在ページに追加」ボタンは「追加」に統合)
-        self._add_current_btn = self._add_btn
-
-        # 階層
-        move_row = QHBoxLayout()
-        self._promote_btn = QPushButton("← 昇格")
-        self._promote_btn.setToolTip("階層を一つ上げます")
-        self._promote_btn.clicked.connect(self._on_promote)
-        move_row.addWidget(self._promote_btn)
-        self._demote_btn = QPushButton("降格 →")
-        self._demote_btn.setToolTip("直前のしおりの子にします")
-        self._demote_btn.clicked.connect(self._on_demote)
-        move_row.addWidget(self._demote_btn)
-        panel_layout.addLayout(move_row)
-
-        # 並べ替え
-        order_row = QHBoxLayout()
-        self._up_btn = QPushButton("↑ 上へ")
-        self._up_btn.setToolTip("同じ階層で一つ上へ移動します")
-        self._up_btn.clicked.connect(lambda: self._move_within_siblings(-1))
-        order_row.addWidget(self._up_btn)
-        self._down_btn = QPushButton("↓ 下へ")
-        self._down_btn.setToolTip("同じ階層で一つ下へ移動します")
-        self._down_btn.clicked.connect(lambda: self._move_within_siblings(1))
-        order_row.addWidget(self._down_btn)
-        panel_layout.addLayout(order_row)
+        self._expand_btn.clicked.connect(lambda: self._tree.expandAll())
+        self._collapse_btn.clicked.connect(lambda: self._tree.collapseAll())
 
         layout.addWidget(self._panel)
 
+        mark_plain_containers(self._panel)
         self.set_open(False)
         self._update_button_states()
 
@@ -554,6 +604,16 @@ class BookmarksPanel(QFrame):
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         # F2=タイトル編集、Delete=削除(ツリーにフォーカスがある間のみ)。
+        if event.type() == QEvent.Type.ShortcutOverride and (
+            obj is self._tree or isinstance(obj, (QLineEdit, QSpinBox))
+        ):
+            # 窓の F2(ファイル名変更)・Delete(ページ削除)より先に、ツリーで受け取る。
+            if (
+                event.key() in (Qt.Key.Key_F2, Qt.Key.Key_Delete)
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            ):
+                event.accept()
+                return True
         if obj is self._tree and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             if key == Qt.Key.Key_F2:
@@ -811,7 +871,7 @@ class BookmarksPanel(QFrame):
         # 閲覧専用(見開き表示)中は、作成系も含めた全編集ボタンを無効化する。
         if self._read_only:
             for btn in (
-                self._add_btn, self._delete_btn, self._promote_btn,
+                self._add_btn, self._delete_btn, self._rename_btn, self._promote_btn,
                 self._demote_btn, self._up_btn, self._down_btn,
             ):
                 btn.setEnabled(False)
@@ -822,13 +882,14 @@ class BookmarksPanel(QFrame):
         # 付箋ノードはしおり編集の対象外。
         if item is not None and self._is_note_node(item):
             for btn in (
-                self._delete_btn, self._promote_btn,
+                self._delete_btn, self._rename_btn, self._promote_btn,
                 self._demote_btn, self._up_btn, self._down_btn,
             ):
                 btn.setEnabled(False)
             return
         has_selection = item is not None
         self._delete_btn.setEnabled(has_selection)
+        self._rename_btn.setEnabled(has_selection)
 
         can_promote = has_selection and item.parent() is not None
         self._promote_btn.setEnabled(bool(can_promote))

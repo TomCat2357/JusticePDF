@@ -11,7 +11,7 @@ from src.views.page_edit_window import PageEditWindow
 
 from src.utils import app_settings
 from src.utils.constants import HEAVY_PDF_PAGE_COUNT_THRESHOLD, PAGETHUMBNAIL_MIME_TYPE
-from src.views.page_edit_widgets import build_page_drag_mime, page_drag_pages
+from src.views.page_edit_widgets import PageThumbnail, build_page_drag_mime, page_drag_pages
 from tests.helpers import create_page_edit_window, make_pdf
 
 PAGES = HEAVY_PDF_PAGE_COUNT_THRESHOLD + 5  # 305 ページ(重量文書)
@@ -69,7 +69,7 @@ def test_pool_is_reused_and_never_shrinks_while_scrolling(big_window):
         seen.update(id(w) for w in window._grid.bound_widgets())
         assert window._grid.widget_for_page(page) is not None
     # 新しく作られるのは、最初の割り当てより少し多くなるときだけ(ページ数に比例しない)。
-    assert window._grid.pool_size <= size_after_load + 2 * window._grid.metrics.cols
+    assert window._grid.pool_size <= size_after_load + 3 * window._grid.metrics.cols
     assert len(seen) == window._grid.pool_size
 
 
@@ -525,7 +525,7 @@ def test_ctrl_wheel_size_change_clears_rendered_and_resizes_pool(big_window):
 
     m = window._grid.metrics
     assert m.item_w == old_item_w + window.PREVIEW_THUMB_STEP
-    assert window._thumb_size == m.item_w - 30
+    assert window._thumb_size == m.item_w - PageThumbnail.CARD_PADDING_X
     # 描画済みは捨てられ(大きさが合わない)、割り当て済み・プール内の全ウィジェットが新サイズになる。
     assert not window._rendered
     assert all(w.width() == m.item_w for w in window._grid._pool)

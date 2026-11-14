@@ -210,8 +210,6 @@ def test_continuous_off_shape_is_one_shot_and_selects_created(qtbot, tmp_path, s
 
     qtbot.mouseClick(window._shape_buttons[shape_type], Qt.MouseButton.LeftButton)
     assert window._create_mode is CreateMode.SHAPE
-    # ドロワーは図形ボタンで開くので、いったん閉じて作成で開き直ることを確かめる。
-    window._set_zoom_annotation_drawer_open(False)
 
     _drag(qtbot, window, _DRAG_1)
     qtbot.waitUntil(lambda: _shape_count(pdf_path) == 1)
@@ -232,7 +230,6 @@ def test_continuous_off_bracket_both_sides_is_one_shot(qtbot, tmp_path):
     window, pdf_path = _open_window(qtbot, tmp_path)
     qtbot.mouseClick(window._shape_buttons[ShapeType.BRACKET], Qt.MouseButton.LeftButton)
     window._zoom_shape_bracket_both_cb.setChecked(True)
-    window._set_zoom_annotation_drawer_open(False)
 
     _drag(qtbot, window, _DRAG_1)
     qtbot.waitUntil(lambda: _shape_count(pdf_path) == 2)
@@ -249,7 +246,6 @@ def test_continuous_off_note_is_one_shot_and_focuses_editor(qtbot, tmp_path):
 
     qtbot.mouseClick(window._zoom_note_btn, Qt.MouseButton.LeftButton)
     assert window._create_mode is CreateMode.NOTE
-    window._set_zoom_annotation_drawer_open(False)
 
     _click(qtbot, window, 200, 200)
     qtbot.waitUntil(lambda: _note_count(pdf_path) == 1)

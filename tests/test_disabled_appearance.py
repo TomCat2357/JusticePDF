@@ -1,11 +1,9 @@
-from pathlib import Path
-
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QSlider
 
 from src.views.page_edit_annotations import _ColorSwatchButton
+from src.views.theme import load_app_stylesheet
 
-_QSS = Path(__file__).resolve().parent.parent / "src" / "views" / "style.qss"
 
 
 def _grab_center(widget) -> QColor:
@@ -26,7 +24,7 @@ def test_swatch_disabled_is_lighter_than_enabled(qtbot):
 
 
 def test_slider_disabled_rules_in_qss(qapp, qtbot):
-    text = _QSS.read_text(encoding="utf-8")
+    text = load_app_stylesheet()
     assert "QSlider::sub-page:horizontal:disabled" in text
     assert "QSlider::groove:horizontal:disabled" in text
     qapp.setStyleSheet(text)

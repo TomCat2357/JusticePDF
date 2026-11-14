@@ -1,0 +1,150 @@
+/* =========================================================================
+ * 右のドロワー類（注釈・しおり・OCR・個人情報）
+ * ========================================================================= */
+
+/* Annotation drawer panel in page edit window */
+QFrame#annotationDrawer,
+QFrame#bookmarksDrawer,
+QFrame#piiDrawer,
+QFrame#ocrDrawer {
+    background-color: @white@;
+    border: none;
+    border-left: 1px solid @slate-300@;
+}
+
+/* ---------- 個人情報検出: 結果一覧の選択行 ------------------------------- */
+/* 既定の選択色は薄く、フォーカスが外れると灰色になって見づらいため、
+   フォーカスの有無に関わらずアクセント色でくっきり表示する。 */
+QTreeWidget#piiResultTree::item:selected,
+QTreeWidget#piiResultTree::item:selected:!active {
+    background-color: @blue-600@;
+    color: @white@;
+}
+QTreeWidget#piiResultTree::item:hover:!selected {
+    background-color: @blue-50@;
+}
+
+/* ---------- パネル共通: 見出し・節・ボタン ------------------------------- */
+QFrame#panelHeader {
+    background-color: @slate-50@;
+    border: none;
+    border-bottom: 1px solid @slate-300@;
+}
+QLabel#panelTitle {
+    font-size: 14px;
+    font-weight: 700;
+    color: @slate-800@;
+}
+QToolButton#panelClose {
+    border: none;
+    border-radius: 4px;
+    padding: 2px;
+    background: transparent;
+}
+QToolButton#panelClose:hover { background-color: @slate-200@; }
+QWidget#panelBody { background-color: @white@; }
+/* アプリ全体の QWidget の薄灰の地を、パネルの中の入れ物・文字・チェック・スライダーでは消す */
+QWidget[panelPlain="true"],
+QWidget#panelBody QLabel,
+QWidget#panelBody QCheckBox,
+QWidget#panelBody QSlider { background-color: transparent; }
+QWidget#panelBody { background-color: @white@; }
+
+QLabel#panelSection {
+    font-size: 13px;
+    font-weight: 700;
+    color: @slate-700@;
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid @slate-300@;
+}
+QLabel#panelHint, QLabel#bookmarksHint { color: @slate-500@; font-size: 12px; }
+QLabel#panelWarn { color: @warn@; font-size: 12px; }
+QLabel#panelIconLabel { background: transparent; }
+QFrame#panelToolSep { background-color: @slate-300@; border: none; }
+
+/* アイコンだけのツールボタン（32x28）。押下中は青地・白アイコン */
+QToolButton[panelTool="true"] {
+    background-color: @white@;
+    border: 1px solid @slate-300@;
+    border-radius: 4px;
+    padding: 0;
+}
+QToolButton[panelTool="true"]:hover { background-color: @slate-100@; }
+QToolButton[panelTool="true"]:checked,
+QToolButton[panelTool="true"]:checked:hover {
+    background-color: @blue-600@;
+    border-color: @blue-700@;
+}
+QToolButton[panelTool="true"]:disabled { background-color: @slate-50@; border-color: @slate-200@; }
+
+/* アイコン + 短い文字の小さなボタン（しおり） */
+QToolButton[panelSmall="true"] {
+    background-color: @white@;
+    border: 1px solid @slate-300@;
+    border-radius: 4px;
+    padding: 3px 6px;
+    color: @slate-700@;
+}
+QToolButton[panelSmall="true"]:hover { background-color: @slate-100@; }
+QToolButton[panelSmall="true"]:disabled { color: @slate-400@; background-color: @slate-50@; }
+
+/* アイコン + 文字の操作ボタン（検出・OCR・削除・設定・エクスポート） */
+QToolButton[panelAction] {
+    background-color: @white@;
+    border: 1px solid @slate-300@;
+    border-radius: 4px;
+    padding: 4px 8px;
+    color: @slate-700@;
+}
+QToolButton[panelAction]:hover { background-color: @slate-100@; }
+QToolButton[panelAction]:disabled { color: @slate-400@; background-color: @slate-50@; }
+QToolButton[panelAction="primary-green"] {
+    background-color: #059669;
+    border-color: #047857;
+    color: @white@;
+    font-weight: 700;
+}
+QToolButton[panelAction="primary-green"]:hover { background-color: #047857; }
+QToolButton[panelAction="primary-green"]:disabled {
+    background-color: #a7d7c5;
+    border-color: #a7d7c5;
+    color: @white@;
+}
+
+/* 注釈パネル: 連続トグル（ON で青塗り） */
+QToolButton#markupContinuous {
+    background-color: @white@;
+    border: 1px solid @slate-300@;
+    border-radius: 4px;
+    padding: 2px 6px;
+}
+QToolButton#markupContinuous:hover { background-color: @slate-100@; }
+QToolButton#markupContinuous:checked { background-color: @blue-600@; border-color: @blue-700@; }
+
+/* 一覧の地は 3 つとも白に揃える */
+QTreeWidget#piiResultTree,
+QListWidget#noteList {
+    background-color: @white@;
+}
+
+/* しおり */
+QTreeWidget#bookmarksTree {
+    background-color: @white@;
+    border: 1px solid @slate-300@;
+    border-radius: 4px;
+}
+
+/* 注釈パネル: 「追加」の見出し行（右端に連続トグル） */
+QFrame#additionHeaderRow {
+    background-color: transparent;
+    margin-top: 8px;
+    border: none;
+    border-top: 1px solid @slate-300@;
+}
+QLabel#panelSectionPlain {
+    font-size: 13px;
+    font-weight: 700;
+    color: @slate-700@;
+    border: none;
+}

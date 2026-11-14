@@ -1,0 +1,142 @@
+/* =========================================================================
+ * 個別画面（ページ一覧・拡大表示）: ページのサムネイル・拡大ビューのボタン
+ * ========================================================================= */
+
+/* ページ一覧の背景(スクロール領域に objectName を付けたとき用の受け皿) */
+QScrollArea#pageEditScroll,
+QScrollArea#pageEditScroll > QWidget > QWidget {
+    background-color: @slate-200@;
+}
+
+/* ---------- PageThumbnail ------------------------------------------------
+ * 地・輪（選択・検索ヒット・ドロップ先）は PageThumbnail.paintEvent が描く
+ * （状態が変わっても中身がずれないようコードで決めている）。ここでは一覧の背景だけ。 */
+
+/* ラバーバンド: 青 1px の枠 + 15% の塗り */
+QRubberBand {
+    border: 1px solid @blue-600@;
+    background-color: rgba(37, 99, 235, 0.15);
+}
+
+/* 拡大ビューの背景（Justice Desk: slate-500 の 80%。紙の白と区別する） */
+QScrollArea#pageEditZoomScroll,
+QScrollArea#pageEditZoomScroll > QWidget > QWidget {
+    background-color: #808ea1;
+}
+
+/* Zoom view navigation buttons (prev/next in page edit window) */
+QToolButton#zoomNav {
+    background-color: @white@;
+    border: 1px solid @slate-300@;
+    border-radius: 4px;
+    padding: 4px;
+}
+QToolButton#zoomNav:hover    { background-color: @slate-100@; }
+QToolButton#zoomNav:pressed  { background-color: @slate-200@; }
+QToolButton#zoomNav:disabled { background-color: @slate-100@; border-color: @slate-300@; }
+QToolButton#zoomNav::arrow   { width: 18px; height: 18px; }
+
+/* 拡大ビューの枠付きボタン（Justice Desk の box 変種） */
+QToolButton[variant="box"],
+QToolBar QToolButton[variant="box"] {
+    background-color: @white@;
+    border: 1px solid @slate-300@;
+    border-radius: 4px;
+    padding: 4px 10px;
+    min-height: 18px;
+    font-size: 13px;
+    font-weight: normal;
+    color: @slate-700@;
+}
+QToolButton[variant="box"]:hover,
+QToolBar QToolButton[variant="box"]:hover   { background-color: @slate-100@; }
+QToolButton[variant="box"]:checked,
+QToolBar QToolButton[variant="box"]:checked {
+    background-color: @blue-100@;
+    border: 1px solid @blue-500@;
+}
+QToolButton[variant="box"]:pressed,
+QToolBar QToolButton[variant="box"]:pressed { background-color: @slate-200@; }
+QToolButton[variant="box"]:disabled,
+QToolBar QToolButton[variant="box"]:disabled { color: @slate-400@; background-color: @white@; }
+QToolButton[variant="box"]::menu-indicator,
+QToolBar QToolButton[variant="box"]::menu-indicator { image: none; width: 0; }
+
+/* 選択モードの 3 連ボタン（つながった角丸グループ） */
+QToolBar QToolButton[variant="box"][seg="first"] {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+QToolBar QToolButton[variant="box"][seg="mid"] {
+    border-radius: 0;
+    border-left-width: 0;
+}
+QToolBar QToolButton[variant="box"][seg="last"] {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left-width: 0;
+}
+QToolBar QToolButton[variant="box"]:checked {
+    background-color: @blue-100@;
+    border: 1px solid @blue-500@;
+    color: @blue-700@;
+}
+
+/* 倍率の「100%」▼（▼は paintEvent で描くので右に空ける） */
+QToolBar QToolButton#zoomPercent {
+    padding: 4px 24px 4px 10px;
+    min-width: 36px;
+}
+
+/* 拡大ビュー用の 1 段ツールバー（地は slate-50） */
+QToolBar#pageEditZoomToolbar {
+    background-color: @slate-50@;
+    border-bottom: 1px solid @slate-300@;
+    padding: 6px 8px;
+    spacing: 6px;
+}
+QLineEdit#zoomPageEdit {
+    padding: 4px 4px;
+    min-height: 18px;
+    background-color: @white@;
+}
+QLabel#zoomPageTotal {
+    color: @slate-500@;
+    font-size: 12px;
+    padding: 0 6px 0 2px;
+}
+
+/* ページ一覧ツールバー右端のファイル名・ページ数 */
+QLabel#pageEditDocName {
+    color: @slate-600@;
+    font-size: 12px;
+    margin-left: 12px;
+}
+QLabel#pageEditPageCount {
+    color: @slate-500@;
+    font-size: 12px;
+    margin-left: 6px;
+    margin-right: 4px;
+}
+
+/* 検索バー（ツールバー直下） */
+QWidget#searchBar {
+    background-color: @white@;
+    border-bottom: 1px solid @slate-300@;
+}
+QWidget#searchBar QLabel {
+    background: transparent;
+}
+QWidget#searchBar QLabel#searchStatus {
+    color: @slate-600@;
+    font-size: 12px;
+}
+
+/* ツールバーの中の部品は、アプリ全体の QWidget 地色を引き継がず透明に */
+QWidget#toolbarSpacer,
+QWidget#selectGroup,
+QLabel#pageEditDocName,
+QLabel#pageEditPageCount,
+QLabel#zoomPageTotal {
+    background: transparent;
+}

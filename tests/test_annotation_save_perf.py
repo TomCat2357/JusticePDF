@@ -299,7 +299,7 @@ def test_annotation_undo_redo_does_not_reload_pages_but_page_ops_do(qtbot, tmp_p
     assert window._zoom_annotations == []
 
     # ページ操作(回転)の Undo/Redo は従来どおり _load_pages を呼ぶ。
-    window._rotate_zoom_page()
+    window._rotate_pages_by(90)
     assert window._undo_manager.peek_undo().affects_pages is True
     loads.clear()
     window._on_undo()

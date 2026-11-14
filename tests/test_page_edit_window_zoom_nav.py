@@ -163,7 +163,7 @@ def test_zoom_preset_dropdown_sets_percent_and_button_text(qtbot, tmp_path):
 
     menu = window._zoom_reset_btn.menu()
     assert menu is not None
-    labels = [action.text() for action in menu.actions()]
+    labels = [action.text() for action in menu.actions() if action.text().endswith("%")]
     assert labels == [f"{p}%" for p in window.ZOOM_PRESETS]
 
     # メニュー項目を発火させると倍率とボタン表示が更新される。

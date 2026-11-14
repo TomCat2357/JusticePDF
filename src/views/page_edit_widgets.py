@@ -52,6 +52,7 @@ from src.utils.pdf_utils import (
     NoteAnnotData,
 )
 from src.views.ocr_overlay import paint_ocr_lines
+from src.views.theme import COLORS
 from src.utils.constants import (
     FREETEXT_LINE_HEIGHT,
     FREETEXT_TEXT_INSET_PT,
@@ -326,14 +327,7 @@ class _PiiOverlayLabel(QLabel):
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().paintEvent(event)
         pix = self.pixmap()
-        page_w, page_h = self._pii_page_size
-        if (
-            not self._pii_targets
-            or pix is None
-            or pix.isNull()
-            or page_w <= 0
-            or page_h <= 0
-        ):
+        if pix is None or pix.isNull():
             return
         dpr = pix.devicePixelRatio() or 1.0
         logical_w = pix.width() / dpr
@@ -343,6 +337,22 @@ class _PiiOverlayLabel(QLabel):
             content.x() + (content.width() - logical_w) / 2.0,
             content.y() + (content.height() - logical_h) / 2.0,
         )
+        # 紙の縁取り（Justice Desk の「白地 + 薄い影」の代わりに、薄い影の線と 1px の枠）。
+        page_rect = QRectF(offset[0], offset[1], logical_w, logical_h)
+        edge = QPainter(self)
+        try:
+            x0, y0 = page_rect.left(), page_rect.top()
+            x1, y1 = page_rect.right(), page_rect.bottom()
+            edge.setPen(QColor(0, 0, 0, 40))
+            edge.drawLine(QPointF(x1 + 0.5, y0 + 1.5), QPointF(x1 + 0.5, y1 + 0.5))
+            edge.drawLine(QPointF(x0 + 1.5, y1 + 0.5), QPointF(x1 + 0.5, y1 + 0.5))
+            edge.setPen(QColor("#cbd5e1"))
+            edge.drawRect(QRectF(x0 + 0.5, y0 + 0.5, logical_w - 1.0, logical_h - 1.0))
+        finally:
+            edge.end()
+        page_w, page_h = self._pii_page_size
+        if not self._pii_targets or page_w <= 0 or page_h <= 0:
+            return
         color, opacity, hidden = self._pii_style
         painter = QPainter(self)
         try:
@@ -381,7 +391,25 @@ class PageThumbnail(QFrame):
     double_clicked = pyqtSignal(int)
     drag_requested = pyqtSignal(int)
     THUMBNAIL_SIZE = 120
-    CARD_PADDING = 30  # total horizontal/vertical padding around the thumbnail
+    # カードの余白（Justice Desk: padding 8）。選択などの輪は余白の外側に描くので、
+    # 状態が変わっても中身はずれない。
+    CARD_MARGIN = 8
+    NUMBER_GAP = 4
+    NUMBER_HEIGHT = 16  # ページ番号（12px）の行
+    CARD_PADDING_X = 2 * CARD_MARGIN
+    CARD_PADDING_Y = 2 * CARD_MARGIN + NUMBER_GAP + NUMBER_HEIGHT
+    CARD_PADDING = CARD_PADDING_X  # 旧名（横方向の余白）
+    CARD_RADIUS = 6
+    # 状態 -> (地の色トークン, 輪の太さ, 輪の色トークン)。輪が無いときは太さ 0。
+    _STATE_PAINT = {
+        "normal": ("page-card-bg", 0, None),
+        "selected": ("select-bg", 3, "select-ring"),
+        "droptarget": ("dnd-bg", 3, "dnd-ring"),
+        "search_hit": ("hit-bg", 4, "hit-ring"),
+        "selected_hit": ("hit-bg", 3, "select-ring"),
+        "current_hit": ("hit-bg", 5, "hit-current-ring"),
+        "selected_current": ("select-bg", 5, "hit-current-ring"),
+    }
 
     def __init__(self, pdf_path: str, page_num: int = -1, display_num: int = None, parent=None, *, thumb_size: int | None = None):
         super().__init__(parent)
@@ -400,40 +428,42 @@ class PageThumbnail(QFrame):
 
     def _setup_ui(self) -> None:
         """Set up the thumbnail UI in the same style as PDFCard."""
-        self.setFixedSize(self._thumb_size + self.CARD_PADDING, self._thumb_size + self.CARD_PADDING)
-        self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
-        self.setLineWidth(1)
+        self.setFixedSize(
+            self._thumb_size + self.CARD_PADDING_X, self._thumb_size + self.CARD_PADDING_Y
+        )
+        self.setFrameStyle(QFrame.Shape.NoFrame)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
+        m = self.CARD_MARGIN
+        layout.setContentsMargins(m, m, m, m)
+        layout.setSpacing(self.NUMBER_GAP)
 
         self._thumbnail_container = QWidget()
         self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
+        # アプリ全体の QSS が QWidget に地色を付けるので、カードの地が見えるよう透明にする。
+        self._thumbnail_container.setStyleSheet("background: transparent;")
 
         self._image_label = _PiiOverlayLabel(self._thumbnail_container)
         self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._image_label.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
+        # 背景は透明（紙の白と縁取りは画像側で描く）。
+        self._image_label.setStyleSheet("background: transparent; border: none;")
         self._image_label.move(0, 0)
-
-        # Page-number badge in the top-right, matching PDFCard's page-count badge.
-        self._number_label = QLabel(str(self._display_num + 1), self._thumbnail_container)
-        self._number_label.setStyleSheet(
-            "background-color: rgba(0, 0, 0, 0.7); color: white; padding: 2px 5px; border-radius: 3px; font-size: 11px;"
-        )
-        self._number_label.adjustSize()
-        self._number_label.move(self._thumb_size - self._number_label.width() - 3, 3)
-        self._number_label.raise_()
 
         layout.addWidget(self._thumbnail_container, alignment=Qt.AlignmentFlag.AlignCenter)
 
+        # ページ番号はサムネイルの下（12px・やや太字・slate-700）。
+        self._number_label = QLabel(str(self._display_num + 1), self)
+        self._number_label.setObjectName("pageNumber")
+        self._number_label.setFixedHeight(self.NUMBER_HEIGHT)
+        self._number_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._number_label.setStyleSheet(
+            "background: transparent; border: none; color: #334155; font-size: 12px; font-weight: 500;"
+        )
+        layout.addWidget(self._number_label)
+
         self.invalidate_thumbnail()
         self._update_style()
-
-    def _reposition_number_badge(self) -> None:
-        self._number_label.adjustSize()
-        self._number_label.move(self._thumb_size - self._number_label.width() - 3, 3)
 
     # --- ページへの割り当て(プール内で使い回す) -----------------------
     def bind(self, page_num: int, display_num: int | None = None, pdf_path: str | None = None) -> None:
@@ -446,7 +476,6 @@ class PageThumbnail(QFrame):
         if display != self._display_num:
             self._display_num = display
             self._number_label.setText(str(display + 1))
-            self._reposition_number_badge()
 
     def unbind(self) -> None:
         """ページへの割り当てを解く。画像・塗りつぶし重ね描き・状態を空に戻す(隠すのは呼び出し側)。"""
@@ -537,10 +566,31 @@ class PageThumbnail(QFrame):
         return "normal"
 
     def _update_style(self) -> None:
-        """選択・ドロップ先・検索ヒット・現在のヒットの組み合わせに応じてスタイルを更新する。"""
+        """選択・ドロップ先・検索ヒット・現在のヒットの組み合わせに応じて再描画する。
+
+        地と輪は paintEvent で描く（輪の太さが変わっても中身の位置は動かない）。
+        ``state`` はテスト・確認用に残す。
+        """
         self.setProperty("state", self._style_state())
-        self.style().unpolish(self)
-        self.style().polish(self)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
+        bg_key, ring_w, ring_key = self._STATE_PAINT[self._style_state()]
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            rect = QRectF(self.rect())
+            r = float(self.CARD_RADIUS)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLORS[bg_key]))
+            painter.drawRoundedRect(rect, r, r)
+            if ring_w and ring_key:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(COLORS[ring_key]), ring_w))
+                half = ring_w / 2.0
+                painter.drawRoundedRect(rect.adjusted(half, half, -half, -half), r, r)
+        finally:
+            painter.end()
 
     @property
     def is_search_hit(self) -> bool:
@@ -580,10 +630,11 @@ class PageThumbnail(QFrame):
         if size == self._thumb_size:
             return
         self._thumb_size = size
-        self.setFixedSize(self._thumb_size + self.CARD_PADDING, self._thumb_size + self.CARD_PADDING)
+        self.setFixedSize(
+            self._thumb_size + self.CARD_PADDING_X, self._thumb_size + self.CARD_PADDING_Y
+        )
         self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
         self._image_label.setFixedSize(self._thumb_size, self._thumb_size)
-        self._reposition_number_badge()
         self.invalidate_thumbnail()
         self.updateGeometry()
 
@@ -709,6 +760,8 @@ class ZoomPageWidget(QWidget):
     zoom_region_requested = pyqtSignal(object)
     # ページ上でマウス操作が始まる直前の通知(フォームの未確定の編集を先に確定させるため)。
     interaction_started = pyqtSignal()
+    # 右クリック(動かさずに離した)の通知。引数はウィジェット内の座標。メニューは持ち主が作る。
+    context_requested = pyqtSignal(QPoint)
 
     HANDLE_SIZE = 10
     # 付箋アイコンの画面上の固定サイズ（px）。ズームに依らず一定。
@@ -798,11 +851,17 @@ class ZoomPageWidget(QWidget):
         self._search_hit_rects: list[QRectF] = []
         # 中ボタンドラッグによるパン（つかんで移動）状態。
         self._pan_active = False
+        self._pan_button = Qt.MouseButton.MiddleButton
         self._pan_last_global: QPoint | None = None
+        # 選択モード(T/V/H): None=文字も注釈も選べる / "text"=文字だけ / "obj"=注釈だけ / "hand"=ページつかみ。
+        # Space を押している間だけ手のひら(_space_hand)。
+        self._select_mode: str | None = None
+        self._space_hand = False
         # 右ドラッグによる範囲指定拡大（マーキーズーム）状態。
         self._marquee_active = False
         self._marquee_origin: QPoint | None = None
         self._marquee_rect: QRect | None = None
+        self._marquee_moved = False
         # 付箋（ノート）配置モードとホバーポップアップ状態。
         self._note_create_mode = False
         self._hover_note_xref: int | None = None
@@ -895,6 +954,42 @@ class ZoomPageWidget(QWidget):
         self._text_select_only_cursor = cursor
         self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
         self.update()
+
+    def set_select_mode(self, mode: str | None) -> None:
+        """選択モード(None / "text" / "obj" / "hand")を切り替える。"""
+        self._select_mode = mode if mode in ("text", "obj", "hand") else None
+        if self._select_mode == "hand":
+            self.cancel_annotation_paste_mode()
+        self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+        self.update()
+
+    def select_mode(self) -> str | None:
+        return self._select_mode
+
+    def _hand_active(self) -> bool:
+        return self._select_mode == "hand" or self._space_hand
+
+    def _text_only_effective(self) -> bool:
+        """文字だけを選ぶ状態か(連続マーカーの専用モード、または T モード)。"""
+        return self._text_select_only_mode or self._select_mode == "text"
+
+    def annotation_at(self, pos: QPoint):
+        """ウィジェット座標 pos の注釈(無ければ None)。右クリックメニューの対象判定用。"""
+        if self._view_only:
+            return None
+        annot, _handle = self._annotation_hit_test(pos)
+        return annot
+
+    def text_selection_contains(self, pos: QPoint) -> bool:
+        """選んでいる文字の上に pos があるか。"""
+        if not self._selected_char_indices:
+            return False
+        point = QPointF(pos)
+        for quad in self.selected_glyph_quads():
+            rect = self._page_rect_to_widget_rect(self._rect_tuple_to_qrectf(quad))
+            if rect.contains(point):
+                return True
+        return False
 
     def clear_text_selection(self) -> None:
         """現在の文字選択（範囲・アンカー）を解除する。"""
@@ -2254,10 +2349,15 @@ class ZoomPageWidget(QWidget):
         return "".join(parts)
 
     def _update_cursor(self, pos: QPoint) -> None:
+        if self._hand_active():
+            self.setCursor(
+                Qt.CursorShape.ClosedHandCursor if self._pan_active else Qt.CursorShape.OpenHandCursor
+            )
+            return
         if self._view_only:
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
-        if self._text_select_only_mode:
+        if self._text_only_effective():
             if self._point_in_pixmap(pos) is not None:
                 self.setCursor(self._text_select_only_cursor or Qt.CursorShape.IBeamCursor)
             else:
@@ -2466,10 +2566,13 @@ class ZoomPageWidget(QWidget):
     def mousePressEvent(self, event) -> None:
         self.interaction_started.emit()
         try:
-            if event.button() == Qt.MouseButton.MiddleButton:
-                # 中ボタンドラッグでつかんで移動（パン）。
+            if event.button() == Qt.MouseButton.MiddleButton or (
+                event.button() == Qt.MouseButton.LeftButton and self._hand_active()
+            ):
+                # 中ボタンドラッグ / 手のひら(H・Space)の左ドラッグでつかんで移動（パン）。
                 self.setFocus()
                 self._pan_active = True
+                self._pan_button = event.button()
                 self._pan_last_global = event.globalPosition().toPoint()
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 event.accept()
@@ -2482,8 +2585,9 @@ class ZoomPageWidget(QWidget):
                     return
                 self.setFocus()
                 self._marquee_active = True
+                self._marquee_moved = False
                 self._marquee_origin = event.pos()
-                self._marquee_rect = QRect(event.pos(), event.pos())
+                self._marquee_rect = None  # 動かす(ドラッグ閾値を超える)まで矩形は出さない
                 self.update()
                 event.accept()
                 return
@@ -2546,7 +2650,7 @@ class ZoomPageWidget(QWidget):
 
                 # マークアップ/消しゴムの連続モード中は、既存注釈のヒットテストと
                 # リンク操作を止めて常にテキスト選択のみを行う。
-                if self._text_select_only_mode:
+                if self._text_only_effective():
                     annot, handle = None, None
                 else:
                     annot, handle = self._annotation_hit_test(event.pos())
@@ -2606,8 +2710,9 @@ class ZoomPageWidget(QWidget):
 
                 self._selection_origin = event.pos()
                 self._selection_rect = None
-                self._pressed_link = None if self._text_select_only_mode else self._link_at(event.pos())
-                self._selection_active = self._pressed_link is None
+                self._pressed_link = None if self._text_only_effective() else self._link_at(event.pos())
+                # 「注釈を選ぶ」(V)では文字選択を始めない。
+                self._selection_active = self._pressed_link is None and self._select_mode != "obj"
                 # Always clear any anchor/head from a prior selection, even
                 # when this press lands on a link (selection stays inactive).
                 # Otherwise a later drag off that link would resume from a
@@ -2631,7 +2736,7 @@ class ZoomPageWidget(QWidget):
             super().mouseDoubleClickEvent(event)
             return
         try:
-            if event.button() == Qt.MouseButton.LeftButton and not self._text_select_only_mode:
+            if event.button() == Qt.MouseButton.LeftButton and not self._text_only_effective():
                 annot, handle = self._annotation_hit_test(event.pos())
                 if annot is not None and handle == "move" and not isinstance(annot, ShapeAnnotData):
                     self.annotation_edit_requested.emit(annot)
@@ -2643,7 +2748,7 @@ class ZoomPageWidget(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         try:
-            if self._pan_active and (event.buttons() & Qt.MouseButton.MiddleButton):
+            if self._pan_active and (event.buttons() & self._pan_button):
                 cur = event.globalPosition().toPoint()
                 if self._pan_last_global is not None:
                     # マウスの移動と逆方向にスクロールして紙をつかんで動かす感覚にする。
@@ -2656,8 +2761,14 @@ class ZoomPageWidget(QWidget):
                 return
             if self._marquee_active and (event.buttons() & Qt.MouseButton.RightButton):
                 if self._marquee_origin is not None:
-                    self._marquee_rect = QRect(self._marquee_origin, event.pos()).normalized()
-                    self.update()
+                    if not self._marquee_moved and (
+                        (event.pos() - self._marquee_origin).manhattanLength()
+                        >= QApplication.startDragDistance()
+                    ):
+                        self._marquee_moved = True  # ここからが範囲拡大のドラッグ
+                    if self._marquee_moved:
+                        self._marquee_rect = QRect(self._marquee_origin, event.pos()).normalized()
+                        self.update()
                 event.accept()
                 return
             if self._view_only:
@@ -2942,7 +3053,7 @@ class ZoomPageWidget(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         try:
-            if event.button() == Qt.MouseButton.MiddleButton and self._pan_active:
+            if event.button() == self._pan_button and self._pan_active:
                 self._pan_active = False
                 self._pan_last_global = None
                 self._update_cursor(event.pos())
@@ -2952,10 +3063,15 @@ class ZoomPageWidget(QWidget):
                 self._marquee_active = False
                 self._marquee_origin = None
                 rect = self._marquee_rect
+                moved = self._marquee_moved
                 self._marquee_rect = None
+                self._marquee_moved = False
                 self.update()
+                if not moved:
+                    # 動かさずに離した右クリック: メニューは持ち主が出す。
+                    self.context_requested.emit(event.pos())
                 # 十分な大きさの範囲が指定されたときだけ拡大する。
-                if rect is not None and rect.width() >= 5 and rect.height() >= 5:
+                elif rect is not None and rect.width() >= 5 and rect.height() >= 5:
                     p0 = self._page_point_from_widget_pos(rect.topLeft(), clamp=True)
                     p1 = self._page_point_from_widget_pos(rect.bottomRight(), clamp=True)
                     if p0 is not None and p1 is not None:
@@ -3112,6 +3228,13 @@ class ZoomPageWidget(QWidget):
         event.accept()
 
     def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Space and not event.modifiers():
+            # Space を押している間だけ手のひら(離すと元のモードへ)。
+            if not event.isAutoRepeat() and not self._space_hand:
+                self._space_hand = True
+                self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+            event.accept()
+            return
         if self._view_only:
             # 閲覧専用: 矢印キーでのビュースクロールのみ許可（Ctrl で高速）。
             if event.key() in self._ARROW_DELTAS:
@@ -3190,6 +3313,15 @@ class ZoomPageWidget(QWidget):
                 return
         super().keyPressEvent(event)
 
+    def keyReleaseEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            if self._space_hand:
+                self._space_hand = False
+                self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
     def _move_selected_annotation(self, dx: float, dy: float) -> bool:
         annot = self._annotation_by_xref(self._selected_annotation_xref)
         if annot is None:
@@ -3218,6 +3350,9 @@ class ZoomPageWidget(QWidget):
 
     def focusOutEvent(self, event) -> None:
         super().focusOutEvent(event)
+        if self._space_hand:
+            self._space_hand = False  # Space を押したままフォーカスが移ったら手のひらを解く
+            self._update_cursor(self.mapFromGlobal(self.cursor().pos()))
         if self.has_annotation_paste_mode():
             self.cancel_annotation_paste_mode()
 

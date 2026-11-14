@@ -27,10 +27,10 @@ from PyQt6.QtGui import QFont, QFontDatabase, QGuiApplication
 from PyQt6.QtWidgets import QApplication, QToolBar
 
 from src.views import main_window, pdf_card
+from src.views.theme import load_app_stylesheet
 from src.views import page_edit_window as page_edit_window_module
 from src.views.export_dialog import ExportOptionsDialog
 from src.views.print_dialog import PrintDialog
-from src.views.search_dialog import SearchDialog
 from src.views.settings_dialog import SettingsDialog
 from src.models.undo_manager import UndoManager
 from src.utils.pdf_utils import (
@@ -155,7 +155,10 @@ def build_main_window(work_dir: Path, with_folders: bool = True) -> "main_window
     if with_folders:
         for sub in sorted([p for p in work_dir.iterdir() if p.is_dir()]):
             win._add_folder_card(str(sub))
+    win._update_mode_bar()  # パンくずは作業フォルダに合わせて作り直す
     win.show()
+    QApplication.processEvents()
+    win._refresh_grid()
     QApplication.processEvents()
     return win
 
@@ -206,6 +209,31 @@ def scene_toolbar(work_dir: Path) -> None:
         return
     QApplication.processEvents()
     _save(toolbar, "04_toolbar.png")
+    win.close()
+
+
+def scene_context_menu(work_dir: Path) -> None:
+    """カードの右クリックメニュー（Justice Desk 風）を、メイン画面の横に並べて撮る。"""
+    from PyQt6.QtGui import QPixmap, QPainter
+    print("[scene] 40_context_menu")
+    win = build_main_window(work_dir)
+    for card in win._cards[:2]:
+        card.set_selected(True)
+        win._selected_cards.append(card)
+    win._update_button_states()
+    QApplication.processEvents()
+    menu = win._build_card_context_menu()
+    menu_pix = _grab_menu(menu)
+    win_pix = win.grab()
+    comp = QPixmap(win_pix.width(), win_pix.height())
+    comp.fill(Qt.GlobalColor.white)
+    painter = QPainter(comp)
+    painter.drawPixmap(0, 0, win_pix)
+    painter.drawPixmap(300, 260, menu_pix)
+    painter.end()
+    out = OUT_DIR / "40_context_menu.png"
+    comp.save(str(out))
+    print(f"  saved {out.name}  ({comp.width()}x{comp.height()})")
     win.close()
 
 
@@ -286,6 +314,44 @@ def scene_zoom_view(pdf_path: Path) -> None:
     pew.close()
 
 
+def scene_page_context_menus(pdf_path: Path) -> None:
+    """ページ一覧の右クリック（ページの上 / 余白）。"""
+    print("[scene] 32_page_context_menu / 33_blank_context_menu")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._page_count:
+        pew.close()
+        return
+    pix = _grab_menu(pew._page_context_menu(1))
+    pix.save(str(OUT_DIR / "32_page_context_menu.png"))
+    print("  saved 32_page_context_menu.png")
+    pix = _grab_menu(pew._blank_context_menu())
+    pix.save(str(OUT_DIR / "33_blank_context_menu.png"))
+    print("  saved 33_blank_context_menu.png")
+    pew.close()
+
+
+def scene_zoom_context_menus(pdf_path: Path) -> None:
+    """拡大ビューの右クリック（何もない所 / 選んだ文字）。"""
+    print("[scene] 34_zoom_context_menu / 35_zoom_text_context_menu")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._page_count:
+        pew.close()
+        return
+    pew._open_zoom_view(0)
+    for _ in range(10):
+        QApplication.processEvents()
+    pix = _grab_menu(pew._zoom_context_menu(QPoint(3, 3)))
+    pix.save(str(OUT_DIR / "34_zoom_context_menu.png"))
+    print("  saved 34_zoom_context_menu.png")
+    label = pew._zoom_label
+    label._selected_char_indices = list(range(0, min(6, len(label._chars))))
+    label.text_selection_contains = lambda _pos: True  # type: ignore[method-assign]
+    pix = _grab_menu(pew._zoom_context_menu(QPoint(3, 3)))
+    pix.save(str(OUT_DIR / "35_zoom_text_context_menu.png"))
+    print("  saved 35_zoom_text_context_menu.png")
+    pew.close()
+
+
 def scene_zoom_annotation_panel(pdf_path: Path) -> None:
     print("[scene] 07_annotation_panel")
     pew = _make_page_edit_window(pdf_path)
@@ -302,17 +368,15 @@ def scene_zoom_annotation_panel(pdf_path: Path) -> None:
     pew.close()
 
 
-def scene_search_dialog() -> None:
+def scene_search_dialog(pdf_path: Path) -> None:
+    """個別画面の検索バー（ファイル名は従来のまま 09_search_dialog.png）。"""
     print("[scene] 09_search_dialog")
-    dlg = SearchDialog()
-    dlg.resize(420, 110)
-    dlg.show()
-    # Populate input + status so the screenshot looks meaningful.
-    dlg._input.setText("契約")
-    dlg.set_status(2, 5)
-    QApplication.processEvents()
-    _save(dlg, "09_search_dialog.png")
-    dlg.close()
+    pew = _make_page_edit_window(pdf_path)
+    pew._open_search_bar("Sample")
+    for _ in range(12):
+        QApplication.processEvents()
+    _save(pew, "09_search_dialog.png")
+    pew.close()
 
 
 def scene_settings_dialog() -> None:
@@ -489,6 +553,36 @@ def scene_callout(pdf_path: Path) -> None:
     pew.close()
 
 
+def scene_pii_panel(pdf_path: Path) -> None:
+    print("[scene] 36_pii_panel")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._page_count:
+        pew.close()
+        return
+    pew._open_zoom_view(0)
+    QApplication.processEvents()
+    pew._zoom_pii_btn.trigger()
+    for _ in range(12):
+        QApplication.processEvents()
+    _save(pew, "36_pii_panel.png")
+    pew.close()
+
+
+def scene_ocr_panel(pdf_path: Path) -> None:
+    print("[scene] 37_ocr_panel")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._page_count:
+        pew.close()
+        return
+    pew._open_zoom_view(0)
+    QApplication.processEvents()
+    pew._zoom_ocr_action.trigger()
+    for _ in range(12):
+        QApplication.processEvents()
+    _save(pew, "37_ocr_panel.png")
+    pew.close()
+
+
 # ---------- Annotated sample PDFs ----------
 
 def _words_on_lines(pdf_path: Path):
@@ -604,9 +698,7 @@ def main() -> None:
             print(f"app font: {family}")
             break
 
-    qss_path = ROOT / "src" / "views" / "style.qss"
-    if qss_path.exists():
-        app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
+    app.setStyleSheet(load_app_stylesheet())
 
     with tempfile.TemporaryDirectory(prefix="justicepdf_manual_") as td:
         work_dir = Path(td) / "PDFs"
@@ -625,6 +717,7 @@ def main() -> None:
         scene_main_drop_merge(work_dir)
         scene_toolbar(work_dir)
         scene_folder_selection(work_dir)
+        scene_context_menu(work_dir)
         scene_multi_window(work_dir, work_dir2)
 
         # Toolbar dropdown menus (composited under their buttons).
@@ -648,8 +741,10 @@ def main() -> None:
         scene_page_edit_grid(proposal_pdf)
         scene_zoom_view(proposal_pdf)
         scene_zoom_annotation_panel(proposal_pdf)
+        scene_page_context_menus(proposal_pdf)
+        scene_zoom_context_menus(proposal_pdf)
 
-        scene_search_dialog()
+        scene_search_dialog(proposal_pdf)
         scene_settings_dialog()
         scene_export_dialog()
         scene_print_dialog(proposal_pdf)
@@ -694,6 +789,9 @@ def main() -> None:
         callout_pdf = work_dir / "_callout_demo.pdf"
         _make_callout_pdf(proposal_pdf, callout_pdf)
         scene_callout(callout_pdf)
+
+        scene_pii_panel(proposal_pdf)
+        scene_ocr_panel(proposal_pdf)
 
         copy_install_images()
 

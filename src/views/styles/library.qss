@@ -1,0 +1,164 @@
+/* =========================================================================
+ * メイン画面（ライブラリ）: ツールバー・スクロール領域・カード
+ * ツールバー関連はページ一覧（page_edit.qss）でも共通に効く。
+ * ========================================================================= */
+
+/* ---------- Toolbar ------------------------------------------------------ */
+
+QToolBar {
+    background-color: @slate-50@;
+    border: none;
+    border-bottom: 1px solid @slate-300@;
+    padding: 4px 8px;
+    spacing: 2px;
+}
+/* モード別の地（ライブラリ=フォルダの青系）。下罫線はモード色の 35% */
+QToolBar#libraryToolbar {
+    background-color: @mode-folder-soft@;
+    border-bottom: 1px solid @mode-folder-line@;
+}
+QToolBar#pageEditToolbar {
+    background-color: @mode-pages-soft@;
+    border-bottom: 1px solid @mode-pages-line@;
+}
+
+QToolBar::separator {
+    background-color: @slate-300@;
+    width: 1px;
+    margin: 6px 6px;
+}
+
+/* Toolbar buttons (QPushButton: 既存の画面) */
+QToolBar QPushButton {
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 5px 10px;
+    min-height: 18px;
+    font-size: 13px;
+    font-weight: 500;
+    color: @slate-700@;
+}
+QToolBar QPushButton:hover     { background-color: @slate-200@; }
+QToolBar QPushButton:pressed   { background-color: @slate-200@; }
+QToolBar QPushButton:disabled  { color: @slate-400@; }
+QToolBar QPushButton:focus     { outline: none; }
+QToolBar QPushButton::menu-indicator {
+    width: 8px;
+    height: 8px;
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    right: 4px;
+}
+
+/* Destructive accent (set via objectName in Python:
+     self._delete_btn.setObjectName("danger")
+*/
+QToolBar QPushButton#danger           { color: @danger@; }
+QToolBar QPushButton#danger:hover     { background-color: @danger-soft@; }
+QToolBar QPushButton#danger:disabled  { color: @danger-muted@; }
+
+/* Toolbar buttons (QToolButton: Justice Desk の flat ボタン。アイコン中心。
+   無効時の薄さは QIcon の Disabled モード(40%)に任せる) */
+QToolBar QToolButton,
+QToolButton[variant="flat"] {
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 8px;
+    min-height: 18px;
+    font-size: 13px;
+    font-weight: normal;
+    color: @slate-700@;
+}
+QToolBar QToolButton:hover,
+QToolButton[variant="flat"]:hover      { background-color: @slate-200@; }
+QToolBar QToolButton:checked,
+QToolBar QToolButton:pressed,
+QToolButton[variant="flat"]:checked,
+QToolButton[variant="flat"]:pressed    { background-color: @slate-200@; border: none; }
+QToolBar QToolButton:disabled,
+QToolButton[variant="flat"]:disabled   { color: @slate-400@; background-color: transparent; }
+/* ▼ はアイコン側に描き込むので、Qt 標準のメニュー記号は隠す */
+QToolBar QToolButton::menu-indicator,
+QToolButton[variant]::menu-indicator   { image: none; width: 0; }
+
+/* ---------- Scroll area (PDF card grid) --------------------------------- */
+
+QScrollArea {
+    background-color: @slate-100@;
+    border: none;
+}
+QScrollArea > QWidget > QWidget {
+    background-color: @slate-100@;
+}
+
+/* ---------- Cards (PDFCard / FolderCard) ------------------------------- */
+/* 枠は通常時も 2px の透明にして、選択しても中身がずれないようにする */
+
+PDFCard,
+FolderCard {
+    background-color: transparent;
+    border: 2px solid transparent;
+    border-radius: 8px;
+}
+PDFCard[state="normal"]:hover,
+FolderCard[state="normal"]:hover {
+    background-color: @card-hover@;
+}
+PDFCard[state="selected"],
+FolderCard[state="selected"] {
+    background-color: @select-bg@;
+    border: 2px solid @select-ring@;
+}
+PDFCard[state="locked"] {
+    background-color: transparent;
+}
+PDFCard[state="droptarget"],
+FolderCard[state="droptarget"] {
+    background-color: @dnd-bg@;
+    border: 2px solid @dnd-ring@;
+}
+
+/* カードの中身は地を透かす */
+PDFCard QWidget,
+FolderCard QWidget {
+    background-color: transparent;
+}
+PDFCard QLabel,
+FolderCard QLabel {
+    background-color: transparent;
+    color: @slate-800@;
+    font-size: 11px;
+    font-weight: normal;
+}
+
+/* 右上の種別バッジ「PDF 3p」 */
+PDFCard QLabel#cardBadge {
+    background-color: @badge-bg@;
+    color: @badge-text@;
+    font-size: 10px;
+    font-weight: bold;
+    padding: 1px 6px;
+    border-radius: 4px;
+}
+
+/* フォルダ: 淡黄の正方形 + 「N 件」 */
+FolderCard QFrame#folderThumb {
+    background-color: @folder-card-bg@;
+    border: 1px solid @folder-card-border@;
+    border-radius: 4px;
+}
+FolderCard QLabel#folderCount {
+    color: @folder-text@;
+    font-weight: bold;
+}
+
+/* ---------- 名前で絞り込みバー ------------------------------------------- */
+
+QWidget#filterBar {
+    background-color: @slate-50@;
+    border-bottom: 1px solid @slate-300@;
+}
+QWidget#filterBar QLabel { background: transparent; }
+QWidget#filterBar QLineEdit { padding: 3px 8px; }

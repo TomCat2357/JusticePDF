@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from PyQt6.QtCore import QRect, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QDrag
 from PyQt6.QtWidgets import QFrame, QRubberBand, QScrollArea, QWidget
 
@@ -25,8 +25,8 @@ from src.views.view_helpers import apply_drag_pixmap
 
 logger = logging.getLogger(__name__)
 
-GRID_MARGIN = 10
-GRID_SPACING = 10
+GRID_MARGIN = 12  # Justice Desk: 外側の余白 12
+GRID_SPACING = 8  # カードの間 8
 # 表示範囲の上下に余分にウィジェットを割り当てる行数(スクロール直後の空白を減らす)。
 OVERSCAN_ROWS = 2
 
@@ -36,6 +36,8 @@ class VirtualPageGrid(QWidget):
 
     page_clicked = pyqtSignal(int)
     page_double_clicked = pyqtSignal(int)
+    # 右クリック: (ページ番号。余白なら -1, グローバル座標)。メニューは持ち主が作る。
+    context_requested = pyqtSignal(int, QPoint)
 
     def __init__(
         self,
@@ -56,8 +58,8 @@ class VirtualPageGrid(QWidget):
         self._thumb_size = int(thumb_size)
         self._metrics = GridMetrics(
             cols=1,
-            item_w=self._thumb_size + PageThumbnail.CARD_PADDING,
-            item_h=self._thumb_size + PageThumbnail.CARD_PADDING,
+            item_w=self._thumb_size + PageThumbnail.CARD_PADDING_X,
+            item_h=self._thumb_size + PageThumbnail.CARD_PADDING_Y,
             margin=GRID_MARGIN,
             spacing=GRID_SPACING,
             count=0,
@@ -72,7 +74,7 @@ class VirtualPageGrid(QWidget):
         # ドロップ位置の縦線と、ラバーバンド(どちらも描画専用の子ウィジェット)。
         self._drop_indicator = QFrame(self)
         self._drop_indicator.setFrameShape(QFrame.Shape.VLine)
-        self._drop_indicator.setStyleSheet("background-color: #4f46e5;")
+        self._drop_indicator.setStyleSheet("background-color: #2563eb;")  # insert-line
         self._drop_indicator.setFixedWidth(3)
         self._drop_indicator.hide()
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
@@ -124,11 +126,10 @@ class VirtualPageGrid(QWidget):
             self._thumb_size = thumb_size
             for widget in self._pool:
                 widget.set_thumbnail_size(thumb_size)
-        item = thumb_size + PageThumbnail.CARD_PADDING
         self._metrics = GridMetrics(
             cols=cols,
-            item_w=item,
-            item_h=item,
+            item_w=thumb_size + PageThumbnail.CARD_PADDING_X,
+            item_h=thumb_size + PageThumbnail.CARD_PADDING_Y,
             margin=GRID_MARGIN,
             spacing=GRID_SPACING,
             count=self._metrics.count,
@@ -205,7 +206,10 @@ class VirtualPageGrid(QWidget):
         m = self._metrics
         if not 0 <= page < m.count:
             return
-        self._scroll.verticalScrollBar().setValue(max(0, m.cell_rect(page).top() - m.margin))
+        # 余白(margin)が行間(spacing)より広いと、前の行の下端が少し見えてしまい「最上行」が前の行になる。
+        # 行間ぶんだけ残せば、前の行は完全に画面の外になる。
+        gap = min(m.margin, m.spacing)
+        self._scroll.verticalScrollBar().setValue(max(0, m.cell_rect(page).top() - gap))
 
     def relayout(self) -> None:
         """表示範囲(+前後の行)のページへウィジェットを割り当て、範囲外は解放する。
@@ -334,6 +338,12 @@ class VirtualPageGrid(QWidget):
     def showEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().showEvent(event)
         self.relayout()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt override
+        """右クリック。ページの上ならそのページ番号、余白なら -1 を通知する。"""
+        pages = self._metrics.pages_in_rect(QRect(event.pos(), QSize(1, 1)))
+        self.context_requested.emit(pages[0] if pages else -1, event.globalPos())
+        event.accept()
 
     # ------------------------------------------------------------------
     # ドロップ位置・ラバーバンド

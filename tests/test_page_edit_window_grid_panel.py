@@ -18,20 +18,20 @@ def _grid_window(qtbot, tmp_path, pages: int = 4, toc: list | None = None):
 
 def test_grid_panel_button_follows_search_and_has_four_items(qtbot, tmp_path):
     window = _grid_window(qtbot, tmp_path)
-    assert window._grid_panel_btn.text() == "パネル"
+    assert not any(a.isChecked() for a in window._zoom_panel_group.actions())
     assert [a.text() for a in window._grid_panel_menu.actions()] == [
-        "アノテーション",
-        "個人情報検出",
-        "OCR",
+        "注釈",
         "しおり",
+        "墨消し",
+        "OCR",
     ]
-    # ツールバー上で検索の直後に並ぶ。
-    bar = window.findChild(QToolBar)
-    actions = bar.actions()
+    # ツールバー上で「検索」「個人情報」の直後に並ぶ。
+    bar = window._grid_toolbar
+    widgets = [bar.widgetForAction(a) for a in bar.actions()]
     search_idx = next(
-        i for i, a in enumerate(actions) if bar.widgetForAction(a) is window._search_btn
+        i for i, w in enumerate(widgets) if getattr(w, "defaultAction", lambda: None)() is window._search_btn
     )
-    assert bar.widgetForAction(actions[search_idx + 1]) is window._grid_panel_btn
+    assert widgets[search_idx + 2] is window._grid_panel_btn
 
 
 def test_bookmarks_opens_in_grid_mode_and_actions_are_shared(qtbot, tmp_path):
@@ -45,17 +45,16 @@ def test_bookmarks_opens_in_grid_mode_and_actions_are_shared(qtbot, tmp_path):
     assert window._zoom_view.isHidden()
     # 共有の QAction なのでチェック状態が両ボタンで連動する。
     assert window._zoom_bookmark_action.isChecked()
-    assert window._grid_panel_btn.text() == "しおり" and window._grid_panel_btn.isChecked()
-    assert window._zoom_panel_btn.text() == "しおり" and window._zoom_panel_btn.isChecked()
-    assert window._grid_panel_menu.actions()[3] is window._zoom_bookmark_action
+    assert window._grid_panel_menu.actions()[1] is window._zoom_bookmark_action
+    assert window._zoom_panel_menu.actions()[1] is window._zoom_bookmark_action
 
     window._zoom_object_btn.trigger()
     assert window._bookmarks_panel.is_open is False
     assert window._zoom_annotation_open is True
-    assert window._grid_panel_btn.text() == "アノテーション"
+    assert window._zoom_object_btn.isChecked()
 
     window._zoom_object_btn.trigger()
-    assert window._grid_panel_btn.text() == "パネル" and not window._grid_panel_btn.isChecked()
+    assert not any(a.isChecked() for a in window._zoom_panel_group.actions())
 
 
 def test_annotation_controls_disabled_in_grid_enabled_in_zoom(qtbot, tmp_path):
@@ -174,17 +173,18 @@ def test_bookmarks_tree_reloads_after_delete_in_grid(qtbot, tmp_path, monkeypatc
     )
 
 
-def test_toolbar_panel_button_hidden_while_zoom_view_shown(qtbot, tmp_path):
+def test_toolbar_switches_with_zoom_view(qtbot, tmp_path):
     window = _grid_window(qtbot, tmp_path)
-    assert window._grid_panel_action.isVisible()
+    assert not window._grid_toolbar.isHidden() and window._zoom_toolbar.isHidden()
+    assert window._mode_bar.mode() == "pages"
 
     window._open_zoom_view(0)
-    assert not window._grid_panel_action.isVisible()
-    qtbot.waitUntil(lambda: not window._grid_panel_btn.isVisible())
+    assert window._grid_toolbar.isHidden() and not window._zoom_toolbar.isHidden()
+    assert window._mode_bar.mode() == "zoom"
 
     window._exit_zoom_view()
-    assert window._grid_panel_action.isVisible()
-    qtbot.waitUntil(lambda: window._grid_panel_btn.isVisible())
+    assert not window._grid_toolbar.isHidden() and window._zoom_toolbar.isHidden()
+    assert window._mode_bar.mode() == "pages"
 
 
 def test_canvas_only_widgets_really_disabled_in_grid(qtbot, tmp_path):

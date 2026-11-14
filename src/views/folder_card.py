@@ -1,11 +1,14 @@
 """Folder card widget for displaying subfolders in the main window grid."""
 import os
 from PyQt6.QtWidgets import (
-    QFrame, QVBoxLayout, QLabel, QApplication, QWidget, QStyle,
+    QFrame, QVBoxLayout, QLabel, QApplication,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QUrl, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import QDrag, QPixmap
 
+from src.views import icons
+from src.views.card_widgets import ElidedNameLabel, card_width_for
+from src.views.theme import COLORS
 from src.views.view_helpers import apply_drag_pixmap
 from src.utils.constants import (
     PDFCARD_MIME_TYPE,
@@ -26,8 +29,8 @@ class FolderCard(QFrame):
     dropped_on = pyqtSignal(object, object)  # self, payloads dict {mime_type: payload_str}
     context_menu_requested = pyqtSignal(object, object)
 
-    CARD_WIDTH = 150
-    THUMBNAIL_SIZE = 120
+    THUMBNAIL_SIZE = 136
+    CARD_WIDTH = card_width_for(THUMBNAIL_SIZE)
 
     def __init__(
         self,
@@ -67,49 +70,41 @@ class FolderCard(QFrame):
         self.setLineWidth(1)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
-        self._thumbnail_container = QWidget()
+        # 淡黄の正方形の中に Folder アイコン(橙)と「N 件」
+        self._thumbnail_container = QFrame()
+        self._thumbnail_container.setObjectName("folderThumb")
         self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
+        inner = QVBoxLayout(self._thumbnail_container)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(2)
+        inner.addStretch(1)
 
-        self._icon_label = QLabel(self._thumbnail_container)
-        self._icon_label.setFixedSize(self._thumb_size, self._thumb_size)
+        self._icon_label = QLabel()
         self._icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._icon_label.setStyleSheet("background-color: transparent; border: none;")
-        self._icon_label.move(0, 0)
-        self._render_folder_icon()
+        inner.addWidget(self._icon_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self._count_label = QLabel("0", self._thumbnail_container)
-        self._count_label.setStyleSheet(
-            "background-color: rgba(0, 0, 0, 0.7); color: white; padding: 2px 5px; border-radius: 3px; font-size: 11px;"
-        )
-        self._count_label.adjustSize()
-        self._count_label.move(self._thumb_size - self._count_label.width() - 3, 3)
-        self._count_label.raise_()
+        self._count_label = QLabel("0 件")
+        self._count_label.setObjectName("folderCount")
+        self._count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        inner.addWidget(self._count_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        inner.addStretch(1)
+        self._render_folder_icon()
 
         layout.addWidget(self._thumbnail_container, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self._name_label = QLabel()
-        self._name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._name_label.setWordWrap(True)
-        layout.addWidget(self._name_label)
+        self._name_label = ElidedNameLabel()
+        self._name_label.setObjectName("cardName")
+        layout.addWidget(self._name_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self._update_style()
 
     def _render_folder_icon(self) -> None:
-        style = self.style()
-        icon = style.standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-        inner = max(16, self._thumb_size - 24)
-        pix = icon.pixmap(inner, inner)
-        if not pix.isNull():
-            self._icon_label.setPixmap(pix)
-            self._icon_label.setText("")
-        else:
-            font = self._icon_label.font()
-            font.setPointSize(max(24, self._thumb_size // 3))
-            self._icon_label.setFont(font)
-            self._icon_label.setText("📁")
+        size = max(16, int(round(self._thumb_size * 0.4)))
+        self._icon_label.setFixedSize(size, size)
+        self._icon_label.setPixmap(icons.pixmap("Folder", COLORS["folder-icon"], size))
 
     def _load_folder_info(self) -> None:
         count = 0
@@ -123,10 +118,10 @@ class FolderCard(QFrame):
         except OSError:
             count = 0
         self._item_count = count
-        self._count_label.setText(str(count))
-        self._count_label.adjustSize()
-        self._count_label.move(self._thumb_size - self._count_label.width() - 3, 3)
-        self._name_label.setText(os.path.basename(self._folder_path) or self._folder_path)
+        self._count_label.setText(f"{count} 件")
+        self._name_label.set_full_text(
+            os.path.basename(self._folder_path) or self._folder_path, self._thumb_size
+        )
 
     def _update_style(self) -> None:
         self.setProperty("state", "selected" if self._is_selected else "normal")
@@ -158,14 +153,12 @@ class FolderCard(QFrame):
         self._thumb_size = int(thumb_size)
         self.setFixedWidth(self._card_width)
         self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
-        self._icon_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._render_folder_icon()
-        self._count_label.adjustSize()
-        self._count_label.move(self._thumb_size - self._count_label.width() - 3, 3)
+        self._name_label.set_full_text(self.filename, self._thumb_size)
         self.updateGeometry()
 
     def set_preview_size_fast(self, card_width: int, thumb_size: int) -> None:
-        if self.width() == int(card_width) and self._icon_label.width() == int(thumb_size):
+        if self.width() == int(card_width) and self._thumbnail_container.width() == int(thumb_size):
             return
         self.set_preview_size(card_width, thumb_size)
 

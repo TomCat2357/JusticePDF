@@ -184,9 +184,9 @@ def test_small_document_search_completes_synchronously(qtbot, tmp_path):
     assert window._search_scan is None
     assert window._search_hit_pages == [3, 13, 23, 33]
     assert window._search_current == 3
-    assert window._search_dialog._status_label.text() == "ページ 1 / 4"
+    assert window._search_bar._status_label.text() == "ページ 1 / 4"
     window._on_search_execute("nothing-here")
-    assert window._search_dialog._status_label.text() == "見つかりません"
+    assert window._search_bar._status_label.text() == "見つかりません"
     assert window._search_hit_pages == []
 
 
@@ -197,7 +197,7 @@ def test_chunked_search_reports_progress_and_jumps_once(qtbot, tmp_path, chunked
     monkeypatch.setattr(window, "_jump_to_search_page", lambda p: (jumps.append(p), orig(p))[1])
     window._on_search_execute("needle")
     assert window._search_scan is not None  # まだ走査中
-    assert "検索中" in window._search_dialog._status_label.text()
+    assert "検索中" in window._search_bar._status_label.text()
     seen_partial = []
     qtbot.waitUntil(
         lambda: (seen_partial.append(len(window._search_hit_pages)), window._search_scan is None)[1],
@@ -207,7 +207,7 @@ def test_chunked_search_reports_progress_and_jumps_once(qtbot, tmp_path, chunked
     assert window._search_hit_pages == expected
     assert jumps == [expected[0]]
     assert any(0 < n < len(expected) for n in seen_partial) or len(expected) == len(window._search_hit_pages)
-    assert window._search_dialog._status_label.text() == f"ページ 1 / {len(expected)}"
+    assert window._search_bar._status_label.text() == f"ページ 1 / {len(expected)}"
     assert window._search_hit_set == set(expected)
     assert set(window._search_hits) == set(expected)
 
@@ -242,7 +242,7 @@ def test_cancel_button_keeps_partial_results(qtbot, tmp_path, chunked):
     window._on_search_cancel()
     assert window._search_scan is None
     assert not window._search_timer.isActive()
-    text = window._search_dialog._status_label.text()
+    text = window._search_bar._status_label.text()
     assert text.endswith("ページ") or text == "見つかりません"
     assert "検索中" not in text
 

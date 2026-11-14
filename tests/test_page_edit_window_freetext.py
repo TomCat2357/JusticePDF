@@ -60,14 +60,13 @@ def test_zoom_drawer_starts_closed_and_can_create_freetext(qtbot, tmp_path):
 
     assert window._zoom_annotation_open is False
     assert window._zoom_panel_btn.isVisible()
-    assert window._zoom_panel_btn.text() == "パネル"
+    assert not any(a.isChecked() for a in window._zoom_panel_group.actions())
 
     # パネルのドロップダウンから「アノテーション」を選ぶ(QAction)。
     window._zoom_object_btn.trigger()
     assert window._zoom_annotation_open is True
     assert window._zoom_object_btn.isChecked() is True
-    assert window._zoom_panel_btn.text() == "アノテーション"
-    assert window._zoom_panel_btn.isChecked() is True
+    assert window._zoom_object_btn.text() == "注釈"
 
     qtbot.mouseClick(window._zoom_annotation_new_btn, Qt.MouseButton.LeftButton)
     assert window._zoom_annotation_new_btn.isChecked() is True

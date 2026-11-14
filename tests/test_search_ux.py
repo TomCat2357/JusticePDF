@@ -41,7 +41,7 @@ def chunked(monkeypatch):
 
 
 def _status(window) -> str:
-    return window._search_dialog._status_label.text()
+    return window._search_bar._status_label.text()
 
 
 # --- サムネイルの見た目の組み合わせ -------------------------------------
@@ -322,9 +322,9 @@ def test_status_counts_pages_and_occurrences(qtbot, tmp_path):
 
 
 def test_status_label_strings_and_stable_width(qtbot):
-    from src.views.search_dialog import SearchDialog
+    from src.views.search_dialog import SearchBar
 
-    dialog = SearchDialog()
+    dialog = SearchBar()
     qtbot.addWidget(dialog)
     label = dialog._status_label
     min_width = label.minimumWidth()

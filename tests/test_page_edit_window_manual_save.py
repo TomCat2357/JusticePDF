@@ -246,7 +246,7 @@ def test_page_operation_asks_to_save_first(qtbot, tmp_path, monkeypatch):
 
     # キャンセル: 回転されず、未保存のまま
     _answer(monkeypatch, Button.Cancel, calls)
-    window._rotate_zoom_page()
+    window._rotate_pages_by(90)
     assert len(calls) == 1 and "ページの回転" in calls[0]
     with fitz.open(str(pdf)) as doc:
         assert doc[0].rotation == 0
@@ -254,7 +254,7 @@ def test_page_operation_asks_to_save_first(qtbot, tmp_path, monkeypatch):
 
     # 保存: 注釈も回転もファイルに入り、セッションは使い続けられる
     _answer(monkeypatch, Button.Save)
-    window._rotate_zoom_page()
+    window._rotate_pages_by(90)
     with fitz.open(str(pdf)) as doc:
         assert doc[0].rotation == 90
     assert _direct_shape_count(pdf) == 1
@@ -268,7 +268,7 @@ def test_page_operation_undo_after_dirty_edit_asks_to_save(qtbot, tmp_path, monk
     make_pdf(pdf, pages=2)
     window = _make_window(qtbot, pdf)
     open_zoom(window, qtbot)
-    window._rotate_zoom_page()  # クリーンなので確認なしでファイルへ
+    window._rotate_pages_by(90)  # クリーンなので確認なしでファイルへ
     _draw_rect(window, qtbot, pdf, 1)
     calls: list = []
     _answer(monkeypatch, Button.Save, calls)
