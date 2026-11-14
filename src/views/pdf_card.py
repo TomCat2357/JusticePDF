@@ -2,7 +2,7 @@
 import os
 from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel, QApplication, QWidget
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QUrl
-from PyQt6.QtGui import QDrag, QPixmap
+from PyQt6.QtGui import QColor, QDrag, QPainter, QPixmap
 
 from src.views import icons
 from src.views.card_widgets import ElidedNameLabel, card_width_for, paper_pixmap
@@ -10,6 +10,7 @@ from src.views import theme
 from src.views.theme import COLORS
 from src.views.view_helpers import apply_drag_pixmap
 from src.utils.pdf_utils import get_pdf_card_info
+from src.utils import file_kinds
 from src.utils.constants import PDFCARD_MIME_TYPE, FOLDERCARD_MIME_TYPE
 
 
@@ -18,6 +19,11 @@ class PDFCard(QFrame):
 
     Displays a thumbnail of the first page, page count, and filename.
     Supports selection and drag-and-drop operations.
+
+    PDF 以外のファイル（Word・Excel・画像など）も同じカードで表す。その場合は
+    fitz で開かず、種類のアイコン・拡張子バッジ・ファイルサイズを描く
+    （:attr:`is_pdf` が False、``page_count`` は 0）。属性名 ``pdf_path`` は
+    PDF 以外でも「ファイルのパス」の意味で使う。
     """
 
     clicked = pyqtSignal(object)  # Emits self when clicked
@@ -36,6 +42,7 @@ class PDFCard(QFrame):
         self._is_locked = False
         self._is_drop_target = False
         self._page_count = 0
+        self._kind = file_kinds.kind_of(pdf_path)
         self._drag_start_pos = None
         self._card_width = int(card_width) if card_width is not None else self.CARD_WIDTH
         self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
@@ -65,6 +72,11 @@ class PDFCard(QFrame):
         self._thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._thumbnail_label.move(0, 0)
 
+        # PDF 以外のとき左下に出すファイルサイズ
+        self._size_label = QLabel("", self._thumbnail_container)
+        self._size_label.setObjectName("cardBadge")
+        self._size_label.hide()
+
         # 種別バッジ「PDF 3p」（右上）
         self._page_count_label = QLabel("PDF", self._thumbnail_container)
         self._page_count_label.setObjectName("cardBadge")
@@ -92,6 +104,8 @@ class PDFCard(QFrame):
     def _place_badge(self) -> None:
         self._page_count_label.adjustSize()
         self._page_count_label.move(self._thumb_size - self._page_count_label.width() - 4, 4)
+        self._size_label.adjustSize()
+        self._size_label.move(4, self._thumb_size - self._size_label.height() - 4)
 
     def _set_thumbnail_pixmap(self, pix: QPixmap | None) -> None:
         if pix is not None and not pix.isNull():
@@ -101,8 +115,45 @@ class PDFCard(QFrame):
             self._thumbnail_label.setPixmap(QPixmap())
             self._thumbnail_label.setText("(空)")
 
+    def _other_thumbnail(self) -> QPixmap:
+        """PDF 以外: 種類のアイコンを中央に描いた正方形（色は描画時の COLORS から引く）。"""
+        size = self._thumb_size
+        dpr = icons._default_dpr()
+        pix = QPixmap(round(size * dpr), round(size * dpr))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(QColor(COLORS["slate-50"]))
+        icon_name, color_key = file_kinds.kind_icon(self._kind)
+        icon_size = max(16, int(round(size * 0.4)))
+        icon_pix = icons.pixmap(icon_name, COLORS[color_key], icon_size, dpr)
+        painter = QPainter(pix)
+        off = (size - icon_size) / 2
+        painter.drawPixmap(int(round(off)), int(round(off)), icon_pix)
+        painter.end()
+        return pix
+
+    def _load_other_info(self) -> None:
+        """PDF 以外のファイルの表示（fitz は使わない）。"""
+        self._original_pixmap = None
+        self._page_count = 0
+        self._thumbnail_label.setText("")
+        self._thumbnail_label.setPixmap(paper_pixmap(self._other_thumbnail()))
+        ext = file_kinds.extension(self._pdf_path)
+        self._page_count_label.setText(ext.upper() if ext else file_kinds.kind_label(self._kind))
+        try:
+            self._size_label.setText(file_kinds.format_size(os.path.getsize(self._pdf_path)))
+        except OSError:
+            self._size_label.setText("")
+        self._size_label.setVisible(bool(self._size_label.text()))
+        self._place_badge()
+        self._filename_label.set_full_text(os.path.basename(self._pdf_path), self._thumb_size)
+
     def _load_pdf_info(self) -> None:
         """Load PDF information and thumbnail."""
+        self._kind = file_kinds.kind_of(self._pdf_path)
+        if self._kind != "pdf":
+            self._load_other_info()
+            return
+        self._size_label.hide()
         thumbnail, page_count = get_pdf_card_info(self._pdf_path, self._thumb_size)
 
         # Thumbnail
@@ -143,6 +194,15 @@ class PDFCard(QFrame):
     def pdf_path(self) -> str:
         """Get the PDF file path."""
         return self._pdf_path
+
+    @property
+    def kind(self) -> str:
+        """ファイルの種類キー（``pdf`` / ``excel`` / …。file_kinds.FILE_KINDS）。"""
+        return self._kind
+
+    @property
+    def is_pdf(self) -> bool:
+        return self._kind == "pdf"
 
     @property
     def filename(self) -> str:
@@ -207,6 +267,10 @@ class PDFCard(QFrame):
         self._thumbnail_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._place_badge()
         self._filename_label.set_full_text(os.path.basename(self._pdf_path), self._thumb_size)
+        if not self.is_pdf:
+            self._thumbnail_label.setPixmap(paper_pixmap(self._other_thumbnail()))
+            self.updateGeometry()
+            return
         if self._original_pixmap and not self._original_pixmap.isNull():
             scaled = self._original_pixmap.scaled(
                 self._thumb_size, self._thumb_size,

@@ -125,10 +125,12 @@ class FileOpsMixin:
         old_paths = [c.pdf_path for c in self._cards]
         pre_selected_paths = [c.pdf_path for c in self._selected_cards]
 
+        if not target_card.is_pdf:
+            return  # PDF 以外のカードは結合先にならない
         target_path = target_card.pdf_path
 
         raw_paths = [p for p in source_paths_str.split('|') if p]
-        card_paths = {c.pdf_path for c in self._cards}
+        card_paths = {c.pdf_path for c in self._cards if c.is_pdf}
         source_paths = [p for p in raw_paths if p in card_paths and p != target_path]
 
         # Backward-compat: if only one path provided and it's part of a multi-selection,
@@ -138,7 +140,7 @@ class FileOpsMixin:
             if src_card and src_card in self._selected_cards and len(self._selected_cards) > 1:
                 source_paths = [
                     c.pdf_path for c in self._cards
-                    if c in self._selected_cards and c.pdf_path != target_path
+                    if c in self._selected_cards and c.is_pdf and c.pdf_path != target_path
                 ]
 
         if not source_paths:
@@ -437,7 +439,7 @@ class FileOpsMixin:
             return
 
         folder_paths = self._selected_folder_paths_in_grid_order()
-        file_paths = self._selected_card_paths_in_grid_order()
+        file_paths = self._selected_pdf_paths_in_grid_order()  # PDF 以外は結合に含めない
         # トップレベルの並び: フォルダ(グリッド順) → 単独ファイル(グリッド順)
         items = folder_paths + file_paths
         if not items or (not folder_paths and len(file_paths) < 2):
@@ -921,8 +923,10 @@ class FileOpsMixin:
         )
 
         if ok and new_name and new_name != old_name:
-            if not new_name.lower().endswith(".pdf"):
-                new_name += ".pdf"
+            # 拡張子は保つ（消したり変えたりされたら元の拡張子を補う）。PDF は常に .pdf。
+            keep_ext = ".pdf" if card.is_pdf else os.path.splitext(old_name)[1]
+            if keep_ext and not new_name.lower().endswith(keep_ext.lower()):
+                new_name += keep_ext
             old_path = card.pdf_path
             new_path = os.path.join(os.path.dirname(old_path), new_name)
             if self._normalize_path(old_path) == self._normalize_path(new_path):
@@ -958,6 +962,8 @@ class FileOpsMixin:
             return
 
         card = self._selected_cards[0]
+        if not card.is_pdf:
+            return  # PDF のタイトル（メタデータ）は PDF だけ
         old_path = card.pdf_path
         old_title = get_pdf_metadata_title(old_path) or os.path.splitext(card.filename)[0]
         new_title, ok = QInputDialog.getText(

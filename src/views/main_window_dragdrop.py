@@ -20,9 +20,8 @@ from src.models.undo_manager import UndoAction
 from src.utils.pdf_utils import (
     PdfWritePermissionError,
 )
+from src.utils.file_kinds import is_library_name
 from src.utils.constants import (
-    IMPORT_EXTS as _IMPORT_EXTS,
-    ZIP_EXTS as _ZIP_EXTS,
     PDFCARD_MIME_TYPE,
     FOLDERCARD_MIME_TYPE,
     PAGETHUMBNAIL_MIME_TYPE,
@@ -50,11 +49,9 @@ class DragDropMixin:
                 local = url.toLocalFile()
                 if not local:
                     continue
-                if os.path.isdir(local):
-                    event.acceptProposedAction()
-                    return
-                ext = os.path.splitext(local)[1].lower()
-                if ext in _IMPORT_EXTS or ext in _ZIP_EXTS:
+                # 外部からのドロップは変換せずコピーするので、種類を問わず受け付ける
+                # （一時ファイル・隠しファイルは除く）。
+                if os.path.isdir(local) or is_library_name(local):
                     event.acceptProposedAction()
                     return
     def dragMoveEvent(self, event) -> None:
@@ -114,9 +111,9 @@ class DragDropMixin:
             card_rect = target_card.geometry()
             edge_margin = card_rect.width() * 0.15  # 70% center = 15% edges
 
-            # Check self-drop exclusion
+            # Check self-drop exclusion（PDF 以外のカードは結合先にならない）
             data = event.mimeData().data(mime_type).data().decode('utf-8')
-            if target_card.pdf_path not in decode_excluded(data):
+            if target_card.is_pdf and target_card.pdf_path not in decode_excluded(data):
                 if drop_pos.x() > card_rect.left() + edge_margin and drop_pos.x() < card_rect.right() - edge_margin:
                     # On card center - merge mode
                     self._hide_drop_indicator()
@@ -550,7 +547,12 @@ class DragDropMixin:
         """
         from src.utils.pdf_utils import merge_pdfs_in_place
 
-        source_paths = source_paths_str.split('|')
+        if not target_card.is_pdf:
+            return
+        pdf_paths = {c.pdf_path for c in self._cards if c.is_pdf}
+        source_paths = [p for p in source_paths_str.split('|') if p in pdf_paths]
+        if not source_paths:
+            return
         target_path = target_card.pdf_path
 
         # Create backup of target
@@ -609,24 +611,20 @@ class DragDropMixin:
             return len(self._cards)
         return 0
     def _handle_external_file_drop(self, urls) -> None:
-        """Handle external file drop (import).
+        """OS からのドロップ: 変換せず、そのままコピーする。
 
-        Accepts both files with importable extensions and whole directories
-        (which are walked recursively while preserving structure).
+        拡張子を問わず受け付ける（一時ファイル・隠しファイルは除く）。フォルダは
+        構造ごとコピー。ZIP も展開せず ZIP のまま置く。
         """
         paths: list[str] = []
         for url in urls:
             local = url.toLocalFile()
             if not local:
                 continue
-            if os.path.isdir(local):
+            if os.path.isdir(local) or is_library_name(local):
                 paths.append(local)
-            else:
-                ext = os.path.splitext(local)[1].lower()
-                if ext in _IMPORT_EXTS or ext in _ZIP_EXTS:
-                    paths.append(local)
         if paths:
-            self._import_paths(paths)
+            self._import_paths(paths, copy_only=True)
     def _handle_page_extraction(
         self,
         data: str,
@@ -669,6 +667,8 @@ class DragDropMixin:
             target_card = None
         else:
             target_card = self._get_card_at_pos(drop_pos) if drop_pos is not None else None
+            if target_card is not None and not target_card.is_pdf:
+                target_card = None  # PDF 以外のカードにはページを差し込めない（新しい PDF にする）
         logger.debug(f"target_card at drop_pos: {target_card}")
         is_new_target = target_card is None
         if not is_new_target:

@@ -33,7 +33,7 @@ class SplitMixin:
         if self._operation_in_progress:
             return
 
-        file_paths = self._selected_card_paths_in_grid_order()
+        file_paths = self._selected_pdf_paths_in_grid_order()  # PDF 以外は対象にしない
         if len(file_paths) != 1:
             return
         src_path = file_paths[0]

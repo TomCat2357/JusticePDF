@@ -258,3 +258,24 @@ def ensure_library_dir() -> Path:
 def set_library_dir(path: str | Path) -> None:
     """ライブラリフォルダを設定へ保存する。"""
     QSettings().setValue(DEFAULT_FOLDER_KEY, str(path))
+
+
+# ---------------------------------------------------------------------------
+# ライブラリ画面: 種類での絞り込み（隠す種類）
+# ---------------------------------------------------------------------------
+HIDDEN_FILE_KINDS_KEY = "library/hidden_kinds"
+
+
+def hidden_file_kinds() -> set[str]:
+    """ライブラリ画面で隠している種類（file_kinds.FILE_KINDS のキー）。既定は空（全部表示）。"""
+    from src.utils.file_kinds import FILE_KINDS
+
+    raw = QSettings().value(HIDDEN_FILE_KINDS_KEY, "", type=str)
+    return {k for k in str(raw or "").split(",") if k in FILE_KINDS}
+
+
+def set_hidden_file_kinds(kinds) -> None:
+    from src.utils.file_kinds import FILE_KINDS
+
+    valid = [k for k in FILE_KINDS if k in set(kinds)]
+    QSettings().setValue(HIDDEN_FILE_KINDS_KEY, ",".join(valid))

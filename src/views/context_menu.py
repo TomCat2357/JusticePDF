@@ -44,6 +44,9 @@ def _from_action(menu: QMenu, source: QAction) -> tuple[str, QAction]:
     if icon_name:
         proxy.setIcon(icons.icon(icon_name, MENU_ICON_COLOR, size=MENU_ICON_SIZE))
     proxy.setEnabled(source.isEnabled())
+    tip = source.property("menu_tip")
+    if tip:
+        proxy.setToolTip(str(tip))  # 無効の理由などを、メニュー上のツールチップで伝える
     if source.isCheckable():
         proxy.setCheckable(True)
         proxy.setChecked(source.isChecked())
@@ -70,6 +73,7 @@ def build_context_menu(parent, header: str | None, entries, footer: str | None =
     節の間に区切り線を入れる。
     """
     menu = QMenu(parent)
+    menu.setToolTipsVisible(True)
     menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)  # 閉じたら消える（親の子に溜めない）
     rows: list[tuple[int, int, str, QAction]] = []
     for i, entry in enumerate(entries):

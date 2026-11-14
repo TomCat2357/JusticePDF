@@ -196,6 +196,7 @@ OPS.update(_ops(
     ("importMenu",     "Upload",        "インポート",             None,         "",       None),
     ("newMenu",        "FilePlus",      "新規作成",               None,         "",       None),
     ("sortMenu",       "ArrowUpDown",   "並び替え",               None,         "",       None),
+    ("kindFilter",     "Eye",           "種類で絞り込み",         None,         "",       None),
     ("sizeMenu",       "MoveDiagonal",  "カードの大きさ",         "Ctrl+ホイール", "",    None),
     ("openNewWindow",  "Columns",       "新しいウィンドウで開く", None,         "open",   None),
     ("showInExplorer", "FolderSearch",  "エクスプローラで表示",   None,         "link",   None),
