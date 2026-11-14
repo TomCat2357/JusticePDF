@@ -194,7 +194,8 @@ def test_convert_kind_rules():
     assert ck("a.txt") == "text"
     for name in ("a.png", "a.jpg", "a.jpeg", "a.gif", "a.webp", "a.bmp", "a.svg", "a.tif"):
         assert ck(name) == "image"
-    for name in ("a.pdf", "a.md", "a.csv", "a.zip", "a.xyz", "noext"):
+    assert ck("a.md") == "markdown" and ck("a.MARKDOWN") == "markdown"
+    for name in ("a.pdf", "a.csv", "a.zip", "a.xyz", "noext"):
         assert ck(name) is None
 
 

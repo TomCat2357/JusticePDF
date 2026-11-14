@@ -742,7 +742,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         toolbar.addWidget(self._export_btn)
         self._print_btn = make_tool_button(make_action(self, "print", self._on_print))
         toolbar.addWidget(self._print_btn)
-        # PDFに変換（Office・txt・画像。変換できるものが選ばれているときだけ有効）
+        # PDFに変換（Office・txt・Markdown・画像。変換できるものが選ばれているときだけ有効）
         self._convert_btn = make_tool_button(make_action(self, "convertPdf", self._on_convert_to_pdf))
         toolbar.addWidget(self._convert_btn)
 
@@ -1876,7 +1876,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                 entries.append(ctx("open", lambda: self._on_card_double_clicked(card)))
                 entries.append(ctx("openZoom", lambda: self._on_card_double_clicked(card, True)))
             else:
-                entries.append(ctx("openApp", lambda: self._on_card_double_clicked(card)))
+                if file_kinds.is_markdown(card.pdf_path):
+                    entries.append(ctx("open", lambda: self._on_card_double_clicked(card)))
+                entries.append(ctx("openApp", lambda: self._open_with_default_app(card.pdf_path)))
             entries.append(ctx("rename", self._on_rename, not busy))
             if card.is_pdf:
                 entries.append(ctx("renamePdf", self._on_rename_pdf_title, not busy))
@@ -1949,6 +1951,36 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                 logger.debug("explorer /select failed", exc_info=True)
         self._open_in_explorer(os.path.dirname(path))
 
+    def _open_with_default_app(self, path: str) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _open_markdown_window(self, path: str) -> None:
+        """Markdown をアプリ内のプレビュー・編集ウィンドウで開く（開いていればそれを前面へ）。"""
+        from src.views.markdown_window import MarkdownWindow
+        from src.utils.markdown_to_pdf import MAX_BYTES
+        try:
+            too_big = os.path.getsize(path) > MAX_BYTES
+        except OSError:
+            too_big = False
+        if too_big:  # 大きすぎるものはアプリ内では開かず、既定のアプリへ
+            self._open_with_default_app(path)
+            return
+        for widget in QApplication.topLevelWidgets():
+            if (isinstance(widget, MarkdownWindow) and widget.isVisible()
+                    and os.path.normcase(widget.path) == os.path.normcase(os.path.abspath(path))):
+                widget.setWindowState(widget.windowState() & ~Qt.WindowState.WindowMinimized)
+                widget.show()
+                widget.raise_()
+                widget.activateWindow()
+                return
+        win = MarkdownWindow(path)
+        win.convert_requested.connect(lambda p: self._convert_paths_to_pdf([p]))
+        # 親なしのトップレベルなので、Python 側で参照を持って破棄されないようにする
+        self._markdown_windows = [w for w in getattr(self, "_markdown_windows", []) if w is not win]
+        self._markdown_windows.append(win)
+        win.closed.connect(lambda w: self._markdown_windows.remove(w) if w in self._markdown_windows else None)
+        win.show()
+
     def _on_card_double_clicked(self, card: PDFCard, open_zoom: bool = False) -> None:
         """Handle card double-click - open page edit window.
 
@@ -1956,8 +1988,11 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         immediately switched into enlarged single-page mode on page 0.
         """
         if not card.is_pdf:
-            # PDF 以外は編集画面を持たない。OS の既定アプリで開く。
-            QDesktopServices.openUrl(QUrl.fromLocalFile(card.pdf_path))
+            if file_kinds.is_markdown(card.pdf_path):
+                self._open_markdown_window(card.pdf_path)
+            else:
+                # それ以外の PDF 以外は編集画面を持たない。OS の既定アプリで開く。
+                self._open_with_default_app(card.pdf_path)
             return
         from src.views.page_edit_window import PageEditWindow
         # If a window for this file is already open, bring it to front.

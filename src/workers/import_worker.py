@@ -143,10 +143,16 @@ def _convert_text(src_path: str, dest_pdf_path: Path) -> None:
     text_to_pdf(src_path, str(dest_pdf_path))
 
 
+def _convert_markdown(src_path: str, dest_pdf_path: Path) -> None:
+    # QTextDocument / QPdfWriter は GUI スレッド外でも使える（画像は QImage で扱う）。
+    from src.utils.markdown_to_pdf import markdown_to_pdf
+    markdown_to_pdf(src_path, str(dest_pdf_path))
+
+
 # ImportWorker の動作モード。
 MODE_IMPORT = "import"    # 従来のインポート: PDF はコピー、Office・画像は PDF に変換
 MODE_COPY = "copy"        # 変換せず、そのままコピー（ドロップ用）
-MODE_CONVERT = "convert"  # ［PDFに変換］: Office・txt・画像を PDF に変換（元は残す）
+MODE_CONVERT = "convert"  # ［PDFに変換］: Office・txt・Markdown・画像を PDF に変換（元は残す）
 
 
 class ImportWorker(QThread):
@@ -218,6 +224,8 @@ class ImportWorker(QThread):
                             _convert_office(src, dest_path, self._soffice)
                         elif kind == "text":
                             _convert_text(src, dest_path)
+                        elif kind == "markdown":
+                            _convert_markdown(src, dest_path)
                         elif kind == "image":
                             _convert_image(src, dest_path)
                         else:
