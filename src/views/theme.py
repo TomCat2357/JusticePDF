@@ -88,7 +88,9 @@ COLORS: dict[str, str] = {
     "warn": "#b45309",
     "warn-soft": "#fffbeb",
     # ラバーバンド
-    "rubber-fill": "rgba(37, 99, 235, 0.10)",
+    "rubber-fill": "rgba(59, 130, 246, 0.20)",
+    # カードのホバー（slate-200 の 70%）
+    "card-hover": "rgba(226, 232, 240, 0.7)",
 }
 # モード色の 35%（ツールバーの下罫線）
 COLORS["mode-folder-line"] = _rgba(COLORS["mode-folder"], 0.35)

@@ -144,6 +144,12 @@ class DragDropMixin:
         # Reset any card merge highlighting
         self._clear_all_drop_targets()
 
+        # 名前で絞り込み中は並べ替え（挿入位置の指定）を受けない
+        if self._filter_active():
+            self._drop_indicator.hide()
+            self._drop_indicator_index = -1
+            return
+
         idx = self._get_drop_index(pos)
         if idx == self._drop_indicator_index:
             return
@@ -201,6 +207,11 @@ class DragDropMixin:
                 not self._normalize_path(os.path.dirname(p)) == wd_norm
                 for p in source_paths
             )
+
+            if self._filter_active() and drop_mode != -2:
+                # 絞り込み中の並べ替え・挿入ドロップは止める（結合は可）
+                event.ignore()
+                return
 
             if is_cross_window:
                 self._handle_cross_window_card_drop(source_paths, drop_pos, is_copy=is_copy)

@@ -4,6 +4,9 @@ from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel, QApplication, QWidget
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QUrl
 from PyQt6.QtGui import QDrag, QPixmap
 
+from src.views import icons
+from src.views.card_widgets import ElidedNameLabel, card_width_for, paper_pixmap
+from src.views.theme import COLORS
 from src.views.view_helpers import apply_drag_pixmap
 from src.utils.pdf_utils import get_pdf_card_info
 from src.utils.constants import PDFCARD_MIME_TYPE, FOLDERCARD_MIME_TYPE
@@ -21,8 +24,9 @@ class PDFCard(QFrame):
     dropped_on = pyqtSignal(object, str)  # Emits (self, source_paths_str) when another card is dropped on this card
     context_menu_requested = pyqtSignal(object, object)  # Emits (self, global_pos) when context menu is requested
 
-    CARD_WIDTH = 150
-    THUMBNAIL_SIZE = 120
+    # サムネイル枠（正方形）の既定の一辺。カード幅は枠 + 余白。
+    THUMBNAIL_SIZE = 136
+    CARD_WIDTH = card_width_for(THUMBNAIL_SIZE)
 
     def __init__(self, pdf_path: str, parent=None, *, card_width: int | None = None, thumb_size: int | None = None):
         super().__init__(parent)
@@ -47,38 +51,54 @@ class PDFCard(QFrame):
         self.setLineWidth(1)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
-        # Thumbnail container with page count overlay
+        # 正方形のサムネイル枠（右上にバッジ、左上に編集中の錠前）
         self._thumbnail_container = QWidget()
         self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
-        
-        # Thumbnail
+
         self._thumbnail_label = QLabel(self._thumbnail_container)
+        self._thumbnail_label.setObjectName("cardThumb")
         self._thumbnail_label.setFixedSize(self._thumb_size, self._thumb_size)
         self._thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._thumbnail_label.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
         self._thumbnail_label.move(0, 0)
 
-        # Page count overlay (top-right of thumbnail)
-        self._page_count_label = QLabel("0p", self._thumbnail_container)
-        self._page_count_label.setStyleSheet(
-            "background-color: rgba(0, 0, 0, 0.7); color: white; padding: 2px 5px; border-radius: 3px; font-size: 11px;"
-        )
+        # 種別バッジ「PDF 3p」（右上）
+        self._page_count_label = QLabel("PDF", self._thumbnail_container)
+        self._page_count_label.setObjectName("cardBadge")
         self._page_count_label.adjustSize()
-        self._page_count_label.move(self._thumb_size - self._page_count_label.width() - 3, 3)
+        self._place_badge()
         self._page_count_label.raise_()
+
+        # 編集中（ロック）の錠前（左上）
+        self._lock_label = QLabel(self._thumbnail_container)
+        self._lock_label.setObjectName("cardLock")
+        self._lock_label.setPixmap(icons.pixmap("Lock", COLORS["star"], 16))
+        self._lock_label.setFixedSize(16, 16)
+        self._lock_label.move(4, 4)
+        self._lock_label.hide()
 
         layout.addWidget(self._thumbnail_container, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Filename only (no page count below)
-        self._filename_label = QLabel()
-        self._filename_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._filename_label.setWordWrap(True)
-        layout.addWidget(self._filename_label)
+        # 名前（中央揃え・2 行まで）
+        self._filename_label = ElidedNameLabel()
+        self._filename_label.setObjectName("cardName")
+        layout.addWidget(self._filename_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self._update_style()
+
+    def _place_badge(self) -> None:
+        self._page_count_label.adjustSize()
+        self._page_count_label.move(self._thumb_size - self._page_count_label.width() - 4, 4)
+
+    def _set_thumbnail_pixmap(self, pix: QPixmap | None) -> None:
+        if pix is not None and not pix.isNull():
+            self._thumbnail_label.setPixmap(paper_pixmap(pix))
+            self._thumbnail_label.setText("")
+        else:
+            self._thumbnail_label.setPixmap(QPixmap())
+            self._thumbnail_label.setText("(空)")
 
     def _load_pdf_info(self) -> None:
         """Load PDF information and thumbnail."""
@@ -86,22 +106,15 @@ class PDFCard(QFrame):
 
         # Thumbnail
         self._original_pixmap = thumbnail if not thumbnail.isNull() else None
-        if not thumbnail.isNull():
-            self._thumbnail_label.setPixmap(thumbnail)
-            self._thumbnail_label.setText("")
-        else:
-            self._thumbnail_label.setPixmap(QPixmap())
-            self._thumbnail_label.setText("(空)")
+        self._set_thumbnail_pixmap(self._original_pixmap)
 
         # Page count (avoid opening PDF twice)
         self._page_count = page_count
-        self._page_count_label.setText(f"{self._page_count}p")
-        self._page_count_label.adjustSize()
-        # Reposition to top-right after text change
-        self._page_count_label.move(self._thumb_size - self._page_count_label.width() - 3, 3)
+        self._page_count_label.setText(f"PDF {self._page_count}p" if self._page_count > 0 else "PDF")
+        self._place_badge()
 
         # Filename
-        self._filename_label.setText(os.path.basename(self._pdf_path))
+        self._filename_label.set_full_text(os.path.basename(self._pdf_path), self._thumb_size)
 
     def _update_style(self) -> None:
         """Update the card style based on selection, locked, and drop-target state."""
@@ -120,6 +133,7 @@ class PDFCard(QFrame):
                 state = "selected"
             else:
                 state = "normal"
+        self._lock_label.setVisible(self._is_locked)
         self.setProperty("state", state)
         self.style().unpolish(self)
         self.style().polish(self)
@@ -190,16 +204,15 @@ class PDFCard(QFrame):
         self.setFixedWidth(self._card_width)
         self._thumbnail_container.setFixedSize(self._thumb_size, self._thumb_size)
         self._thumbnail_label.setFixedSize(self._thumb_size, self._thumb_size)
-        # Reposition page count label
-        self._page_count_label.adjustSize()
-        self._page_count_label.move(self._thumb_size - self._page_count_label.width() - 3, 3)
+        self._place_badge()
+        self._filename_label.set_full_text(os.path.basename(self._pdf_path), self._thumb_size)
         if self._original_pixmap and not self._original_pixmap.isNull():
             scaled = self._original_pixmap.scaled(
                 self._thumb_size, self._thumb_size,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            self._thumbnail_label.setPixmap(scaled)
+            self._thumbnail_label.setPixmap(paper_pixmap(scaled))
         self.updateGeometry()
 
     def render_high_quality(self) -> None:

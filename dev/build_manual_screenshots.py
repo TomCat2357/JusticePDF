@@ -156,7 +156,10 @@ def build_main_window(work_dir: Path, with_folders: bool = True) -> "main_window
     if with_folders:
         for sub in sorted([p for p in work_dir.iterdir() if p.is_dir()]):
             win._add_folder_card(str(sub))
+    win._update_mode_bar()  # パンくずは作業フォルダに合わせて作り直す
     win.show()
+    QApplication.processEvents()
+    win._refresh_grid()
     QApplication.processEvents()
     return win
 
@@ -207,6 +210,31 @@ def scene_toolbar(work_dir: Path) -> None:
         return
     QApplication.processEvents()
     _save(toolbar, "04_toolbar.png")
+    win.close()
+
+
+def scene_context_menu(work_dir: Path) -> None:
+    """カードの右クリックメニュー（Justice Desk 風）を、メイン画面の横に並べて撮る。"""
+    from PyQt6.QtGui import QPixmap, QPainter
+    print("[scene] 40_context_menu")
+    win = build_main_window(work_dir)
+    for card in win._cards[:2]:
+        card.set_selected(True)
+        win._selected_cards.append(card)
+    win._update_button_states()
+    QApplication.processEvents()
+    menu = win._build_card_context_menu()
+    menu_pix = _grab_menu(menu)
+    win_pix = win.grab()
+    comp = QPixmap(win_pix.width(), win_pix.height())
+    comp.fill(Qt.GlobalColor.white)
+    painter = QPainter(comp)
+    painter.drawPixmap(0, 0, win_pix)
+    painter.drawPixmap(300, 260, menu_pix)
+    painter.end()
+    out = OUT_DIR / "40_context_menu.png"
+    comp.save(str(out))
+    print(f"  saved {out.name}  ({comp.width()}x{comp.height()})")
     win.close()
 
 
@@ -624,6 +652,7 @@ def main() -> None:
         scene_main_drop_merge(work_dir)
         scene_toolbar(work_dir)
         scene_folder_selection(work_dir)
+        scene_context_menu(work_dir)
         scene_multi_window(work_dir, work_dir2)
 
         # Toolbar dropdown menus (composited under their buttons).

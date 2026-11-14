@@ -2,6 +2,7 @@
 """Main window for JusticePDF application."""
 import os
 import logging
+import subprocess
 import time
 from pathlib import Path
 from PyQt6.QtWidgets import (
@@ -10,8 +11,11 @@ from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QToolBar,
-    QPushButton,
+    QToolButton,
     QDialog,
+    QLabel,
+    QSizePolicy,
+    QStatusBar,
     QScrollArea,
     QGridLayout,
     QInputDialog,
@@ -21,8 +25,18 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QMenu,
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QPoint, QRect
-from PyQt6.QtGui import QKeySequence, QActionGroup
+from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QPoint, QRect, QUrl
+from PyQt6.QtGui import QKeySequence, QActionGroup, QAction, QCursor, QDesktopServices
+
+from src.views import icons
+from src.views.app_bar import AppBar
+from src.views.card_widgets import card_width_for, thumb_for_card_width
+from src.views.context_menu import build_context_menu
+from src.views.filter_bar import FilterBar, name_matches, parse_name_filter
+from src.views.help_dialogs import AboutDialog, HelpDialog
+from src.views.mode_bar import ModeBar
+from src.views.ops import OPS, make_action, make_tool_button
+from src.views.theme import COLORS
 
 from src.views.pdf_card import PDFCard
 from src.views.folder_card import FolderCard
@@ -69,9 +83,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
     Displays PDF files as cards in a grid layout.
     """
 
-    PREVIEW_THUMB_MIN = 80
-    PREVIEW_THUMB_MAX = 400
-    PREVIEW_THUMB_STEP = 20
+    # カードの大きさ（サムネイル枠の一辺）の 4 段: 小 / 中(既定) / 大 / 特大
+    PREVIEW_SIZES = (104, 136, 200, 280)
+    PREVIEW_SIZE_LABELS = ("小", "中", "大", "特大")
 
     # Registry of live MainWindow instances for cross-window DnD.
     _instances: list["MainWindow"] = []
@@ -106,9 +120,11 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._file_stability: dict[
             str, tuple[tuple[int, int, int, int], int]
         ] = {}
-        self._preview_thumb_size = PDFCard.THUMBNAIL_SIZE
-        self._preview_card_ratio = PDFCard.CARD_WIDTH / PDFCard.THUMBNAIL_SIZE
-        self._preview_card_width = int(round(self._preview_thumb_size * self._preview_card_ratio))
+        self._preview_thumb_size = self._snap_preview_size(PDFCard.THUMBNAIL_SIZE)
+        self._preview_card_width = card_width_for(self._preview_thumb_size)
+        self._wheel_accum = 0
+        # 名前での絞り込み（空 = 絞り込みなし）
+        self._filter_groups: list = []
 
         # Zoom debounce timer for Ctrl+wheel
         self._zoom_debounce_timer = QTimer(self)
@@ -240,17 +256,48 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             QTimer.singleShot(0, lambda: window.import_external_paths(children))
         return window
 
+    @classmethod
+    def _snap_preview_size(cls, size: int) -> int:
+        """保存済み・任意の大きさを、いちばん近い 4 段のどれかへ丸める。"""
+        return min(cls.PREVIEW_SIZES, key=lambda v: abs(v - int(size)))
+
     def _setup_ui(self) -> None:
         """Set up the main UI."""
         self.setWindowTitle("JusticePDF")
         self.resize(1000, 700)
         self.setAcceptDrops(True)
 
+        # 上端: アプリバー + モード帯（ツールバーより上に置く）
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(0)
+        self._app_bar = AppBar()
+        self._mode_bar = ModeBar()
+        top_layout.addWidget(self._app_bar)
+        top_layout.addWidget(self._mode_bar)
+        self.setMenuWidget(top)
+        # 設定はアプリバーへ移した（属性名は従来どおり）。
+        self._settings_btn = self._app_bar.settings_btn
+        self._app_bar.settings_requested.connect(lambda: self._on_open_settings())
+        self._app_bar.help_requested.connect(lambda: self._on_open_help())
+        self._app_bar.about_requested.connect(lambda: self._on_open_about())
+        self._mode_bar.set_mode("folder")
+        self._mode_bar.reload_requested.connect(lambda: self._on_refresh())
+        self._update_mode_bar()
+
         central = QWidget()
         self.setCentralWidget(central)
 
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 名前で絞り込むバー（ツールバー直下。Ctrl+F で開閉）
+        self._filter_bar = FilterBar()
+        self._filter_bar.text_changed.connect(self._on_filter_text_changed)
+        self._filter_bar.close_requested.connect(self._close_filter_bar)
+        layout.addWidget(self._filter_bar)
 
         # Keep as an attribute so we can reliably use viewport width for column calculation.
         self._scroll_area = QScrollArea()
@@ -264,130 +311,185 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._scroll_area.setWidget(self._container)
 
         self._grid_layout = QGridLayout(self._container)
-        self._grid_layout.setSpacing(10)
-        self._grid_layout.setContentsMargins(10, 10, 10, 10)
+        self._grid_layout.setSpacing(8)
+        self._grid_layout.setContentsMargins(12, 12, 12, 12)
         self._grid_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        # Drop indicator line
+        # Drop indicator line（挿入位置の縦線）
         self._drop_indicator = QFrame(self._container)
         self._drop_indicator.setFrameShape(QFrame.Shape.VLine)
-        self._drop_indicator.setStyleSheet("background-color: #4f46e5;")
+        self._drop_indicator.setStyleSheet(f"background-color: {COLORS['insert-line']};")
         self._drop_indicator.setFixedWidth(3)
         self._drop_indicator.hide()
 
         # Rubber band for selection
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self._container)
 
+        # ステータスバー（常設）
+        sb = QStatusBar()
+        sb.setSizeGripEnabled(False)
+        self.setStatusBar(sb)
+        self._status_count = QLabel()
+        self._status_sort = QLabel()
+        self._status_busy = QLabel()
+        self._status_busy.setObjectName("statusBusy")
+        for lbl in (self._status_count, self._status_sort, self._status_busy):
+            lbl.setContentsMargins(0, 0, 16, 0)
+            sb.addWidget(lbl)
+        self._status_count.setContentsMargins(12, 0, 16, 0)
+        self._status_hint = QLabel(self.STATUS_HINT)
+        self._status_hint.setContentsMargins(0, 0, 12, 0)
+        sb.addPermanentWidget(self._status_hint)
+
+    STATUS_HINT = (
+        "Ctrl+クリック: 複数選択 / Ctrl+ドロップ: コピー / "
+        "カードの中央へドロップ: 結合 / Shift+右クリック: エクスプローラのメニュー"
+    )
+    SORT_LABELS = {
+        ("name", True): "名前順（昇順）",
+        ("name", False): "名前順（降順）",
+        ("date", True): "日付順（昇順）",
+        ("date", False): "日付順（降順）",
+    }
+
+    def _update_mode_bar(self) -> None:
+        """パンくずを今のフォルダのパスの区間にする（区間のクリックは L2 で配線する）。"""
+        parts = Path(self._work_dir).parts
+        crumbs: list[tuple[str, str]] = []
+        acc = None
+        for i, part in enumerate(parts):
+            acc = Path(part) if acc is None else acc / part
+            label = (part.rstrip("\\/") or part) if i == 0 else part
+            crumbs.append((label, str(acc)))
+        self._mode_bar.set_crumbs(crumbs)
+
+    def _menu_action(self, menu: QMenu, text: str, slot, *, keys: str | None = None,
+                     icon: str | None = None, checkable: bool = False) -> QAction:
+        """ドロップダウンの 1 行（右端にキー表記。実際のショートカットは登録しない）。"""
+        action = QAction(f"{text}\t{keys}" if keys else text, menu)
+        if icon:
+            action.setIcon(icons.icon(icon, "#64748b", size=14))
+        action.setCheckable(checkable)
+        action.triggered.connect(lambda _checked=False: slot())
+        menu.addAction(action)
+        return action
+
     def _setup_toolbar(self) -> None:
-        """Set up the toolbar."""
+        """Set up the toolbar（アイコンだけの flat ボタン。名前とキーはツールチップ）。"""
         toolbar = QToolBar()
-        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setObjectName("libraryToolbar")
         toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.addToolBar(toolbar)
 
-        self._undo_btn = QPushButton("元に戻す")
-        self._undo_btn.clicked.connect(self._on_undo)
-        toolbar.addWidget(self._undo_btn)
+        def tip(op_id: str) -> str:
+            op = OPS[op_id]
+            return f"{op.label} ({op.keys})" if op.keys else op.label
 
-        self._redo_btn = QPushButton("やり直し")
-        self._redo_btn.clicked.connect(self._on_redo)
-        toolbar.addWidget(self._redo_btn)
+        def named(btn, op_id: str):
+            btn.setText(OPS[op_id].label)  # IconOnly でも .text() を取れるように
+            return btn
+
+        # 名前変更（ファイル名 / PDF名 / フォルダ名）。選択に応じて項目を出し分ける。
+        self._rename_menu = QMenu(self)
+        self._rename_file_action = self._menu_action(
+            self._rename_menu, "ファイル名", self._on_rename, keys="F2")
+        self._rename_title_action = self._menu_action(
+            self._rename_menu, "PDF名", self._on_rename_pdf_title, keys="Shift+F2")
+        self._rename_folder_action = self._menu_action(
+            self._rename_menu, "フォルダ名", self._on_rename_folder_selected)
+        self._rename_btn = named(
+            make_tool_button(None, icon="Pencil", tooltip=tip("renameMenu"), menu=self._rename_menu),
+            "renameMenu")
+        toolbar.addWidget(self._rename_btn)
 
         toolbar.addSeparator()
 
-        self._delete_btn = QPushButton("削除")
-        self._delete_btn.setObjectName("danger")
-        self._delete_btn.clicked.connect(self._on_delete)
+        self._select_all_btn = make_tool_button(make_action(self, "selectall", self._on_select_all))
+        toolbar.addWidget(self._select_all_btn)
+
+        self._delete_btn = make_tool_button(make_action(self, "delete", self._on_delete))
         toolbar.addWidget(self._delete_btn)
 
-        # 名前変更（ファイル名 / PDF名）を 1 つのボタンに統合し、
-        # クリックでドロップダウンメニューを表示する。
-        self._rename_btn = QPushButton("名前変更")
-        self._rename_menu = QMenu(self._rename_btn)
-        self._rename_file_action = self._rename_menu.addAction("ファイル名")
-        self._rename_file_action.triggered.connect(self._on_rename)
-        self._rename_title_action = self._rename_menu.addAction("PDF名")
-        self._rename_title_action.triggered.connect(self._on_rename_pdf_title)
-        # フォルダを1つだけ選択しているときに現れる「フォルダ名」変更。
-        self._rename_folder_action = self._rename_menu.addAction("フォルダ名")
-        self._rename_folder_action.triggered.connect(self._on_rename_folder_selected)
-        self._rename_btn.setMenu(self._rename_menu)
-        toolbar.addWidget(self._rename_btn)
+        # 回転（右90° / 左90° / 180°）
+        self._rotate_menu = QMenu(self)
+        self._menu_action(self._rotate_menu, OPS["rotateRight"].label, lambda: self._on_rotate(90),
+                          keys="R", icon="RotateCw")
+        self._menu_action(self._rotate_menu, OPS["rotateLeft"].label, lambda: self._on_rotate(270),
+                          icon="RotateCcw")
+        self._menu_action(self._rotate_menu, OPS["rotate180"].label, lambda: self._on_rotate(180),
+                          icon="Repeat")
+        self._rotate_btn = named(
+            make_tool_button(None, icon="RotateCw", tooltip=tip("rotateMenu"), menu=self._rotate_menu),
+            "rotateMenu")
+        toolbar.addWidget(self._rotate_btn)
 
-        # 結合（複数→1つ）と分解（1つ→複数）は互いに逆操作なので 1 つのボタンに
-        # 統合し、クリックでドロップダウンメニューを表示する。
-        self._merge_split_btn = QPushButton("結合・分解")
-        self._merge_split_btn.setToolTip("複数ファイルを1つに結合／1つのPDFを複数に分解")
-        self._merge_split_menu = QMenu(self._merge_split_btn)
+        toolbar.addSeparator()
+
+        # 結合（複数→1つ）と分解（1つ→複数）は互いに逆操作なので 1 つのボタンに統合する。
+        self._merge_split_menu = QMenu(self)
         self._merge_split_menu.setToolTipsVisible(True)
-        self._merge_action = self._merge_split_menu.addAction("結合")
+        self._merge_action = self._menu_action(
+            self._merge_split_menu, "結合", self._on_merge_selected, icon="Combine")
         self._merge_action.setToolTip(
             "選択したファイル・フォルダを1つのPDFに結合\n"
             "（フォルダ構成をしおりの階層として再現します）"
         )
-        self._merge_action.triggered.connect(self._on_merge_selected)
-        self._split_action = self._merge_split_menu.addAction("分解")
+        self._split_action = self._menu_action(
+            self._merge_split_menu, "分解", self._on_split_selected, icon="Scissors")
         self._split_action.setToolTip(
             "選択したPDFをしおりの最上位階層ごとに複数ファイルへ分解\n"
             "（しおりが無い場合は1ページずつ分解します）"
         )
-        self._split_action.triggered.connect(self._on_split_selected)
-        self._merge_split_btn.setMenu(self._merge_split_menu)
+        self._merge_split_btn = named(
+            make_tool_button(None, icon="Combine", tooltip="複数ファイルを1つに結合／1つのPDFを複数に分解",
+                             menu=self._merge_split_menu),
+            "mergeSplit")
         toolbar.addWidget(self._merge_split_btn)
 
         toolbar.addSeparator()
 
-        # インポート（ファイル / フォルダ）を 1 つのボタンに統合し、
-        # クリックでドロップダウンメニューを表示する。
-        self._import_btn = QPushButton("インポート")
-        self._import_menu = QMenu(self._import_btn)
-        import_files_action = self._import_menu.addAction("ファイルをインポート")
-        import_files_action.triggered.connect(self._on_import)
-        import_folder_action = self._import_menu.addAction("フォルダをインポート")
-        import_folder_action.triggered.connect(self._on_import_folder)
-        self._import_btn.setMenu(self._import_menu)
+        # インポート（ファイル / フォルダ）
+        self._import_menu = QMenu(self)
+        self._menu_action(self._import_menu, "ファイルを選ぶ…", self._on_import, icon="FileText")
+        self._menu_action(self._import_menu, "フォルダを選ぶ…", self._on_import_folder, icon="Folder")
+        self._import_btn = named(
+            make_tool_button(None, icon="Upload", tooltip=tip("importMenu"), menu=self._import_menu),
+            "importMenu")
         toolbar.addWidget(self._import_btn)
 
-        # 新規作成（ファイル / フォルダ）を 1 つのボタンに統合し、
-        # クリックでドロップダウンメニューを表示する。
-        self._new_btn = QPushButton("新規作成")
-        self._new_menu = QMenu(self._new_btn)
-        new_file_action = self._new_menu.addAction("ファイル")
-        new_file_action.triggered.connect(self._on_new_file)
-        new_folder_action = self._new_menu.addAction("フォルダ")
-        new_folder_action.triggered.connect(self._on_new_folder)
-        self._new_btn.setMenu(self._new_menu)
+        # 新規作成（PDF ファイル / フォルダ）
+        self._new_menu = QMenu(self)
+        self._menu_action(self._new_menu, "PDF ファイル", self._on_new_file, icon="FileText")
+        self._menu_action(self._new_menu, "フォルダ", self._on_new_folder, icon="FolderPlus")
+        self._new_btn = named(
+            make_tool_button(None, icon="FilePlus", tooltip=tip("newMenu"), menu=self._new_menu),
+            "newMenu")
         toolbar.addWidget(self._new_btn)
 
-        self._export_btn = QPushButton("エクスポート")
-        self._export_btn.clicked.connect(self._on_export)
-        toolbar.addWidget(self._export_btn)
+        toolbar.addSeparator()
 
-        self._print_btn = QPushButton("印刷")
-        self._print_btn.clicked.connect(self._on_print)
+        self._export_btn = make_tool_button(make_action(self, "export", self._on_export))
+        toolbar.addWidget(self._export_btn)
+        self._print_btn = make_tool_button(make_action(self, "print", self._on_print))
         toolbar.addWidget(self._print_btn)
 
         toolbar.addSeparator()
 
-        self._rotate_btn = QPushButton("回転")
-        self._rotate_btn.clicked.connect(self._on_rotate)
-        toolbar.addWidget(self._rotate_btn)
+        # 検索（名前で絞り込み。押下状態あり）
+        self._search_action = make_action(self, "filter", checkable=True)
+        self._search_action.toggled.connect(self._on_search_toggled)
+        self._search_btn = make_tool_button(self._search_action)
+        toolbar.addWidget(self._search_btn)
 
-        self._select_all_btn = QPushButton("すべて選択")
-        self._select_all_btn.clicked.connect(self._on_select_all)
-        toolbar.addWidget(self._select_all_btn)
-
-        # 並び替え（名前順・日付順 × 昇順・降順）を 1 つのボタンに統合し、
-        # クリックでドロップダウンメニューを表示する。
-        self._sort_btn = QPushButton("並び替え")
-        self._sort_menu = QMenu(self._sort_btn)
+        # 並び替え（名前順・日付順 × 昇順・降順、手動順）。選択中に印。
+        self._sort_menu = QMenu(self)
         self._sort_action_group = QActionGroup(self)
         self._sort_action_group.setExclusive(True)
 
         def _add_sort_action(text: str, sort_type: str, ascending: bool):
-            action = self._sort_menu.addAction(text)
-            action.setCheckable(True)
-            action.triggered.connect(lambda: self._apply_sort(sort_type, ascending))
+            action = self._menu_action(
+                self._sort_menu, text, lambda: self._apply_sort(sort_type, ascending), checkable=True)
             self._sort_action_group.addAction(action)
             return action
 
@@ -396,21 +498,48 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._sort_action_date_asc = _add_sort_action("日付順（昇順）", "date", True)
         self._sort_action_date_desc = _add_sort_action("日付順（降順）", "date", False)
         self._sort_menu.addSeparator()
-        self._sort_action_manual = self._sort_menu.addAction("手動順")
-        self._sort_action_manual.setCheckable(True)
-        self._sort_action_manual.triggered.connect(self._apply_manual_sort)
+        self._sort_action_manual = self._menu_action(
+            self._sort_menu, "手動順", self._apply_manual_sort, checkable=True)
         self._sort_action_group.addAction(self._sort_action_manual)
-        self._sort_btn.setMenu(self._sort_menu)
+        self._sort_btn = named(
+            make_tool_button(None, icon="ArrowUpDown", tooltip=tip("sortMenu"), menu=self._sort_menu),
+            "sortMenu")
         toolbar.addWidget(self._sort_btn)
         self._sync_sort_menu_state()
 
-        toolbar.addSeparator()
+        # 右寄せ: カードの大きさ（小 / 中 / 大 / 特大）
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        spacer.setStyleSheet("background: transparent;")
+        toolbar.addWidget(spacer)
 
-        # 設定（デフォルトで開くフォルダ等）。単独動作でファイル操作に
-        # 影響しないため、選択状態に関わらず常に有効。
-        self._settings_btn = QPushButton("設定")
-        self._settings_btn.clicked.connect(self._on_open_settings)
-        toolbar.addWidget(self._settings_btn)
+        self._size_menu = QMenu(self)
+        self._size_action_group = QActionGroup(self)
+        self._size_action_group.setExclusive(True)
+        self._size_actions: dict[int, QAction] = {}
+        for size, label in zip(self.PREVIEW_SIZES, self.PREVIEW_SIZE_LABELS):
+            action = self._menu_action(
+                self._size_menu, label, lambda s=size: self._set_preview_thumb_size(s), checkable=True)
+            self._size_action_group.addAction(action)
+            self._size_actions[size] = action
+        self._size_actions[self._preview_thumb_size].setChecked(True)
+        self._size_btn = named(
+            make_tool_button(None, icon="MoveDiagonal", tooltip=tip("sizeMenu"), menu=self._size_menu),
+            "sizeMenu")
+        toolbar.addWidget(self._size_btn)
+
+        # 元に戻す・やり直しはツールバーから外し、QAction として持つ（空白の右クリックに出す）。
+        # ショートカット Ctrl+Z / Ctrl+Y は _setup_shortcuts で登録する。
+        self._undo_btn = make_action(self, "undo", self._on_undo)
+        self._redo_btn = make_action(self, "redo", self._on_redo)
+
+        # QToolBar が子ボタンのアイコン寸法を上書きするので、最後に正しい寸法へ戻す
+        # （ドロップダウンは「アイコン + 小さな ▼」の横長）。
+        for btn in toolbar.findChildren(QToolButton):
+            if btn.menu() is not None:
+                btn.setIconSize(QSize(*icons.chevron_icon_size(17)))
+            else:
+                btn.setIconSize(QSize(17, 17))
 
         self._update_button_states()
 
@@ -427,6 +556,10 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                 (QKeySequence.StandardKey.SelectAll, self._on_select_all),
                 (QKeySequence("Ctrl+E"), self._on_export),
                 (QKeySequence.StandardKey.Print, self._on_print),
+                (QKeySequence("R"), lambda: self._on_rotate(90)),
+                (QKeySequence(Qt.Key.Key_Escape), self._on_escape),
+                (QKeySequence(Qt.Key.Key_F5), self._on_refresh),
+                (QKeySequence("Ctrl+F"), self._on_find_shortcut),
             ),
         )
 
@@ -458,6 +591,79 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._merge_action.setVisible(can_merge)
         self._split_action.setVisible(can_split)
         self._merge_split_btn.setEnabled((can_merge or can_split) and not busy)
+        self._update_status()
+
+    # ---- ステータスバー ------------------------------------------------
+    def _update_status(self) -> None:
+        """左「N 項目 / N 選択」+ 並び順 + 処理中。絞り込み中は「N / M 項目（絞り込み中）」。"""
+        if not hasattr(self, "_status_count"):
+            return
+        total = len(self._cards) + len(self._folder_cards)
+        if self._filter_groups:
+            shown = sum(1 for it in (*self._folder_cards, *self._cards) if self._item_visible(it))
+            text = f"{shown} / {total} 項目（絞り込み中）"
+        else:
+            text = f"{total} 項目"
+        selected = len(self._selected_cards) + len(self._selected_folder_cards)
+        if selected:
+            text += f" / {selected} 選択"
+        self._status_count.setText(text)
+        if self._sort_order == "manual":
+            self._status_sort.setText("手動順")
+        else:
+            self._status_sort.setText(self.SORT_LABELS.get((self._sort_order, self._sort_ascending), ""))
+        busy = self._operation_in_progress or self._active_import_worker is not None
+        self._status_busy.setText("処理中…" if busy else "")
+
+    # ---- 名前での絞り込み ----------------------------------------------
+    def _item_visible(self, item) -> bool:
+        return name_matches(item.filename, self._filter_groups)
+
+    def _filter_active(self) -> bool:
+        return bool(self._filter_groups)
+
+    def _on_search_toggled(self, on: bool) -> None:
+        self._filter_bar.setVisible(on)
+        if on:
+            self._filter_bar.focus_input()
+        else:
+            self._filter_bar.clear()  # text_changed -> 絞り込み解除
+
+    def _close_filter_bar(self) -> None:
+        self._search_action.setChecked(False)
+
+    def _on_find_shortcut(self) -> None:
+        if not self._search_action.isChecked():
+            self._search_action.setChecked(True)
+        else:
+            self._filter_bar.focus_input()
+
+    def _on_filter_text_changed(self, text: str) -> None:
+        self._filter_groups = parse_name_filter(text)
+        # 隠れる項目は選択から外す（見えない項目に操作が及ばないように）
+        for card in list(self._selected_cards):
+            if not self._item_visible(card):
+                card.set_selected(False)
+                self._selected_cards.remove(card)
+        for fc in list(self._selected_folder_cards):
+            if not self._item_visible(fc):
+                fc.set_selected(False)
+                self._selected_folder_cards.remove(fc)
+        self._refresh_grid()
+        self._update_button_states()
+
+    def _on_escape(self) -> None:
+        """Esc: 絞り込みバーが開いていれば閉じる。無ければ選択を解除する。"""
+        if self._filter_bar.isVisible():
+            self._close_filter_bar()
+        else:
+            self._clear_selection()
+
+    def _on_open_help(self) -> None:
+        HelpDialog(self).exec()
+
+    def _on_open_about(self) -> None:
+        AboutDialog(self).exec()
 
     def _on_open_settings(self) -> None:
         """「設定」ボタンのハンドラ。デフォルトで開くフォルダ・大容量PDFの
@@ -1023,7 +1229,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         # preview size while the window is resized; only the column count
         # should change.  If one item cannot fit, the scroll area handles the
         # overflow instead of shrinking the preview.
-        thumb_size = max(1, int(round(card_width / self._preview_card_ratio)))
+        thumb_size = thumb_for_card_width(card_width)
         pdf_thumbnail_size_changed = any(
             card._thumb_size != thumb_size for card in self._cards
         )
@@ -1032,11 +1238,15 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         if pdf_thumbnail_size_changed:
             self._zoom_debounce_timer.start()
 
-        all_items: list[QWidget] = list(self._folder_cards) + list(self._cards)
+        # 名前で絞り込み中は、一致する項目だけを並べる（隠れた項目は親なしのまま）。
+        all_items: list[QWidget] = [
+            item for item in (*self._folder_cards, *self._cards) if self._item_visible(item)
+        ]
         for i, item in enumerate(all_items):
             row = i // cols
             col = i % cols
             self._grid_layout.addWidget(item, row, col)
+        self._update_status()
 
     def _on_deferred_grid_refresh(self) -> None:
         """Callback for the debounced grid refresh timer."""
@@ -1093,13 +1303,22 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         return [fc.folder_path for fc in self._folder_cards if fc in self._selected_folder_cards]
 
     def _set_preview_thumb_size(self, size: int) -> None:
-        size = max(self.PREVIEW_THUMB_MIN, min(self.PREVIEW_THUMB_MAX, int(size)))
+        """カードの大きさを 4 段のうち最も近い段にする。"""
+        size = self._snap_preview_size(size)
+        if size in getattr(self, "_size_actions", {}):
+            self._size_actions[size].setChecked(True)
         if size == self._preview_thumb_size:
             return
         self._preview_thumb_size = size
-        self._preview_card_width = int(round(self._preview_thumb_size * self._preview_card_ratio))
+        self._preview_card_width = card_width_for(size)
         self._refresh_grid()
         self._zoom_debounce_timer.start()
+
+    def _step_preview_size(self, direction: int) -> None:
+        """Ctrl+ホイール: 1 段ずつ大きく / 小さく。"""
+        idx = self.PREVIEW_SIZES.index(self._preview_thumb_size) + direction
+        idx = max(0, min(len(self.PREVIEW_SIZES) - 1, idx))
+        self._set_preview_thumb_size(self.PREVIEW_SIZES[idx])
 
     def eventFilter(self, obj, event) -> bool:
         scroll_area = getattr(self, "_scroll_area", None)
@@ -1114,8 +1333,12 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 delta = event.angleDelta().y()
                 if delta != 0:
-                    step = self.PREVIEW_THUMB_STEP if delta > 0 else -self.PREVIEW_THUMB_STEP
-                    self._set_preview_thumb_size(self._preview_thumb_size + step)
+                    # 高精度ホイールでも 1 ノッチ(120)ごとに 1 段だけ動かす
+                    self._wheel_accum += delta
+                    while abs(self._wheel_accum) >= 120:
+                        direction = 1 if self._wheel_accum > 0 else -1
+                        self._wheel_accum -= 120 * direction
+                        self._step_preview_size(direction)
                 event.accept()
                 return True
         return super().eventFilter(obj, event)
@@ -1129,6 +1352,11 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                     super().mousePressEvent(event)
                     return
                 child = child.parent()
+            # 帯・ツールバー・絞り込みバーなど、カード領域の外では範囲選択を始めない
+            viewport = self._scroll_area.viewport()
+            if not viewport.rect().contains(viewport.mapFrom(self, event.pos())):
+                super().mousePressEvent(event)
+                return
             # Start rubber band selection on empty area
             container_pos = self._container.mapFrom(self, event.pos())
             self._rubber_band_origin = container_pos
@@ -1200,18 +1428,111 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._update_button_states()
 
     def _on_card_context_menu_requested(self, card: PDFCard, global_pos: QPoint) -> None:
-        """Handle Explorer-style right-click selection and menu opening."""
+        """カードの右クリック。未選択ならそのカードだけ選ぶ。Shift なら純正メニュー。"""
         if card not in self._selected_cards:
             self._clear_selection()
             card.set_selected(True)
             self._selected_cards.append(card)
             self._update_button_states()
 
-        show_native_file_context_menu(
-            int(self.winId()),
-            self._selected_card_paths_in_grid_order(),
-            global_pos,
-        )
+        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
+            show_native_file_context_menu(
+                int(self.winId()),
+                self._selected_card_paths_in_grid_order(),
+                global_pos,
+            )
+            return
+        self._build_card_context_menu().exec(global_pos)
+
+    # ---- 右クリックメニュー（Justice Desk 風） --------------------------
+    def _selected_paths_in_grid_order(self) -> list[str]:
+        return self._selected_folder_paths_in_grid_order() + self._selected_card_paths_in_grid_order()
+
+    @staticmethod
+    def _ctx(op_id: str, slot, enabled: bool = True, label: str | None = None) -> tuple:
+        op = OPS[op_id]
+        return (op.group, op.icon, label or op.label, slot, op.keys, enabled)
+
+    def _build_card_context_menu(self) -> QMenu:
+        """選択中のカード（PDF / フォルダ）に対する右クリックメニューを作る。"""
+        n_files = len(self._selected_cards)
+        n_folders = len(self._selected_folder_cards)
+        n = n_files + n_folders
+        busy = self._operation_in_progress
+        one_file = n_files == 1 and n_folders == 0
+        one_folder = n_folders == 1 and n_files == 0
+        if n == 1:
+            header = (self._selected_cards[0].filename if one_file
+                      else self._selected_folder_cards[0].filename)
+        else:
+            header = f"{n} 件"
+        ctx = self._ctx
+        entries: list = []
+        if one_file:
+            card = self._selected_cards[0]
+            entries.append(ctx("open", lambda: self._on_card_double_clicked(card)))
+            entries.append(ctx("openZoom", lambda: self._on_card_double_clicked(card, True)))
+            entries.append(ctx("rename", self._on_rename, not busy))
+            entries.append(ctx("renamePdf", self._on_rename_pdf_title, not busy))
+        elif one_folder:
+            fc = self._selected_folder_cards[0]
+            entries.append(ctx("open", lambda: self._open_folder_in_new_window(fc.folder_path)))
+            entries.append(ctx("openNewWindow", lambda: self._open_folder_in_new_window(fc.folder_path)))
+            entries.append(ctx("rename", self._on_rename_folder_selected, not busy))
+        if n_folders >= 1 or n_files >= 2:
+            entries.append(ctx("merge", self._on_merge_selected, not busy))
+        if one_file:
+            entries.append(ctx("split", self._on_split_selected, not busy))
+        entries.append(ctx("export", self._on_export, not busy))
+        if n_files >= 1:
+            entries.append(ctx("print", self._on_print, not busy))
+        paths = self._selected_paths_in_grid_order()
+        if n == 1:
+            entries.append(ctx("showInExplorer", lambda: self._show_in_explorer(paths[0])))
+        entries.append(ctx("copyPath", lambda: self._copy_paths(paths)))
+        entries.append(ctx("nativeMenu", lambda: show_native_file_context_menu(
+            int(self.winId()), paths, QCursor.pos())))
+        entries.append(ctx("delete", self._on_delete, not busy))
+        return build_context_menu(self, header, entries, "Shift + 右クリックでエクスプローラのメニュー")
+
+    def _build_blank_context_menu(self) -> QMenu:
+        """カードの無い所の右クリックメニュー。"""
+        ctx = self._ctx
+        busy = self._operation_in_progress
+        entries = [
+            ctx("selectall", self._on_select_all, bool(self._cards or self._folder_cards)),
+            ctx("undo", self._on_undo, self._undo_manager.can_undo() and not busy),
+            ctx("redo", self._on_redo, self._undo_manager.can_redo() and not busy),
+            ctx("openInExplorer", lambda: self._open_in_explorer(str(self._work_dir))),
+            ctx("copyPath", lambda: self._copy_paths([str(self._work_dir)])),
+            ctx("refresh", self._on_refresh),
+        ]
+        return build_context_menu(self, "このフォルダ", entries)
+
+    def contextMenuEvent(self, event) -> None:
+        """カード以外（空白）の右クリック。カード自身は自分で処理して accept 済み。"""
+        viewport = self._scroll_area.viewport()
+        if viewport.rect().contains(viewport.mapFromGlobal(event.globalPos())):
+            self._build_blank_context_menu().exec(event.globalPos())
+            event.accept()
+            return
+        super().contextMenuEvent(event)
+
+    def _copy_paths(self, paths: list[str]) -> None:
+        QApplication.clipboard().setText("\n".join(paths))
+
+    def _open_in_explorer(self, folder: str) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _show_in_explorer(self, path: str) -> None:
+        """エクスプローラで、その項目を選んだ状態で表示する。"""
+        if os.name == "nt":
+            try:
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+                return
+            except OSError:
+                logger.debug("explorer /select failed", exc_info=True)
+        self._open_in_explorer(os.path.dirname(path))
 
     def _on_card_double_clicked(self, card: PDFCard, open_zoom: bool = False) -> None:
         """Handle card double-click - open page edit window.
@@ -1434,27 +1755,18 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         fc: FolderCard,
         global_pos: QPoint,
     ) -> None:
-        """Handle Explorer-style right-click selection and menu opening."""
+        """フォルダカードの右クリック。Shift なら従来のエクスプローラ純正メニュー。"""
         if fc not in self._selected_folder_cards:
             self._clear_selection()
             fc.set_selected(True)
             self._selected_folder_cards.append(fc)
             self._update_button_states()
 
-        paths = self._selected_folder_paths_in_grid_order()
-        if show_native_file_context_menu(int(self.winId()), paths, global_pos):
-            return
-
-        # Fallback for non-Windows or when the native menu cannot be shown.
-        from PyQt6.QtWidgets import QMenu
-        menu = QMenu(self)
-        rename_action = menu.addAction("名前変更")
-        delete_action = menu.addAction("削除")
-        chosen = menu.exec(global_pos)
-        if chosen is rename_action:
-            self._rename_folder(fc)
-        elif chosen is delete_action:
-            self._delete_folder(fc)
+        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
+            paths = self._selected_folder_paths_in_grid_order()
+            if show_native_file_context_menu(int(self.winId()), paths, global_pos):
+                return
+        self._build_card_context_menu().exec(global_pos)
 
 
     def _find_window_by_path(self, path: str) -> "MainWindow | None":
@@ -1644,8 +1956,11 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             return
         print_pdfs(targets, self, settings=dialog.get_settings(), printer=dialog.build_printer())
 
-    def _on_rotate(self) -> None:
-        """Handle rotate action."""
+    def _on_rotate(self, angle: int = 90) -> None:
+        """選んだ PDF を回転する（右90° = 90 / 左90° = 270 / 180）。Undo は逆の角度。"""
+        if angle not in (90, 180, 270):  # triggered(bool) などの誤った引数は右90°として扱う
+            angle = 90
+        undo_angle = (360 - angle) % 360
         # Store paths and page indices instead of widget references
         rotations = []
 
@@ -1661,7 +1976,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         def do_rotate():
             rotated_paths: list[str] = []
             for pdf_path, indices in rotations:
-                rotate_pages(pdf_path, indices, 90)
+                rotate_pages(pdf_path, indices, angle)
                 rotated_paths.append(pdf_path)
                 # Find and refresh the card for this path
                 for card in self._cards:
@@ -1673,7 +1988,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         def undo_rotate():
             rotated_paths: list[str] = []
             for pdf_path, indices in rotations:
-                rotate_pages(pdf_path, indices, 270)
+                rotate_pages(pdf_path, indices, undo_angle)
                 rotated_paths.append(pdf_path)
                 # Find and refresh the card for this path
                 for card in self._cards:
@@ -1689,7 +2004,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             return
 
         self._undo_manager.add_action(UndoAction(
-            description=f"Rotate {len(rotations)} PDF(s)",
+            description=f"Rotate {len(rotations)} PDF(s) by {angle}",
             undo_func=undo_rotate,
             redo_func=do_rotate
         ))
@@ -1802,6 +2117,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         )
         for action in actions:
             action.setChecked(False)
+        self._update_status()
 
         if self._sort_order == "manual":
             self._sort_action_manual.setChecked(True)

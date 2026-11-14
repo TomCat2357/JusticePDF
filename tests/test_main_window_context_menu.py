@@ -11,6 +11,15 @@ from src.views import page_edit_window as page_edit_window_module
 from tests.helpers import FakeWatcher
 
 
+def _hold_shift(monkeypatch):
+    """Shift+右クリック（エクスプローラ純正メニュー）の経路を試す。"""
+    monkeypatch.setattr(
+        main_window.QApplication,
+        "keyboardModifiers",
+        staticmethod(lambda: Qt.KeyboardModifier.ShiftModifier),
+    )
+
+
 @pytest.fixture
 def window_factory(monkeypatch, qtbot, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -42,6 +51,7 @@ def window_factory(monkeypatch, qtbot, tmp_path):
 
 def test_context_menu_selects_unselected_card_only(window_factory, monkeypatch):
     window, paths = window_factory()
+    _hold_shift(monkeypatch)
     captured: list[tuple[int, list[str], QPoint]] = []
 
     monkeypatch.setattr(
@@ -64,6 +74,7 @@ def test_context_menu_selects_unselected_card_only(window_factory, monkeypatch):
 
 def test_context_menu_preserves_existing_multi_selection(window_factory, monkeypatch):
     window, paths = window_factory()
+    _hold_shift(monkeypatch)
     captured: list[list[str]] = []
 
     monkeypatch.setattr(
@@ -86,6 +97,7 @@ def test_context_menu_preserves_existing_multi_selection(window_factory, monkeyp
 
 def test_context_menu_paths_follow_grid_order(window_factory, monkeypatch):
     window, paths = window_factory()
+    _hold_shift(monkeypatch)
     captured: list[list[str]] = []
 
     monkeypatch.setattr(
@@ -149,7 +161,7 @@ def test_file_grid_reflows_without_horizontal_overflow(window_factory, qtbot):
             == Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         assert not window._scroll_area.horizontalScrollBar().isVisible()
-        assert {card.width() for card in (*window._folder_cards, *window._cards)} == {150}
+        assert {card.width() for card in (*window._folder_cards, *window._cards)} == {pdf_card.PDFCard.CARD_WIDTH}
         viewport = window._scroll_area.viewport()
         viewport_rect = viewport.rect()
         for card in (*window._folder_cards, *window._cards):

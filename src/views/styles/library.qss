@@ -93,50 +93,72 @@ QScrollArea > QWidget > QWidget {
     background-color: @slate-100@;
 }
 
-/* ---------- PDFCard ------------------------------------------------------ */
+/* ---------- Cards (PDFCard / FolderCard) ------------------------------- */
+/* 枠は通常時も 2px の透明にして、選択しても中身がずれないようにする */
 
-PDFCard {
-    background-color: @white@;
-    border: 1px solid @slate-200@;
-    border-radius: 8px;
-}
-PDFCard[state="selected"] {
-    background-color: @select-bg@;
-    border: 1px solid @select-ring@;
-}
-PDFCard[state="locked"] {
-    background-color: @slate-200@;
-    border: 1px solid @slate-300@;
-}
-PDFCard[state="droptarget"] {
-    background-color: @dnd-bg@;
-    border: 1px solid @dnd-ring@;
-}
-
-/* Filename label inside the card */
-PDFCard QLabel {
-    color: @slate-800@;
-    font-size: 11px;
-    font-weight: 500;
-}
-
-/* ---------- FolderCard --------------------------------------------------- */
-
+PDFCard,
 FolderCard {
-    background-color: @folder-card-bg@;
-    border: 1px solid @folder-card-border@;
+    background-color: transparent;
+    border: 2px solid transparent;
     border-radius: 8px;
 }
+PDFCard[state="normal"]:hover,
+FolderCard[state="normal"]:hover {
+    background-color: @card-hover@;
+}
+PDFCard[state="selected"],
 FolderCard[state="selected"] {
     background-color: @select-bg@;
-    border: 1px solid @select-ring@;
+    border: 2px solid @select-ring@;
 }
+PDFCard[state="locked"] {
+    background-color: transparent;
+}
+PDFCard[state="droptarget"],
 FolderCard[state="droptarget"] {
     background-color: @dnd-bg@;
-    border: 1px solid @dnd-ring@;
+    border: 2px solid @dnd-ring@;
 }
+
+/* カードの中身は地を透かす */
+PDFCard QWidget,
+FolderCard QWidget {
+    background-color: transparent;
+}
+PDFCard QLabel,
 FolderCard QLabel {
+    background-color: transparent;
     color: @slate-800@;
     font-size: 11px;
-    font-weight: 500;
+    font-weight: normal;
 }
+
+/* 右上の種別バッジ「PDF 3p」 */
+PDFCard QLabel#cardBadge {
+    background-color: @badge-bg@;
+    color: @badge-text@;
+    font-size: 10px;
+    font-weight: bold;
+    padding: 1px 6px;
+    border-radius: 4px;
+}
+
+/* フォルダ: 淡黄の正方形 + 「N 件」 */
+FolderCard QFrame#folderThumb {
+    background-color: @folder-card-bg@;
+    border: 1px solid @folder-card-border@;
+    border-radius: 4px;
+}
+FolderCard QLabel#folderCount {
+    color: @folder-text@;
+    font-weight: bold;
+}
+
+/* ---------- 名前で絞り込みバー ------------------------------------------- */
+
+QWidget#filterBar {
+    background-color: @slate-50@;
+    border-bottom: 1px solid @slate-300@;
+}
+QWidget#filterBar QLabel { background: transparent; }
+QWidget#filterBar QLineEdit { padding: 3px 8px; }

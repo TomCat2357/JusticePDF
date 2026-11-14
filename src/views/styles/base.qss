@@ -84,7 +84,7 @@ QDialog {
     background-color: @white@;
 }
 
-QLabel { color: @slate-800@; }
+QLabel { color: @slate-800@; background-color: transparent; }
 
 QLineEdit,
 QPlainTextEdit,
@@ -304,6 +304,14 @@ QProgressBar::chunk {
 /* ---------- Rubber band (selection marquee) ----------------------------- */
 
 QRubberBand {
-    border: 1px solid @blue-600@;
+    border: 1px solid @blue-500@;
     background-color: @rubber-fill@;
 }
+
+/* ステータスバー内のラベル（地を透かし、11px の灰色） */
+QStatusBar QLabel {
+    background-color: transparent;
+    color: @slate-500@;
+    font-size: 11px;
+}
+QStatusBar QLabel#statusBusy { color: @blue-600@; }

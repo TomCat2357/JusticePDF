@@ -161,3 +161,29 @@ def make_tool_button(action_or_None=None, *, icon=None, tooltip: str | None = No
     if tooltip is not None:
         btn.setToolTip(tooltip)
     return btn
+
+
+# ---- メイン画面（ライブラリ）で使う操作 -----------------------------------
+OPS.update(_ops(
+    ("refresh",        "RefreshCw",     "再読み込み",             "F5",         "reload", None),
+    ("filter",         "Search",        "検索",                   "Ctrl+F",     "",       None),
+    ("renameMenu",     "Pencil",        "名前変更",               "F2",         "",       None),
+    ("renamePdf",      "Pencil",        "PDF名を変更",            "Shift+F2",   "edit",   None),
+    ("renameFolder",   "Pencil",        "フォルダ名を変更",       None,         "edit",   None),
+    ("rotateMenu",     "RotateCw",      "回転",                   "R",          "",       None),
+    ("mergeSplit",     "Combine",       "結合・分解",             None,         "output", None),
+    ("merge",          "Combine",       "結合",                   None,         "output", None),
+    ("split",          "Scissors",      "分解",                   None,         "output", None),
+    ("importMenu",     "Upload",        "インポート",             None,         "",       None),
+    ("newMenu",        "FilePlus",      "新規作成",               None,         "",       None),
+    ("sortMenu",       "ArrowUpDown",   "並び替え",               None,         "",       None),
+    ("sizeMenu",       "MoveDiagonal",  "カードの大きさ",         "Ctrl+ホイール", "",    None),
+    ("openNewWindow",  "Columns",       "新しいウィンドウで開く", None,         "open",   None),
+    ("showInExplorer", "FolderSearch",  "エクスプローラで表示",   None,         "link",   None),
+    ("openInExplorer", "ExternalLink",  "エクスプローラで開く",   None,         "link",   None),
+    ("copyPath",       "Link",          "パスをコピー",           None,         "link",   None),
+    ("nativeMenu",     "MoreHorizontal", "エクスプローラのメニュー…", None,      "link",   None),
+    ("settings",       "Settings",      "設定",                   None,         "",       None),
+    ("help",           "HelpCircle",    "ヘルプ",                 None,         "",       None),
+    ("about",          "Info",          "このアプリについて",     None,         "",       None),
+))
