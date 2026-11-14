@@ -27,6 +27,7 @@ from src.utils.pdf_utils import (
     update_pdf_metadata_title,
     create_empty_pdf,
 )
+from src.utils.file_kinds import convert_kind, is_pdf
 from src.utils.path_utils import ensure_unique_path
 from src.utils.trash_utils import build_trash_failure_message
 from src.workers.file_worker import FileOperationWorker
@@ -430,34 +431,95 @@ class FileOpsMixin:
         - トップレベルの並び順はグリッド表示順(フォルダが先、次にファイル)。
         - フォルダ構成はしおり(目次)の階層として再現される
           (:func:`merge_paths_to_pdf`)。
-        - 結合後、元のファイル/フォルダはゴミ箱へ移動する(Undo で復元可)。
+        - PDF 以外(Office・txt・Markdown・画像)は一時ファイルへ PDF に変換して結合する
+          (元のファイルは触らず、隣に ``名前.pdf`` も残さない)。変換できない種類は
+          確認のうえ抜かす。
+        - PDF だけのときは、結合後に元のファイル/フォルダをゴミ箱へ移動する(Undo で復元可)。
+          PDF 以外を含むときは「コピーとして結合」し、元は動かさない。
         - 出力は現在のフォルダに「結合_<最初の項目名>.pdf」として自動命名する。
         """
-        from src.utils.pdf_utils import merge_paths_to_pdf
+        from src.utils.merge_plan import assess_limits, block_note, scan_paths, warn_note
 
-        if self._operation_in_progress:
+        if self._operation_in_progress or self._active_import_worker is not None:
             return
 
         folder_paths = self._selected_folder_paths_in_grid_order()
-        file_paths = self._selected_pdf_paths_in_grid_order()  # PDF 以外は結合に含めない
+        selected_files = [c.pdf_path for c in self._cards if c in self._selected_cards]
+        n_mergeable = sum(1 for p in selected_files if is_pdf(p) or convert_kind(p))
         # トップレベルの並び: フォルダ(グリッド順) → 単独ファイル(グリッド順)
-        items = folder_paths + file_paths
-        if not items or (not folder_paths and len(file_paths) < 2):
+        items = folder_paths + selected_files
+        if not items or (not folder_paths and n_mergeable < 2):
             return
 
+        plan = scan_paths(items)
+        if plan.count == 0:
+            QMessageBox.information(self, "結合", "結合できるファイルがありません。")
+            return
+        status = assess_limits(plan.count, plan.bytes)
+        if status.level == "block":
+            QMessageBox.warning(self, "結合", block_note(status))
+            return
+
+        if plan.unsupported:
+            names = "\n".join(f"・{f.name}" for f in plan.unsupported[:10])
+            if len(plan.unsupported) > 10:
+                names += f"\n…（他 {len(plan.unsupported) - 10} 件）"
+            choice = self._ask_choice(
+                "結合",
+                f"PDF に変換できない種類のファイルが {len(plan.unsupported)} 件あります。\n{names}\n\n"
+                "これらを抜かして続けますか？",
+                ["抜かして続ける", "やめる"],
+            )
+            if choice != "抜かして続ける":
+                return
+
+        copy_only = plan.has_non_pdf
+        text = (
+            f"選択した {len(items)} 項目を1つのPDFに結合します。\n"
+            "フォルダ構成はしおり(目次)の階層として再現されます。\n\n"
+        )
+        if plan.converts:
+            text += (
+                f"PDF 以外のファイル {len(plan.converts)} 件は「PDF に変換して結合」します"
+                "（変換は一時的なコピーで行い、元のファイルはそのまま残ります）。\n\n"
+            )
+        if copy_only:
+            text += "PDF 以外を含むため、元のファイル・フォルダは動かさず、結合結果を新しく作ります。"
+        else:
+            text += "結合後、元のファイル・フォルダはゴミ箱へ移動します（「元に戻す」で復元できます）。"
+        if status.level == "warn":
+            text += "\n\n" + warn_note(status)
         reply = QMessageBox.question(
             self,
             "結合",
-            f"選択した {len(items)} 項目を1つのPDFに結合します。\n"
-            "フォルダ構成はしおり(目次)の階層として再現されます。\n\n"
-            "結合後、元のファイル・フォルダはゴミ箱へ移動します"
-            "（「元に戻す」で復元できます）。\n\n続けますか？",
+            text + "\n\n続けますか？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        if plan.converts:
+            self._convert_for_merge(
+                [f.path for f in plan.converts],
+                lambda converted, tmp_dir: self._execute_merge(
+                    items, folder_paths, converted, tmp_dir, copy_only),
+            )
+        else:
+            self._execute_merge(items, folder_paths, {}, None, copy_only)
+
+    def _execute_merge(
+        self,
+        items: list[str],
+        folder_paths: list[str],
+        converted: dict[str, str],
+        tmp_dir: str | None,
+        copy_only: bool,
+    ) -> None:
+        """結合の本体(変換済みの一時 PDF ``converted`` を含む)。``tmp_dir`` は終わったら消す。"""
+        from src.utils.pdf_utils import merge_paths_to_pdf
+
+        file_paths = [p for p in items if p not in set(folder_paths)]
         first_stem = Path(items[0].rstrip("/\\")).stem or "merged"
         output_path = str(
             ensure_unique_path(
@@ -467,61 +529,75 @@ class FileOpsMixin:
         pdf_cards = [c for c in self._cards if c.pdf_path in set(file_paths)]
 
         # Phase A: 即時 UI 更新(結合元カードを外し、新ファイルは内部追加として予約)
-        self._register_internal_remove(items)
+        # コピーとして結合する(PDF 以外を含む)ときは元を動かさないので、カードも残す。
         self._register_internal_add([output_path])
-        for path in folder_paths:
-            self._remove_folder_card(path)
-        for card in pdf_cards:
-            if card in self._cards:
-                self._cards.remove(card)
-            card.deleteLater()
-        self._selected_folder_cards.clear()
-        self._selected_cards.clear()
+        if not copy_only:
+            self._register_internal_remove(items)
+            for path in folder_paths:
+                self._remove_folder_card(path)
+            for card in pdf_cards:
+                if card in self._cards:
+                    self._cards.remove(card)
+                card.deleteLater()
+            self._selected_folder_cards.clear()
+            self._selected_cards.clear()
         self._refresh_grid()
         self._begin_async_operation()
 
         # Phase B: 重い I/O — バックアップ → 結合 → 結合元をゴミ箱へ
-        def _do_io() -> dict[str, dict[str, str]]:
+        def _do_io() -> dict:
             backup_dir = tempfile.mkdtemp(prefix="justicepdf_merge_backup_")
             folder_backups: dict[str, str] = {}
             pdf_backups: dict[str, str] = {}
-            for path in folder_paths:
-                bp = Path(backup_dir) / Path(path).name
-                shutil.copytree(path, bp)
-                folder_backups[path] = str(bp)
-            for path in file_paths:
-                bp = Path(backup_dir) / Path(path).name
-                shutil.copy2(path, bp)
-                pdf_backups[path] = str(bp)
-
-            total = merge_paths_to_pdf(output_path, items)
-            if total <= 0:
-                raise RuntimeError("結合できるPDFページがありませんでした。")
-
-            deleted: list[str] = []
             try:
-                for path in items:
-                    send2trash(path)
-                    deleted.append(path)
-            except OSError:
-                # 途中失敗時は、すでにゴミ箱へ送った分を復元してから送出
-                for restored in deleted:
-                    bp = folder_backups.get(restored) or pdf_backups.get(restored)
-                    if not bp or not os.path.exists(bp):
-                        continue
-                    if restored in folder_backups:
-                        shutil.copytree(bp, restored)
-                    else:
-                        shutil.copy2(bp, restored)
-                if os.path.exists(output_path):
-                    os.unlink(output_path)
-                raise
-            return {"folders": folder_backups, "pdfs": pdf_backups}
+                if not copy_only:
+                    for path in folder_paths:
+                        bp = Path(backup_dir) / Path(path).name
+                        shutil.copytree(path, bp)
+                        folder_backups[path] = str(bp)
+                    for path in file_paths:
+                        bp = Path(backup_dir) / Path(path).name
+                        shutil.copy2(path, bp)
+                        pdf_backups[path] = str(bp)
+
+                total = merge_paths_to_pdf(output_path, items, converted)
+                if total <= 0:
+                    raise RuntimeError("結合できるPDFページがありませんでした。")
+            finally:
+                if tmp_dir:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            output_backup = ""
+            if copy_only:
+                # Redo 用: 変換した一時ファイルは消えるので、結合結果そのものを控えておく
+                output_backup = os.path.join(backup_dir, "merged_output.pdf")
+                shutil.copy2(output_path, output_backup)
+            else:
+                deleted: list[str] = []
+                try:
+                    for path in items:
+                        send2trash(path)
+                        deleted.append(path)
+                except OSError:
+                    # 途中失敗時は、すでにゴミ箱へ送った分を復元してから送出
+                    for restored in deleted:
+                        bp = folder_backups.get(restored) or pdf_backups.get(restored)
+                        if not bp or not os.path.exists(bp):
+                            continue
+                        if restored in folder_backups:
+                            shutil.copytree(bp, restored)
+                        else:
+                            shutil.copy2(bp, restored)
+                    if os.path.exists(output_path):
+                        os.unlink(output_path)
+                    raise
+            return {"folders": folder_backups, "pdfs": pdf_backups, "output": output_backup}
 
         def _on_success(result: object) -> None:
-            backups: dict[str, dict[str, str]] = result  # type: ignore[assignment]
+            backups: dict = result  # type: ignore[assignment]
             folder_backups = backups["folders"]
             pdf_backups = backups["pdfs"]
+            output_backup = backups["output"]
             restore_paths = list(folder_backups.keys()) + list(pdf_backups.keys())
 
             # 結合結果カードを追加(ウォッチャが先に追加していれば再利用)して選択
@@ -558,20 +634,23 @@ class FileOpsMixin:
                 self._refresh_grid()
 
             def redo_merge() -> None:
-                # 再結合 → 結合元を再びゴミ箱へ
+                # 再結合 → 結合元を再びゴミ箱へ(コピーとして結合したときは結果を戻すだけ)
                 self._register_internal_add([output_path])
-                merge_paths_to_pdf(output_path, items)
-                self._register_internal_remove(restore_paths)
-                for path in folder_paths:
-                    self._remove_folder_card(path)
-                for path in file_paths:
-                    self._remove_card(path)
-                for path in restore_paths:
-                    if os.path.exists(path):
-                        try:
-                            send2trash(path)
-                        except Exception:
-                            pass
+                if output_backup:
+                    shutil.copy2(output_backup, output_path)
+                else:
+                    merge_paths_to_pdf(output_path, items)
+                    self._register_internal_remove(restore_paths)
+                    for path in folder_paths:
+                        self._remove_folder_card(path)
+                    for path in file_paths:
+                        self._remove_card(path)
+                    for path in restore_paths:
+                        if os.path.exists(path):
+                            try:
+                                send2trash(path)
+                            except Exception:
+                                pass
                 self._clear_selection()
                 card = self._get_card_by_path(output_path) or self._add_card(output_path)
                 card.set_selected(True)
@@ -589,16 +668,17 @@ class FileOpsMixin:
         def _on_error(exc: Exception) -> None:
             # ロールバック: 外したカードを戻し、予約を解除する
             self._internal_adds.discard(self._normalize_path(output_path))
-            for path in folder_paths:
-                if os.path.exists(path):
-                    self._internal_removes.discard(self._normalize_path(path))
-                    if self._get_folder_card_by_path(path) is None:
-                        self._add_folder_card(path)
-            existing = {c.pdf_path for c in self._cards}
-            for path in file_paths:
-                if os.path.exists(path) and path not in existing:
-                    self._internal_removes.discard(self._normalize_path(path))
-                    self._add_card(path)
+            if not copy_only:
+                for path in folder_paths:
+                    if os.path.exists(path):
+                        self._internal_removes.discard(self._normalize_path(path))
+                        if self._get_folder_card_by_path(path) is None:
+                            self._add_folder_card(path)
+                existing = {c.pdf_path for c in self._cards}
+                for path in file_paths:
+                    if os.path.exists(path) and path not in existing:
+                        self._internal_removes.discard(self._normalize_path(path))
+                        self._add_card(path)
             self._refresh_grid()
             self._end_async_operation()
             QMessageBox.warning(self, "結合", f"結合に失敗しました: {exc}")

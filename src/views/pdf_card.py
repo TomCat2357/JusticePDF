@@ -47,6 +47,7 @@ class PDFCard(QFrame):
         self._card_width = int(card_width) if card_width is not None else self.CARD_WIDTH
         self._thumb_size = int(thumb_size) if thumb_size is not None else self.THUMBNAIL_SIZE
         self._original_pixmap: QPixmap | None = None
+        self._text_pixmap: QPixmap | None = None  # テキスト・Markdown の本文サムネイル（拡大縮小の元）
         self.setAcceptDrops(True)
 
         self._setup_ui()
@@ -116,9 +117,19 @@ class PDFCard(QFrame):
             self._thumbnail_label.setText("(空)")
 
     def _other_thumbnail(self) -> QPixmap:
-        """PDF 以外: 種類のアイコンを中央に描いた正方形（色は描画時の COLORS から引く）。"""
+        """PDF 以外: 種類のアイコンを中央に描いた正方形（色は描画時の COLORS から引く）。
+
+        テキスト・Markdown は本文の冒頭を紙のように描く（読めなければアイコンに戻す）。
+        """
         size = self._thumb_size
         dpr = icons._default_dpr()
+        if self._kind == "text":
+            from src.views import text_thumbnail
+            image = text_thumbnail.render_text_thumbnail(self._pdf_path, size, dpr)
+            if image is not None:
+                self._text_pixmap = QPixmap.fromImage(image)
+                return self._text_pixmap
+        self._text_pixmap = None
         pix = QPixmap(round(size * dpr), round(size * dpr))
         pix.setDevicePixelRatio(dpr)
         pix.fill(QColor(COLORS["slate-50"]))
@@ -268,6 +279,14 @@ class PDFCard(QFrame):
         self._place_badge()
         self._filename_label.set_full_text(os.path.basename(self._pdf_path), self._thumb_size)
         if not self.is_pdf:
+            if self._kind == "text" and self._text_pixmap is not None and not self._text_pixmap.isNull():
+                # ズーム中は PDF と同じく作り済みの絵を縮尺するだけ（確定時の refresh で描き直す）
+                scaled = self._text_pixmap.scaled(
+                    self._thumb_size, self._thumb_size,
+                    Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                self._thumbnail_label.setPixmap(paper_pixmap(scaled))
+                self.updateGeometry()
+                return
             self._thumbnail_label.setPixmap(paper_pixmap(self._other_thumbnail()))
             self.updateGeometry()
             return

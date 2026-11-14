@@ -143,10 +143,35 @@ def _convert_text(src_path: str, dest_pdf_path: Path) -> None:
     text_to_pdf(src_path, str(dest_pdf_path))
 
 
+def _convert_markdown(src_path: str, dest_pdf_path: Path) -> None:
+    # QTextDocument / QPdfWriter は GUI スレッド外でも使える（画像は QImage で扱う）。
+    from src.utils.markdown_to_pdf import markdown_to_pdf
+    markdown_to_pdf(src_path, str(dest_pdf_path))
+
+
+def convert_file_to_pdf(src_path: str, dest_pdf_path: Path | str, soffice: str | None = None) -> None:
+    """Office・txt・Markdown・画像を PDF に変換する（種類は :func:`convert_kind` で決まる）。
+
+    変換できない種類は RuntimeError。［PDFに変換］と、結合時の一時変換が共通で使う。
+    """
+    dest = Path(dest_pdf_path)
+    kind = convert_kind(src_path)
+    if kind == "office":
+        _convert_office(src_path, dest, soffice)
+    elif kind == "text":
+        _convert_text(src_path, dest)
+    elif kind == "markdown":
+        _convert_markdown(src_path, dest)
+    elif kind == "image":
+        _convert_image(src_path, dest)
+    else:
+        raise RuntimeError(f"PDF に変換できない種類です: {os.path.splitext(src_path)[1].lower()}")
+
+
 # ImportWorker の動作モード。
 MODE_IMPORT = "import"    # 従来のインポート: PDF はコピー、Office・画像は PDF に変換
 MODE_COPY = "copy"        # 変換せず、そのままコピー（ドロップ用）
-MODE_CONVERT = "convert"  # ［PDFに変換］: Office・txt・画像を PDF に変換（元は残す）
+MODE_CONVERT = "convert"  # ［PDFに変換］: Office・txt・Markdown・画像を PDF に変換（元は残す）
 
 
 class ImportWorker(QThread):
@@ -213,15 +238,7 @@ class ImportWorker(QThread):
                     if self._mode == MODE_COPY:
                         shutil.copy2(src, dest_path)
                     elif self._mode == MODE_CONVERT:
-                        kind = convert_kind(src)
-                        if kind == "office":
-                            _convert_office(src, dest_path, self._soffice)
-                        elif kind == "text":
-                            _convert_text(src, dest_path)
-                        elif kind == "image":
-                            _convert_image(src, dest_path)
-                        else:
-                            raise RuntimeError(f"PDF に変換できない種類です: {ext}")
+                        convert_file_to_pdf(src, dest_path, self._soffice)
                     elif ext == ".pdf":
                         shutil.copy2(src, dest_path)
                     elif ext in _OFFICE_EXTS:

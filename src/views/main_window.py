@@ -75,13 +75,14 @@ CONVERT_DISABLED_TIP = "PDF に変換できる種類のファイルが選ばれ�
 from src.views.main_window_fileops import FileOpsMixin
 from src.views.main_window_split import SplitMixin
 from src.views.main_window_import import ImportMixin
+from src.views.main_window_merge import MergeMixin
 from src.views.main_window_export import ExportMixin
 from src.views.main_window_dragdrop import DragDropMixin
 
 logger = logging.getLogger(__name__)
 
 
-class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWindow):
+class MainWindow(FileOpsMixin, MergeMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMixin, QMainWindow):
     """Main application window.
 
     Displays PDF files as cards in a grid layout.
@@ -742,7 +743,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         toolbar.addWidget(self._export_btn)
         self._print_btn = make_tool_button(make_action(self, "print", self._on_print))
         toolbar.addWidget(self._print_btn)
-        # PDFに変換（Office・txt・画像。変換できるものが選ばれているときだけ有効）
+        # PDFに変換（Office・txt・Markdown・画像。変換できるものが選ばれているときだけ有効）
         self._convert_btn = make_tool_button(make_action(self, "convertPdf", self._on_convert_to_pdf))
         toolbar.addWidget(self._convert_btn)
 
@@ -879,8 +880,10 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._redo_btn.setEnabled(self._undo_manager.can_redo() and not busy)
         # エクスポート: ファイルまたはフォルダを1つ以上選択しているとき有効
         self._export_btn.setEnabled((n_pdf >= 1 or n_folders >= 1) and not busy)
-        # 結合: フォルダを1つ以上、または PDF を2つ以上選択しているとき
-        can_merge = n_folders >= 1 or n_pdf >= 2
+        # 結合: フォルダを1つ以上、または結合できるファイル(PDF + 変換できるもの)を2つ以上選択しているとき
+        n_mergeable = sum(
+            1 for c in self._selected_cards if c.is_pdf or file_kinds.convert_kind(c.pdf_path))
+        can_merge = n_folders >= 1 or n_mergeable >= 2
         # 分解: PDFをちょうど1つだけ選択しているとき（フォルダは含まない）
         can_split = n_pdf == 1 and n_folders == 0
         self._merge_action.setVisible(can_merge)
@@ -1876,7 +1879,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                 entries.append(ctx("open", lambda: self._on_card_double_clicked(card)))
                 entries.append(ctx("openZoom", lambda: self._on_card_double_clicked(card, True)))
             else:
-                entries.append(ctx("openApp", lambda: self._on_card_double_clicked(card)))
+                if file_kinds.is_markdown(card.pdf_path):
+                    entries.append(ctx("open", lambda: self._on_card_double_clicked(card)))
+                entries.append(ctx("openApp", lambda: self._open_with_default_app(card.pdf_path)))
             entries.append(ctx("rename", self._on_rename, not busy))
             if card.is_pdf:
                 entries.append(ctx("renamePdf", self._on_rename_pdf_title, not busy))
@@ -1885,10 +1890,13 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             entries.append(ctx("open", lambda: self.navigate_to(fc.folder_path)))
             entries.append(ctx("openNewWindow", lambda: self._open_folder_in_new_window(fc.folder_path)))
             entries.append(ctx("rename", self._on_rename_folder_selected, not busy))
-        # PDF 専用の操作は、選択に PDF を含まないとき無効（混在なら PDF だけが対象）
+        # 結合は PDF と変換できるファイル(Office・txt・Markdown・画像)が対象。分解は PDF だけ
+        n_mergeable = sum(
+            1 for c in self._selected_cards if c.is_pdf or file_kinds.convert_kind(c.pdf_path))
         if n_folders >= 1 or n_files >= 2:
             entries.append(ctx(
-                "merge", self._on_merge_selected, not busy and (n_folders >= 1 or n_pdf >= 2)))
+                "merge", self._on_merge_selected,
+                not busy and (n_folders >= 1 or n_mergeable >= 2)))
         if one_file:
             entries.append(ctx("split", self._on_split_selected, not busy and n_pdf == 1))
         convert_paths = self._selected_convertible_paths()
@@ -1949,6 +1957,36 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                 logger.debug("explorer /select failed", exc_info=True)
         self._open_in_explorer(os.path.dirname(path))
 
+    def _open_with_default_app(self, path: str) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _open_markdown_window(self, path: str) -> None:
+        """Markdown をアプリ内のプレビュー・編集ウィンドウで開く（開いていればそれを前面へ）。"""
+        from src.views.markdown_window import MarkdownWindow
+        from src.utils.markdown_to_pdf import MAX_BYTES
+        try:
+            too_big = os.path.getsize(path) > MAX_BYTES
+        except OSError:
+            too_big = False
+        if too_big:  # 大きすぎるものはアプリ内では開かず、既定のアプリへ
+            self._open_with_default_app(path)
+            return
+        for widget in QApplication.topLevelWidgets():
+            if (isinstance(widget, MarkdownWindow) and widget.isVisible()
+                    and os.path.normcase(widget.path) == os.path.normcase(os.path.abspath(path))):
+                widget.setWindowState(widget.windowState() & ~Qt.WindowState.WindowMinimized)
+                widget.show()
+                widget.raise_()
+                widget.activateWindow()
+                return
+        win = MarkdownWindow(path)
+        win.convert_requested.connect(lambda p: self._convert_paths_to_pdf([p]))
+        # 親なしのトップレベルなので、Python 側で参照を持って破棄されないようにする
+        self._markdown_windows = [w for w in getattr(self, "_markdown_windows", []) if w is not win]
+        self._markdown_windows.append(win)
+        win.closed.connect(lambda w: self._markdown_windows.remove(w) if w in self._markdown_windows else None)
+        win.show()
+
     def _on_card_double_clicked(self, card: PDFCard, open_zoom: bool = False) -> None:
         """Handle card double-click - open page edit window.
 
@@ -1956,8 +1994,11 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         immediately switched into enlarged single-page mode on page 0.
         """
         if not card.is_pdf:
-            # PDF 以外は編集画面を持たない。OS の既定アプリで開く。
-            QDesktopServices.openUrl(QUrl.fromLocalFile(card.pdf_path))
+            if file_kinds.is_markdown(card.pdf_path):
+                self._open_markdown_window(card.pdf_path)
+            else:
+                # それ以外の PDF 以外は編集画面を持たない。OS の既定アプリで開く。
+                self._open_with_default_app(card.pdf_path)
             return
         from src.views.page_edit_window import PageEditWindow
         # If a window for this file is already open, bring it to front.

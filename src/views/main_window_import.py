@@ -290,21 +290,25 @@ class ImportMixin:
         ]
 
     def _on_convert_to_pdf(self) -> None:
-        """選択した Office・txt・画像を、同じフォルダに「元の名前.pdf」として変換する。
+        """選択した Office・txt・Markdown・画像を、同じフォルダに「元の名前.pdf」として変換する。
 
         元のファイルは残す。同名があれば「名前(1).pdf」の連番（置き換えは訊かない）。
         PDF・フォルダ・変換できない種類は無視し、件数だけ完了時に伝える。
         """
-        if self._operation_in_progress or self._active_import_worker is not None:
-            QMessageBox.information(self, "PDFに変換", "別の処理が進行中です。完了までお待ちください。")
-            return
         targets = self._selected_convertible_paths()
-        if not targets:
-            return
         unsupported = sum(
             1 for c in self._selected_cards
             if not c.is_pdf and not convert_kind(c.pdf_path)
         )
+        self._convert_paths_to_pdf(targets, unsupported=unsupported)
+
+    def _convert_paths_to_pdf(self, targets: list[str], *, unsupported: int = 0) -> None:
+        """``targets``（Office・txt・Markdown・画像）を PDF に変換する（選択以外、例: Markdown ウィンドウからも使う）。"""
+        if self._operation_in_progress or self._active_import_worker is not None:
+            QMessageBox.information(self, "PDFに変換", "別の処理が進行中です。完了までお待ちください。")
+            return
+        if not targets:
+            return
         tree = self._build_convert_tree(targets)
         self._start_import_worker(tree, mode=MODE_CONVERT, unsupported=unsupported)
 
