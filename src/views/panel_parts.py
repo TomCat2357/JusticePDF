@@ -9,6 +9,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -82,6 +83,10 @@ def mark_plain_containers(root: QWidget) -> None:
     """
     for w in [root, *root.findChildren(QWidget)]:
         if type(w) is QWidget:
+            # 一覧（ツリー・リスト）のビューポートは一覧自身の地（白）を見せる。
+            parent = w.parentWidget()
+            if isinstance(parent, QAbstractItemView) and parent.viewport() is w:
+                continue
             w.setProperty("panelPlain", True)
 
 

@@ -420,6 +420,7 @@ class ZoomAnnotationMixin:
         self._style_section_header(self._zoom_note_list_label)
         body_layout.addWidget(self._zoom_note_list_label)
         self._zoom_note_list = QListWidget()
+        self._zoom_note_list.setObjectName("noteList")
         self._zoom_note_list.setMaximumHeight(140)
         self._zoom_note_list.itemClicked.connect(self._on_note_list_item_clicked)
         body_layout.addWidget(self._zoom_note_list)
@@ -923,6 +924,10 @@ class ZoomAnnotationMixin:
         if self._zoom_annotation_open and getattr(self, "_ocr_panel", None):
             if self._ocr_panel.is_open:
                 self._ocr_panel.set_open(False)
+        if not self._zoom_annotation_open:
+            # パネルを閉じたら作成ツール(墨消し用 MASK_* は墨消しパネル側の管轄)も解除する。
+            if self._create_mode not in (CreateMode.NONE, CreateMode.MASK_MARKUP, CreateMode.MASK_SHAPE):
+                self._activate_create_mode(CreateMode.NONE)
         sync_panel_button = getattr(self, "_sync_zoom_panel_button", None)
         if sync_panel_button is not None:
             sync_panel_button()

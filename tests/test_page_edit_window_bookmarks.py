@@ -204,3 +204,22 @@ def test_reload_during_add_is_deferred_until_editor_closes(qtbot, tmp_path):
 
     assert [(e.title, e.page) for e in get_pdf_toc(str(pdf_path))] == [("遅延", 2)]
     assert panel._tree.topLevelItemCount() == 1
+
+
+def test_f2_on_bookmark_tree_edits_bookmark_not_filename(qtbot, tmp_path, monkeypatch):
+    pdf_path = tmp_path / "bm.pdf"
+    make_pdf(pdf_path, pages=2)
+    window = create_page_edit_window(qtbot, pdf_path)
+    window._open_zoom_view(0)
+    window._bookmarks_panel.set_open(True)
+    _add_bookmark(qtbot, window._bookmarks_panel, "章")
+    renamed = []
+    monkeypatch.setattr(window, "_on_rename", lambda *a, **k: renamed.append(1))
+    tree = window._bookmarks_panel._tree
+    tree.setCurrentItem(tree.topLevelItem(0))
+    tree.setFocus()
+    window.show()
+    qtbot.keyClick(tree, Qt.Key.Key_F2)
+    QApplication.processEvents()
+    assert not renamed
+    assert tree.findChild(QLineEdit) is not None

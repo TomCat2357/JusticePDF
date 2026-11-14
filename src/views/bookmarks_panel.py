@@ -123,10 +123,12 @@ class _BookmarkDelegate(QStyledItemDelegate):
             spin.setRange(1, self._panel._max_page())
             spin.setStyleSheet(_EDITOR_STYLE.format(sel="QSpinBox"))
             spin.setMinimumHeight(_MIN_ROW_HEIGHT)
+            spin.installEventFilter(self._panel)  # F2/Delete を窓のショートカットに取られない
             return spin
         edit = QLineEdit(parent)
         edit.setStyleSheet(_EDITOR_STYLE.format(sel="QLineEdit"))
         edit.setMinimumHeight(_MIN_ROW_HEIGHT)
+        edit.installEventFilter(self._panel)
         return edit
 
     def setEditorData(self, editor, index) -> None:
@@ -602,6 +604,16 @@ class BookmarksPanel(QFrame):
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         # F2=タイトル編集、Delete=削除(ツリーにフォーカスがある間のみ)。
+        if event.type() == QEvent.Type.ShortcutOverride and (
+            obj is self._tree or isinstance(obj, (QLineEdit, QSpinBox))
+        ):
+            # 窓の F2(ファイル名変更)・Delete(ページ削除)より先に、ツリーで受け取る。
+            if (
+                event.key() in (Qt.Key.Key_F2, Qt.Key.Key_Delete)
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            ):
+                event.accept()
+                return True
         if obj is self._tree and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             if key == Qt.Key.Key_F2:

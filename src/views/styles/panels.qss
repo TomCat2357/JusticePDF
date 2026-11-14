@@ -122,6 +122,12 @@ QToolButton#markupContinuous {
 QToolButton#markupContinuous:hover { background-color: @slate-100@; }
 QToolButton#markupContinuous:checked { background-color: @blue-600@; border-color: @blue-700@; }
 
+/* 一覧の地は 3 つとも白に揃える */
+QTreeWidget#piiResultTree,
+QListWidget#noteList {
+    background-color: @white@;
+}
+
 /* しおり */
 QTreeWidget#bookmarksTree {
     background-color: @white@;
