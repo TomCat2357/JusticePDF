@@ -102,3 +102,10 @@ def open_zoom(window: PageEditWindow, qtbot) -> None:
 def page_click_pos(window: PageEditWindow, x: int, y: int) -> QPoint:
     offset = window._zoom_label._pixmap_offset()
     return QPoint(int(offset.x() + x), int(offset.y() + y))
+
+
+def zoom_page_text(window: PageEditWindow) -> str:
+    """拡大ビューのページ表示（番号の欄 + 「/ N」）を 1 つの文字にする。例: ``1 / 4``、複数ページは ``1-2 / 4``。"""
+    number = window._zoom_page_edit.text()
+    total = window._zoom_page_label.text()
+    return f"{number} {total}" if total.startswith("/") else f"{number}{total}"

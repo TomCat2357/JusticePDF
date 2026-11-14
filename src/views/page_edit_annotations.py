@@ -985,6 +985,11 @@ class ZoomAnnotationMixin:
         有効化するモード以外を必ず解除してから対象モードを有効化する。
         各ボタンハンドラにコピペされていた相互排他の前処理を一元化したもの。
         """
+        if mode is not CreateMode.NONE:
+            # 作成ツールを選んだら、選択モード(T/V/H)は解除する(手のひらだと作成の操作が効かないため)。
+            set_select_mode = getattr(self, "_set_select_mode", None)
+            if set_select_mode is not None:
+                set_select_mode(None)
         if mode is not CreateMode.FREETEXT:
             self._set_zoom_annotation_create_mode(False)
         if mode is not CreateMode.SHAPE:

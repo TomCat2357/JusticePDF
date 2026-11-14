@@ -11,6 +11,7 @@ from tests.helpers import (
     make_pdf,
     open_zoom,
     page_click_pos,
+    zoom_page_text,
 )
 
 
@@ -22,7 +23,7 @@ def test_spread_toggle_sets_view_only_and_label(qtbot, tmp_path):
     open_zoom(window, qtbot)
 
     assert window._zoom_page_layout is ZoomPageLayout.SINGLE
-    assert window._zoom_page_label.text() == "1 / 4"
+    assert zoom_page_text(window) == "1 / 4"
 
     window._toggle_zoom_spread_view()
 
@@ -35,7 +36,7 @@ def test_spread_toggle_sets_view_only_and_label(qtbot, tmp_path):
     # しおりは閲覧/ジャンプ専用で使えるため、パネルボタンとしおり項目は有効のまま。
     assert window._zoom_panel_btn.isEnabled() is True
     assert window._zoom_bookmark_action.isEnabled() is True
-    assert window._zoom_page_label.text() == "1-2 / 4"
+    assert zoom_page_text(window) == "1-2 / 4"
 
     window._toggle_zoom_spread_view()
 
@@ -43,7 +44,7 @@ def test_spread_toggle_sets_view_only_and_label(qtbot, tmp_path):
     assert window._zoom_object_btn.isEnabled() is True
     assert window._zoom_pii_btn.isEnabled() is True
     assert window._zoom_panel_btn.isEnabled() is True
-    assert window._zoom_page_label.text() == "1 / 4"
+    assert zoom_page_text(window) == "1 / 4"
 
 
 @pytest.mark.usefixtures("qtbot")
@@ -74,7 +75,7 @@ def test_spread_disables_rotate_delete_and_bookmark_edit(qtbot, tmp_path):
     window._on_rotate()
     window._on_delete()
     assert window._zoom_page_layout is ZoomPageLayout.HORIZONTAL
-    assert window._zoom_page_label.text() == "1-2 / 4"
+    assert zoom_page_text(window) == "1-2 / 4"
 
     window._toggle_zoom_spread_view()
 
@@ -99,14 +100,14 @@ def test_spread_next_prev_step_by_two(qtbot, tmp_path):
 
     window._on_zoom_next_page()
     assert window._zoom_page_num == 2
-    assert window._zoom_page_label.text() == "3-4 / 4"
+    assert zoom_page_text(window) == "3-4 / 4"
     # 最後の見開きに到達したので「次」は無効。
     assert window._zoom_next_btn.isEnabled() is False
     assert window._zoom_prev_btn.isEnabled() is True
 
     window._on_zoom_prev_page()
     assert window._zoom_page_num == 0
-    assert window._zoom_page_label.text() == "1-2 / 4"
+    assert zoom_page_text(window) == "1-2 / 4"
 
 
 @pytest.mark.usefixtures("qtbot")
@@ -117,12 +118,12 @@ def test_spread_odd_last_page_shows_single(qtbot, tmp_path):
     open_zoom(window, qtbot)
     window._toggle_zoom_spread_view()
 
-    assert window._zoom_page_label.text() == "1-2 / 3"
+    assert zoom_page_text(window) == "1-2 / 3"
 
     window._on_zoom_next_page()
     assert window._zoom_page_num == 2
     # 右ページが無いので単独表示。
-    assert window._zoom_page_label.text() == "3 / 3"
+    assert zoom_page_text(window) == "3 / 3"
     assert window._zoom_next_btn.isEnabled() is False
 
 
@@ -182,7 +183,7 @@ def test_exit_zoom_resets_spread_mode(qtbot, tmp_path):
     # 再度開くと単ページで開始する。
     window._open_zoom_view(0)
     assert window._zoom_page_layout is ZoomPageLayout.SINGLE
-    assert window._zoom_page_label.text() == "1 / 4"
+    assert zoom_page_text(window) == "1 / 4"
 
 
 @pytest.mark.usefixtures("qtbot")
@@ -231,14 +232,14 @@ def test_page_layout_controls_render_and_page_by_layout(
 
     window._set_zoom_page_layout(layout)
 
-    assert window._zoom_page_label.text() == first_label
+    assert zoom_page_text(window) == first_label
     assert window._zoom_page_num == 0
     assert window._zoom_next_btn.isEnabled() is True
 
     window._on_zoom_next_page()
 
     assert window._zoom_page_num == next_page
-    assert window._zoom_page_label.text() == next_label
+    assert zoom_page_text(window) == next_label
 
 
 @pytest.mark.usefixtures("qtbot")

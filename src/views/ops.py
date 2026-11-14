@@ -93,6 +93,25 @@ OPS: dict[str, Op] = _ops(
     ("panel",        "PanelRight",        "パネル",                     "Alt+P",    "",        None),
 )
 
+# 個別画面（ページ一覧・拡大ビュー）の操作。ライブラリ側の追記とは別ブロック。
+OPS.update(_ops(
+    ("toList",       "ArrowLeft",         "ページ一覧へ戻る",           None,       "",        None),
+    ("blankInsert",  "FilePlus",          "白紙挿入",                   None,       "",        None),
+    ("thumbSize",    "MoveDiagonal",      "サムネイルの大きさ",         None,       "",        None),
+    ("pii",          "ShieldAlert",       "個人情報",                   None,       "",        None),
+    ("pagePrev",     "ChevronLeft",       "前のページ",                 "PageUp",   "",        None),
+    ("pageNext",     "ChevronRight",      "次のページ",                 "PageDown", "",        None),
+    ("zoomIn",       "ZoomIn",            "拡大",                       "Ctrl++",   "",        None),
+    ("zoomOut",      "ZoomOut",           "縮小",                       "Ctrl+-",   "",        None),
+    ("zoomLayout",   "LayoutGrid",        "表示",                       None,       "",        None),
+    ("selText",      "TextCursor",        "文字を選ぶ",                 "T",        "",        None),
+    ("selObj",       "MousePointer2",     "注釈を選ぶ",                 "V",        "",        None),
+    ("selHand",      "Hand",              "ページつかみ",               "H",        "",        None),
+    ("searchPrev",   "ChevronUp",         "前へ",                       "Shift+Enter", "",     None),
+    ("searchNext",   "ChevronDown",       "次へ",                       "Enter",    "",        None),
+    ("searchClose",  "X",                 "閉じる",                     "Esc",      "",        None),
+))
+
 
 def tooltip_text(label: str, keys: str | None) -> str:
     """ツールチップは「表示名 (キー)」。キーが無ければ表示名だけ。"""

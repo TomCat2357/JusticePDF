@@ -690,3 +690,30 @@ def insert_pages(dest_path: str, src_path: str, insert_indices: list[int]) -> No
         dest_doc.close()
         src_doc.close()
 
+
+# 白紙の大きさ（ポイント。縦向きの幅 x 高さ）
+BLANK_PAGE_SIZES: dict[str, tuple[float, float]] = {
+    "A4": (595.0, 842.0),
+    "A3": (842.0, 1191.0),
+}
+
+
+def insert_blank_pages(
+    pdf_path: str,
+    at: int,
+    size: str = "A4",
+    landscape: bool = False,
+    count: int = 1,
+) -> None:
+    """``at`` 番目（0 始まり。ページ数以上なら末尾）の位置に白紙ページを挿入する（in place）。"""
+    width, height = BLANK_PAGE_SIZES[size]
+    if landscape:
+        width, height = height, width
+    doc = _open_doc_for_write(pdf_path)
+    try:
+        position = max(0, min(int(at), len(doc)))
+        for i in range(max(1, int(count))):
+            doc.new_page(pno=position + i, width=width, height=height)
+        _save_document_in_place(doc, pdf_path, incremental=True)
+    finally:
+        doc.close()

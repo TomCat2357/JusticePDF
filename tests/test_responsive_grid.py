@@ -3,6 +3,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QRect, Qt
 
 from src.models.undo_manager import UndoManager
+from src.views.page_edit_widgets import PageThumbnail
 from src.views.page_edit_window import PageEditWindow
 from src.views.view_helpers import responsive_grid_metrics
 from tests.helpers import make_pdf
@@ -65,7 +66,9 @@ def test_page_grid_reflows_without_horizontal_overflow(qtbot, tmp_path) -> None:
         assert not window._grid_scroll.horizontalScrollBar().isVisible()
         bound = window._grid.bound_widgets()
         assert bound
-        assert {thumb.width() for thumb in bound} == {150}
+        assert {thumb.width() for thumb in bound} == {
+            window._preferred_thumb_size + PageThumbnail.CARD_PADDING_X
+        }
         _assert_items_fit_horizontally(
             window._grid_scroll,
             window._container,

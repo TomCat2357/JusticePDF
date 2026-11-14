@@ -31,7 +31,6 @@ from src.views.theme import load_app_stylesheet
 from src.views import page_edit_window as page_edit_window_module
 from src.views.export_dialog import ExportOptionsDialog
 from src.views.print_dialog import PrintDialog
-from src.views.search_dialog import SearchDialog
 from src.views.settings_dialog import SettingsDialog
 from src.models.undo_manager import UndoManager
 from src.utils.pdf_utils import (
@@ -315,6 +314,44 @@ def scene_zoom_view(pdf_path: Path) -> None:
     pew.close()
 
 
+def scene_page_context_menus(pdf_path: Path) -> None:
+    """ページ一覧の右クリック（ページの上 / 余白）。"""
+    print("[scene] 32_page_context_menu / 33_blank_context_menu")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._page_count:
+        pew.close()
+        return
+    pix = _grab_menu(pew._page_context_menu(1))
+    pix.save(str(OUT_DIR / "32_page_context_menu.png"))
+    print("  saved 32_page_context_menu.png")
+    pix = _grab_menu(pew._blank_context_menu())
+    pix.save(str(OUT_DIR / "33_blank_context_menu.png"))
+    print("  saved 33_blank_context_menu.png")
+    pew.close()
+
+
+def scene_zoom_context_menus(pdf_path: Path) -> None:
+    """拡大ビューの右クリック（何もない所 / 選んだ文字）。"""
+    print("[scene] 34_zoom_context_menu / 35_zoom_text_context_menu")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._page_count:
+        pew.close()
+        return
+    pew._open_zoom_view(0)
+    for _ in range(10):
+        QApplication.processEvents()
+    pix = _grab_menu(pew._zoom_context_menu(QPoint(3, 3)))
+    pix.save(str(OUT_DIR / "34_zoom_context_menu.png"))
+    print("  saved 34_zoom_context_menu.png")
+    label = pew._zoom_label
+    label._selected_char_indices = list(range(0, min(6, len(label._chars))))
+    label.text_selection_contains = lambda _pos: True  # type: ignore[method-assign]
+    pix = _grab_menu(pew._zoom_context_menu(QPoint(3, 3)))
+    pix.save(str(OUT_DIR / "35_zoom_text_context_menu.png"))
+    print("  saved 35_zoom_text_context_menu.png")
+    pew.close()
+
+
 def scene_zoom_annotation_panel(pdf_path: Path) -> None:
     print("[scene] 07_annotation_panel")
     pew = _make_page_edit_window(pdf_path)
@@ -331,17 +368,15 @@ def scene_zoom_annotation_panel(pdf_path: Path) -> None:
     pew.close()
 
 
-def scene_search_dialog() -> None:
+def scene_search_dialog(pdf_path: Path) -> None:
+    """個別画面の検索バー（ファイル名は従来のまま 09_search_dialog.png）。"""
     print("[scene] 09_search_dialog")
-    dlg = SearchDialog()
-    dlg.resize(420, 110)
-    dlg.show()
-    # Populate input + status so the screenshot looks meaningful.
-    dlg._input.setText("契約")
-    dlg.set_status(2, 5)
-    QApplication.processEvents()
-    _save(dlg, "09_search_dialog.png")
-    dlg.close()
+    pew = _make_page_edit_window(pdf_path)
+    pew._open_search_bar("Sample")
+    for _ in range(12):
+        QApplication.processEvents()
+    _save(pew, "09_search_dialog.png")
+    pew.close()
 
 
 def scene_settings_dialog() -> None:
@@ -676,8 +711,10 @@ def main() -> None:
         scene_page_edit_grid(proposal_pdf)
         scene_zoom_view(proposal_pdf)
         scene_zoom_annotation_panel(proposal_pdf)
+        scene_page_context_menus(proposal_pdf)
+        scene_zoom_context_menus(proposal_pdf)
 
-        scene_search_dialog()
+        scene_search_dialog(proposal_pdf)
         scene_settings_dialog()
         scene_export_dialog()
         scene_print_dialog(proposal_pdf)

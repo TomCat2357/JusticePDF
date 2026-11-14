@@ -118,13 +118,13 @@ def test_panel_dropdown_replaces_separate_buttons_and_opens_one_panel(qtbot, tmp
     open_zoom(window, qtbot)
 
     btn = window._zoom_panel_btn
-    assert btn.text() == "パネル"
-    assert btn.isCheckable() and not btn.isChecked()
+    assert btn.menu() is window._zoom_panel_menu
+    assert not any(a.isChecked() for a in window._zoom_panel_group.actions())
     assert [a.text() for a in window._zoom_panel_menu.actions()] == [
-        "アノテーション",
-        "個人情報検出",
-        "OCR",
+        "注釈",
         "しおり",
+        "個人情報",
+        "OCR",
     ]
     # OCR も実際のドロワーを持つ(依存が無くてもパネルは開き、案内が出る)。
     assert window._zoom_ocr_action.isEnabled() is True
@@ -134,47 +134,47 @@ def test_panel_dropdown_replaces_separate_buttons_and_opens_one_panel(qtbot, tmp
 
     window._zoom_pii_btn.trigger()
     assert window._pii_panel.is_open is True
-    assert btn.text() == "個人情報検出" and btn.isChecked()
+    assert window._zoom_pii_btn.isChecked()
     assert window._zoom_pii_btn.isChecked() and not window._zoom_object_btn.isChecked()
 
     # 別の項目を選ぶと切り替わる(ドロワーは排他)。
     window._zoom_object_btn.trigger()
     assert window._zoom_annotation_open is True
     assert window._pii_panel.is_open is False
-    assert btn.text() == "アノテーション"
+    assert window._zoom_object_btn.isChecked()
     assert window._zoom_object_btn.isChecked() and not window._zoom_pii_btn.isChecked()
 
     # 選択済みの項目をもう一度選ぶと閉じる。
     window._zoom_object_btn.trigger()
     assert window._zoom_annotation_open is False
-    assert btn.text() == "パネル" and not btn.isChecked()
+    assert not any(a.isChecked() for a in window._zoom_panel_group.actions())
     assert not window._zoom_object_btn.isChecked()
 
     # プログラムからの開閉(しおり等との排他)も表示に追従する。
     window._toggle_pii_drawer()
-    assert btn.text() == "個人情報検出" and window._zoom_pii_btn.isChecked()
+    assert window._zoom_pii_btn.isChecked()
     window._bookmarks_panel.set_open(True)
     assert window._pii_panel.is_open is False
     # しおりもパネルの1項目なので、ボタン表示は「しおり」になる。
-    assert btn.text() == "しおり" and btn.isChecked()
+    assert window._zoom_bookmark_action.isChecked()
     assert window._zoom_bookmark_action.isChecked() and not window._zoom_pii_btn.isChecked()
 
     # OCR も同じドロップダウンで排他的に開閉できる。
     window._zoom_ocr_action.trigger()
     assert window._ocr_panel.is_open is True
     assert window._bookmarks_panel.is_open is False
-    assert btn.text() == "OCR" and btn.isChecked()
+    assert window._zoom_ocr_action.isChecked()
     assert window._zoom_ocr_action.isChecked() and not window._zoom_pii_btn.isChecked()
     window._zoom_pii_btn.trigger()
     assert window._ocr_panel.is_open is False and window._pii_panel.is_open is True
-    assert btn.text() == "個人情報検出"
+    assert window._zoom_pii_btn.isChecked()
     window._zoom_object_btn.trigger()
     assert window._pii_panel.is_open is False and window._zoom_annotation_open is True
     window._zoom_ocr_action.trigger()
     assert window._zoom_annotation_open is False and window._ocr_panel.is_open is True
     window._zoom_ocr_action.trigger()  # 再選択で閉じる
     assert window._ocr_panel.is_open is False
-    assert btn.text() == "パネル" and not btn.isChecked()
+    assert not any(a.isChecked() for a in window._zoom_panel_group.actions())
 
 
 def test_pii_detection_creates_highlight_and_undo_removes_it(qtbot, tmp_path):

@@ -207,6 +207,9 @@ from src.views.page_edit_annotations import (
 )
 from src.views.page_edit_ocr import OcrDrawerMixin
 from src.views.page_edit_pii import PiiDrawerMixin
+from src.views.page_edit_chrome import THUMB_DEFAULT, PageEditChromeMixin
+from src.views.main_window_export import ExportMixin
+from src.views.search_dialog import SearchBar
 
 
 logger = logging.getLogger(__name__)
@@ -234,7 +237,9 @@ class ZoomPageLayout(Enum):
 # 括弧図形コンボボックスの並び(インデックス⇔値の唯一の対応表)
 
 
-class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawerMixin):
+class PageEditWindow(
+    QMainWindow, PageEditChromeMixin, ExportMixin, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawerMixin
+):
     """Window for editing pages within a PDF."""
 
     ZOOM_MIN = 25
@@ -242,8 +247,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     ZOOM_STEP = 5
     # 「100%」ボタンのドロップダウンに並べる倍率プリセット（25/100/400% は必須）。
     ZOOM_PRESETS = (25, 50, 75, 100, 150, 200, 300, 400)
-    # 右側ドロワー(アノテーション/個人情報検出/OCR)ドロップダウンの、パネルが開いていないときの表示。
-    ZOOM_PANEL_BUTTON_DEFAULT_TEXT = "パネル"
     PREVIEW_THUMB_MIN = 80
     PREVIEW_THUMB_MAX = 400
     PREVIEW_THUMB_STEP = 20
@@ -291,6 +294,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._zoom_percent_label = None
         self._zoom_reset_btn = None
         self._zoom_page_label = None
+        self._select_mode: str | None = None
         self._zoom_prev_btn = None
         self._zoom_next_btn = None
         self._zoom_page_num = None
@@ -385,7 +389,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # Preferred size is controlled by Ctrl+wheel.  _thumb_size stays at
         # that size while the window is resized; a narrow viewport scrolls
         # horizontally instead of shrinking the thumbnails.
-        self._preferred_thumb_size = PageThumbnail.THUMBNAIL_SIZE
+        self._preferred_thumb_size = THUMB_DEFAULT
         self._thumb_size = self._preferred_thumb_size
         self._thumb_render_queue: deque[int] = deque()
         self._thumb_render_queue_set: set[int] = set()
@@ -438,7 +442,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._rubber_band_origin = None
 
         # Text search (Ctrl+F)
-        self._search_dialog = None
+        self._search_bar: SearchBar | None = None
         self._search_hits: dict[int, list] = {}
         self._search_hit_pages: list[int] = []
         self._search_hit_set: set[int] = set()
@@ -485,8 +489,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         main_area = QWidget()
         layout = QVBoxLayout(main_area)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         root_layout.addWidget(main_area, 1)
 
+        self._build_panel_actions()
+        # 検索バー（ツールバー直下の帯。ページ一覧・拡大ビュー共通）
+        self._search_bar = SearchBar()
+        self._search_bar.search_requested.connect(self._on_search_execute)
+        self._search_bar.next_requested.connect(self._on_search_next)
+        self._search_bar.prev_requested.connect(self._on_search_prev)
+        self._search_bar.cancel_requested.connect(self._on_search_cancel)
+        self._search_bar.closed.connect(self._on_search_bar_closed)
+        self._search_bar.hide()
+        layout.addWidget(self._search_bar)
         self._build_page_grid(layout)
         self._build_zoom_view(layout)
 
@@ -504,6 +519,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         ``PageThumbnail`` を割り当てる(ページ番号ごとの状態はこのウィンドウが持つ)。
         """
         self._grid_scroll = QScrollArea()
+        self._grid_scroll.setObjectName("pageEditScroll")
         self._grid_scroll.setWidgetResizable(True)
         self._grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._grid_scroll.viewport().installEventFilter(self)
@@ -528,139 +544,24 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._grid_scroll.setWidget(self._grid)
         self._grid.page_clicked.connect(self._on_page_clicked)
         self._grid.page_double_clicked.connect(self._open_zoom_view)
+        self._grid.context_requested.connect(self._on_grid_context_requested)
 
     def _build_zoom_view(self, layout: QVBoxLayout) -> None:
-        """拡大表示ビュー(操作バー+キャンバス)を組み立てる。ドロワーは _setup_ui が右列に置く。"""
+        """拡大表示ビュー(キャンバス)を組み立てる。操作バーは拡大ビュー用ツールバー(_setup_zoom_toolbar)、
+        ドロワーは _setup_ui が右列に置く。"""
         self._zoom_view = QWidget()
         zoom_layout = QVBoxLayout(self._zoom_view)
         zoom_layout.setContentsMargins(0, 0, 0, 0)
 
-        zoom_layout.addWidget(self._build_zoom_controls())
         zoom_layout.addWidget(self._build_zoom_canvas(), 1)
 
         layout.addWidget(self._zoom_view)
         self._zoom_view.hide()
 
-    def _build_zoom_controls(self) -> QWidget:
-        """拡大表示上部の操作バー(戻る/倍率/ページ移動/各ドロワー/検索)を組み立てる。"""
-        zoom_controls = QWidget()
-        controls_layout = QHBoxLayout(zoom_controls)
-        controls_layout.setContentsMargins(10, 10, 10, 10)
-
-        self._zoom_back_btn = QPushButton("戻る")
-        self._zoom_back_btn.clicked.connect(self._exit_zoom_view)
-        controls_layout.addWidget(self._zoom_back_btn)
-
-        self._zoom_out_btn = QPushButton("-")
-        self._zoom_out_btn.clicked.connect(self._on_zoom_out)
-        controls_layout.addWidget(self._zoom_out_btn)
-
-        self._zoom_in_btn = QPushButton("+")
-        self._zoom_in_btn.clicked.connect(self._on_zoom_in)
-        controls_layout.addWidget(self._zoom_in_btn)
-
-        # 「100%」ボタン。クリックすると倍率プリセットのドロップダウンが開く。
-        # ボタン表示は現在の倍率を反映する。
-        self._zoom_reset_btn = QToolButton()
-        self._zoom_reset_btn.setObjectName("zoomPreset")
-        self._zoom_reset_btn.setText("100%")
-        self._zoom_reset_btn.setToolTip("倍率を選択")
-        self._zoom_reset_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        zoom_preset_menu = QMenu(self._zoom_reset_btn)
-        for preset in self.ZOOM_PRESETS:
-            action = zoom_preset_menu.addAction(f"{preset}%")
-            action.triggered.connect(
-                lambda _checked=False, p=preset: self._set_zoom_percent(p)
-            )
-        self._zoom_reset_btn.setMenu(zoom_preset_menu)
-        controls_layout.addWidget(self._zoom_reset_btn)
-
-        # ページ移動(◁ ▷)
-        self._zoom_prev_btn = QToolButton()
-        self._zoom_prev_btn.setObjectName("zoomNav")
-        self._zoom_prev_btn.setArrowType(Qt.ArrowType.LeftArrow)
-        self._zoom_prev_btn.setToolTip("前のページ")
-        self._zoom_prev_btn.setFixedWidth(40)
-        self._zoom_prev_btn.clicked.connect(self._on_zoom_prev_page)
-        controls_layout.addWidget(self._zoom_prev_btn)
-
-        self._zoom_next_btn = QToolButton()
-        self._zoom_next_btn.setObjectName("zoomNav")
-        self._zoom_next_btn.setArrowType(Qt.ArrowType.RightArrow)
-        self._zoom_next_btn.setToolTip("次のページ")
-        self._zoom_next_btn.setFixedWidth(40)
-        self._zoom_next_btn.clicked.connect(self._on_zoom_next_page)
-        controls_layout.addWidget(self._zoom_next_btn)
-
-        # 右側ドロワー(アノテーション/個人情報検出/OCR/しおり)を1つのドロップダウンに
-        # まとめる。ボタン表示は開いているパネル名(無ければ「パネル」)。項目は
-        # 同時に1つだけ選べ(全て外すことも可)、選択済みの項目を選ぶと閉じる。
-        # ドロワー同士の排他はそれぞれの開閉ハンドラが担う。
-        self._zoom_panel_btn = QPushButton(self.ZOOM_PANEL_BUTTON_DEFAULT_TEXT)
-        self._zoom_panel_btn.setCheckable(True)
-        self._zoom_panel_btn.setToolTip("右側のパネル(アノテーション/個人情報検出/OCR/しおり)を選択")
-        self._zoom_panel_menu = QMenu(self._zoom_panel_btn)
-        self._zoom_panel_menu.setToolTipsVisible(True)
-        self._zoom_panel_group = QActionGroup(self._zoom_panel_menu)
-        self._zoom_panel_group.setExclusionPolicy(QActionGroup.ExclusionPolicy.ExclusiveOptional)
-        # 属性名は従来のボタンのまま(setEnabled/setChecked/trigger は QAction にもある)。
-        self._zoom_object_btn = self._zoom_panel_menu.addAction("アノテーション")
-        self._zoom_object_btn.setToolTip("付箋編集")
-        self._zoom_pii_btn = self._zoom_panel_menu.addAction("個人情報検出")
-        self._zoom_pii_btn.setToolTip("個人情報(PII)の検出・ハイライト・黒塗りエクスポート")
-        self._zoom_ocr_action = self._zoom_panel_menu.addAction("OCR")
-        self._zoom_ocr_action.setToolTip("文字認識(OCR)して、検索・個人情報検出で使えるテキストを埋め込む")
-        self._zoom_bookmark_action = self._zoom_panel_menu.addAction("しおり")
-        self._zoom_bookmark_action.setToolTip("しおり編集")
-        # 旧しおりボタンの属性名も QAction へ向ける(text/isChecked/setChecked/trigger は共通)。
-        self._zoom_bookmark_btn = self._zoom_bookmark_action
-        for action in (
-            self._zoom_object_btn,
-            self._zoom_pii_btn,
-            self._zoom_ocr_action,
-            self._zoom_bookmark_action,
-        ):
-            action.setCheckable(True)
-            self._zoom_panel_group.addAction(action)
-        self._zoom_object_btn.triggered.connect(self._on_zoom_panel_annotation_triggered)
-        self._zoom_pii_btn.triggered.connect(self._on_zoom_panel_pii_triggered)
-        self._zoom_ocr_action.triggered.connect(self._on_zoom_panel_ocr_triggered)
-        self._zoom_bookmark_action.triggered.connect(self._on_zoom_panel_bookmarks_triggered)
-        # ボタンのクリックでメニューを開いた後にチェック状態がずれないよう、
-        # メニューが閉じたら実際のドロワーの開閉状態に合わせ直す。
-        self._zoom_panel_menu.aboutToHide.connect(
-            lambda: QTimer.singleShot(0, self._sync_zoom_panel_button)
-        )
-        self._zoom_panel_btn.setMenu(self._zoom_panel_menu)
-        controls_layout.addWidget(self._zoom_panel_btn)
-
-        # ページ表示レイアウト。クリックで選択肢を開き、1枚を選ぶと閲覧専用を解除する。
-        self._zoom_spread_btn = QPushButton("ページ表示")
-        self._zoom_spread_btn.setToolTip("ページ表示方法を選択")
-        self._zoom_layout_menu = QMenu(self._zoom_spread_btn)
-        for layout in ZoomPageLayout:
-            action = self._zoom_layout_menu.addAction(layout.label)
-            action.setCheckable(True)
-            action.setToolTip(
-                "通常表示・編集可" if layout is ZoomPageLayout.SINGLE else "閲覧専用"
-            )
-            action.triggered.connect(
-                lambda _checked=False, selected=layout: self._set_zoom_page_layout(selected)
-            )
-            self._zoom_layout_actions[layout] = action
-        self._zoom_spread_btn.setMenu(self._zoom_layout_menu)
-        controls_layout.addWidget(self._zoom_spread_btn)
-
-        controls_layout.addStretch()
-
-        self._zoom_page_label = QLabel("")
-        controls_layout.addWidget(self._zoom_page_label)
-
-        return zoom_controls
-
     def _build_zoom_canvas(self) -> QScrollArea:
         """拡大表示キャンバス(ZoomPageWidget)とそのシグナル配線を組み立てる。"""
         self._zoom_scroll = QScrollArea()
+        self._zoom_scroll.setObjectName("pageEditZoomScroll")
         self._zoom_scroll.setWidgetResizable(True)
         self._zoom_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._zoom_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -692,6 +593,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         )
         self._zoom_label.create_tool_escape_requested.connect(self._on_create_tool_escape_requested)
         self._zoom_label.scroll_requested.connect(self._on_zoom_scroll_requested)
+        self._zoom_label.context_requested.connect(self._on_zoom_context_requested)
         self._zoom_label.zoom_region_requested.connect(self._on_zoom_region_requested)
         self._zoom_scroll.setWidget(self._zoom_label)
         return self._zoom_scroll
@@ -742,45 +644,23 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             panel.set_open(bool(checked))
         self._sync_zoom_panel_button()
 
-    def _panel_buttons(self) -> list:
-        """パネルのドロップダウンボタン(拡大表示バーとページ一覧ツールバーの両方)。"""
-        return [
-            b
-            for b in (
-                getattr(self, "_zoom_panel_btn", None),
-                getattr(self, "_grid_panel_btn", None),
-            )
-            if b is not None
-        ]
-
     def _sync_zoom_panel_button(self) -> None:
-        """パネルボタンの表示(開いているパネル名/「パネル」)とチェック状態を実状態に合わせる。"""
-        buttons = self._panel_buttons()
-        if not buttons:
+        """パネルメニューのチェック(✓)を、実際のパネルの開閉状態に合わせる。"""
+        if getattr(self, "_zoom_object_btn", None) is None:
             return
         pii_panel = getattr(self, "_pii_panel", None)
         ocr_panel = getattr(self, "_ocr_panel", None)
         bookmarks_panel = getattr(self, "_bookmarks_panel", None)
-        if self._zoom_annotation_open:
-            name = self._zoom_object_btn.text()
-        elif pii_panel is not None and pii_panel.is_open:
-            name = self._zoom_pii_btn.text()
-        elif ocr_panel is not None and ocr_panel.is_open:
-            name = self._zoom_ocr_action.text()
-        elif bookmarks_panel is not None and bookmarks_panel.is_open:
-            name = self._zoom_bookmark_action.text()
-        else:
-            name = None
-        for button in buttons:
-            button.setText(name or self.ZOOM_PANEL_BUTTON_DEFAULT_TEXT)
-            button.setChecked(name is not None)
-        # メニュー側のチェックも実状態へ(プログラムから開閉された場合の同期)。
+        # メニュー側のチェックを実状態へ(プログラムから開閉された場合の同期)。
         self._zoom_object_btn.setChecked(bool(self._zoom_annotation_open))
         self._zoom_pii_btn.setChecked(bool(pii_panel is not None and pii_panel.is_open))
         self._zoom_ocr_action.setChecked(bool(ocr_panel is not None and ocr_panel.is_open))
         self._zoom_bookmark_action.setChecked(
             bool(bookmarks_panel is not None and bookmarks_panel.is_open)
         )
+        opened = [a for a in self._zoom_panel_group.actions() if a.isChecked()]
+        if opened:
+            self._last_panel_action = opened[0]
 
     def _zoom_view_shown(self) -> bool:
         """拡大表示(ビュー)に切り替わっているか(ウィンドウ未表示でも切替状態で判定する)。"""
@@ -795,10 +675,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         """表示モード(ページ一覧/拡大)に合わせて、各パネルの画面依存の操作を有効/無効にする。"""
         canvas = self._canvas_available()
         self._set_annotation_canvas_available(canvas)
-        # 拡大表示バーにも同じ「パネル」があるので、拡大表示中はツールバー側を隠す。
-        grid_action = getattr(self, "_grid_panel_action", None)
-        if grid_action is not None:
-            grid_action.setVisible(not self._zoom_view_shown())
         pii_panel = getattr(self, "_pii_panel", None)
         if pii_panel is not None:
             pii_panel.set_canvas_available(canvas)
@@ -1029,86 +905,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     # --- Proofreading callout --------------------------------------------
 
 
-    def _setup_toolbar(self) -> None:
-        toolbar = QToolBar()
-        toolbar.setIconSize(QSize(24, 24))
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-
-        self._undo_btn = QPushButton("元に戻す")
-        self._undo_btn.clicked.connect(self._on_undo)
-        toolbar.addWidget(self._undo_btn)
-
-        self._redo_btn = QPushButton("やり直し")
-        self._redo_btn.clicked.connect(self._on_redo)
-        toolbar.addWidget(self._redo_btn)
-
-        # 手動保存モードのときだけ表示する「保存」ボタン(未保存の変更があるときだけ有効)。
-        self._save_btn = QPushButton("保存")
-        self._save_btn.setToolTip("編集内容をファイルへ保存 (Ctrl+S)")
-        self._save_btn.clicked.connect(self._on_save)
-        self._save_action = toolbar.addWidget(self._save_btn)
-        self._save_action.setVisible(self._session is not None)
-
-        toolbar.addSeparator()
-
-        self._delete_btn = QPushButton("削除")
-        self._delete_btn.setObjectName("danger")
-        self._delete_btn.clicked.connect(self._on_delete)
-        toolbar.addWidget(self._delete_btn)
-
-        # 名前変更(ファイル名 / PDF名)を 1 つのボタンに統合し、クリックで
-        # ドロップダウンメニューを表示する(ファイル一覧モードと見た目・挙動を統一)。
-        self._rename_btn = QPushButton("名前変更")
-        self._rename_menu = QMenu(self._rename_btn)
-        self._rename_file_action = self._rename_menu.addAction("ファイル名")
-        self._rename_file_action.triggered.connect(self._on_rename)
-        self._rename_title_action = self._rename_menu.addAction("PDF名")
-        self._rename_title_action.triggered.connect(self._on_rename_pdf_title)
-        self._rename_btn.setMenu(self._rename_menu)
-        toolbar.addWidget(self._rename_btn)
-
-        self._print_btn = QPushButton("印刷")
-        self._print_btn.clicked.connect(self._on_print)
-        toolbar.addWidget(self._print_btn)
-
-        toolbar.addSeparator()
-
-        self._rotate_btn = QPushButton("回転")
-        self._rotate_btn.clicked.connect(self._on_rotate)
-        toolbar.addWidget(self._rotate_btn)
-
-        self._select_all_btn = QPushButton("すべて選択")
-        self._select_all_btn.clicked.connect(self._on_select_all)
-        toolbar.addWidget(self._select_all_btn)
-
-        toolbar.addSeparator()
-
-        self._search_btn = QPushButton("検索")
-        self._search_btn.setToolTip("PDF 内のテキストを検索 (Ctrl+F)")
-        self._search_btn.clicked.connect(self._on_open_search)
-        toolbar.addWidget(self._search_btn)
-
-        # 拡大表示バーの「パネル」と同じ QAction を共有する(チェック状態が連動する)。
-        # 画面(ページ)が要る機能はページ一覧ではパネル内でグレーアウトされる。
-        self._grid_panel_btn = QPushButton(self.ZOOM_PANEL_BUTTON_DEFAULT_TEXT)
-        self._grid_panel_btn.setCheckable(True)
-        self._grid_panel_btn.setToolTip(self._zoom_panel_btn.toolTip())
-        self._grid_panel_menu = QMenu(self._grid_panel_btn)
-        self._grid_panel_menu.setToolTipsVisible(True)
-        for action in self._zoom_panel_group.actions():
-            self._grid_panel_menu.addAction(action)
-        self._grid_panel_menu.aboutToHide.connect(
-            lambda: QTimer.singleShot(0, self._sync_zoom_panel_button)
-        )
-        self._grid_panel_btn.setMenu(self._grid_panel_menu)
-        # QToolBar に載せたウィジェットの表示切替は、返された QAction で行う。
-        self._grid_panel_action = toolbar.addWidget(self._grid_panel_btn)
-
-        self._apply_panel_context()
-        self._sync_zoom_panel_button()
-        self._update_button_states()
-
     def _setup_shortcuts(self) -> None:
         register_shortcuts(
             self,
@@ -1116,15 +912,19 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 (QKeySequence.StandardKey.Undo, self._on_undo),
                 (QKeySequence.StandardKey.Redo, self._on_redo),
                 (QKeySequence.StandardKey.Save, self._on_save_shortcut),
-                (QKeySequence.StandardKey.Delete, self._on_delete),
+                (QKeySequence.StandardKey.Delete, self._unless_typing(self._on_delete_key)),
                 (QKeySequence(Qt.Key.Key_F2), self._on_rename),
                 (QKeySequence("Shift+F2"), self._on_rename_pdf_title),
                 (QKeySequence.StandardKey.SelectAll, self._on_select_all),
-                (QKeySequence(Qt.Key.Key_R), self._on_rotate),
+                (QKeySequence(Qt.Key.Key_R), self._unless_typing(self._on_rotate)),
                 (QKeySequence.StandardKey.Print, self._on_print),
                 (QKeySequence.StandardKey.Find, self._on_open_search),
+                (QKeySequence("Ctrl+E"), self._on_export_file),
+                (QKeySequence(Qt.Key.Key_F3), self._on_search_next),
+                (QKeySequence("Shift+F3"), self._on_search_prev),
             ),
         )
+        self._setup_chrome_shortcuts()
         # 拡大モード中だけ有効化するページ送りショートカット。
         # グリッドモードでは無効化し、PageUp/PageDown/Home/End を
         # QScrollArea のデフォルトスクロールに譲る。
@@ -1248,6 +1048,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
 
     def _update_button_states(self) -> None:
+        if getattr(self, "_menu_buttons", None) is None:
+            return  # ツールバーを作る前
         has_selection = len(self._selected_pages) > 0
         zoom_active = bool(
             self._zoom_view
@@ -1258,8 +1060,15 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         spread = self._zoom_page_layout_is_multi()
         can_edit_pages = (has_selection or zoom_active) and not spread
         self._delete_btn.setEnabled(can_edit_pages)
-        self._rename_btn.setEnabled(True)
-        self._rotate_btn.setEnabled(can_edit_pages)
+        self._zoom_delete_action.setEnabled(can_edit_pages)
+        self._extract_action.setEnabled(can_edit_pages)
+        for btn in self._menu_buttons.get("rotate", ()):
+            btn.setEnabled(can_edit_pages)
+        for btn in self._menu_buttons.get("blank", ()):
+            btn.setEnabled(not spread)
+        for btn in self._menu_buttons.get("rename", ()):
+            btn.setEnabled(True)
+        self._select_all_btn.setEnabled(self._page_count > 0)
         self._undo_btn.setEnabled(not spread and self._undo_manager.can_undo())
         self._redo_btn.setEnabled(not spread and self._undo_manager.can_redo())
         self._update_save_button()
@@ -1307,6 +1116,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         """未保存の状態が変わったとき(未保存になった・保存した)の画面更新。"""
         self.setWindowTitle(self._page_edit_window_title())
         self._update_save_button()
+        self._refresh_toolbar_info()
 
     def _save_blocked_by_worker(self) -> bool:
         """OCR・個人情報検出のワーカー実行中は保存しない(ワーカーはファイルを読んでいるため)。"""
@@ -1412,6 +1222,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._session = None
             self._open_manual_session()
         self.setWindowTitle(self._page_edit_window_title())
+        self._update_crumbs()
+        self._refresh_toolbar_info(reload_title=True)
 
     def _finish_manual_session_on_close(self) -> bool:
         """ウィンドウを閉じる前の保存確認とセッションの後始末。閉じてよければ True(キャンセルは False)。
@@ -1872,12 +1684,14 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # ファイル存在チェック
         if not os.path.exists(self._pdf_path):
             self._grid.set_page_count(0)
+            self._refresh_toolbar_info()
             return
 
         page_count = self._count_pages_keeping_doc()
         if page_count == 0:
             self._release_held_doc()
             self._grid.set_page_count(0)
+            self._refresh_toolbar_info()
             return
 
         self._refresh_page_bound_views()
@@ -1900,6 +1714,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         if saved_scroll:
             vbar.setValue(saved_scroll)
         self._enqueue_visible_thumbnail_renders()
+        self._refresh_toolbar_info(reload_title=True)
+        self._update_button_states()
         if self._zoom_view and self._zoom_view.isVisible():
             self._render_zoom()
 
@@ -2129,8 +1945,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                     return False
                 delta = event.angleDelta().y()
                 if delta != 0:
-                    step = self.PREVIEW_THUMB_STEP if delta > 0 else -self.PREVIEW_THUMB_STEP
-                    self._set_thumbnail_size(self._preferred_thumb_size + step)
+                    self._step_thumb_preset(1 if delta > 0 else -1)  # 小/中/大/特大を 1 段ずつ
                 event.accept()
                 return True
         return super().eventFilter(obj, event)
@@ -2181,6 +1996,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._zoom_view.show()
         for action in getattr(self, "_zoom_nav_actions", ()):
             action.setEnabled(True)
+        self._apply_chrome_mode()
         self._apply_panel_context()
         self._sync_ocr_overlay()  # 表示前の描画では重ね表示を省くため、開いた直後に反映する
         self._reload_bookmarks_tree()
@@ -2195,8 +2011,10 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._set_selected_zoom_annotation(None)
         for action in getattr(self, "_zoom_nav_actions", ()):
             action.setEnabled(False)
+        self._set_select_mode(None)
         if self._zoom_view:
             self._zoom_view.hide()
+        self._apply_chrome_mode()
         if self._grid_scroll:
             self._grid_scroll.show()
             # 隠れている間のリサイズはレイアウトへ反映されていないので、ここで確定させてから
@@ -2455,8 +2273,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         )
         page_count = page_data["page_count"]
         self._update_zoom_nav_buttons(page_count)
-        if self._zoom_page_label:
-            self._zoom_page_label.setText(f"{self._zoom_page_num + 1} / {page_count}")
+        self._set_zoom_page_display(self._zoom_page_num, 1, page_count)
         if self._zoom_page_num >= page_count:
             self._exit_zoom_view()
             return
@@ -2576,10 +2393,7 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         page_indices = list(range(start, min(start + capacity, page_count)))
 
         self._update_zoom_nav_buttons(page_count)
-        if self._zoom_page_label:
-            self._zoom_page_label.setText(
-                self._format_zoom_page_label(start, len(page_indices), page_count)
-            )
+        self._set_zoom_page_display(start, len(page_indices), page_count)
 
         dpr = self._zoom_label.devicePixelRatioF()
         scale = self._zoom_factor * dpr
@@ -2689,15 +2503,23 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._ink_xrefs_by_page_cache = None
         self._update_button_states()
 
+    def _on_delete_key(self) -> None:
+        """Delete キー。拡大ビューでは注釈の削除だけ(選んでいなければ何もしない。ページは消さない)。"""
+        if self._zoom_page_layout_is_multi():
+            return
+        if self._zoom_view_shown():
+            if self._selected_zoom_annotation is not None:
+                self._delete_selected_zoom_annotation()
+            return
+        self._on_delete()
+
     def _on_delete(self) -> None:
-        # 複数ページ表示(閲覧専用)中は削除不可(Delete キーのショートカット対策)。
+        """削除ボタン・右クリックの「削除」。ページ一覧は選択ページ、拡大ビューは表示中のページ。"""
+        # 複数ページ表示(閲覧専用)中は削除不可。
         if self._zoom_page_layout_is_multi():
             return
         # ズームビュー表示中の場合
         if self._zoom_view and self._zoom_view.isVisible():
-            if self._selected_zoom_annotation is not None:
-                self._delete_selected_zoom_annotation()
-                return
             self._delete_zoom_page()
             return
 
@@ -2846,34 +2668,37 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         print_pdfs([self._pdf_path], self, settings=dialog.get_settings(), printer=dialog.build_printer())
 
     def _on_rotate(self) -> None:
-        # 複数ページ表示(閲覧専用)中は回転不可(R キーのショートカット対策)。
+        """R キー: 選択ページ(拡大ビューは表示中のページ)を右に 90° 回転する。"""
+        self._rotate_pages_by(90)
+
+    def _rotate_pages_by(self, angle: int) -> None:
+        """選択ページ（拡大ビューは表示中のページ）を angle 度（90 / 180 / 270）回転する。"""
         if self._zoom_page_layout_is_multi():
             return
-        # ズームビュー表示中の場合
-        if self._zoom_view and self._zoom_view.isVisible():
-            self._rotate_zoom_page()
+        pages = self._selected_or_current_pages()
+        if not pages or not self._ensure_saved("ページの回転"):
             return
-
-        if not self._selected_pages:
-            return
-        if not self._ensure_saved("ページの回転"):
-            return
-
-        indices = list(self._selected_pages)
         pdf_path = self._pdf_path
-        selected_pages = list(indices)
+        back = (360 - angle) % 360 or 180
+        zoom = self._zoom_view_shown()
 
-        def do_rotate():
-            rotate_pages(pdf_path, indices, 90)
-            for page in selected_pages:
-                self._request_thumbnail_refresh(page)
+        def refresh() -> None:
+            for page in pages:
+                self._zoom_text_cache.pop(page, None)
+                if page < self._page_count:
+                    self._request_thumbnail_refresh(page)
+            if zoom and self._zoom_view_shown():
+                self._render_zoom()
 
-        def undo_rotate():
-            rotate_pages(pdf_path, indices, 270)
-            for page in selected_pages:
-                self._request_thumbnail_refresh(page)
+        def do_rotate() -> None:
+            rotate_pages(pdf_path, pages, angle)
+            refresh()
 
-        self._push_undoable(f"Rotate {len(indices)} page(s)", do_rotate, undo_rotate, writes_file=True)
+        def undo_rotate() -> None:
+            rotate_pages(pdf_path, pages, back)
+            refresh()
+
+        self._push_undoable(f"Rotate {len(pages)} page(s)", do_rotate, undo_rotate, writes_file=True)
 
     def _on_select_all(self) -> None:
         self._select_pages(range(self._page_count))
@@ -2937,36 +2762,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 self._render_zoom()
 
         self._push_undoable("Delete page from zoom view", do_delete, undo_delete, writes_file=True)
-
-    def _rotate_zoom_page(self) -> None:
-        """ズームビュー表示中のページを回転"""
-        if self._zoom_page_num is None:
-            return
-        if not self._ensure_saved("ページの回転"):
-            return
-
-        pdf_path = self._pdf_path
-        page_num = self._zoom_page_num
-
-        def do_rotate():
-            rotate_pages(pdf_path, [page_num], 90)
-            # ズームテキストキャッシュをクリアして再描画
-            self._zoom_text_cache.pop(page_num, None)
-            if self._zoom_view and self._zoom_view.isVisible():
-                self._render_zoom()
-            # サムネイルも更新
-            if page_num < self._page_count:
-                self._request_thumbnail_refresh(page_num)
-
-        def undo_rotate():
-            rotate_pages(pdf_path, [page_num], 270)
-            self._zoom_text_cache.pop(page_num, None)
-            if self._zoom_view and self._zoom_view.isVisible():
-                self._render_zoom()
-            if page_num < self._page_count:
-                self._request_thumbnail_refresh(page_num)
-
-        self._push_undoable("Rotate page from zoom view", do_rotate, undo_rotate, writes_file=True)
 
     def _delete_all_pages(self, backup_path: str) -> None:
         """全ページ削除（ファイルをゴミ箱へ移動し、UNDO対応）"""
@@ -3057,9 +2852,31 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
             self._did_initial_grid_layout = True
             QTimer.singleShot(0, self._relayout_grid)
 
+    def keyPressEvent(self, event) -> None:
+        """Esc: 開いている検索バーを閉じる。無ければ(ページ一覧で)選択を解除する。
+
+        入力欄・キャンバス・パネルが自分で Esc を使うときはここへ来ない(伝わってきた分だけ)。
+        """
+        if event.key() == Qt.Key.Key_Escape and not event.modifiers():
+            if self._search_bar is not None and self._search_bar.isVisible():
+                self._search_bar.close_bar()
+                event.accept()
+                return
+            if not self._zoom_view_shown() and self._selected_pages:
+                self._clear_selection()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def mousePressEvent(self, event) -> None:
         """Handle mouse press - start rubber band selection on empty area."""
         if event.button() == Qt.MouseButton.LeftButton:
+            # 検索バー・ツールバー・モード帯などの空きをクリックしても、選択を解いたり
+            # ラバーバンドを始めたりしない(ページ一覧の領域の中だけ)。
+            viewport = self._grid_scroll.viewport()
+            if self._grid_scroll.isHidden() or not viewport.rect().contains(viewport.mapFrom(self, event.pos())):
+                super().mousePressEvent(event)
+                return
             child = self.childAt(event.pos())
             while child is not None:
                 if isinstance(child, PageThumbnail):
@@ -3464,9 +3281,6 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
 
         self._stop_search_scan()
         self._search_index = None
-        if self._search_dialog is not None:
-            self._search_dialog.close()
-            self._search_dialog = None
 
         owner = self.parent()
         if isinstance(owner, MainWindow):
@@ -3476,23 +3290,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
     # --- Text search (Ctrl+F) ---
 
     def _on_open_search(self) -> None:
-        """Open or focus the modeless search dialog."""
-        from src.views.search_dialog import SearchDialog
-
-        if self._search_dialog is None:
-            self._search_dialog = SearchDialog(self)
-            self._search_dialog.search_requested.connect(self._on_search_execute)
-            self._search_dialog.next_requested.connect(self._on_search_next)
-            self._search_dialog.prev_requested.connect(self._on_search_prev)
-            self._search_dialog.finished.connect(self._on_search_dialog_finished)
-            self._search_dialog.cancel_requested.connect(self._on_search_cancel)
-        self._search_dialog.show()
-        self._search_dialog.raise_()
-        self._search_dialog.activateWindow()
-        self._search_dialog.focus_input()
-
-    def _on_search_dialog_finished(self, _result: int) -> None:
-        self._clear_search_highlights()
+        """Ctrl+F: 検索バーを開いて入力欄へフォーカスする。"""
+        self._open_search_bar()
 
     # 小さい文書(このページ数以下)は、検索を _on_search_execute の中で最後まで同期実行する
     SEARCH_SYNC_MAX_PAGES = 300
@@ -3504,8 +3303,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         # まず以前のハイライトをクリア(実行中の検索も止まる)
         self._clear_search_highlights()
         if not query:
-            if self._search_dialog is not None:
-                self._search_dialog.set_status(0, 0)
+            if self._search_bar is not None:
+                self._search_bar.set_status(0, 0)
             return
         self._search_query = query
         self._search_jumped = False
@@ -3546,8 +3345,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._search_token = index.token
         self._search_scan = SearchScan(index, self._search_query, self._page_count)
         self._search_sync = self._page_count <= self.SEARCH_SYNC_MAX_PAGES
-        if self._search_dialog is not None and not self._search_scan.done:
-            self._search_dialog.set_progress(0, self._page_count, 0)
+        if self._search_bar is not None and not self._search_scan.done:
+            self._search_bar.set_progress(0, self._page_count, 0)
         if self._search_sync:
             while self._search_scan is not None:
                 self._search_step()
@@ -3621,8 +3420,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
                 "search failed: pdf=%s query=%r", self._pdf_path, self._search_query, exc_info=True
             )
             self._clear_search_highlights()
-            if self._search_dialog is not None:
-                self._search_dialog.set_status(0, 0)
+            if self._search_bar is not None:
+                self._search_bar.set_status(0, 0)
             return
         for page, rects in found:
             self._add_search_hit(page, rects)
@@ -3710,8 +3509,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         return i + 1 if i < len(pages) and pages[i] == current else 0
 
     def _show_search_status(self) -> None:
-        """ヒットしたページ数・現在位置(走査中は進み具合も)をダイアログへ表示する。"""
-        dialog = self._search_dialog
+        """ヒットしたページ数・現在位置(走査中は進み具合も)を検索バーへ表示する。"""
+        dialog = self._search_bar
         if dialog is None:
             return
         pages = len(self._search_hit_pages)
@@ -3845,8 +3644,8 @@ class PageEditWindow(QMainWindow, ZoomAnnotationMixin, PiiDrawerMixin, OcrDrawer
         self._search_hit_pages = []
         if self._zoom_label is not None:
             self._zoom_label.set_search_hit_rects([])
-        if self._search_dialog is not None:
-            self._search_dialog.clear_status()
+        if self._search_bar is not None:
+            self._search_bar.clear_status()
 
 
 def ensure_path_saved(pdf_path: str, reason: str) -> bool:
