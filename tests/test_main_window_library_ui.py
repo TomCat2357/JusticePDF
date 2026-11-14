@@ -63,3 +63,49 @@ def test_filter_narrows_cards_and_typing_does_not_fire_single_key_shortcuts(wind
     # Esc で閉じると絞り込みが解除される
     window._on_escape()
     assert all(window._item_visible(c) for c in window._cards)
+
+
+def test_navigating_into_a_folder_clears_undo_history_and_keeps_its_saved_order(window, qtbot):
+    from src.models.undo_manager import UndoAction
+    from src.utils import order_store
+
+    sub = window._work_dir / "案件A"
+    sub.mkdir()
+    order_store.save_folder_order(
+        sub, manual_files=["b.pdf", "a.pdf"], manual_subfolders=[],
+        sort_order="manual", sort_ascending=True,
+    )
+    before = order_store.load_folder_order(sub)
+    window._undo_manager.add_action(UndoAction(description="x", undo_func=lambda: None,
+                                               redo_func=lambda: None))
+    assert window._undo_manager.can_undo()
+
+    assert window.navigate_to(str(sub)) is True
+    qtbot.wait(700)  # 遅延保存のタイマが残っていても新フォルダの並び順は書き換わらない
+
+    assert window._work_dir == sub
+    assert not window._undo_manager.can_undo()
+    assert order_store.load_folder_order(sub) == before
+    assert window._nav_back and window.go_back() and window._work_dir != sub
+
+
+def test_navigation_opens_new_window_while_a_page_edit_window_is_open(window, monkeypatch):
+    sub = window._work_dir / "案件B"
+    sub.mkdir()
+
+    class FakePageEdit:
+        def parent(self):
+            return window
+
+        def isVisible(self):
+            return True
+
+    opened = []
+    monkeypatch.setattr(window, "_get_open_page_edit_windows", lambda: [FakePageEdit()])
+    monkeypatch.setattr(window, "_open_folder_in_new_window", lambda p: opened.append(p))
+    before = window._work_dir
+
+    assert window.navigate_to(str(sub)) is False
+
+    assert window._work_dir == before
+    assert opened == [str(sub)]

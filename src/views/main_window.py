@@ -123,6 +123,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._preview_thumb_size = self._snap_preview_size(PDFCard.THUMBNAIL_SIZE)
         self._preview_card_width = card_width_for(self._preview_thumb_size)
         self._wheel_accum = 0
+        # 戻る / 進むの履歴（移動先のフォルダのパス）
+        self._nav_back: list[str] = []
+        self._nav_forward: list[str] = []
         # 名前での絞り込み（空 = 絞り込みなし）
         self._filter_groups: list = []
 
@@ -284,6 +287,10 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._app_bar.about_requested.connect(lambda: self._on_open_about())
         self._mode_bar.set_mode("folder")
         self._mode_bar.reload_requested.connect(lambda: self._on_refresh())
+        self._mode_bar.back_requested.connect(lambda: self.go_back())
+        self._mode_bar.forward_requested.connect(lambda: self.go_forward())
+        self._mode_bar.up_requested.connect(lambda: self.go_up())
+        self._mode_bar.crumb_requested.connect(lambda path: self.navigate_to(path))
         self._update_mode_bar()
 
         central = QWidget()
@@ -352,16 +359,248 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         ("date", False): "日付順（降順）",
     }
 
+    @staticmethod
+    def _is_within(path: Path, base: Path) -> bool:
+        """path が base と同じ、または base の中か（大文字小文字を区別しない）。"""
+        pn = os.path.normcase(os.path.abspath(str(path)))
+        bn = os.path.normcase(os.path.abspath(str(base)))
+        return pn == bn or pn.startswith(bn.rstrip("\\/") + os.sep)
+
+    def _crumb_specs(self) -> list[tuple]:
+        """パンくずの区間 [(表示名, パス, アイコン名 or None), ...]。
+
+        ライブラリの根の中なら根から、ホームの中ならホームから、
+        どちらでもなければドライブから。個人名のフォルダが出ないようにする。
+        """
+        wd = Path(self._work_dir)
+        root = app_settings.library_dir()
+        home = Path.home()
+        if self._is_within(wd, root):
+            base, label, icon = root, (root.name or str(root)), "HardDrive"
+        elif self._is_within(wd, home):
+            base, label, icon = home, "ホーム", "Home"
+        else:
+            base, label, icon = None, None, None
+        if base is None:
+            parts = wd.parts
+            acc = None
+            specs = []
+            for i, part in enumerate(parts):
+                acc = Path(part) if acc is None else acc / part
+                text = (part.rstrip("\\/") or part) if i == 0 else part
+                specs.append((text, str(acc), None))
+            return specs
+        specs = [(label, str(base), icon)]
+        acc = Path(base)
+        for part in wd.parts[len(base.parts):]:
+            acc = acc / part
+            specs.append((part, str(acc), None))
+        return specs
+
     def _update_mode_bar(self) -> None:
-        """パンくずを今のフォルダのパスの区間にする（区間のクリックは L2 で配線する）。"""
-        parts = Path(self._work_dir).parts
-        crumbs: list[tuple[str, str]] = []
-        acc = None
-        for i, part in enumerate(parts):
-            acc = Path(part) if acc is None else acc / part
-            label = (part.rstrip("\\/") or part) if i == 0 else part
-            crumbs.append((label, str(acc)))
-        self._mode_bar.set_crumbs(crumbs)
+        """パンくずと、戻る・進む・上へのボタンを今のフォルダに合わせる。"""
+        self._mode_bar.set_crumbs(self._crumb_specs())
+        self._update_nav_state()
+
+    @staticmethod
+    def _folder_label(path: str) -> str:
+        return os.path.basename(path.rstrip("\\/")) or path
+
+    def _update_nav_state(self) -> None:
+        parent = Path(self._work_dir).parent
+        has_parent = os.path.normcase(str(parent)) != os.path.normcase(str(self._work_dir))
+        self._mode_bar.set_nav_enabled(bool(self._nav_back), bool(self._nav_forward), has_parent)
+        self._mode_bar.set_back_tooltip(
+            self._folder_label(self._nav_back[-1]) if self._nav_back else None)
+        self._mode_bar.set_forward_tooltip(
+            self._folder_label(self._nav_forward[-1]) if self._nav_forward else None)
+        self._mode_bar.set_up_tooltip(self._folder_label(str(parent)) if has_parent else None)
+
+    # ---- フォルダのその場移動 ------------------------------------------
+    def _live_windows(self) -> list["MainWindow"]:
+        """閉じた窓を除いた MainWindow の一覧（_instances から外れていないものも守る）。"""
+        out = []
+        for w in list(MainWindow._instances):
+            try:
+                w.isVisible()
+            except RuntimeError:
+                MainWindow._instances.remove(w)
+                continue
+            out.append(w)
+        return out
+
+    def _visible_window_for(self, folder: str) -> "MainWindow | None":
+        """folder を「今」表示している、自分以外の開いている窓。"""
+        target = self._normalize_path(folder)
+        for w in self._live_windows():
+            if w is self or not w.isVisible():
+                continue
+            if self._normalize_path(str(w._work_dir)) == target:
+                return w
+        return None
+
+    @staticmethod
+    def _raise_window(w) -> None:
+        if w.isMinimized():
+            w.setWindowState(
+                (w.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive
+            )
+        w.show()
+        w.raise_()
+        w.activateWindow()
+
+    def _owned_page_edit_windows(self) -> list:
+        """この窓から開いた、開いたままの個別画面。"""
+        out = []
+        for w in self._get_open_page_edit_windows():
+            try:
+                if w.parent() is self and w.isVisible():
+                    out.append(w)
+            except RuntimeError:
+                continue
+        return out
+
+    def navigate_to(self, folder, *, push_history: bool = True) -> bool:
+        """この窓の表示をフォルダ ``folder`` へその場で切り替える（入口はここ 1 つ）。
+
+        処理中・個別画面を開いたまま・移動先が別窓で開いているときは移動せず、
+        新しい窓で開く / その窓を前面化する。その場で移動したときだけ True。
+        """
+        folder = str(folder)
+        if not os.path.isdir(folder):
+            self.statusBar().showMessage("移動先のフォルダが見つかりません", 4000)
+            return False
+        if self._normalize_path(folder) == self._normalize_path(str(self._work_dir)):
+            return False
+        other = self._visible_window_for(folder)
+        if other is not None:
+            self._raise_window(other)
+            return False
+        if self._operation_in_progress or self._owned_page_edit_windows():
+            self._open_folder_in_new_window(folder)
+            return False
+
+        old_dir = str(self._work_dir)
+        # ① 並び順の遅延保存を同期で済ませ、タイマを止める（新フォルダのキーへ旧順を書かない）
+        self._flush_order_save()
+        self._order_save_timer.stop()
+        self._order_dirty = False
+        # ② 旧 watcher のシグナルを切ってから止める（止めた後に届くイベントの誤配送を防ぐ）
+        old_watcher = self._watcher
+        for sig in (old_watcher.file_added, old_watcher.file_removed, old_watcher.file_modified,
+                    old_watcher.folder_added, old_watcher.folder_removed):
+            try:
+                sig.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+        old_watcher.stop()
+        # ③ Undo の履歴はフォルダをまたげない（クロージャが今のカード一覧を書き換える）
+        had_history = self._undo_manager.can_undo() or self._undo_manager.can_redo()
+        self._undo_manager.clear()
+        self._order_save_timer.stop()  # clear の通知で再開した保存は不要
+        self._order_dirty = False
+        # ④ 窓ごとの状態を捨てる
+        self._reset_folder_state()
+        # ⑤ 作業フォルダとタイトルを切り替える
+        self._work_dir = Path(folder)
+        self._update_window_title()
+        # ⑥ 新しい watcher
+        self._watcher = self._create_watcher(folder)
+        self._watcher.start()
+        # ⑦ 読み込み
+        self._load_existing_files()
+        self._refresh_grid()
+        self._scroll_area.verticalScrollBar().setValue(0)
+        self._relock_open_cards()
+        if push_history:
+            self._nav_back.append(old_dir)
+            self._nav_forward.clear()
+        self._update_mode_bar()
+        self._update_button_states()
+        self._schedule_reconcile()
+        if had_history:
+            self.statusBar().showMessage(
+                "フォルダを移動したため、元に戻す履歴を消しました", 5000)
+        return True
+
+    def _reset_folder_state(self) -> None:
+        """フォルダ固有の表示状態（カード・選択・絞り込み・内部登録）を空にする。"""
+        self._search_action.setChecked(False)  # 絞り込みバーを閉じて解除する
+        self._clear_selection()
+        self._rubber_band_origin = None
+        self._rubber_band.hide()
+        self._hide_drop_indicator()
+        self._zoom_debounce_timer.stop()
+        for timer in self._modified_timers.values():
+            timer.stop()
+            timer.deleteLater()
+        self._modified_timers.clear()
+        self._modified_last_mtime.clear()
+        for container in (self._internal_adds, self._internal_removes,
+                          self._pending_rename_removed, self._pending_rename_added):
+            container.clear()
+        self._pending_rename_old_to_new.clear()
+        self._pending_rename_new_to_old.clear()
+        self._busy_since.clear()
+        self._file_signatures.clear()
+        self._file_stability.clear()
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+        for item in (*self._folder_cards, *self._cards):
+            item.setParent(None)
+            item.deleteLater()
+        self._cards = []
+        self._folder_cards = []
+        self._selected_cards = []
+        self._selected_folder_cards = []
+
+    def _relock_open_cards(self) -> None:
+        """開いている個別画面のファイルが今のフォルダ直下にあれば、カードを編集中にする。"""
+        for w in self._owned_page_edit_windows():
+            self.lock_card(w._pdf_path)
+
+    def _update_window_title(self) -> None:
+        wd = Path(self._work_dir)
+        if self._normalize_path(str(wd)) == self._normalize_path(str(app_settings.library_dir())):
+            self.setWindowTitle("JusticePDF")
+        else:
+            self.setWindowTitle(f"JusticePDF - {wd.name or str(wd)}")
+
+    def go_back(self) -> bool:
+        while self._nav_back and not os.path.isdir(self._nav_back[-1]):
+            self._nav_back.pop()
+        if not self._nav_back:
+            self._update_nav_state()
+            return False
+        target, current = self._nav_back[-1], str(self._work_dir)
+        if self.navigate_to(target, push_history=False):
+            self._nav_back.pop()
+            self._nav_forward.append(current)
+            self._update_nav_state()
+            return True
+        return False
+
+    def go_forward(self) -> bool:
+        while self._nav_forward and not os.path.isdir(self._nav_forward[-1]):
+            self._nav_forward.pop()
+        if not self._nav_forward:
+            self._update_nav_state()
+            return False
+        target, current = self._nav_forward[-1], str(self._work_dir)
+        if self.navigate_to(target, push_history=False):
+            self._nav_forward.pop()
+            self._nav_back.append(current)
+            self._update_nav_state()
+            return True
+        return False
+
+    def go_up(self) -> bool:
+        parent = Path(self._work_dir).parent
+        if os.path.normcase(str(parent)) == os.path.normcase(str(self._work_dir)):
+            return False
+        return self.navigate_to(parent)
 
     def _menu_action(self, menu: QMenu, text: str, slot, *, keys: str | None = None,
                      icon: str | None = None, checkable: bool = False) -> QAction:
@@ -560,6 +799,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                 (QKeySequence(Qt.Key.Key_Escape), self._on_escape),
                 (QKeySequence(Qt.Key.Key_F5), self._on_refresh),
                 (QKeySequence("Ctrl+F"), self._on_find_shortcut),
+                (QKeySequence("Alt+Left"), lambda: self.go_back()),
+                (QKeySequence("Alt+Right"), lambda: self.go_forward()),
+                (QKeySequence("Alt+Up"), lambda: self.go_up()),
             ),
         )
 
@@ -1345,6 +1587,12 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
 
     def mousePressEvent(self, event) -> None:
         """Handle mouse press - clear selection when clicking empty area or start rubber band."""
+        if event.button() == Qt.MouseButton.BackButton:
+            self.go_back()
+            return
+        if event.button() == Qt.MouseButton.ForwardButton:
+            self.go_forward()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             child = self.childAt(event.pos())
             while child is not None:
@@ -1476,7 +1724,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             entries.append(ctx("renamePdf", self._on_rename_pdf_title, not busy))
         elif one_folder:
             fc = self._selected_folder_cards[0]
-            entries.append(ctx("open", lambda: self._open_folder_in_new_window(fc.folder_path)))
+            entries.append(ctx("open", lambda: self.navigate_to(fc.folder_path)))
             entries.append(ctx("openNewWindow", lambda: self._open_folder_in_new_window(fc.folder_path)))
             entries.append(ctx("rename", self._on_rename_folder_selected, not busy))
         if n_folders >= 1 or n_files >= 2:
@@ -1644,8 +1892,11 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._update_button_states()
 
     def _on_folder_card_double_clicked(self, fc: FolderCard, alt_pressed: bool = False) -> None:
-        """Open a new MainWindow scoped to the clicked subfolder."""
-        self._open_folder_in_new_window(fc.folder_path)
+        """ダブルクリック: その場で移動。Ctrl+ダブルクリックは新しい窓で開く。"""
+        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._open_folder_in_new_window(fc.folder_path)
+        else:
+            self.navigate_to(fc.folder_path)
 
     def _open_folder_in_new_window(self, folder_path: str) -> "MainWindow | None":
         """Open ``folder_path`` in a cascaded child window (or focus if open).
@@ -1658,27 +1909,15 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         if not os.path.isdir(folder_path):
             return None
         # If already open, bring that window to front.
-        for w in MainWindow._instances:
-            if w is self:
-                continue
-            try:
-                if self._normalize_path(str(w._work_dir)) == self._normalize_path(folder_path):
-                    if w.isMinimized():
-                        w.setWindowState(
-                            (w.windowState() & ~Qt.WindowState.WindowMinimized)
-                            | Qt.WindowState.WindowActive
-                        )
-                    w.show()
-                    w.raise_()
-                    w.activateWindow()
-                    return w
-            except RuntimeError:
-                continue
+        other = self._visible_window_for(folder_path)
+        if other is not None:
+            self._raise_window(other)
+            return other
 
         new_window = MainWindow(folder_path)
 
         existing_count = sum(
-            1 for w in MainWindow._instances
+            1 for w in self._live_windows()
             if w is not new_window and w.isVisible()
         )
         main_geo = self.geometry()
@@ -2178,4 +2417,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._undo_manager.remove_listener(self._on_undo_manager_changed)
         self._flush_order_save()
         self._watcher.stop()
+        try:
+            MainWindow._instances.remove(self)  # 閉じた窓を前面化の対象に残さない
+        except ValueError:
+            pass
         super().closeEvent(event)

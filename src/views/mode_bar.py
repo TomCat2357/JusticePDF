@@ -78,7 +78,7 @@ class ModeBar(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedHeight(BAR_HEIGHT)
         self._mode = "folder"
-        self._crumbs: list[tuple[str, object]] = []
+        self._crumbs: list[tuple[str, object, str | None]] = []
         self._rendered_key = None
 
         lay = QHBoxLayout(self)
@@ -167,7 +167,7 @@ class ModeBar(QWidget):
 
     def set_crumbs(self, crumbs) -> None:
         """crumbs = [(表示名, payload), ...]。区間をクリックすると crumb_requested(payload)。"""
-        self._crumbs = [(str(label), payload) for label, payload in crumbs]
+        self._crumbs = [(str(c[0]), c[1], c[2] if len(c) > 2 else None) for c in crumbs]
         self._rendered_key = None
         self._render_crumbs()
 
@@ -214,6 +214,8 @@ class ModeBar(QWidget):
         widths = [fm.horizontalAdvance(c[0]) + 4 for c in self._crumbs]
         if n:
             widths[-1] = fmb.horizontalAdvance(self._crumbs[-1][0]) + 4
+            if self._crumbs[0][2]:
+                widths[0] += 18  # 先頭の区間のアイコン
         total = sum(widths) + sep * (n - 1)
         if n <= 2 or total <= avail:
             return list(range(n)), []
@@ -251,7 +253,12 @@ class ModeBar(QWidget):
             if hidden and pos == 1:
                 self._add_ellipsis(hidden)
                 self._add_separator()
-            label, payload = self._crumbs[i]
+            label, payload, icon_name = self._crumbs[i]
+            if icon_name:
+                ic = QLabel(self._host)
+                ic.setPixmap(icons.pixmap(icon_name, _WHITE, 14))
+                ic.setFixedSize(14, 14)
+                self._crumb_lay.addWidget(ic)
             w = _CrumbLabel(label, bold=(i == last), parent=self._host)
             w.setProperty("crumb", True)
             w.clicked.connect(lambda p=payload: self.crumb_requested.emit(p))
