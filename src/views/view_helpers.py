@@ -6,6 +6,7 @@ import logging
 from collections.abc import Callable, Iterable
 from typing import Protocol, TypeVar
 
+from PyQt6 import sip
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtGui import QAction, QColor, QDrag, QFont, QKeySequence, QPainter
 from PyQt6.QtWidgets import (
@@ -128,6 +129,8 @@ def responsive_grid_metrics(
 def clear_selection(items: list[TSelectable]) -> None:
     """Unselect and clear all selectable items in-place."""
     for item in items:
+        if sip.isdeleted(item):  # C++ 側が破棄済み（選択から外し損ねた分）
+            continue
         item.set_selected(False)
     items.clear()
 

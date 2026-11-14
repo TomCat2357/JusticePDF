@@ -124,3 +124,57 @@ def test_select_all_skips_hidden_items_and_back_does_not_open_new_window(window,
     window._nav_back.append(str(window._work_dir.parent))
     assert window.go_back() is False
     assert opened == [] and len(window._nav_back) == 1
+
+
+def test_removed_folder_card_cannot_be_selected_and_navigation_still_works(window, qtbot):
+    """取り除いて破棄待ちのカードをクリックしても選択に残らず、破棄後の移動で落ちない。"""
+    from PyQt6 import sip
+    from PyQt6.QtCore import QCoreApplication, QEvent
+    from PyQt6.QtWidgets import QApplication
+
+    for name in ("a", "b"):
+        (window._work_dir / name).mkdir()
+        window._add_folder_card(str(window._work_dir / name))
+    window._refresh_grid()
+    QApplication.processEvents()
+    fc = window._folder_cards[0]
+
+    window._remove_folder_card(fc.folder_path)
+    window._on_folder_card_clicked(fc)  # 破棄待ちのうちにクリックされた
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+
+    assert sip.isdeleted(fc)
+    assert window._selected_folder_cards == []
+    assert window.navigate_to(str(window._folder_cards[0].folder_path)) is True
+
+
+def test_grid_refresh_and_navigation_never_show_cards_as_top_level_windows(window, qtbot):
+    """カードを親なしにした後に、積まれていた表示要求が走って窓として現れない。"""
+    from PyQt6.QtCore import QEvent, QObject
+    from PyQt6.QtWidgets import QApplication
+    from src.views.folder_card import FolderCard
+
+    class Spy(QObject):
+        shown = []
+
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Type.Show and isinstance(obj, FolderCard) and obj.parent() is None:
+                self.shown.append(obj)
+            return False
+
+    for name in ("a", "b", "c"):
+        (window._work_dir / name).mkdir()
+        window._add_folder_card(str(window._work_dir / name))
+    window._refresh_grid()
+    QApplication.processEvents()
+    spy = Spy()
+    QApplication.instance().installEventFilter(spy)
+    try:
+        window._refresh_grid()
+        window._refresh_grid()  # 間にイベントを回さない
+        assert window.navigate_to(str(window._work_dir / "a")) is True
+        QApplication.processEvents()
+        qtbot.wait(30)
+    finally:
+        QApplication.instance().removeEventFilter(spy)
+    assert spy.shown == []

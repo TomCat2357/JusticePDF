@@ -250,7 +250,7 @@ def validate_pii_pattern(pattern: str) -> str:
 
 
 def scope_target(word: str, pattern: "str | None" = None) -> "tuple[str, str]":
-    """範囲選択ダイアログに出す「(見出し, 表示する文字列)」を返す。
+    r"""範囲選択ダイアログに出す「(見出し, 表示する文字列)」を返す。
 
     語句とパターンを二重に出さず1か所にまとめる。パターンが語句と異なる(簡易指定で
     ``^…$`` や ``\s*`` が付く、詳細指定で編集した等)ときは、実際に登録・検出に使う
@@ -1113,7 +1113,7 @@ class PiiPanel(QFrame):
         r, g, b = (max(0, min(255, round(c * 255))) for c in self._mask_color)
         self._color_btn.setStyleSheet(
             f"QPushButton {{ background-color: rgb({r}, {g}, {b}); border: 1px solid #cbd5e1;"
-            " border-radius: 4px; }}"
+            " border-radius: 4px; }"
         )
 
     def _on_color_button_clicked(self) -> None:

@@ -547,9 +547,9 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
             if item.widget():
-                item.widget().setParent(None)
+                self._detach_widget(item.widget())
         for item in (*self._folder_cards, *self._cards):
-            item.setParent(None)
+            self._detach_widget(item)
             item.deleteLater()
         self._cards = []
         self._folder_cards = []
@@ -1252,6 +1252,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         if fc in self._selected_folder_cards:
             self._selected_folder_cards.remove(fc)
         self._folder_cards.remove(fc)
+        fc.hide()  # 破棄待ちの間にクリックされて選択に入らないよう、すぐ隠す
         fc.deleteLater()
 
     def _schedule_reconcile(self) -> None:
@@ -1450,6 +1451,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                 if card in self._selected_cards:
                     self._selected_cards.remove(card)
                 self._cards.remove(card)
+                card.hide()
                 card.deleteLater()
                 normalized = self._normalize_path(card.pdf_path)
                 self._file_signatures.pop(normalized, None)
@@ -1464,7 +1466,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         while self._grid_layout.count():
             item = self._grid_layout.takeAt(0)
             if item.widget():
-                item.widget().setParent(None)
+                self._detach_widget(item.widget())
 
         if sort_cards:
             self._sort_cards()
@@ -1514,6 +1516,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             row = i // cols
             col = i % cols
             self._grid_layout.addWidget(item, row, col)
+            item.show()  # _detach_widget で明示的に隠した分を戻す
         self._update_status()
 
     def _on_deferred_grid_refresh(self) -> None:
@@ -1555,6 +1558,17 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         """Re-render visible cards at full quality after zoom debounce."""
         for card in self._get_visible_cards():
             card.render_high_quality()
+
+    @staticmethod
+    def _detach_widget(widget: QWidget) -> None:
+        """レイアウトから外したウィジェットを親なしにし、明示的に隠す。
+
+        レイアウトへ addWidget すると「親が見えていれば表示する」呼び出しが
+        イベントキューに積まれる。親なしにした後にそれが走ると、カードが
+        トップレベルの窓として一瞬表示されてしまうので、先に hide() しておく。
+        """
+        widget.setParent(None)
+        widget.hide()
 
     def _clear_selection(self) -> None:
         """Clear all selections (PDF cards and folder cards)."""
@@ -1669,6 +1683,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
     def _on_card_clicked(self, card: PDFCard) -> None:
         """Handle card click."""
         from PyQt6.QtWidgets import QApplication
+        if card not in self._cards:  # 取り除かれて破棄待ちのカード
+            return
         modifiers = QApplication.keyboardModifiers()
 
         if modifiers & Qt.KeyboardModifier.ControlModifier:
@@ -1704,6 +1720,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
 
     def _on_card_context_menu_requested(self, card: PDFCard, global_pos: QPoint) -> None:
         """カードの右クリック。未選択ならそのカードだけ選ぶ。Shift なら純正メニュー。"""
+        if card not in self._cards:
+            return
         if card not in self._selected_cards:
             self._clear_selection()
             card.set_selected(True)
@@ -1907,6 +1925,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         self._schedule_order_save()
 
     def _on_folder_card_clicked(self, fc: FolderCard) -> None:
+        if fc not in self._folder_cards:  # 取り除かれて破棄待ちのカード
+            return
         modifiers = QApplication.keyboardModifiers()
         if modifiers & Qt.KeyboardModifier.ControlModifier:
             if fc in self._selected_folder_cards:
@@ -2026,6 +2046,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         global_pos: QPoint,
     ) -> None:
         """フォルダカードの右クリック。Shift なら従来のエクスプローラ純正メニュー。"""
+        if fc not in self._folder_cards:
+            return
         if fc not in self._selected_folder_cards:
             self._clear_selection()
             fc.set_selected(True)

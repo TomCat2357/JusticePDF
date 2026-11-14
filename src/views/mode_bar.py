@@ -244,6 +244,8 @@ class ModeBar(QWidget):
             item = self._crumb_lay.takeAt(0)
             w = item.widget()
             if w is not None:
+                # 先に隠す。積まれていた表示要求が親なしになった後に走ると、窓として一瞬出る
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
         last = len(self._crumbs) - 1
