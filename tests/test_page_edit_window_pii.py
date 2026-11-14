@@ -123,7 +123,7 @@ def test_panel_dropdown_replaces_separate_buttons_and_opens_one_panel(qtbot, tmp
     assert [a.text() for a in window._zoom_panel_menu.actions()] == [
         "注釈",
         "しおり",
-        "個人情報",
+        "墨消し",
         "OCR",
     ]
     # OCR も実際のドロワーを持つ(依存が無くてもパネルは開き、案内が出る)。
@@ -1323,3 +1323,26 @@ def test_panel_signals_route_simple_and_detail(qtbot, monkeypatch, tmp_path):
     window._pii_panel.add_detect_word_requested.emit("公務員", "")
     assert log["input_states"] == [None]
     assert ("PERSON", "公務員X") in window._pii_settings().additional_patterns
+
+
+def test_panel_header_close_button_closes_panel_and_unchecks_menu(qtbot, tmp_path):
+    """パネル見出しの × でパネルが閉じ、パネル▼メニューの ✓ も外れる。"""
+    pdf_path = tmp_path / "panel-close.pdf"
+    _make_pii_pdf(pdf_path)
+    window = PageEditWindow(str(pdf_path), UndoManager(max_size=20))
+    qtbot.addWidget(window)
+    window.show()
+    open_zoom(window, qtbot)
+
+    window._zoom_pii_btn.trigger()
+    assert window._pii_panel.is_open is True
+    assert window._pii_panel._panel.panel_header.title() == "墨消し"
+    window._pii_panel._panel.panel_header.close_button.click()
+    assert window._pii_panel.is_open is False
+    assert not window._zoom_pii_btn.isChecked()
+
+    window._zoom_object_btn.trigger()
+    assert window._zoom_annotation_open is True
+    window._zoom_annotation_panel.panel_header.close_button.click()
+    assert window._zoom_annotation_open is False
+    assert not window._zoom_object_btn.isChecked()

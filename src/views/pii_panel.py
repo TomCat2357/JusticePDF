@@ -51,6 +51,13 @@ from src.pii.entity_types import (
 )
 from src.pii.text_normalize import normalize_pattern
 from src.utils.pdf_utils import ShapeAnnotData, ShapeType, TextMarkupAnnotData
+from src.views.panel_parts import (
+    make_action_button,
+    make_panel_shell,
+    make_tool_button,
+    mark_plain_containers,
+    section_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -694,27 +701,26 @@ class PiiPanel(QFrame):
 
         self._toggle_btn = QToolButton()
         self._toggle_btn.setText("◀")
-        self._toggle_btn.setToolTip("個人情報検出")
+        self._toggle_btn.setToolTip("墨消し")
         self._toggle_btn.setFixedWidth(32)
         self._toggle_btn.clicked.connect(self.toggle)
         layout.addWidget(self._toggle_btn)
 
         self._panel = QWidget()
-        panel_layout = QVBoxLayout(self._panel)
+        body = make_panel_shell(self._panel, "墨消し", lambda: self.set_open(False))
+        panel_layout = QVBoxLayout(body)
         panel_layout.setContentsMargins(10, 10, 10, 10)
-
-        panel_layout.addWidget(QLabel("個人情報検出"))
 
         # --- 検出実行 ---
         # 検出範囲は左から「全ページ」→「このページだけ」の順に並べる。追加検出
         # パターン登録ダイアログの3択(全ページ/このページだけ/登録のみ)と
         # 表記を揃え、範囲の選び方を一貫させる。
         detect_row = QHBoxLayout()
-        self._detect_all_btn = QPushButton("全ページを検出")
+        self._detect_all_btn = make_action_button("ScanSearch", "全ページを検出")
         self._detect_all_btn.setToolTip("すべてのページを個人情報検出します。")
         self._detect_all_btn.clicked.connect(self.detect_all_pages_requested.emit)
         detect_row.addWidget(self._detect_all_btn)
-        self._detect_current_btn = QPushButton("このページだけ検出")
+        self._detect_current_btn = make_action_button("FileSearch", "このページだけ検出")
         self._detect_current_btn.setToolTip("表示中のページだけを個人情報検出します。")
         self._detect_current_btn.clicked.connect(self.detect_current_page_requested.emit)
         detect_row.addWidget(self._detect_current_btn)
@@ -734,54 +740,53 @@ class PiiPanel(QFrame):
         self._progress_bar.setVisible(False)
         panel_layout.addWidget(self._progress_bar)
         self._status_label = QLabel("")
-        self._status_label.setStyleSheet("color: palette(dark);")
+        self._status_label.setObjectName("panelHint")
         panel_layout.addWidget(self._status_label)
 
         # --- 手動で塗りつぶし候補を追加 ---
         # 手動追加分の種別は常に「手動」(種別は選ばせない)。
-        manual_group = QGroupBox("手動で塗りつぶし候補を追加")
-        manual_layout = QVBoxLayout(manual_group)
+        panel_layout.addWidget(section_label("手動で塗りつぶし候補を追加"))
+        manual_layout = QVBoxLayout()
 
         tools_row = QHBoxLayout()
-        self._mask_markup_btn = QToolButton()
-        self._mask_markup_btn.setText("テキスト候補")
-        self._mask_markup_btn.setToolTip(
+        tools_row.setSpacing(4)
+        self._mask_markup_btn = make_tool_button(
+            "Type", "テキスト候補",
             "ページ上のテキストをドラッグ選択して塗りつぶし候補にします。\n"
             "先にテキストを選択してから押すと、その場で追加します。\n"
-            "先に押すと連続モードになり、選択するたびに追加します(Esc で終了)。"
+            "先に押すと連続モードになり、選択するたびに追加します(Esc で終了)。",
+            checkable=True,
         )
-        self._mask_markup_btn.setCheckable(True)
         self._mask_markup_btn.toggled.connect(self.mask_markup_tool_toggled.emit)
         tools_row.addWidget(self._mask_markup_btn)
-        self._mask_rect_btn = QToolButton()
-        self._mask_rect_btn.setText("塗り四角")
-        self._mask_rect_btn.setToolTip(
-            "ドラッグで塗りつぶし用の四角を描きます(文字の無い写真等にも使えます)。"
+        self._mask_rect_btn = make_tool_button(
+            "Square", "塗り四角",
+            "ドラッグで塗りつぶし用の四角を描きます(文字の無い写真等にも使えます)。",
+            checkable=True,
         )
-        self._mask_rect_btn.setCheckable(True)
         self._mask_rect_btn.toggled.connect(self.mask_rect_tool_toggled.emit)
         tools_row.addWidget(self._mask_rect_btn)
-        self._mask_ellipse_btn = QToolButton()
-        self._mask_ellipse_btn.setText("塗り丸")
-        self._mask_ellipse_btn.setToolTip(
-            "ドラッグで塗りつぶし用の楕円を描きます(印影等にも使えます)。"
+        self._mask_ellipse_btn = make_tool_button(
+            "Circle", "塗り丸",
+            "ドラッグで塗りつぶし用の楕円を描きます(印影等にも使えます)。",
+            checkable=True,
         )
-        self._mask_ellipse_btn.setCheckable(True)
         self._mask_ellipse_btn.toggled.connect(self.mask_ellipse_tool_toggled.emit)
         tools_row.addWidget(self._mask_ellipse_btn)
         # ボタンを押してもフォーカスを奪わない(ページ上で選択済みのテキスト選択や
         # キー操作(Esc)の受け取り先を変えないため)。
         for btn in (self._mask_markup_btn, self._mask_rect_btn, self._mask_ellipse_btn):
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tools_row.addStretch(1)
         manual_layout.addLayout(tools_row)
-        panel_layout.addWidget(manual_group)
+        panel_layout.addLayout(manual_layout)
 
         # --- 結果一覧 ---
         # 元の「検出結果・塗りつぶし対象」は何を指しているか分かりにくいとの
         # 要望を受け、一覧の実際の役割(自動検出+手動追加分をまとめた、
         # 「エクスポート時に塗りつぶされる対象そのもの」の一覧)が伝わる表記に
         # 変更した。表示する種別は下の「表示・検出する種別」で絞り込める。
-        result_label = QLabel("塗りつぶし対象一覧")
+        result_label = section_label("塗りつぶし対象一覧")
         result_label.setToolTip(
             "自動検出された箇所と手動で追加した候補/図形の一覧です。\n"
             "ここに表示されている項目はすべて塗りつぶし(黒塗り/文字削除)の対象になります。\n"
@@ -791,14 +796,15 @@ class PiiPanel(QFrame):
 
         # 種別ごとの「表示・検出する」チェックボックス(3列)。自動検出の8種別は
         # 検出対象の設定そのもの、「手動」は手動追加分の表示設定。
-        entity_group = QGroupBox("表示・検出する種別")
+        panel_layout.addWidget(section_label("表示・検出する種別"))
+        entity_group = QWidget()
         entity_group.setToolTip(
             "チェックした種別だけを、一覧・ページ上・エクスポートの対象にし、検出も行います。\n"
             "チェックを外した種別は一覧・ページ上に出ず、クリックもできず、"
             "検出・エクスポートの対象外になります(PDF上の注釈は消えません)。"
         )
         entity_grid = QGridLayout(entity_group)
-        entity_grid.setContentsMargins(8, 4, 8, 4)
+        entity_grid.setContentsMargins(0, 0, 0, 0)
         self._entity_checks: dict[str, QCheckBox] = {}
         for i, entity_type in enumerate(ENTITY_TYPES_WITH_MANUAL):
             check = QCheckBox(get_entity_type_name_ja(entity_type))
@@ -870,16 +876,16 @@ class PiiPanel(QFrame):
         # 全件削除は結果一覧で Ctrl+A → 「削除」で行える。
         # 削除・設定・エクスポートは1行に並べる(縦に3段積むと結果一覧が狭くなるため)。
         action_row = QHBoxLayout()
-        self._remove_selected_btn = QPushButton("削除")
+        self._remove_selected_btn = make_action_button("Trash2", "削除")
         self._remove_selected_btn.setToolTip("結果一覧で選択した項目を塗りつぶし対象から削除します。")
         self._remove_selected_btn.clicked.connect(self.remove_selected_requested.emit)
         action_row.addWidget(self._remove_selected_btn)
 
-        self._settings_btn = QPushButton("設定...")
+        self._settings_btn = make_action_button("Settings", "設定...")
         self._settings_btn.clicked.connect(self.settings_requested.emit)
         action_row.addWidget(self._settings_btn)
 
-        self._export_btn = QPushButton("エクスポート...")
+        self._export_btn = make_action_button("ShieldCheck", "エクスポート...", kind="primary-green")
         self._export_btn.setToolTip(
             "チェック中の種別の塗りつぶし対象を黒塗りし(下の文字も削除)、"
             "PDF・画像として書き出します。\n"
@@ -892,6 +898,7 @@ class PiiPanel(QFrame):
         panel_layout.addStretch()
         layout.addWidget(self._panel)
 
+        mark_plain_containers(self._panel)
         self.set_open(False)
         self._update_button_states()
 
@@ -1104,7 +1111,8 @@ class PiiPanel(QFrame):
     def _apply_color_swatch(self) -> None:
         r, g, b = (max(0, min(255, round(c * 255))) for c in self._mask_color)
         self._color_btn.setStyleSheet(
-            f"QPushButton {{ background-color: rgb({r}, {g}, {b}); border: 1px solid palette(mid); }}"
+            f"QPushButton {{ background-color: rgb({r}, {g}, {b}); border: 1px solid #cbd5e1;"
+            " border-radius: 4px; }}"
         )
 
     def _on_color_button_clicked(self) -> None:

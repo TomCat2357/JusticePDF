@@ -553,6 +553,36 @@ def scene_callout(pdf_path: Path) -> None:
     pew.close()
 
 
+def scene_pii_panel(pdf_path: Path) -> None:
+    print("[scene] 36_pii_panel")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._page_count:
+        pew.close()
+        return
+    pew._open_zoom_view(0)
+    QApplication.processEvents()
+    pew._zoom_pii_btn.trigger()
+    for _ in range(12):
+        QApplication.processEvents()
+    _save(pew, "36_pii_panel.png")
+    pew.close()
+
+
+def scene_ocr_panel(pdf_path: Path) -> None:
+    print("[scene] 37_ocr_panel")
+    pew = _make_page_edit_window(pdf_path)
+    if not pew._page_count:
+        pew.close()
+        return
+    pew._open_zoom_view(0)
+    QApplication.processEvents()
+    pew._zoom_ocr_action.trigger()
+    for _ in range(12):
+        QApplication.processEvents()
+    _save(pew, "37_ocr_panel.png")
+    pew.close()
+
+
 # ---------- Annotated sample PDFs ----------
 
 def _words_on_lines(pdf_path: Path):
@@ -759,6 +789,9 @@ def main() -> None:
         callout_pdf = work_dir / "_callout_demo.pdf"
         _make_callout_pdf(proposal_pdf, callout_pdf)
         scene_callout(callout_pdf)
+
+        scene_pii_panel(proposal_pdf)
+        scene_ocr_panel(proposal_pdf)
 
         copy_install_images()
 

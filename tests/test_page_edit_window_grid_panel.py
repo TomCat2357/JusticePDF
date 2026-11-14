@@ -22,7 +22,7 @@ def test_grid_panel_button_follows_search_and_has_four_items(qtbot, tmp_path):
     assert [a.text() for a in window._grid_panel_menu.actions()] == [
         "注釈",
         "しおり",
-        "個人情報",
+        "墨消し",
         "OCR",
     ]
     # ツールバー上で「検索」「個人情報」の直後に並ぶ。

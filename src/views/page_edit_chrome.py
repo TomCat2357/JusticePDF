@@ -127,7 +127,7 @@ class PageEditChromeMixin:
         rows = (
             ("_zoom_object_btn", "注釈", "付箋・図形・文字などの注釈", "Alt+1", self._on_zoom_panel_annotation_triggered),
             ("_zoom_bookmark_action", "しおり", "しおり編集", "Alt+2", self._on_zoom_panel_bookmarks_triggered),
-            ("_zoom_pii_btn", "個人情報", "個人情報(PII)の検出・ハイライト・黒塗りエクスポート", "Alt+3", self._on_zoom_panel_pii_triggered),
+            ("_zoom_pii_btn", "墨消し", "個人情報(PII)の検出・ハイライト・黒塗りエクスポート", "Alt+3", self._on_zoom_panel_pii_triggered),
             ("_zoom_ocr_action", "OCR", "文字認識(OCR)して、検索・個人情報検出で使えるテキストを埋め込む", "Alt+4", self._on_zoom_panel_ocr_triggered),
         )
         for attr, text, tip, keys, handler in rows:
