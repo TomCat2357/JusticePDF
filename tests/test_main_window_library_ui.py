@@ -109,3 +109,18 @@ def test_navigation_opens_new_window_while_a_page_edit_window_is_open(window, mo
 
     assert window._work_dir == before
     assert opened == [str(sub)]
+
+
+def test_select_all_skips_hidden_items_and_back_does_not_open_new_window(window, qtbot, monkeypatch):
+    window._search_action.setChecked(True)
+    window._filter_bar.line_edit().setText("契約 OR 請求")
+    window._on_select_all()
+    assert sorted(c.filename for c in window._selected_cards) == ["契約書_A社.pdf", "請求書.pdf"]
+
+    # 個別画面を開いたまま「戻る」を押しても新しい窓は開かず、履歴も動かない
+    opened = []
+    monkeypatch.setattr(main_window.MainWindow, "_open_folder_in_new_window", lambda self, f: opened.append(f))
+    monkeypatch.setattr(main_window.MainWindow, "_owned_page_edit_windows", lambda self: [object()])
+    window._nav_back.append(str(window._work_dir.parent))
+    assert window.go_back() is False
+    assert opened == [] and len(window._nav_back) == 1

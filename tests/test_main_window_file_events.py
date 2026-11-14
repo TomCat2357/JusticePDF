@@ -38,7 +38,7 @@ def window_factory(monkeypatch, qtbot, tmp_path):
 
 def test_file_added_refreshes_existing_card_for_reused_path(window_factory, tmp_path):
     window, state = window_factory()
-    pdf_path = tmp_path / "same-name.pdf"
+    pdf_path = Path(window._work_dir) / "same-name.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
 
     card = window._add_card(str(pdf_path))
@@ -54,7 +54,7 @@ def test_file_added_refreshes_existing_card_for_reused_path(window_factory, tmp_
 
 def test_file_removed_ignores_stale_remove_when_path_exists(window_factory, tmp_path):
     window, state = window_factory()
-    pdf_path = tmp_path / "same-name.pdf"
+    pdf_path = Path(window._work_dir) / "same-name.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
 
     card = window._add_card(str(pdf_path))

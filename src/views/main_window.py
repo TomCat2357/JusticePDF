@@ -568,7 +568,24 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         else:
             self.setWindowTitle(f"JusticePDF - {wd.name or str(wd)}")
 
+    def _nav_block_reason(self) -> str | None:
+        """戻る/進む/上へで移動できない理由（無ければ None）。"""
+        if self._operation_in_progress:
+            return "処理中のため移動できません"
+        if self._owned_page_edit_windows():
+            return "編集中の画面を閉じてから移動してください"
+        return None
+
+    def _nav_blocked(self) -> bool:
+        reason = self._nav_block_reason()
+        if reason is None:
+            return False
+        self.statusBar().showMessage(reason, 4000)
+        return True
+
     def go_back(self) -> bool:
+        if self._nav_blocked():
+            return False
         while self._nav_back and not os.path.isdir(self._nav_back[-1]):
             self._nav_back.pop()
         if not self._nav_back:
@@ -583,6 +600,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         return False
 
     def go_forward(self) -> bool:
+        if self._nav_blocked():
+            return False
         while self._nav_forward and not os.path.isdir(self._nav_forward[-1]):
             self._nav_forward.pop()
         if not self._nav_forward:
@@ -597,6 +616,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         return False
 
     def go_up(self) -> bool:
+        if self._nav_blocked():
+            return False
         parent = Path(self._work_dir).parent
         if os.path.normcase(str(parent)) == os.path.normcase(str(self._work_dir)):
             return False
@@ -963,6 +984,11 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
     def _normalize_path(self, path: str) -> str:
         """Normalize paths for internal tracking."""
         return os.path.normcase(os.path.abspath(path))
+
+    def _is_in_work_dir(self, path: str) -> bool:
+        """イベントのパスが今表示中のフォルダ直下か（移動前のフォルダの遅れた通知を捨てる）。"""
+        parent = self._normalize_path(os.path.dirname(os.path.abspath(path)))
+        return parent == self._normalize_path(str(self._work_dir))
 
     def _get_file_signature(self, path: str) -> tuple[int, int, int, int] | None:
         """Return a signature that changes for writes and atomic replacement."""
@@ -1623,11 +1649,11 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
             # Select cards intersecting with rubber band
             self._clear_selection()
             for card in self._cards:
-                if rect.intersects(card.geometry()):
+                if self._item_visible(card) and rect.intersects(card.geometry()):
                     card.set_selected(True)
                     self._selected_cards.append(card)
             for fc in self._folder_cards:
-                if rect.intersects(fc.geometry()):
+                if self._item_visible(fc) and rect.intersects(fc.geometry()):
                     fc.set_selected(True)
                     self._selected_folder_cards.append(fc)
             self._update_button_states()
@@ -1659,9 +1685,10 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
                 if start_idx > end_idx:
                     start_idx, end_idx = end_idx, start_idx
                 for i in range(start_idx, end_idx + 1):
-                    if self._cards[i] not in self._selected_cards:
-                        self._cards[i].set_selected(True)
-                        self._selected_cards.append(self._cards[i])
+                    c = self._cards[i]
+                    if c not in self._selected_cards and self._item_visible(c):
+                        c.set_selected(True)
+                        self._selected_cards.append(c)
             else:
                 card.set_selected(True)
                 self._selected_cards.append(card)
@@ -1850,6 +1877,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
 
     def _on_folder_added(self, path: str) -> None:
         """Handle subfolder created on disk."""
+        if not self._is_in_work_dir(path):
+            return
         normalized = self._normalize_path(path)
         for fc in self._folder_cards:
             if self._normalize_path(fc.folder_path) == normalized:
@@ -1866,6 +1895,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
 
     def _on_folder_removed(self, path: str) -> None:
         """Handle subfolder removed from disk."""
+        if not self._is_in_work_dir(path):
+            return
         normalized = self._normalize_path(path)
         if normalized in self._internal_removes:
             self._internal_removes.discard(normalized)
@@ -2036,6 +2067,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
 
     def _on_file_added(self, path: str) -> None:
         """Handle new file added to folder."""
+        if not self._is_in_work_dir(path):
+            return
         clear_pixmap_cache_for_path(path)
         normalized = self._normalize_path(path)
         self._modified_last_mtime.pop(normalized, None)
@@ -2067,6 +2100,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
 
     def _on_file_removed(self, path: str) -> None:
         """Handle file removed from folder."""
+        if not self._is_in_work_dir(path):
+            return
         # If a save is in progress, there may be a pending debounced refresh.
         self._cancel_debounced_modified(path)
         clear_pixmap_cache_for_path(path)
@@ -2097,6 +2132,8 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         Many editors save by writing the file multiple times. Debounce per-path to avoid
         repeated expensive refreshes (PDF open, thumbnail regen, layout).
         """
+        if not self._is_in_work_dir(path):
+            return
         self._schedule_debounced_modified(path)
 
     def _schedule_debounced_modified(self, path: str) -> None:
@@ -2185,7 +2222,7 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         targets = (
             [c.pdf_path for c in self._selected_cards]
             if self._selected_cards
-            else [c.pdf_path for c in self._cards]
+            else [c.pdf_path for c in self._cards if self._item_visible(c)]
         )
         if not targets:
             QMessageBox.information(self, "印刷", "印刷対象のPDFがありません。")
@@ -2252,11 +2289,13 @@ class MainWindow(FileOpsMixin, SplitMixin, ImportMixin, ExportMixin, DragDropMix
         """Handle select all action (includes folder cards)."""
         self._clear_selection()
         for fc in self._folder_cards:
-            fc.set_selected(True)
-            self._selected_folder_cards.append(fc)
+            if self._item_visible(fc):
+                fc.set_selected(True)
+                self._selected_folder_cards.append(fc)
         for card in self._cards:
-            card.set_selected(True)
-            self._selected_cards.append(card)
+            if self._item_visible(card):
+                card.set_selected(True)
+                self._selected_cards.append(card)
         self._update_button_states()
 
     def _apply_sort(self, sort_type: str, ascending: bool) -> None:

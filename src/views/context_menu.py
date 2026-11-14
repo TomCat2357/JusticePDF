@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtWidgets import QMenu
 
@@ -69,6 +70,7 @@ def build_context_menu(parent, header: str | None, entries, footer: str | None =
     節の間に区切り線を入れる。
     """
     menu = QMenu(parent)
+    menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)  # 閉じたら消える（親の子に溜めない）
     rows: list[tuple[int, int, str, QAction]] = []
     for i, entry in enumerate(entries):
         group, act = (_from_action(menu, entry) if isinstance(entry, QAction)
